@@ -1,0 +1,74 @@
+{
+  "name": "bundlebees",
+  "version": "0.1.0",
+  "description": "Dark-mode Desktop pane for bundlebees launcher health, containers, models, concurrency, authorized projects, live attempts, verify results, and the remote-host prompt. Reports configured/not-configured only; never renders tokens or host addresses.",
+  "icon": "bee",
+  "dark_mode": true,
+  "color_scheme": "dark",
+  "entry": "desktop/plugin.js",
+  "router": "router",
+  "module": "dashboard.plugin_api",
+  "mount": "/api/plugins/bundlebees",
+  "tabs": [
+    {
+      "id": "health",
+      "label": "Health",
+      "routes": ["/health"]
+    },
+    {
+      "id": "containers",
+      "label": "Containers",
+      "routes": ["/containers"]
+    },
+    {
+      "id": "models",
+      "label": "Models",
+      "routes": ["/models"]
+    },
+    {
+      "id": "concurrency",
+      "label": "Concurrency",
+      "routes": ["/concurrency"]
+    },
+    {
+      "id": "projects",
+      "label": "Projects",
+      "routes": ["/projects"]
+    },
+    {
+      "id": "attempts",
+      "label": "Live attempts",
+      "routes": [
+        "/attempts",
+        "/attempts/{attempt_id}",
+        "/attempts/{attempt_id}/events",
+        "/attempts/{attempt_id}/cancel",
+        "/attempts/{attempt_id}/review"
+      ]
+    },
+    {
+      "id": "verify-results",
+      "label": "Verify results",
+      "routes": ["/verify-results"]
+    },
+    {
+      "id": "host-prompt",
+      "label": "Remote host",
+      "routes": ["/host-prompt"]
+    }
+  ],
+  "routes": [
+    "/health",
+    "/containers",
+    "/models",
+    "/concurrency",
+    "/projects",
+    "/attempts",
+    "/attempts/{attempt_id}",
+    "/attempts/{attempt_id}/events",
+    "/attempts/{attempt_id}/cancel",
+    "/attempts/{attempt_id}/review",
+    "/verify-results",
+    "/host-prompt"
+  ]
+}
