@@ -1,0 +1,39 @@
+# Native Hermes plugin manifest (v2). Quote version. Keep provides_* in sync with register().
+name: bundlebees
+version: "0.1.0"
+description: >-
+  Orchestrate CUA bees from Hermes: check launcher health, dispatch leased
+  briefs, watch attempts, and generate a paste-ready host setup prompt.
+  Disclosure — talks to a local or user-configured worker launcher (loopback
+  by default); dispatching a bee can spend model budget on that worker
+  machine; secrets are read only through Hermes get_secret; the user-run CLI
+  (hermes bundlebees verify / deploy) can push a feature branch and, when you
+  invoke it, reach a remote host. A Cua sandbox is not a sandbox for the
+  Hermes process. The Desktop pane never shows tokens or host addresses.
+author: mojomast
+license: MIT
+homepage: https://github.com/mojomast/bundlebees
+tags:
+  - automation
+  - tools
+  - desktop
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - bundlebees_status
+  - bundlebees_dispatch
+  - bundlebees_attempt
+  - bundlebees_host_prompt
+provides_hooks: []
+requires_env:
+  - name: BUNDLEBEES_LAUNCHER_TOKEN
+    description: >-
+      API token for the local Orbit workers adapter or the worker launcher.
+      Configure it in Hermes secrets. Never paste the value into chat.
+    secret: true
+config_schema:
+  adapter:
+    type: str
+    default: orbit-loopback
+    description: How to reach workers (orbit-loopback or launcher). The pane never displays the URL.
