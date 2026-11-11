@@ -4,7 +4,7 @@ Repository: `https://github.com/mojomast/bundlebees.git`
 
 Branch: **`video/showcase`**
 
-Base: `feat/v0.1.0` at `bf5f1a7b4ef7ed661a892ac2450186081e238e4c` (PR #1).
+Base: `feat/v0.1.0` at `bf5f1a7b4ef7ed661a892ac2450186081e238e4c`. Product facts: v0.1.0 at `57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c` (see `FACTS.md`). Revision 2 adds real stills and a MorningDAW score.
 
 The user requested this finished presentation be committed and pushed for the agent managing the project on another host. All additions are under `film/`.
 
@@ -30,15 +30,15 @@ Read `film/README.md`, `film/REVIEW.md`, `film/STORYBOARD.md` and `film/SCRIPT.m
 
 ## Finished artifacts
 
-- **`film/delivery/bundlebees-1080p.mp4`** — primary presentation; 1920×1080, 30 fps, exactly 72 seconds / 2,160 frames, H.264/yuv420p + AAC stereo, faststart, 5,572,044 bytes.
-- `film/delivery/bundlebees-720p.mp4` — compact preview, 1280×720, 3,104,570 bytes.
+- **`film/delivery/bundlebees-1080p.mp4`** — primary presentation; 1920×1080, 30 fps, exactly 72 seconds / 2,160 frames, H.264/yuv420p + AAC stereo, faststart, 5,508,989 bytes.
+- `film/delivery/bundlebees-720p.mp4` — compact preview, 1280×720, 3,039,141 bytes.
 - **`film/delivery/poster.png`** — exact 1280×720 poster extracted from the final master.
 - **`film/STORYBOARD.md`** — timing, shot design and factual sources.
 - **`film/SCRIPT.md`** — screen script and source ledger.
 - `film/delivery/bundlebees-delivery.zip` — ready-to-use media, Markdown documents, review page and verification data.
 - `film/delivery/verification.json` — hashes and measured results; file paths are relative to `film/delivery/`.
 
-The finished files are committed. They need neither the original host/private review server nor a rerender. All editable modules, local fonts with licenses, actual pane-source capture, original score and synthesis source are included in `film/`.
+The finished files are committed. They need neither the original host/private review server nor a rerender. All editable modules, local fonts with licenses, real stills, the original score and its reproduction notes (`assets/audio/SCORE.md`) are included in `film/`.
 
 Verify committed delivery files from the repository root:
 
@@ -59,17 +59,17 @@ PY
 
 HIVE / CONTROL: graphite dark mode, honey amber and electric cyan, geometric bees and hexagonal sandbox cells, Space Grotesk + IBM Plex Mono. The film shows contracts, two dispatch waves, attempts, user-run verification, rejection and retry, feature-branch integration and explicit user control. Lower third y=720–1080 stays clear. Original 120 BPM instrumental lifts at 20s; no voiceover. Final tagline: **Lead the swarm. Keep control.** Closing URL: `github.com/mojomast/bundlebees`.
 
-Facts come only from README.md and docs/ at the pinned revision. The brief supplied approximately 571 schema tokens and 142 tests, but those figures are absent from those documents. The film therefore shows **4 tools** and the documented **≤900 o200k schema-token budget**, explicitly labelled as a budget. Do not change it to a measured size or introduce a test-count claim without an updated approved source.
+Facts come from `FACTS.md`: 4 tools, 571 o200k schema tokens (measured), 150 tests, v0.1.0 at `57a6f12`, catalog PR #153888. Only change these if a newer release changes the measurements.
 
-Diagrams are labelled illustrations. The genuine Models card comes from unmodified `desktop/plugin.js` component/CSS with an isolated SDK fixture and the documented model ID. It is labelled as an isolated demo, not a live worker run. Preserve these distinctions and the user-run verify/deploy boundary.
+Diagrams are labelled illustrations. Real stills (banner, orch board, terminal captures, Health pane) are scrubbed of private data and recorded in `assets/provenance.json`. Keep the user-run verify/deploy boundary.
 
 ## Verification
 
-Both MP4s passed full decoding, dimensions, 30fps, 2,160-frame count and 72-second duration. Master encoded audio: **−15.03 LUFS / −2.68 dBTP**. Full compact-preview playback: zero dropped frames, zero waits, no errors, seek to 46s passed. Source QA: 73 reverse + 73 shuffled exact-frame matches, ten motion intervals, 1,886 text bounds checks, sampled lower-third clearance. Clean install/build reproduced the rendered composition fingerprint exactly. Encoded scenes, cut boundaries and poster were inspected. Subjective listening was not performed.
+Both MP4s passed full decoding plus dimension, 30fps, 2,160-frame and 72-second checks. Encoded master audio measures **−15.13 LUFS / −3.33 dBTP**. The score PCM is −15.00 LUFS / −4.78 dBTP, and the drop onset is at 19.998s. Preview playback had zero dropped frames. A clean source build reproduced the fingerprint. Details are in `REVIEW.md`. Nobody has listened to it by ear yet.
 
 ## Optional revisions
 
-Hyperrizz / HyperFrames **0.9.34**, exact dependency pin and lockfile. Rendering requires Node.js 22+, Python 3, FFmpeg/ffprobe and Chromium. Finished assets are bundled; NumPy is only needed to regenerate the original score.
+HyperFrames **0.9.34**, exact dependency pin and lockfile. Rendering requires Node.js 22+, Python 3, FFmpeg/ffprobe and Chromium. Finished assets are bundled. To regenerate the score you need MorningDAW 1.6.3 and the hermes-morningdaw tools (see `assets/audio/SCORE.md`).
 
 ```bash
 cd film

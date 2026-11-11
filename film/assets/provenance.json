@@ -1,5 +1,5 @@
 {
-  "sourceCommit": "bf5f1a7b4ef7ed661a892ac2450186081e238e4c",
+  "sourceCommit": "57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c",
   "repository": "https://github.com/mojomast/bundlebees",
   "assets": [
     {
@@ -27,19 +27,76 @@
       "license": "OFL-1.1"
     },
     {
+      "path": "assets/images/banner.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c/docs/assets/banner.png",
+      "sha256": "683270c0e8e4f8b7f0ab429d2922cbae5cb1aca324e64da03a27a3d5bc8f3ff1",
+      "license": "MIT",
+      "capture": "Real docs/assets/banner.png from the v0.1.0 tree (1280\u00d7640), cropped to the top 1280\u00d7556. The banner footer strip still reads \"142 tests\" in the repo, which predates the 150-test v0.1.0 count, so it is cropped out rather than edited.",
+      "bytes": 207031
+    },
+    {
+      "path": "assets/images/pane-health.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c/docs/screenshots/pane-health.png",
+      "sha256": "0ac068dbfd0d17da72e30d25acf7293c6673bff1244e3980b618f769ba9a24bc",
+      "license": "MIT",
+      "capture": "Copied from the v0.1.0 tree docs/screenshots/pane-health.png (1096\u00d7538). Real Health pane screenshot, not a fixture.",
+      "bytes": 44546
+    },
+    {
+      "path": "assets/images/term-doctor.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c",
+      "sha256": "2a97ee3949b750ebcad2f5d0e157799ac28b03dc1e3bcc4b707cfbabd23dea6e",
+      "license": "MIT",
+      "capture": "Terminal still rendered from a real `hermes plugins doctor --ci .` run on the v0.1.0 tree (4 tool registrations). Local paths scrubbed before capture.",
+      "bytes": 99438
+    },
+    {
+      "path": "assets/images/term-pytest.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c",
+      "sha256": "4b320345a3c7040af56a6520ebbb623dd292c953eca712b2af1a96c56a39fe4c",
+      "license": "MIT",
+      "capture": "Terminal still rendered from a real pytest run on the v0.1.0 tree: 150 passed. Local paths scrubbed before capture.",
+      "bytes": 43196
+    },
+    {
+      "path": "assets/images/term-schemas.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c",
+      "sha256": "8ff9f93dde93c189d6bd8a31c6ab3101af33fff887cb4af84a584890e1a1c27a",
+      "license": "MIT",
+      "capture": "Terminal still rendered from a real schema-token measurement on the v0.1.0 tree: tools=4 chars=2617 o200k=571 cl100k=561. Local paths scrubbed before capture.",
+      "bytes": 38906
+    },
+    {
+      "path": "assets/images/orch-state.png",
+      "url": "local orch state.json (compose-v2 + bundlebees waves, 2026-11-11)",
+      "sha256": "95a25af91725ff1b68d6cbdd0dbef80ef47b6acaf426ce0019e9788dd24a759a",
+      "license": "MIT",
+      "capture": "Board still drawn from live launcher state for CV01\u201304 and BB01\u201304, including the BB02 rejection and retry. Tokens, tailnet hosts, IPs, private URLs and local paths were scrubbed. group.txt was not read or copied.",
+      "bytes": 350488
+    },
+    {
+      "path": "assets/audio/hive-mind.wav",
+      "url": "original score composed in MorningDAW 1.6.3 via hermes-morningdaw tools",
+      "sha256": "38d69fc1d63d47961d8637e0ba1695da2c921e8b4e267de2cd7a842ee5d4f46c",
+      "license": "CC0-1.0",
+      "capture": "Original 120 BPM D-minor instrumental. Drop at bar 11 / 20.00s. Two-pass ffmpeg loudnorm to \u221215 LUFS, true peak \u2264 \u22121.5 dBTP, trimmed to 72s. Factory Surge patches and kit samples are not redistributed; see assets/audio/SCORE.md.",
+      "bytes": 13824078
+    },
+    {
       "path": "assets/images/pane-models.png",
       "url": "https://github.com/mojomast/bundlebees/blob/bf5f1a7b4ef7ed661a892ac2450186081e238e4c/desktop/plugin.js",
       "sha256": "0ca77d6654222b0a1204449f00435593c9ec7c3604ee1662502b64969eb27aaf",
+      "license": "MIT",
+      "capture": "Historical isolated Models-card fixture from the first film pass. Not used on screen in this revision; Health screenshot is the pane evidence.",
+      "bytes": 17907,
       "cssBox": {
         "x": 231,
         "y": 19,
         "height": 90.03125,
         "width": 468
       },
-      "deviceScaleFactor": 3,
-      "license": "MIT",
-      "capture": "Actual unmodified pane component and CSS via local React SDK fixture; Models card cropped at device scale 3 for legibility. Model ID from docs/RESEARCH.md; no launcher connection or result metrics.",
-      "browser": "HeadlessChrome/152.0.7977.30"
+      "deviceScaleFactor": 3
     }
-  ]
+  ],
+  "sourceTag": "v0.1.0"
 }

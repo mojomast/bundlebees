@@ -1,10 +1,75 @@
 {
-  "sourceCommit": "bf5f1a7b4ef7ed661a892ac2450186081e238e4c",
+  "sourceCommit": "57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c",
+  "filmBase": "bf5f1a7b4ef7ed661a892ac2450186081e238e4c",
+  "facts": {
+    "tools": 4,
+    "o200kSchemaTokens": 571,
+    "testsPassed": 150,
+    "release": "v0.1.0",
+    "catalogPR": "NousResearch/hermes-agent#153888"
+  },
+  "score": {
+    "title": "HIVE MIND",
+    "source": "MorningDAW 1.6.3 + hermes-morningdaw tools",
+    "seed": 20261111,
+    "bpm": 120,
+    "key": "D minor",
+    "sections": [
+      {
+        "name": "Intro",
+        "bars": 10
+      },
+      {
+        "name": "Drop",
+        "bars": 16
+      },
+      {
+        "name": "Break",
+        "bars": 8
+      },
+      {
+        "name": "Hook",
+        "bars": 1
+      },
+      {
+        "name": "Outro",
+        "bars": 1
+      }
+    ],
+    "pictureSeconds": 72,
+    "mixSeconds": 74,
+    "downbeatSeconds": 0,
+    "dropBar": 11,
+    "liftSeconds": 20.0,
+    "onsetSeconds": 19.998,
+    "onsetErrorSeconds": -0.002,
+    "onsetWithinOneFrame": true,
+    "patches": {
+      "pad": "Pads/Distant.fxp",
+      "arp": "Plucks/Bell 1.fxp",
+      "bass": "Basses/Sub 2.fxp"
+    },
+    "effects": {
+      "pad": "michaelwillis.dragonfly.hall",
+      "master": "airwindows:ToTape6"
+    },
+    "qa_ok": true,
+    "license": "CC0-1.0",
+    "pcm": {
+      "input_i": "-15.00",
+      "input_tp": "-4.78",
+      "input_lra": "3.30",
+      "input_thresh": "-25.02",
+      "normalization_type": "two-pass-loudnorm",
+      "target_i": "-15",
+      "target_tp": "-1.5"
+    }
+  },
   "files": [
     {
       "file": "bundlebees-1080p.mp4",
-      "sha256": "d603b02d9d58ff440f00fba60d3d71fc78a70bebaedc472ba14eccbf345e761a",
-      "bytes": 5572044,
+      "sha256": "e4530749288d1b0fa4d1c8288b234c83a498abd232d480f2a7632ed806fb2cf1",
+      "bytes": 5508989,
       "videoCodec": "h264",
       "width": 1920,
       "height": 1080,
@@ -15,9 +80,9 @@
       "expectedPictureDuration": 72.0,
       "audioStreams": 1,
       "loudness": {
-        "integratedLufs": -15.03,
-        "truePeakDbtp": -2.68,
-        "rangeLu": 3.2,
+        "integratedLufs": -15.13,
+        "truePeakDbtp": -3.33,
+        "rangeLu": 3.4,
         "scope": "first encoded audio stream"
       },
       "fullDecode": true,
@@ -26,8 +91,8 @@
     },
     {
       "file": "bundlebees-720p.mp4",
-      "sha256": "cc3a165ca878170f4af34ec66b6b2fe9ceb2fda68659a84a767e4a62e2bcb259",
-      "bytes": 3104570,
+      "sha256": "3fd38b496274542618b45173ebebb07cbf1016533f8080de1cdbf9763727d195",
+      "bytes": 3039141,
       "videoCodec": "h264",
       "width": 1280,
       "height": 720,
@@ -38,9 +103,9 @@
       "expectedPictureDuration": 72.0,
       "audioStreams": 1,
       "loudness": {
-        "integratedLufs": -15.05,
-        "truePeakDbtp": -2.67,
-        "rangeLu": 3.2,
+        "integratedLufs": -15.23,
+        "truePeakDbtp": -3.27,
+        "rangeLu": 3.5,
         "scope": "first encoded audio stream"
       },
       "fullDecode": true,
@@ -49,28 +114,28 @@
     },
     {
       "file": "poster.png",
-      "bytes": 192846,
-      "sha256": "62fad68d83ec9f118c9432a794dbf5c39c5a8d0deb3e3611c41afe66893da272"
+      "bytes": 196348,
+      "sha256": "dadcfcdfcfcd6e3aee33d3d0a392964149ad6b0ba864df578a0c837442a401f5"
     },
     {
       "file": "STORYBOARD.md",
-      "bytes": 3386,
-      "sha256": "ee3e394ac9c6a7dd25bc6141b87bffc75873a7689cadf5c1b948df1d980d158b"
+      "bytes": 3555,
+      "sha256": "036c98c55ee7f9e204af160a2d37c5212ef9f8f2633ebc931342529877991069"
     },
     {
       "file": "SCRIPT.md",
-      "bytes": 2792,
-      "sha256": "e559b37c18a297027622df46481b6d692c4851fb9d54c7a915974690022afdc2"
+      "bytes": 2980,
+      "sha256": "a25b85592af28db7abde3c3bb42c5e8c7db7436099a45b3cecf7ccbb954ff832"
     },
     {
       "file": "REVIEW.md",
-      "bytes": 3612,
-      "sha256": "1b43fa7a1ed2fc3fccf3506173de55bcf0a126b677a52baea4204bcbbbce89c1"
+      "bytes": 4169,
+      "sha256": "14e0ac373ce9960eab42a7254f3eaf23cc0affbc9d6ec47b331f6bdab7b2068f"
     }
   ],
   "subjectiveListening": false,
   "render-build": {
-    "sha256": "13b89e235612a2919aa10181a36d65330d3970cc13d3ff61efe0a9401b2d310b",
+    "sha256": "92160fbed1683e1609cb5efede8e05f61c41111ec72f5bb0e4deb94a6687a825",
     "width": 1920,
     "height": 1080,
     "frames": 2160,
@@ -118,47 +183,47 @@
     "motion": [
       {
         "scene": "hook",
-        "changedChannels": 288653
+        "changedChannels": 607818
       },
       {
         "scene": "contracts",
-        "changedChannels": 1286513
+        "changedChannels": 1293641
       },
       {
         "scene": "waves",
-        "changedChannels": 174518
+        "changedChannels": 2136698
       },
       {
         "scene": "dispatch",
-        "changedChannels": 217301
+        "changedChannels": 218123
       },
       {
         "scene": "verify",
-        "changedChannels": 286323
+        "changedChannels": 288260
       },
       {
         "scene": "retry",
-        "changedChannels": 93182
+        "changedChannels": 94680
       },
       {
         "scene": "control",
-        "changedChannels": 1191870
+        "changedChannels": 1197230
       },
       {
         "scene": "boundary",
-        "changedChannels": 427230
+        "changedChannels": 426327
       },
       {
         "scene": "proof",
-        "changedChannels": 514613
+        "changedChannels": 1257821
       },
       {
         "scene": "pane",
-        "changedChannels": 967386
+        "changedChannels": 1160367
       }
     ],
     "lowerThirdMaxSpatialRange": 0,
-    "endHoldMeanDifference": 0.052595485001802444,
+    "endHoldMeanDifference": 0.05657777190208435,
     "poster": {
       "file": "delivery/poster.png",
       "width": 1280,
@@ -171,7 +236,7 @@
     "passed": true,
     "sourceOnlyInstall": true,
     "build": {
-      "sha256": "13b89e235612a2919aa10181a36d65330d3970cc13d3ff61efe0a9401b2d310b",
+      "sha256": "92160fbed1683e1609cb5efede8e05f61c41111ec72f5bb0e4deb94a6687a825",
       "width": 1920,
       "height": 1080,
       "frames": 2160,
@@ -275,14 +340,14 @@
     "captionAreaClear": true,
     "pageErrors": [],
     "build": {
-      "sha256": "13b89e235612a2919aa10181a36d65330d3970cc13d3ff61efe0a9401b2d310b",
+      "sha256": "92160fbed1683e1609cb5efede8e05f61c41111ec72f5bb0e4deb94a6687a825",
       "width": 1920,
       "height": 1080,
       "frames": 2160,
       "fps": 30,
       "duration": 72
     },
-    "browser": "HeadlessChrome/152.0.7977.30"
+    "browser": "Chrome/155.0.8059.84"
   },
-  "textBoundsChecks": 1886
+  "textBoundsChecks": 1743
 }

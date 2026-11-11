@@ -1,13 +1,13 @@
 {
   "hook":{"label":"BUNDLEBEES / HERMES AGENT PLUGIN","title":["One agent.","A swarm of work."],"resolve":"Give it a hive."},
   "contracts":{"label":"01 / DEFINE THE WORK","title":["Small briefs.","Clear boundaries."],"cards":["OBJECTIVE","FILE LEASES","ACCEPTANCE"],"note":"Contracts first. Budgets in the brief."},
-  "waves":{"label":"02 / DISPATCH IN WAVES","title":"A sandbox for every bee.","waveA":"WAVE A","waveB":"WAVE B","note":"DeepSeek workers · on a machine you control"},
+  "waves":{"label":"02 / DISPATCH IN WAVES","title":"A sandbox for every bee.","waveA":"WAVE A","waveB":"WAVE B","note":"Live orch state · CV01–04 and BB01–04, including BB02 reject and retry"},
   "dispatch":{"label":"03 / FOLLOW THE ATTEMPT","title":"Dispatch. Observe. Review.","tool":"bundlebees_dispatch","attempt":"bundlebees_attempt","note":"Tracked on Hermes’ own kanban."},
   "verify":{"label":"04 / USER-RUN VERIFICATION","title":"Evidence before acceptance.","checks":["File scope","Tests","Secret scan"],"reject":"REJECTED","note":"Worker claims are not evidence."},
   "retry":{"label":"05 / REJECT · REVISE · RETRY","title":["A failed attempt","is feedback."],"resolved":"Verify again. Then integrate.","note":"Feature branch first. Merge stays with the owner."},
   "control":{"label":"06 / THE USER HAS CONTROL","title":["The agent coordinates.","You run the checks."],"commands":["hermes bundlebees verify","hermes bundlebees deploy"],"note":"User-run CLI · not model tools"},
   "boundary":{"label":"07 / EXPLICIT BOUNDARIES","title":"No model-executed untrusted code.","items":["Minimal child environment","Confined worktree paths","Secrets via get_secret only"],"note":"Worker sandboxes do not sandbox the Hermes process."},
-  "proof":{"label":"08 / DOCUMENTED INTERFACE","title":"Small surface. Deliberate scope.","tools":["bundlebees_status","bundlebees_dispatch","bundlebees_attempt","bundlebees_host_prompt"],"budget":"o200k schema-token budget","source":"README + docs / v0.1.0"},
-  "pane":{"label":"09 / VISIBILITY, BUILT IN","title":["One pane.","The whole operation."],"features":["Health + live attempts","Verify results","Bundled operator skill"],"evidence":"ACTUAL PANE SOURCE · ISOLATED DEMO"},
-  "end":{"label":"OPEN SOURCE / BY MOJOMAST","title":"bundlebees","tagline":"Lead the swarm. Keep control.","url":"github.com/mojomast/bundlebees","credit":"A plugin for Hermes Agent · NousResearch/hermes-agent","version":"v0.1.0 · feat/v0.1.0"}
+  "proof":{"label":"08 / DOCUMENTED INTERFACE","title":"Measured interface. Deliberate scope.","tools":["bundlebees_status","bundlebees_dispatch","bundlebees_attempt","bundlebees_host_prompt"],"budget":"571 o200k tokens · measured","tests":"150 tests passed","source":"v0.1.0 · 57a6f12"},
+  "pane":{"label":"09 / VISIBILITY, BUILT IN","title":["One pane.","The whole operation."],"features":["Health + live attempts","Verify results","Bundled operator skill"],"evidence":"ACTUAL PANE · HEALTH"},
+  "end":{"label":"OPEN SOURCE / BY MOJOMAST","title":"bundlebees","tagline":"Lead the swarm. Keep control.","url":"github.com/mojomast/bundlebees","credit":"A plugin for Hermes Agent · NousResearch/hermes-agent","version":"v0.1.0 · 57a6f12 · catalog PR #153888"}
 }

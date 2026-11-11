@@ -1,33 +1,42 @@
 {
   "title": "HIVE MIND",
-  "seed": 3612026,
+  "source": "MorningDAW 1.6.3 + hermes-morningdaw tools",
+  "seed": 20261111,
   "bpm": 120,
-  "downbeatSeconds": 0,
-  "liftSeconds": 20,
-  "hitsSeconds": [
-    0,
-    6,
-    12,
-    20,
-    26,
-    32,
-    40,
-    46,
-    52,
-    58,
-    65
+  "key": "D minor",
+  "sections": [
+    {"name": "Intro", "bars": 10},
+    {"name": "Drop", "bars": 16},
+    {"name": "Break", "bars": 8},
+    {"name": "Hook", "bars": 1},
+    {"name": "Outro", "bars": 1}
   ],
+  "pictureSeconds": 72,
+  "mixSeconds": 74,
+  "downbeatSeconds": 0,
+  "dropBar": 11,
+  "liftSeconds": 20.0,
+  "onsetSeconds": 19.998,
+  "onsetErrorSeconds": -0.002,
+  "onsetWithinOneFrame": true,
+  "patches": {
+    "pad": "Pads/Distant.fxp",
+    "arp": "Plucks/Bell 1.fxp",
+    "bass": "Basses/Sub 2.fxp"
+  },
+  "effects": {
+    "pad": "michaelwillis.dragonfly.hall",
+    "master": "airwindows:ToTape6"
+  },
+  "qa_ok": true,
   "license": "CC0-1.0",
   "pcm": {
-    "input_i": "-15.01",
-    "input_tp": "-3.01",
-    "input_lra": "3.20",
-    "input_thresh": "-25.06",
-    "output_i": "-15.06",
-    "output_tp": "-3.00",
-    "output_lra": "3.40",
-    "output_thresh": "-25.09",
-    "normalization_type": "dynamic",
-    "target_offset": "0.06"
+    "input_i": "-15.00",
+    "input_tp": "-4.78",
+    "input_lra": "3.30",
+    "input_thresh": "-25.02",
+    "normalization_type": "two-pass-loudnorm",
+    "target_i": "-15",
+    "target_tp": "-1.5"
   }
 }

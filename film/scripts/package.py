@@ -1,7 +1,7 @@
 from pathlib import Path
 import hashlib,json,shutil,zipfile,re
 r=Path(__file__).resolve().parents[1];d=r/'delivery';d.mkdir(exist_ok=True)
-report={'sourceCommit':'bf5f1a7b4ef7ed661a892ac2450186081e238e4c','files':[],'subjectiveListening':False}
+report={'sourceCommit':'57a6f12cdcfa789c5aba5f22f3f46efd2b8b3d5c','filmBase':'bf5f1a7b4ef7ed661a892ac2450186081e238e4c','facts':{'tools':4,'o200kSchemaTokens':571,'testsPassed':150,'release':'v0.1.0','catalogPR':'NousResearch/hermes-agent#153888'},'score':json.loads((r/'assets/audio/mastering.json').read_text()),'files':[],'subjectiveListening':False}
 for src,name,ver in [('out/bundlebees-1080p.mp4','bundlebees-1080p.mp4','master-verification.json'),('previews/bundlebees-720p.mp4','bundlebees-720p.mp4','preview-verification.json')]:
  j=json.loads((r/'out'/ver).read_text());p=r/src;assert p.stat().st_size==j['bytes'] and hashlib.sha256(p.read_bytes()).hexdigest()==j['sha256'];j['file']=name;report['files'].append(j);tmp=d/(name+'.tmp');shutil.copy2(p,tmp);tmp.replace(d/name)
 for name in ['STORYBOARD.md','SCRIPT.md','REVIEW.md']:

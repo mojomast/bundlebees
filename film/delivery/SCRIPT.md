@@ -13,8 +13,8 @@ Contracts first. Budgets in the brief.
 
 **00:12–00:20**\
 A sandbox for every bee.\
-WAVE A / WAVE B\
-DeepSeek workers · on a machine you control
+REAL ORCH STATE · CV01–04 / BB01–04\
+Live orch state · including BB02 reject and retry
 
 **00:20–00:26**\
 Dispatch. Observe. Review.\
@@ -30,6 +30,8 @@ Worker claims are not evidence.
 **00:32–00:40**\
 A failed attempt is feedback.\
 REVISE → RETRY → ACCEPTED\
+BB02 rejected att_8d589c81592c66a7 · child_env allowlist\
+retried att_238d7f7d39f31891 · merged da2aff1\
 Verify again. Then integrate.\
 Feature branch first. Merge stays with the owner.
 
@@ -47,16 +49,17 @@ Secrets via get_secret only\
 Worker sandboxes do not sandbox the Hermes process.
 
 **00:52–00:58**\
-Small surface. Deliberate scope.\
+Measured interface. Deliberate scope.\
 4 tools\
 bundlebees_status / bundlebees_dispatch / bundlebees_attempt / bundlebees_host_prompt\
-≤900 o200k schema-token budget\
-README + docs / v0.1.0
+571 o200k tokens · measured\
+150 tests passed\
+v0.1.0 · 57a6f12
 
 **00:58–01:05**\
 One pane. The whole operation.\
 Health + live attempts / Verify results / Bundled operator skill\
-ACTUAL PANE SOURCE · ISOLATED DEMO
+ACTUAL PANE · HEALTH
 
 **01:05–01:12**\
 bundlebees\
@@ -64,15 +67,15 @@ Lead the swarm. Keep control.\
 github.com/mojomast/bundlebees\
 A plugin for Hermes Agent · NousResearch/hermes-agent\
 OPEN SOURCE / BY MOJOMAST\
-v0.1.0 · feat/v0.1.0
+v0.1.0 · 57a6f12 · catalog PR #153888
 
 ## Fact ledger
 
-- README.md: identity, four exact tool names, user-run verify/deploy, dark pane, bundled skill, ≤900 o200k schema budget, MIT license, version/branch status.
+- film/FACTS.md and the v0.1.0 release tree (`57a6f12`): identity, four exact tool names, measured 571 o200k schema tokens, 150 passing tests, catalog PR #153888, MIT license.
 - docs/RESEARCH.md §3.2–3.3: worker claims are self-reports; model does not run verify/deploy or untrusted code.
 - docs/RESEARCH.md §4: Hermes kanban, dependency waves.
 - docs/RESEARCH.md §6 and §9: briefs, budgets, DeepSeek Flash, two waves of two.
 - docs/RESEARCH.md §7: exact-name child environment, confined worktrees, get_secret, worker sandbox scope.
 - docs/tasks/BB00_CONTRACTS.md: objective/assigned_files/acceptance, scope rejection, named tests and secret scan, feature-branch-only push, user-owned merge.
 
-The supplied “~571 tokens” and “142 tests” are not present in the pinned README/docs, so the film does not assert them. The ≤900 number is a design budget, not a measurement. No live product test results are represented.
+On-screen proof uses the measured v0.1.0 figures: 4 tools, 571 o200k tokens, 150 tests. Terminal stills and the orch board were rendered from real command output and live launcher state, then scrubbed of local paths, tokens, IPs and private URLs.

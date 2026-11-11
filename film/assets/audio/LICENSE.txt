@@ -1,5 +1,13 @@
 HIVE MIND — original instrumental score composed for the bundlebees presentation.
-All sounds synthesized locally; no recordings, third-party samples or voice.
-Dedicated to the public domain under CC0 1.0 Universal.
+
+Composed in MorningDAW 1.6.3 through the hermes-morningdaw plugin tools
+(generate, surge_patches, add_instrument, add_effect, ab_check, drum_kit, mix_stems).
+120 BPM, D minor, drop on bar 11 at 20.00 s. No voice, no third-party recordings.
+
+The composition and the mastered 72-second mix (hive-mind.wav) are dedicated to the
+public domain under CC0 1.0 Universal.
 https://creativecommons.org/publicdomain/zero/1.0/
-Reproducible source: film/scripts/music.py
+
+Surge XT factory patches (Pads/Distant, Plucks/Bell 1, Basses/Sub 2) and MorningDAW
+factory drum samples were used in the render only. Those factory files are not
+redistributed here. Reproduction notes are in SCORE.md.

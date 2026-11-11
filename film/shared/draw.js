@@ -20,3 +20,11 @@ export function curve(points,p){const q=1-p;return [0,1].map(k=>q*q*q*points[0][
 export function fly(g,points,p,T,color=P.amber,scale=1){const [x,y]=curve(points,p),[x2,y2]=curve(points,Math.min(1,p+.005)),angle=p>.995?0:Math.atan2(y2-y,x2-x);bee(g,x,y,scale,angle,color,Math.sin(T*16))}
 export function card(g,x,y,w,h,stroke=P.line){poly(g,[[x,y],[x+w-24,y],[x+w,y+24],[x+w,y+h],[x,y+h]],P.surface,stroke,2)}
 export function tick(g,x,y,color=P.cyan){line(g,x-10,y,x-2,y+8,color,4);line(g,x-2,y+8,x+14,y-11,color,4)}
+export function fitImage(g,img,x,y,w,h,{stroke=null,lineWidth=2,anchor='center'}={}){
+  if(!img||!img.width)return {x,y,w:0,h:0};
+  const r=Math.min(w/img.width,h/img.height),iw=img.width*r,ih=img.height*r;
+  const ix=anchor==='left'?x:x+(w-iw)/2,iy=y+(h-ih)/2;
+  g.drawImage(img,ix,iy,iw,ih);
+  if(stroke){g.strokeStyle=stroke;g.lineWidth=lineWidth;g.strokeRect(ix,iy,iw,ih)}
+  return {x:ix,y:iy,w:iw,h:ih};
+}
