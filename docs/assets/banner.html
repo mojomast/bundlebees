@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bundlebees banner</title>
+<style>
+@font-face {
+  font-family: "SyneVar";
+  src: url("file:///usr/share/fonts/truetype/sand-box/google/Syne/Syne-VariableFont_wght.ttf") format("truetype");
+  font-weight: 400 800;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "GeistVar";
+  src: url("file:///usr/share/fonts/truetype/sand-box/google/Geist/Geist-VariableFont_wght.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "GeistMonoVar";
+  src: url("file:///usr/share/fonts/truetype/sand-box/google/Geist%20Mono/GeistMono-VariableFont_wght.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  width: 1280px;
+  height: 640px;
+  overflow: hidden;
+  background: #0b0f14;
+  color: #e6edf5;
+}
+.artboard {
+  width: 1280px;
+  height: 640px;
+  position: relative;
+  background: #0b0f14;
+  overflow: hidden;
+}
+.grid { position: absolute; inset: 0; pointer-events: none; }
+.rule {
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  height: 8px;
+  background: #54d3a1;
+}
+.frame {
+  position: absolute;
+  inset: 24px;
+  border: 1px solid #243242;
+  pointer-events: none;
+}
+.layout {
+  position: absolute;
+  left: 64px;
+  right: 72px;
+  top: 48px;
+  bottom: 96px;
+  display: grid;
+  grid-template-columns: 460px 1fr;
+  align-items: center;
+  column-gap: 24px;
+}
+.mark { display: flex; align-items: center; justify-content: center; }
+.copy { padding-bottom: 10px; }
+.wordmark {
+  font-family: "SyneVar", sans-serif;
+  font-weight: 800;
+  font-size: 128px;
+  letter-spacing: -0.055em;
+  line-height: 0.86;
+  color: #e6edf5;
+}
+.wordmark .bees { color: #54d3a1; display: block; }
+.pitch {
+  margin-top: 28px;
+  font-family: "GeistVar", sans-serif;
+  font-weight: 430;
+  font-size: 26px;
+  letter-spacing: -0.02em;
+  color: #93a4b8;
+  max-width: 640px;
+  line-height: 1.3;
+}
+.meta {
+  position: absolute;
+  left: 72px;
+  right: 72px;
+  bottom: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: "GeistMonoVar", ui-monospace, monospace;
+  font-weight: 450;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  color: #93a4b8;
+  border-top: 1px solid #243242;
+  padding-top: 16px;
+}
+.meta strong { color: #e6edf5; font-weight: 550; }
+.dots { display: flex; gap: 28px; align-items: baseline; }
+</style>
+</head>
+<body>
+<div class="artboard" id="artboard">
+  <svg class="grid" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <pattern id="hex" width="56" height="48.497" patternUnits="userSpaceOnUse">
+        <path d="M14 0 L42 0 L56 24.248 L42 48.497 L14 48.497 L0 24.248 Z"
+              fill="none" stroke="#243242" stroke-width="1"/>
+      </pattern>
+      <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="white" stop-opacity="0.7"/>
+        <stop offset="46%" stop-color="white" stop-opacity="0.28"/>
+        <stop offset="78%" stop-color="white" stop-opacity="0"/>
+      </linearGradient>
+      <mask id="gridmask">
+        <rect width="1280" height="640" fill="url(#fade)"/>
+      </mask>
+    </defs>
+    <rect width="820" height="640" fill="url(#hex)" mask="url(#gridmask)"/>
+  </svg>
+  <div class="rule"></div>
+  <div class="frame"></div>
+  <div class="layout">
+    <div class="mark">
+      <svg width="420" height="420" viewBox="0 0 440 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bundlebees mark">
+        <defs>
+          <g id="hexcell">
+            <path d="M-21 -36.373 L21 -36.373 L42 0 L21 36.373 L-21 36.373 L-42 0 Z"/>
+          </g>
+        </defs>
+        <g fill="none" stroke="#54d3a1" stroke-width="2.25" transform="translate(196 248)">
+          <use href="#hexcell" fill="#111821"/>
+          <use href="#hexcell" transform="translate(63 36.373)" fill="#0b0f14"/>
+          <use href="#hexcell" transform="translate(63 -36.373)" fill="#111821"/>
+          <use href="#hexcell" transform="translate(0 -72.746)" fill="#0b0f14"/>
+          <use href="#hexcell" transform="translate(-63 -36.373)" fill="#111821"/>
+          <use href="#hexcell" transform="translate(-63 36.373)" fill="#54d3a1" fill-opacity="0.16" stroke="#54d3a1"/>
+        </g>
+        <g transform="translate(268 148) rotate(-18)">
+          <ellipse cx="4" cy="-28" rx="28" ry="16" transform="rotate(-18 4 -28)"
+                   fill="#54d3a1" fill-opacity="0.18" stroke="#54d3a1" stroke-width="2"/>
+          <ellipse cx="28" cy="-26" rx="26" ry="14" transform="rotate(12 28 -26)"
+                   fill="#54d3a1" fill-opacity="0.28" stroke="#54d3a1" stroke-width="2"/>
+          <rect x="-8" y="-12" width="64" height="28" rx="14" fill="#f0b86e"/>
+          <rect x="10" y="-12" width="7" height="28" fill="#0b0f14"/>
+          <rect x="26" y="-12" width="7" height="28" fill="#0b0f14"/>
+          <rect x="42" y="-12" width="6" height="28" fill="#0b0f14"/>
+          <circle cx="-6" cy="2" r="16" fill="#e6edf5"/>
+          <circle cx="-28" cy="-2" r="11" fill="#e6edf5"/>
+          <path d="M-34 -10 C-40 -24, -48 -28, -52 -26" fill="none" stroke="#e6edf5" stroke-width="2" stroke-linecap="round"/>
+          <path d="M-30 -12 C-32 -26, -38 -32, -44 -34" fill="none" stroke="#e6edf5" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="-52" cy="-26" r="2.4" fill="#54d3a1"/>
+          <circle cx="-44" cy="-34" r="2.4" fill="#54d3a1"/>
+          <path d="M56 2 L68 2 L56 -4 Z" fill="#f0b86e"/>
+        </g>
+      </svg>
+    </div>
+    <div class="copy">
+      <div class="wordmark">bundle<span class="bees">bees</span></div>
+      <div class="pitch">Orchestrate CUA bees from Hermes.</div>
+    </div>
+  </div>
+  <div class="meta">
+    <div class="dots">
+      <span><strong>v0.1.0</strong></span>
+      <span>MIT</span>
+      <span>Hermes ≥ 0.23.0</span>
+    </div>
+    <div class="dots">
+      <span>4 tools</span>
+      <span>571 o200k</span>
+      <span>142 tests</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
