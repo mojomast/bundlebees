@@ -8,8 +8,11 @@ paths cannot reach a model-visible envelope.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,7 +20,9 @@ from typing import Any, Callable, Mapping
 
 from .security import (
     UnsafeURLError,
+    config_flag,
     is_public_git_url,
+    resolve_pinned_endpoint,
     scrub,
     validate_url,
 )
@@ -80,14 +85,85 @@ class NotConfigured(ClientError):
         )
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
-        return None
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that dials a pre-resolved IP with SNI/verify for the hostname."""
+
+    def __init__(self, ip: str, port: int, *, server_hostname: str, timeout: float, context: ssl.SSLContext):
+        super().__init__(ip, port, timeout=timeout, context=context)
+        self._server_hostname = server_hostname
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname)
 
 
-def _build_opener() -> urllib.request.OpenerDirector:
-    # An empty ProxyHandler disables ambient HTTP(S)_PROXY configuration.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+def _host_header(hostname: str, port: int, scheme: str) -> str:
+    default = 443 if scheme == "https" else 80
+    if ":" in hostname and not hostname.startswith("["):
+        display = f"[{hostname}]"
+    else:
+        display = hostname
+    if port != default:
+        return f"{display}:{port}"
+    return display
+
+
+def _pinned_request(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+    allow_loopback: bool,
+    allow_private: bool,
+    max_bytes: int,
+) -> tuple[int, Mapping[str, str], bytes]:
+    """Open ``request`` by connecting to a validated, pre-resolved address.
+
+    Ambient HTTP(S)_PROXY is not consulted. Redirects are not followed here;
+    the caller re-validates each Location and calls this again.
+    """
+    url = request.full_url
+    try:
+        hostname, port, ip, scheme = resolve_pinned_endpoint(
+            url,
+            allow_loopback=allow_loopback,
+            allow_private=allow_private,
+        )
+    except UnsafeURLError as exc:
+        raise ClientError(
+            "launcher endpoint is not allowed by the address policy",
+            "unsafe_url",
+            "Use the loopback Orbit adapter, or set a launcher endpoint in "
+            "the plugin settings. URLs are never taken from tool arguments.",
+        ) from exc
+
+    parts = urllib.parse.urlsplit(url)
+    selector = parts.path or "/"
+    if parts.query:
+        selector += "?" + parts.query
+
+    headers = {key: value for key, value in request.header_items()}
+    headers["Host"] = _host_header(hostname, port, scheme)
+
+    if scheme == "https":
+        context = ssl.create_default_context()
+        conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+            ip, port, server_hostname=hostname, timeout=timeout, context=context
+        )
+    else:
+        conn = http.client.HTTPConnection(ip, port, timeout=timeout)
+
+    try:
+        conn.request(request.get_method() or "GET", selector, body=request.data, headers=headers)
+        response = conn.getresponse()
+        status = int(response.status)
+        # Copy headers before reading/closing.
+        response_headers = {k: v for k, v in response.headers.items()}
+        data = response.read(max_bytes + 1)
+        return status, response_headers, data
+    finally:
+        conn.close()
 
 
 def _unwrap_attempt(data: Any) -> dict[str, Any]:
@@ -440,49 +516,52 @@ class _BaseClient:
                 headers=self._headers(),
             )
             try:
-                with _build_opener().open(request, timeout=self._timeout) as response:
-                    data = response.read(self._max_bytes + 1)
-                    if len(data) > self._max_bytes:
-                        raise ClientError(
-                            "launcher response exceeded the size limit",
-                            "response_too_large",
-                            _FIX_LAUNCHER,
-                        )
-                    return self._decode(data)
-            except urllib.error.HTTPError as exc:
-                data = exc.read(self._max_bytes + 1)
-                status = exc.code
-                location = exc.headers.get("Location") if exc.headers else None
-                exc.close()
-                if len(data) > self._max_bytes:
-                    raise ClientError(
-                        "launcher response exceeded the size limit",
-                        "response_too_large",
-                        _FIX_LAUNCHER,
-                    ) from exc
-                if status in (301, 302, 303, 307, 308):
-                    if not location:
-                        raise ClientError(
-                            "launcher returned a redirect without a location",
-                            "launcher_unavailable",
-                            _FIX_LAUNCHER,
-                        ) from exc
-                    url = urllib.parse.urljoin(url, location)
-                    # Re-validate immediately; the next loop also validates.
-                    self._validate(url)
-                    if status == 303 or (
-                        status in (301, 302) and method.upper() not in ("GET", "HEAD")
-                    ):
-                        method = "GET"
-                        body = None
-                    continue
-                raise self._http_error(status, data) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                status, response_headers, data = _pinned_request(
+                    request,
+                    timeout=self._timeout,
+                    allow_loopback=self._allow_loopback,
+                    allow_private=self._allow_private,
+                    max_bytes=self._max_bytes,
+                )
+            except ClientError:
+                raise
+            except (TimeoutError, OSError, ssl.SSLError) as exc:
                 raise ClientError(
                     "launcher is unreachable",
                     "launcher_unavailable",
                     _FIX_LAUNCHER,
                 ) from exc
+            if len(data) > self._max_bytes:
+                raise ClientError(
+                    "launcher response exceeded the size limit",
+                    "response_too_large",
+                    _FIX_LAUNCHER,
+                )
+            if status in (301, 302, 303, 307, 308):
+                location = None
+                for key, value in response_headers.items():
+                    if key.lower() == "location":
+                        location = value
+                        break
+                if not location:
+                    raise ClientError(
+                        "launcher returned a redirect without a location",
+                        "launcher_unavailable",
+                        _FIX_LAUNCHER,
+                    )
+                url = urllib.parse.urljoin(url, location)
+                # Re-validate immediately; the next loop also validates
+                # and pins the new address before connecting.
+                self._validate(url)
+                if status == 303 or (
+                    status in (301, 302) and method.upper() not in ("GET", "HEAD")
+                ):
+                    method = "GET"
+                    body = None
+                continue
+            if status >= 400:
+                raise self._http_error(status, data)
+            return self._decode(data)
         raise ClientError(
             "launcher returned too many redirects",
             "launcher_unavailable",
@@ -735,7 +814,7 @@ def client_from_agent(
             str(url),
             token_provider=provider,
             allow_loopback=True,
-            allow_private=bool(config.get("allow_private", True)),
+            allow_private=config_flag(config.get("allow_private"), False),
         )
     url = (
         config.get("orbit_url")

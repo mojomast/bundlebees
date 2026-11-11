@@ -5,7 +5,8 @@ description: >-
   Orchestrate CUA bees from Hermes: check launcher health, dispatch leased
   briefs, watch attempts, and generate a paste-ready host setup prompt.
   Disclosure — talks to a local or user-configured worker launcher (loopback
-  by default); dispatching a bee can spend model budget on that worker
+  by default; a private or LAN launcher URL requires allow_private=true in
+  plugin settings); dispatching a bee can spend model budget on that worker
   machine; secrets are read only through Hermes get_secret; the user-run CLI
   (hermes bundlebees verify / deploy) can push a feature branch and, when you
   invoke it, reach a remote host. A Cua sandbox is not a sandbox for the
@@ -37,3 +38,42 @@ config_schema:
     type: str
     default: orbit-loopback
     description: How to reach workers (orbit-loopback or launcher). The pane never displays the URL.
+  launcher_url:
+    type: str
+    default: ""
+    description: >-
+      Launcher endpoint used when adapter is launcher. Never a tool argument.
+      The pane never displays the URL. Loopback is allowed; private or LAN
+      addresses also require allow_private.
+  allow_private:
+    type: bool
+    default: false
+    description: >-
+      Opt in to a private or LAN launcher URL. Default is false. Metadata
+      and link-local addresses are never allowed. Ignored for the
+      orbit-loopback adapter, which is loopback-only.
+  orbit_url:
+    type: str
+    default: "http://127.0.0.1:4318"
+    description: >-
+      Loopback Orbit adapter URL. Private non-loopback addresses are
+      rejected. The pane never displays the URL.
+  worktree:
+    type: str
+    default: ""
+    description: >-
+      Default clean git worktree for the user-run hermes bundlebees verify
+      command. Not used as a model tool argument.
+  branch:
+    type: str
+    default: ""
+    description: >-
+      Default feature branch for hermes bundlebees verify. main and master
+      are refused.
+  deploy_host_alias:
+    type: str
+    default: ""
+    description: >-
+      Stored SSH host alias for the user-run hermes bundlebees deploy
+      --execute command. Not a hostname field for tools, and never shown
+      in the pane.

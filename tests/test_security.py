@@ -173,3 +173,59 @@ def test_validate_url_rejects_ipv4_mapped_metadata_address():
 
 def test_scrub_leaves_plain_text_alone():
     assert security.scrub("normal progress message") == "normal progress message"
+
+
+def test_config_flag_does_not_treat_string_false_as_true():
+    assert security.config_flag(True) is True
+    assert security.config_flag(False) is False
+    assert security.config_flag("false") is False
+    assert security.config_flag("true") is True
+    assert security.config_flag(None, False) is False
+    assert security.config_flag("nope", False) is False
+
+
+def test_resolve_pinned_endpoint_pins_literal_loopback():
+    host, port, ip, scheme = security.resolve_pinned_endpoint("http://127.0.0.1:4318/health")
+    assert (host, port, ip, scheme) == ("127.0.0.1", 4318, "127.0.0.1", "http")
+
+
+def test_resolve_pinned_endpoint_rejects_private_without_opt_in():
+    with pytest.raises(security.UnsafeURLError):
+        security.resolve_pinned_endpoint("http://10.0.0.5:8080/")
+
+
+def test_resolve_pinned_endpoint_uses_a_single_checked_resolution(monkeypatch):
+    import socket
+
+    def fake_gai(host, port, *args, **kwargs):
+        assert host == "launcher.example.test"
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ]
+
+    monkeypatch.setattr(security.socket, "getaddrinfo", fake_gai)
+    host, port, ip, scheme = security.resolve_pinned_endpoint(
+        "http://launcher.example.test:4318/health"
+    )
+    assert host == "launcher.example.test"
+    assert port == 4318
+    assert ip == "127.0.0.1"
+    assert scheme == "http"
+
+
+def test_resolve_pinned_endpoint_rejects_if_any_address_is_metadata(monkeypatch):
+    import socket
+
+    def fake_gai(host, port, *args, **kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port)),
+        ]
+
+    monkeypatch.setattr(security.socket, "getaddrinfo", fake_gai)
+    with pytest.raises(security.UnsafeURLError):
+        security.resolve_pinned_endpoint(
+            "http://evil.example.test/",
+            allow_loopback=False,
+            allow_private=False,
+        )

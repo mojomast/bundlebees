@@ -450,3 +450,14 @@ def test_manifest_lists_all_expected_routes_and_dark_mode():
         "/host-prompt",
     }
     assert expected <= routes
+
+
+
+def test_default_data_dir_does_not_read_hermes_home_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "secret-home"))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(API, "_hermes_plugin_data_dir", lambda: None)
+    path = API._default_data_dir()
+    assert "secret-home" not in str(path)
+    assert path.name == "bundlebees"
+    assert "hermes-plugins" in path.parts

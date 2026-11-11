@@ -318,6 +318,84 @@ def public_fetch_guard(url: str) -> str:
     return validate_url(url, allow_loopback=False, allow_private=False)
 
 
+def resolve_pinned_endpoint(
+    url: str,
+    *,
+    allow_loopback: bool = True,
+    allow_private: bool = False,
+) -> tuple[str, int, str, str]:
+    """Validate ``url`` and return ``(hostname, port, pinned_ip, scheme)``.
+
+    Every address from a single ``getaddrinfo`` call is checked, and the first
+    allowed address is the one the caller must connect to. A later DNS lookup
+    cannot steer the socket (DNS rebinding).
+    """
+    if not isinstance(url, str) or not url:
+        raise UnsafeURLError("URL must be a non-empty string")
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise UnsafeURLError("URL could not be parsed") from exc
+    # Reuse the scheme/credentials/metadata policy checks without a second DNS
+    # pass; we resolve once below and pin to a checked address.
+    validate_url(
+        url,
+        allow_loopback=allow_loopback,
+        allow_private=allow_private,
+        resolve=False,
+    )
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port or _DEFAULT_PORTS[scheme]
+    except ValueError as exc:
+        raise UnsafeURLError("URL has an invalid port") from exc
+
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        _check_ip(literal, allow_loopback=allow_loopback, allow_private=allow_private)
+        return host, port, str(literal), scheme
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeURLError("endpoint host could not be resolved") from exc
+    chosen: ipaddress._BaseAddress | None = None
+    addresses: set[ipaddress._BaseAddress] = set()
+    for info in infos:
+        raw = str(info[4][0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(raw)
+        except ValueError:
+            raise UnsafeURLError("endpoint resolved to an invalid address") from None
+        addresses.add(address)
+        _check_ip(address, allow_loopback=allow_loopback, allow_private=allow_private)
+        if chosen is None:
+            chosen = address
+    if chosen is None or not addresses:
+        raise UnsafeURLError("endpoint host did not resolve to an address")
+    return host, port, str(chosen), scheme
+
+
+def config_flag(value: object, default: bool = False) -> bool:
+    """Parse a config boolean without treating the string ``'false'`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
 def is_public_git_url(url: str) -> bool:
     """True only for a public-looking HTTPS git URL with no credentials.
 

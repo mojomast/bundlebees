@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -417,3 +418,68 @@ def test_public_mapping_cannot_leak_bind_or_token():
     assert "/home/x" not in json.dumps(public_project({"key": "p", "local_path": "/home/x"}))
     assert "bind" not in public_container({"digest": "sha256:" + "d" * 64, "bind": "0.0.0.0:1"})
     assert public_result({"observed": {"changed_files": ["/etc/passwd"]}})["observed"]["changed_files"] == []
+
+
+
+def test_launcher_pins_resolved_ip_and_sends_hostname_host_header(monkeypatch):
+    recorded: dict[str, str] = {}
+
+    class HostHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            recorded["host"] = self.headers.get("Host") or ""
+            recorded["path"] = self.path
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true, "status": "ok"}')
+
+        def log_message(self, format, *args):  # noqa: A003
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), HostHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    port = httpd.server_address[1]
+    try:
+        from bundlebees_plugin import security as security_mod
+
+        real_gai = security_mod.socket.getaddrinfo
+
+        def fake_gai(host, svc, *args, **kwargs):
+            if host == "launcher.example.test":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+            return real_gai(host, svc, *args, **kwargs)
+
+        monkeypatch.setattr(security_mod.socket, "getaddrinfo", fake_gai)
+        client = LauncherClient(
+            f"http://launcher.example.test:{port}",
+            token_provider=lambda: TOKEN,
+            allow_loopback=True,
+        )
+        client.health()
+        assert recorded["host"] == f"launcher.example.test:{port}"
+        assert "127.0.0.1" not in recorded["host"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def test_client_from_agent_requires_allow_private_for_lan_launcher():
+    from bundlebees_plugin.client import client_from_agent, ClientError
+
+    class Agent:
+        secret_scope = type("S", (), {"get_secret": staticmethod(lambda name: TOKEN)})()
+
+    with pytest.raises(ClientError) as excinfo:
+        client_from_agent(
+            Agent(),
+            {"adapter": "launcher", "launcher_url": "http://10.0.0.5:8080", "allow_private": "false"},
+        )
+    assert excinfo.value.code == "unsafe_url"
+
+    client = client_from_agent(
+        Agent(),
+        {"adapter": "launcher", "launcher_url": "http://10.0.0.5:8080", "allow_private": True},
+    )
+    assert client._allow_private is True

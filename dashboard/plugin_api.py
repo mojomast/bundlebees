@@ -571,7 +571,24 @@ def attempt_review(attempt_id: str, payload: Any = Body(default=None)) -> JSONRe
 # ---------------------------------------------------------------------------
 
 
-def _default_data_dir() -> Path:
+def _hermes_plugin_data_dir() -> Path | None:
+    """Ask the host for a profile-aware plugin data dir when the API exists.
+
+    Prefers ``plugins.plugin_storage.plugin_data_dir`` and
+    ``hermes_constants.get_hermes_home()``. Does not read ``HERMES_HOME``
+    from the process environment.
+    """
+    try:
+        from plugins.plugin_storage import plugin_data_dir as storage_dir  # type: ignore
+    except Exception:
+        storage_dir = None
+    if callable(storage_dir):
+        try:
+            path = storage_dir("bundlebees")
+        except Exception:
+            path = None
+        if path:
+            return Path(path).expanduser().resolve()
     for module_name in ("hermes.plugins", "hermes.plugin", "hermes", "hermes_cli"):
         try:
             module = importlib.import_module(module_name)
@@ -580,12 +597,38 @@ def _default_data_dir() -> Path:
         helper = getattr(module, "plugin_data_dir", None)
         if callable(helper):
             try:
-                return Path(helper("bundlebees")).expanduser().resolve()
+                path = helper("bundlebees")
             except Exception:
-                continue
-    home = os.environ.get("HERMES_HOME")
-    base = Path(home).expanduser() if home else Path.home() / ".hermes"
-    return (base / "plugin_data" / "bundlebees").resolve()
+                path = None
+            if path:
+                return Path(path).expanduser().resolve()
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+    except Exception:
+        return None
+    try:
+        home = get_hermes_home()
+    except Exception:
+        return None
+    if home:
+        return (Path(home) / "plugin-data" / "bundlebees").expanduser().resolve()
+    return None
+
+
+def _data_home_fallback() -> Path:
+    """Profile-neutral fallback when Hermes APIs are unavailable.
+
+    Does not read ``HERMES_HOME`` and does not hardcode ``~/.hermes``.
+    """
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg and str(xdg).strip():
+        return (Path(xdg).expanduser() / "hermes-plugins" / "bundlebees").resolve()
+    return (Path.home() / ".local" / "share" / "hermes-plugins" / "bundlebees").resolve()
+
+
+def _default_data_dir() -> Path:
+    found = _hermes_plugin_data_dir()
+    return (found or _data_home_fallback()).resolve()
 
 
 def _data_root() -> Path:
