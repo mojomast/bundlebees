@@ -1,0 +1,33 @@
+{
+  "title": "HIVE MIND",
+  "seed": 3612026,
+  "bpm": 120,
+  "downbeatSeconds": 0,
+  "liftSeconds": 20,
+  "hitsSeconds": [
+    0,
+    6,
+    12,
+    20,
+    26,
+    32,
+    40,
+    46,
+    52,
+    58,
+    65
+  ],
+  "license": "CC0-1.0",
+  "pcm": {
+    "input_i": "-15.01",
+    "input_tp": "-3.01",
+    "input_lra": "3.20",
+    "input_thresh": "-25.06",
+    "output_i": "-15.06",
+    "output_tp": "-3.00",
+    "output_lra": "3.40",
+    "output_thresh": "-25.09",
+    "normalization_type": "dynamic",
+    "target_offset": "0.06"
+  }
+}

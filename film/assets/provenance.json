@@ -1,0 +1,45 @@
+{
+  "sourceCommit": "bf5f1a7b4ef7ed661a892ac2450186081e238e4c",
+  "repository": "https://github.com/mojomast/bundlebees",
+  "assets": [
+    {
+      "path": "assets/fonts/Grotesk.ttf",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/spacegrotesk/SpaceGrotesk%5Bwght%5D.ttf",
+      "sha256": "acad6de1fc93436f5c0f1f4137751ef04f1aea3063e7036535970ffcfbd79f72",
+      "license": "OFL-1.1"
+    },
+    {
+      "path": "assets/fonts/spacegrotesk-OFL.txt",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/spacegrotesk/OFL.txt",
+      "sha256": "564ce565c371c5e5bbf286006565a7c9aa55a9f56e7ca58d56e05d649dd61a72",
+      "license": "OFL-1.1"
+    },
+    {
+      "path": "assets/fonts/Mono.ttf",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/IBMPlexMono-Medium.ttf",
+      "sha256": "a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755",
+      "license": "OFL-1.1"
+    },
+    {
+      "path": "assets/fonts/ibmplexmono-OFL.txt",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/OFL.txt",
+      "sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da",
+      "license": "OFL-1.1"
+    },
+    {
+      "path": "assets/images/pane-models.png",
+      "url": "https://github.com/mojomast/bundlebees/blob/bf5f1a7b4ef7ed661a892ac2450186081e238e4c/desktop/plugin.js",
+      "sha256": "0ca77d6654222b0a1204449f00435593c9ec7c3604ee1662502b64969eb27aaf",
+      "cssBox": {
+        "x": 231,
+        "y": 19,
+        "height": 90.03125,
+        "width": 468
+      },
+      "deviceScaleFactor": 3,
+      "license": "MIT",
+      "capture": "Actual unmodified pane component and CSS via local React SDK fixture; Models card cropped at device scale 3 for legibility. Model ID from docs/RESEARCH.md; no launcher connection or result metrics.",
+      "browser": "HeadlessChrome/152.0.7977.30"
+    }
+  ]
+}

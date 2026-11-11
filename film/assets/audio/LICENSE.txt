@@ -1,0 +1,5 @@
+HIVE MIND — original instrumental score composed for the bundlebees presentation.
+All sounds synthesized locally; no recordings, third-party samples or voice.
+Dedicated to the public domain under CC0 1.0 Universal.
+https://creativecommons.org/publicdomain/zero/1.0/
+Reproducible source: film/scripts/music.py

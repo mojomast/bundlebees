@@ -1,0 +1,9 @@
+node_modules/
+.build/
+.cache/
+.hyperframes/
+out/
+previews/encoded/
+previews/stills/
+*.log
+*.lock

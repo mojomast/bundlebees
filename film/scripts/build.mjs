@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
+import {build} from 'esbuild';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');process.chdir(root);
+const s=JSON.parse(fs.readFileSync('settings.json'));
+fs.rmSync('.build',{recursive:true,force:true});fs.mkdirSync('.build');fs.cpSync('assets','.build/assets',{recursive:true});
+await build({entryPoints:['shared/runtime.js'],bundle:true,format:'iife',globalName:'Film',outfile:'.build/runtime.js',target:'chrome120'});
+fs.copyFileSync('style.css','.build/style.css');
+const scenes=s.scenes.map(x=>`<section id="${x.id}" data-composition-id="${x.id}" data-start="${x.start/s.fps}" data-duration="${(x.end-x.start)/s.fps}" data-track-index="1" data-track-kind="graphics" data-no-timeline class="scene"><canvas width="${s.width}" height="${s.height}" data-layout-ignore></canvas></section>`).join('');
+const html=`<main id="film" data-composition-id="film" data-width="${s.width}" data-height="${s.height}" data-fps="${s.fps}" data-duration="${s.duration}" data-no-timeline style="width:${s.width}px;height:${s.height}px">${scenes}<audio id="hive-mind-score" class="clip" src="${s.audio}" data-start="0" data-duration="${s.duration}" data-track-index="2"></audio></main>`;
+fs.writeFileSync('.build/index.html',fs.readFileSync('index.html','utf8').replace('<!-- FILM -->',html));
+const hash=createHash('sha256');function add(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const p=path.join(dir,e.name);if(e.isDirectory())add(p);else hash.update(p).update(fs.readFileSync(p))}}add('.build');hash.update(fs.readFileSync('package-lock.json'));
+fs.writeFileSync('.build/build.json',JSON.stringify({sha256:hash.digest('hex'),width:s.width,height:s.height,frames:s.frames,fps:s.fps,duration:s.duration},null,2));console.log(`Built ${s.width}×${s.height}, ${s.frames} frames.`);
