@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/bundlebees/bundlebees_plugin/schemas/brief.schema.json",
+  "title": "bundlebees launcher brief",
+  "description": "Public launcher brief shape. Only objective is required; code-work briefs also need assigned_files.",
+  "type": "object",
+  "required": ["objective"],
+  "properties": {
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the worker must accomplish."
+    },
+    "project": {
+      "type": "string",
+      "description": "Authorized launcher project key."
+    },
+    "branch": {
+      "type": "string",
+      "description": "Feature branch the worker may use."
+    },
+    "source_rev": {
+      "type": "string",
+      "description": "Starting revision."
+    },
+    "assigned_files": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Exact files this worker may change."
+    },
+    "commands": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Commands the worker may run."
+    },
+    "acceptance": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Acceptance checks."
+    },
+    "deliverables": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Expected deliverables."
+    },
+    "deps": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Dependencies or sibling tasks."
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "timeout_s": {"type": "integer", "minimum": 1},
+        "max_tool_calls": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": true
+    },
+    "kanban_task_id": {
+      "type": "string",
+      "description": "Optional Hermes kanban task id."
+    }
+  },
+  "additionalProperties": true
+}
