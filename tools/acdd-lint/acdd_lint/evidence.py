@@ -17,6 +17,8 @@ Problem = dict[str, str]
 
 _AUTHORITY_ROLES = {"verifier", "human"}
 
+_PHASE_ORDER = {"red": 0, "green": 1, "refactor": 2, "integration": 3, "review": 4}
+
 
 def canonical(record: Mapping[str, Any]) -> bytes:
     """Return the canonical signed bytes for *record*."""
@@ -56,9 +58,13 @@ def _phase(record: Mapping[str, Any]) -> str:
     return str(record.get("phase") or "")
 
 
-def _sort_key(item: tuple[str, Mapping[str, Any]]) -> tuple[str, str]:
+def _phase_rank(record: Mapping[str, Any]) -> int:
+    return _PHASE_ORDER.get(_phase(record), 5)
+
+
+def _sort_key(item: tuple[str, Mapping[str, Any]]) -> tuple[str, int, str]:
     filename, record = item
-    return (str(record.get("at") or ""), filename)
+    return (str(record.get("at") or ""), _phase_rank(record), filename)
 
 
 def _expected_contract_sha(contract: Mapping[str, Any]) -> str:
@@ -103,7 +109,8 @@ def check_history(
 
     for filename, record in items:
         record = record if isinstance(record, Mapping) else {}
-        if str(record.get("contract_sha256") or "") != expected_sha:
+        stale = str(record.get("contract_sha256") or "") != expected_sha
+        if stale:
             problems.append(
                 _problem(
                     "evidence_stale",
@@ -119,6 +126,8 @@ def check_history(
                     "record signature is missing or invalid; re-record it with the coordinator key",
                 )
             )
+        if stale:
+            continue
 
         role = _role(record)
         if _phase(record) == "red" and role in _AUTHORITY_ROLES:
