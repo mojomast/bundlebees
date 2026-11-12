@@ -1029,10 +1029,38 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
+    """Keep only the approved targets pytest can collect; drop non-Python fixtures."""
+    kept: list[str] = []
+    for target in targets:
+        if not isinstance(target, str):
+            continue
+        text = target.strip()
+        if not text:
+            continue
+        if "::" in text or text.endswith(".py") or text == ".":
+            kept.append(text)
+            continue
+        try:
+            candidate = Path(contain_path(text.split("::", 1)[0] or ".", str(workdir)))
+        except ValueError:
+            continue
+        if candidate.is_dir():
+            kept.append(text)
+    return kept
+
+
 def _run_sandboxed(workdir: Path, targets: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
     """Run pytest on a disposable copy of *workdir*; return evidence only."""
+    pytest_targets = _pytest_targets(list(targets), Path(workdir))
+    if not pytest_targets:
+        raise CliError(
+            "no_test_targets",
+            "none of the approved test files can be collected by pytest",
+            "Reference at least one Python test file in scope.test_files.",
+        )
     try:
-        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(list(targets)), **_sandbox_options(config))
+        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(pytest_targets), **_sandbox_options(config))
     except sandbox.SandboxUnavailable as exc:
         raise CliError(exc.code, exc.error, exc.fix) from exc
     except ValueError as exc:
