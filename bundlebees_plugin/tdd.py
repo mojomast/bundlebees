@@ -29,12 +29,13 @@ import hmac
 import json
 import os
 import re
+import secrets
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .security import scrub
+from .security import contain_path, scrub
 
 EVIDENCE_VERSION = "tdd-evidence/1"
 
@@ -735,6 +736,45 @@ def load_records(state_dir: os.PathLike[str] | str, contract_id: str, key: bytes
         record["_path"] = str(path)
         loaded.append(record)
     return loaded
+
+
+def write_report(state_dir: os.PathLike[str] | str, signed: Mapping[str, Any]) -> Path:
+    """Atomically write a signed report at ``<state>/reports/<contract_id>.json``.
+
+    The directory is private (``0700``) and the file is created exclusively as
+    ``0600`` through a temporary file that is replaced into place, so a reader
+    never sees a half-written report. The contract id is confined with
+    :func:`bundlebees_plugin.security.contain_path`.
+    """
+    contract_id = str(signed.get("contract_id") or "")
+    _check_id(contract_id)
+    root = Path(state_dir)
+    reports = _private_dir(root / "reports")
+    try:
+        target = Path(contain_path(f"{contract_id}.json", str(reports)))
+    except ValueError as exc:
+        raise TddError("evidence_invalid", f"report path is unsafe: {exc}") from exc
+    payload = json.dumps(signed, indent=2, sort_keys=True)
+    tmp = reports / f".{contract_id}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(tmp, flags, 0o600)
+    except OSError as exc:
+        raise TddError("evidence_invalid", f"could not create the report: {exc}") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise TddError("evidence_invalid", f"could not write the report: {exc}") from exc
+    return target
 
 
 # ---------------------------------------------------------------------------

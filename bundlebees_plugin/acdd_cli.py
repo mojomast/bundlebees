@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -408,10 +409,19 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
         try:
             records = tdd.load_records(state_dir, str(contract["id"]), key)
             report = tdd.acceptance_report(contract, sha, records)
+            report["report_version"] = "acceptance_report/1"
+            report["generated_at"] = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            signed = tdd.sign_record(report, key)
+            tdd.write_report(state_dir, signed)
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
         if getattr(args, "json", False):
-            print(json.dumps(report, indent=2, sort_keys=True))
+            print(json.dumps(signed, indent=2, sort_keys=True))
         else:
             print("bundlebees tdd report")
             print(f"contract: {scrub(str(contract['id']))}")
@@ -422,6 +432,7 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
                 print(f"{cid}: {'not run' if item['status'] in ('unrun', 'not_run') else item['status']}")
             print(f"test-first: {'yes' if report['test_first'] else 'no'}")
             print(f"accepted: {'yes' if report['accepted'] else 'no'}")
+            print(f"report: reports/{contract['id']}.json")
         return 0 if report["accepted"] else 1
     if sub == "refactor":
         return _cmd_refactor(ctx, args, contract, sha, state_dir, key)
