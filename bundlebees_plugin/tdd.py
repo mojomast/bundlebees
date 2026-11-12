@@ -744,7 +744,7 @@ def load_records(state_dir: os.PathLike[str] | str, contract_id: str, key: bytes
         if not isinstance(data, dict) or not verify_signature(data, key):
             raise TddError("evidence_tampered", f"evidence record signature is invalid: {path.name}")
         record = dict(data)
-        record["_path"] = str(path)
+        record["_path"] = f"evidence/{contract_id}/{path.name}"
         loaded.append(record)
     return loaded
 
@@ -1010,6 +1010,7 @@ def _criteria_report(
     latest: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     sources = [latest.get(phase) for phase in ("integration", "refactor", "green")]
+    review = latest.get("review")
     report: dict[str, dict[str, Any]] = {}
     for criterion in contract.get("acceptance_criteria") or []:
         if not isinstance(criterion, Mapping):
@@ -1027,6 +1028,15 @@ def _criteria_report(
                 status = str(values[ac_id])
                 evidence = record.get("_path")
                 break
+        if (
+            criterion.get("verification") == "review"
+            and status == "review_required"
+            and review is not None
+            and (review.get("produced_by") or {}).get("role") == "human"
+            and review.get("classification") == "passed"
+        ):
+            status = "passed"
+            evidence = review.get("_path")
         report[ac_id] = {"status": status, "evidence": evidence}
     return report
 
@@ -1071,12 +1081,7 @@ def acceptance_report(
     }
     criteria = _criteria_report(contract, latest)
     phases_ok = all(status == "valid" for status in phases.values())
-    review_valid = phases.get("review") == "valid"
-    criteria_ok = all(
-        item["status"] == "passed"
-        or (item["status"] == "review_required" and review_valid)
-        for item in criteria.values()
-    )
+    criteria_ok = all(item["status"] == "passed" for item in criteria.values())
     return {
         "contract_id": str(contract.get("id") or ""),
         "contract_sha256": str(contract_sha256),
