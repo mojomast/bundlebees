@@ -17,6 +17,10 @@ dev = [
   "fastapi>=0.110,<1",
   "httpx>=0.27,<1",
   "jsonschema>=4,<5",
+  "cryptography>=42,<47",
+]
+review = [
+  "cryptography>=42,<47",
 ]
 
 [tool.pytest.ini_options]

@@ -39,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "pytest>=8,<9" "pyyaml>=6,<7" "ruamel.yaml>=0.18,<0.19" \
             "tiktoken>=0.7,<1" "fastapi>=0.110,<1" "httpx>=0.27,<1" \
-            "jsonschema>=4,<5"
+            "jsonschema>=4,<5" "cryptography>=42,<47"
       - name: Report sandbox backend
         run: |
           python -c "from bundlebees_plugin import sandbox; print('auto backend:', sandbox.detect_backend())"
@@ -51,6 +51,10 @@ jobs:
           python -m pytest -rs -q tests/test_tdd.py::test_records_match_the_evidence_schema \
             tests/test_collection.py::test_signed_records_and_frozen_contracts_match_the_schemas 2>&1 | tee schema-run.txt
           ! grep -q "SKIPPED" schema-run.txt
+      - name: Human-review token tests ran (not skipped)
+        run: |
+          python -m pytest -rs -q tests/test_review_token.py tests/test_cli_review_token.py 2>&1 | tee review-token-run.txt
+          ! grep -q "SKIPPED" review-token-run.txt
       - name: Measure tool-schema tokens
         run: python scripts/measure_schemas.py
 

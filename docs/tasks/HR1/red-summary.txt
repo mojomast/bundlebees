@@ -1,0 +1,33 @@
+HR1 RED (tests only; implementation absent). Base: fix/review-c1-c6 750b10b
+command: CI=1 python -m pytest -q tests/test_review_token.py tests/test_cli_review_token.py
+FAILED tests/test_cli_review_token.py::test_valid_token_records_a_verified_human_review - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[wrong_head] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[wrong_key] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[wrong_test_rev] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[reviewer_mismatch] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[no_key] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_unverifiable_token_fails_closed_and_records_nothing[garbage] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_same_token_cannot_be_used_twice - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_report_reverifies_and_fails_closed[rotated] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_report_reverifies_and_fails_closed[missing] - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_role_human_without_token_stays_coordinator_recorded - KeyError: 'chain_head'
+FAILED tests/test_cli_review_token.py::test_plugin_cli_has_review_token_mint - KeyError: 'chain_head'
+ERROR tests/test_review_token.py::test_mint_binds_reviewer_contract_test_rev_chain_head_expiry_and_nonce - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_mint_refuses_bad_or_missing_binding - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_valid_token_verifies_with_pem_or_inline_public_key - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over0-token_binding_mismatch] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over1-token_binding_mismatch] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over2-token_binding_mismatch] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over3-token_binding_mismatch] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over4-token_expired] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_binding_or_time_is_refused[over5-token_not_yet_valid] - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_wrong_key_tampered_or_malformed_token_is_refused - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_signed_token_with_overlong_lifetime_is_refused - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_consumed_token_cannot_be_replayed - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_missing_or_bad_public_key_fails_closed - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_private_key_file_must_be_owner_only - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+ERROR tests/test_review_token.py::test_standalone_mint_prints_only_the_token - ImportError: cannot import name 'review_token' from 'bundlebees_plugin' (/workspace/bbfix/bundlebees/bundlebee
+result: 28 approved tests -> 12 failed, 15 errors, 1 passed.
+Errors: ImportError, bundlebees_plugin.review_token does not exist (missing interface).
+Failures: KeyError 'chain_head', tdd report has no chain head yet (missing interface).
+Passed: test_repository_tracks_no_private_key, a guard that must hold before and after (no PEM private key tracked).
