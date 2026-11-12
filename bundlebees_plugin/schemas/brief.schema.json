@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mojomast/bundlebees/bundlebees_plugin/schemas/brief.schema.json",
   "title": "bundlebees launcher brief",
-  "description": "Public launcher brief shape. Only objective is required; code-work briefs also need assigned_files.",
+  "description": "Strict public launcher brief. objective, a full 40- or 64-character lowercase hex source_rev, a non-empty repository-relative assigned_files lease, and acceptance criteria or commands are required. Optional fields stay allowed.",
   "type": "object",
-  "required": ["objective"],
+  "required": ["objective", "source_rev", "assigned_files", "acceptance"],
   "properties": {
     "objective": {
       "type": "string",
@@ -21,12 +21,14 @@
     },
     "source_rev": {
       "type": "string",
-      "description": "Starting revision."
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "description": "Full 40-character SHA-1 or 64-character SHA-256 commit id. Short SHAs, branches, and tags are rejected."
     },
     "assigned_files": {
       "type": "array",
-      "items": {"type": "string"},
-      "description": "Exact files this worker may change."
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "description": "Exact repository-relative files this worker may change."
     },
     "commands": {
       "type": "array",
@@ -34,9 +36,42 @@
       "description": "Commands the worker may run."
     },
     "acceptance": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Acceptance checks."
+      "description": "Acceptance criteria array, or an object with criteria, commands, and tests.",
+      "anyOf": [
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "criteria": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
+            "commands": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
+            "tests": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            }
+          },
+          "anyOf": [
+            {
+              "required": ["criteria"],
+              "properties": {"criteria": {"minItems": 1}}
+            },
+            {
+              "required": ["commands"],
+              "properties": {"commands": {"minItems": 1}}
+            }
+          ],
+          "additionalProperties": true
+        }
+      ]
     },
     "deliverables": {
       "type": "array",
@@ -59,6 +94,26 @@
     "kanban_task_id": {
       "type": "string",
       "description": "Optional Hermes kanban task id."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "Optional run identifier."
+    },
+    "retry_of": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional attempt id this brief retries."
+    },
+    "wave": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "Optional wave identifier."
+    },
+    "tests": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Test targets the worker should run."
     }
   },
   "additionalProperties": true

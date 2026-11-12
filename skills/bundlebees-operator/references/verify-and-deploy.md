@@ -1,7 +1,7 @@
 # Verify and deploy (user-run CLI)
 
-`hermes bundlebees verify` and `hermes bundlebees deploy` are registered CLI
-commands, **not model tools**. They apply worker output, run tests, push a
+`hermes bundlebees verify`, `integrate`, `lease`, `metrics` and `deploy` are
+registered CLI commands, **not model tools**. They apply worker output, run tests, push a
 branch, or reach a machine, so a model turn must not invoke them. Ask the user
 to type the command and paste the result back. The model may explain what the
 command will do and read its output, but it does not run it.
@@ -29,35 +29,76 @@ Flags:
 
 What verify does, in order:
 
-1. Fetch the attempt result. Missing or 409 maps to `no_result_yet`; wait and
-   retry, do not invent a result.
-2. Check out a clean copy of the **feature branch** in the user's worktree or
-   a configured worktree. It refuses to use `main` as the push target.
-3. Apply the worker patch. Any path outside the attempt's `assigned_files`
-   fails with `scope_violation`; the patch is not committed and nothing is
-   pushed.
-4. Run only the tests named in the brief or passed with `--tests`, plus the
-   repository's documented secret scan. No full end-to-end suite unless the
-   brief listed it.
-5. On green, commit and push the **feature branch only**. No merge, tag,
+1. Load the coordinator lease `leases/<attempt_id>.json` from plugin data. It
+   was written read-only and HMAC-signed at dispatch; a missing or edited
+   lease fails closed (`lease_missing`, `lease_tampered`). File scope, branch,
+   `source_rev` and tests come only from this record. Scope claims in the
+   worker result are ignored and listed as `ignored_worker_claims`.
+2. Fetch the attempt result and reduce it to the adapter result contract
+   (patch, declared base, usage, worker-claimed checks). Missing or 409 maps
+   to `no_result_yet`; wait and retry, do not invent a result.
+3. Check out a clean copy of the **feature branch**. It refuses `main` and
+   `master` as the push target.
+4. Revision guarantees: the worker's declared base must equal the lease's
+   `source_rev` (`base_undeclared`, `base_mismatch`); that commit must exist
+   (`source_rev_missing`); the patch must apply to that exact commit, checked
+   in a temporary index (`patch_not_at_source_rev`); and the feature branch
+   must descend from it (`branch_diverged`).
+5. Apply the patch to the branch. Any path outside the lease fails with
+   `scope_violation`; nothing is committed or pushed. Then the secret scan.
+6. Run the named tests in a **disposable sandbox**: a throwaway copy of the
+   worktree (no `.git`), run as an unprivileged user under bubblewrap
+   (or firejail, or unshare) with no network and a scrubbed environment that
+   has no coordinator credentials or home dotfiles. Only evidence returns:
+   backend, exit code, junit counts, an output tail. With no backend verify
+   refuses (`sandbox_unavailable`) unless `verify_allow_unsafe_local` is set.
+7. On green, commit and push the **feature branch only**. No merge, tag,
    force-push, or hook skip.
-6. Print a summary with the SHA, tests, and changed files, plus a suggested
-   `hermes kanban request-review <id>` line. It does not mutate the board
-   unless the user passed `--kanban-comment`.
+8. Print a summary with the SHA, tests, files and sandbox backend, and a note
+   that the wave is not accepted until integrate passes.
 
-Verify writes a small record under plugin data
-`verify-results/<attempt_id>.json` with `attempt_id`, `ok`, `sha`, `branch`,
-`files`, `tests`, and `at`. That record has no hosts, paths outside the repo,
-or tokens.
+Verify writes `verify-results/<attempt_id>.json` with `attempt_id`, `ok`,
+`sha`, `branch`, `files`, `tests`, `at`, and `evidence` (`source_rev`,
+`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`). It also appends a
+`verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside
+the repo.
 
-If verify is red:
+## Integrate (wave acceptance)
 
-- `no_result_yet` - ask the user to wait and retry.
-- `scope_violation` - the bee exceeded its lease. Stop; do not dispatch a
-  repair until the user decides.
-- A failing named test - report the test name and output, then ask whether to
-  dispatch a fresh narrow brief.
-- A secret-scan hit - stop immediately. Do not echo the matched value.
+```text
+hermes bundlebees integrate --wave <id> --attempts <id> [<id> ...] [--branch <feat>]
+```
+
+Requires every attempt to have an `ok` verify record whose SHA is an ancestor
+of the combined branch HEAD, then runs the **full** suite on that branch in
+the same sandbox. It writes `waves/<id>.json`; only `accepted: true` counts,
+and an accepted record is final. `bundlebees_attempt op=review accepted=true`
+is refused with `integration_required` until then.
+
+## Lease and metrics
+
+- `hermes bundlebees lease <attempt_id> --brief <file>` records the lease for
+  a brief dispatched outside `bundlebees_dispatch` (validated first, refused
+  if a lease already exists).
+- `hermes bundlebees metrics [--run <id>] [--json]` summarizes the
+  append-only, hash-chained log: first-pass rate, accepted changes, tokens and
+  cost per accepted change, human interventions, plan-to-accepted time,
+  regressions, failed-worker recoveries. `--note <text>` records one human
+  intervention.
+
+If verify or integrate is red:
+
+| Code | Meaning and next step |
+|---|---|
+| `no_result_yet` | Ask the user to wait and retry. |
+| `lease_missing` / `lease_tampered` | No valid coordinator lease. Never edit lease files; record one from the dispatched brief or re-dispatch. |
+| `base_undeclared` / `base_mismatch` / `source_rev_missing` / `patch_not_at_source_rev` / `branch_diverged` | Not built on the brief's exact revision. Re-dispatch with the right `source_rev` and `retry_of`. |
+| `scope_violation` | The bee exceeded its lease. Stop; no repair dispatch until the user decides. |
+| `sandbox_unavailable` | Install bubblewrap (or firejail). Do not suggest the unsafe local flag on a shared or credentialed host. |
+| `tests_failed` | Report the test names and output tail; ask whether to dispatch a fresh narrow brief. |
+| `secret_detected` | Stop immediately. Do not echo the matched value. |
+| `integration_required` | Run integrate for the wave first. |
+| `accepted: no` (integrate) | Report the problems or failing suite; regressions are counted in metrics. |
 
 ## Deploy
 

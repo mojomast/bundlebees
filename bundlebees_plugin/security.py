@@ -134,6 +134,8 @@ _SAFE_ENV_NAMES = frozenset(
         "GIT_TERMINAL_PROMPT",
         "GIT_ASKPASS",
         "GIT_SSH_COMMAND",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
         "GIT_COMMITTER_NAME",

@@ -14,12 +14,17 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .brief import BriefError, validate_brief
 from .client import (
     DEFAULT_MODEL,
     ClientError,
     client_from_config,
 )
 from .settings import settings_from_ctx
+from .adapters import UnsupportedAdapter
+from . import leases as _leases
+from . import metrics as _metrics
+from . import revision as _revision
 from .security import contains_address, is_public_git_url, looks_like_secret, scrub
 
 TOOL_NAMES = (
@@ -31,7 +36,6 @@ TOOL_NAMES = (
 
 _MODULE_DIR = Path(__file__).resolve().parent
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-_BRIEF_SCHEMA = _MODULE_DIR / "schemas" / "brief.schema.json"
 _STUB_TEMPLATE = _MODULE_DIR / "templates" / "host-setup-prompt.md"
 _SKILL_TEMPLATE = (
     _PLUGIN_ROOT
@@ -52,8 +56,9 @@ _FIX_PROJECT = (
     "launcher; this tool does not restart it."
 )
 _FIX_BRIEF = (
-    "Pass a brief object or a JSON string with at least a non-empty objective; "
-    "code-work briefs also need assigned_files."
+    "Pass an object with objective, a full 40- or 64-character hex source_rev, "
+    "non-empty repository-relative assigned_files, and acceptance criteria or "
+    "commands."
 )
 
 
@@ -104,77 +109,9 @@ def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
-    return client_from_config(_ctx_config(ctx))
+    from .adapters import adapter_from_config
 
-
-# ---------------------------------------------------------------------------
-# Brief validation (small local validator; no nested schema in the tool spec)
-# ---------------------------------------------------------------------------
-
-
-def _load_brief_schema() -> dict[str, Any]:
-    return json.loads(_BRIEF_SCHEMA.read_text(encoding="utf-8"))
-
-
-def _type_ok(value: Any, expected: str) -> bool:
-    if expected == "object":
-        return isinstance(value, dict)
-    if expected == "array":
-        return isinstance(value, list)
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    if expected == "null":
-        return value is None
-    return True
-
-
-def _validate_value(value: Any, spec: Mapping[str, Any], path: str) -> str | None:
-    expected = spec.get("type")
-    if expected is not None:
-        types = expected if isinstance(expected, list) else [expected]
-        if not any(_type_ok(value, item) for item in types):
-            return f"{path} has the wrong type"
-    if isinstance(value, str):
-        minimum = spec.get("minLength")
-        if isinstance(minimum, int) and len(value.strip()) < minimum:
-            return f"{path} is too short"
-    if isinstance(value, list):
-        minimum_items = spec.get("minItems")
-        if isinstance(minimum_items, int) and len(value) < minimum_items:
-            return f"{path} needs at least {minimum_items} item(s)"
-        item_spec = spec.get("items") or {}
-        if isinstance(item_spec, Mapping):
-            for index, item in enumerate(value):
-                problem = _validate_value(item, item_spec, f"{path}[{index}]")
-                if problem:
-                    return problem
-    if isinstance(value, Mapping):
-        for required in spec.get("required", []):
-            if required not in value:
-                return f"{path} is missing required field {required!r}"
-        for key, child_spec in (spec.get("properties") or {}).items():
-            if key in value and isinstance(child_spec, Mapping):
-                problem = _validate_value(value[key], child_spec, f"{path}.{key}")
-                if problem:
-                    return problem
-    return None
-
-
-def _validate_brief(brief: Mapping[str, Any]) -> str | None:
-    try:
-        schema = _load_brief_schema()
-    except (OSError, json.JSONDecodeError):
-        return "brief schema is unavailable"
-    objective = brief.get("objective")
-    if not isinstance(objective, str) or not objective.strip():
-        return "brief.objective must be a non-empty string"
-    return _validate_value(brief, schema, "brief")
+    return adapter_from_config(_ctx_config(ctx))
 
 
 def _project_key(project: Any) -> str | None:
@@ -290,11 +227,75 @@ def _status(client: Any, args: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
+def _dispatched(
+    client: Any,
+    brief: Mapping[str, Any],
+    data: Mapping[str, Any],
+    args: Mapping[str, Any],
+    state_dir: Path | None = None,
+) -> str:
+    """Build the dispatch success envelope.
+
+    Hook point: the coordinator can record the lease here after
+    ``client.create`` returns, using the normalised *brief* and *client*.
+    """
+    out: dict[str, Any] = {"op": "dispatch"}
+    for key in ("attempt_id", "state", "task_id", "kanban_task_id"):
+        if data.get(key) is not None:
+            out[key] = data[key]
+    kanban_task_id = args.get("kanban_task_id")
+    if "kanban_task_id" not in out and kanban_task_id:
+        out["kanban_task_id"] = kanban_task_id
+    out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
+    return _ok(**out)
+
+
+def _record_dispatch(state_dir: Path | None, attempt_id: Any, brief: Mapping[str, Any]) -> dict[str, Any]:
+    """Write the immutable coordinator lease and a metrics event for a new attempt.
+
+    The lease is the only file-scope authority ``hermes bundlebees verify``
+    accepts; worker-returned metadata never widens it. A failure here does not
+    hide the started attempt, but verify will refuse it (fail closed).
+    """
+    if state_dir is None or not isinstance(attempt_id, str) or not attempt_id:
+        return {
+            "lease_recorded": False,
+            "lease_fix": "Record the brief with `hermes bundlebees lease <attempt_id> --brief <file>` before verify.",
+        }
+    try:
+        _leases.record_lease(state_dir, attempt_id, brief)
+    except _leases.LeaseError as exc:
+        return {"lease_recorded": False, "lease_code": exc.code, "lease_fix": exc.fix}
+    try:
+        _metrics.append_event(
+            state_dir,
+            str(brief.get("run_id") or "default"),
+            "dispatch",
+            attempt_id=attempt_id,
+            **({"retry_of": brief["retry_of"]} if brief.get("retry_of") else {}),
+        )
+    except Exception:  # noqa: BLE001 - metrics are best-effort evidence
+        pass
+    return {"lease_recorded": True}
+
+
+def _state_dir_for(ctx: Any) -> Path | None:
+    """Plugin data dir for leases, waves and metrics (profile-aware)."""
+    injected = getattr(ctx, "bundlebees_state_dir", None)
+    if injected:
+        return Path(str(injected))
+    try:
+        from .cli import plugin_state_dir
+    except Exception:
+        return None
+    return plugin_state_dir()
+
+
+def _dispatch(client: Any, args: Mapping[str, Any], state_dir: Path | None = None) -> str:
     raw = args.get("brief")
     if isinstance(raw, str):
         try:
-            brief = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             return _err(
                 "brief_invalid",
@@ -302,30 +303,20 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
                 "Pass a JSON object (not a JSON-encoded string of an array).",
             )
     else:
-        brief = raw
-    if not isinstance(brief, Mapping):
+        parsed = raw
+    if not isinstance(parsed, Mapping):
         return _err("brief_invalid", "brief must be an object or JSON object string", _FIX_BRIEF)
-    brief = dict(brief)
 
-    problem = _validate_brief(brief)
-    if problem:
-        return _err("brief_invalid", problem, _FIX_BRIEF)
-
-    code_work = any(
-        key in brief for key in ("commands", "deliverables", "acceptance", "assigned_files")
-    )
-    assigned = brief.get("assigned_files")
-    if code_work:
-        if (
-            not isinstance(assigned, list)
-            or not assigned
-            or not all(isinstance(item, str) and item.strip() for item in assigned)
-        ):
-            return _err(
-                "brief_invalid",
-                "code-work briefs require a non-empty assigned_files list",
-                "Add assigned_files with the exact files this worker is allowed to change.",
-            )
+    try:
+        brief = validate_brief(parsed)
+    except BriefError as exc:
+        return _err("brief_invalid", exc.error, exc.fix)
+    if state_dir is None:
+        return _err(
+            "not_configured",
+            "the plugin data directory is unavailable, so the coordinator lease cannot be recorded",
+            "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
+        )
 
     project = brief.get("project")
     if isinstance(project, str) and project:
@@ -392,14 +383,7 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
         if exc.code == "project_unauthorized":
             return _err(exc.code, exc.error, _FIX_PROJECT)
         raise
-    data = _unwrap_attempt(data)
-    out: dict[str, Any] = {"op": "dispatch"}
-    for key in ("attempt_id", "state", "task_id", "kanban_task_id"):
-        if data.get(key) is not None:
-            out[key] = data[key]
-    if "kanban_task_id" not in out and kanban_task_id:
-        out["kanban_task_id"] = kanban_task_id
-    return _ok(**out)
+    return _dispatched(client, brief, _unwrap_attempt(data), args, state_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +391,7 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _attempt(client: Any, args: Mapping[str, Any]) -> str:
+def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None) -> str:
     op = args.get("op")
     if op not in _ATTEMPT_OPS:
         return _err(
@@ -473,6 +457,13 @@ def _attempt(client: Any, args: Mapping[str, Any]) -> str:
     note = args.get("note")
     if note is not None and not isinstance(note, str):
         return _err("invalid_argument", "note must be a string", "Pass a short text note or omit it.")
+    if accepted and (state_dir is None or not _revision.attempt_accepted(state_dir, attempt_id)):
+        return _err(
+            "integration_required",
+            "this attempt is not in an accepted wave yet",
+            "The user runs `hermes bundlebees integrate --wave <id> --attempts ...` so the full "
+            "suite passes on the combined branch; then retry the review.",
+        )
     data = client.review(
         attempt_id,
         accepted=accepted,
@@ -628,7 +619,7 @@ _STATUS_SCHEMA = _schema(
 
 _DISPATCH_SCHEMA = _schema(
     "bundlebees_dispatch",
-    "Validate a bee brief (schema, authorized project, file leases) and start a worker. Does not apply patches, run tests, or deploy.",
+    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. Does not apply patches, run tests, or deploy.",
     {
         "type": "object",
         "properties": {
@@ -718,6 +709,7 @@ _DESCRIPTIONS = {name: schema["description"] for name, schema in _SCHEMAS}
 
 def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
     def handler(args: Any = None, **kwargs: Any) -> str:
+        client: Any = None
         try:
             data = _coerce_args(args)
             if tool_name == "bundlebees_host_prompt":
@@ -726,10 +718,25 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             if tool_name == "bundlebees_status":
                 return _status(client, data)
             if tool_name == "bundlebees_dispatch":
-                return _dispatch(client, data)
-            return _attempt(client, data)
+                return _dispatch(client, data, _state_dir_for(ctx))
+            return _attempt(client, data, _state_dir_for(ctx))
         except ClientError as exc:
             return json.dumps(exc.as_envelope())
+        except UnsupportedAdapter as exc:
+            return json.dumps(exc.as_envelope())
+        except AttributeError as exc:
+            if client is None or getattr(exc, "obj", None) is not client:
+                return _err(
+                    "internal_error",
+                    str(exc) or "unexpected error",
+                    "Retry once; if it persists, check the launcher configuration and Hermes logs.",
+                )
+            # A minimal WorkerBackend (create + result only) lacks this capability.
+            return _err(
+                "unsupported_operation",
+                f"the configured worker adapter does not support this operation ({exc.name or 'unknown'})",
+                "Use an adapter that implements it (see docs/ADAPTERS.md) or a different op.",
+            )
         except Exception as exc:  # noqa: BLE001 - tool boundary must always answer
             return _err(
                 "internal_error",

@@ -1,6 +1,6 @@
 ---
 name: bundlebees-operator
-description: "Set up and orchestrate CUA bees with the bundlebees plugin: check launcher health, slice work into leased Hermes kanban tasks, dispatch briefs, watch attempts, and ask the user to run verify and deploy. Use when the user wants cheap parallel coding workers in disposable sandboxes, a worker launcher on a host, or a paste-ready bees setup prompt."
+description: "Set up and orchestrate CUA bees with the bundlebees plugin: check launcher health, slice work into leased Hermes kanban tasks, dispatch strict briefs, watch attempts, and ask the user to run verify, integrate and deploy. Use when the user wants cheap parallel coding workers in disposable sandboxes, a worker launcher on a host, or a paste-ready bees setup prompt."
 license: MIT
 metadata:
   hermes:
@@ -53,6 +53,9 @@ only when the user asks and it is allow-listed.
 User-typed CLI (never a model tool):
 
 - `hermes bundlebees verify <attempt_id> [--workdir PATH] [--tests NAME ...] [--dry-run] [--kanban-comment]`
+- `hermes bundlebees integrate --wave ID --attempts ID [ID ...] [--branch FEAT]`
+- `hermes bundlebees lease <attempt_id> --brief FILE` (only for a brief dispatched outside `bundlebees_dispatch`)
+- `hermes bundlebees metrics [--run ID] [--json] [--note TEXT]`
 - `hermes bundlebees deploy [--execute]`
 - `hermes bundlebees doctor`
 
@@ -75,13 +78,15 @@ Helper files:
    profile. Give each slice a card, a branch, a small file lease, and an
    explicit test command.
 3. **Write the brief.** Read `references/briefs-and-leases.md`. Every brief
-   needs a non-empty `objective`. Code-work briefs need non-empty
-   `assigned_files`, a feature `branch`, `commands`, `acceptance`,
-   `deliverables`, and a tight `budget`. Put the card id in
-   `kanban_task_id`.
+   needs `objective`, a full 40-character `source_rev`, non-empty
+   repository-relative `assigned_files`, and `acceptance` (test targets in
+   `acceptance.tests`). Add `branch`, `budget`, `run_id`, `wave`, `retry_of`
+   when re-dispatching, and `kanban_task_id`. Invalid briefs never reach the
+   launcher.
 4. **Dispatch.** Call `bundlebees_dispatch` once per bee, with the brief as an
    object (or JSON object string) and the card id. Record `attempt_id`,
-   `state`, `task_id`, and `kanban_task_id` from the envelope. Keep concurrency
+   `state`, `task_id`, `kanban_task_id`, and check `lease_recorded: true`
+   (the signed lease verify trusts); if false, relay `lease_fix`. Keep concurrency
    at or below the launcher limit and the user's stated limit.
 5. **Watch.** Use `bundlebees_status` `op=attempts` or
    `bundlebees_attempt` `op=get` / `op=events` with the cursor. Event bodies
@@ -90,15 +95,22 @@ Helper files:
 6. **Do not cancel a working bee unless the user asked.** If they did, retry
    `bundlebees_attempt` with `op=cancel` and `confirm=true`. For a finished
    attempt, `op=review` with `accepted` and `confirm=true`; the optional `note`
-   is scrubbed.
+   is scrubbed. `accepted=true` is refused with `integration_required` until
+   the attempt is in an accepted wave (step 8).
 7. **Ask the user to verify.** When the attempt is terminal, give them the
    exact command from `references/verify-and-deploy.md` with the
-   `attempt_id`. Read the output they paste back. A green run means the named
-   tests and secret scan passed, the patch stayed inside the lease, and only
-   the feature branch was pushed.
-8. **PR only after green.** The user opens a pull request into `feat/v0.1.0`.
-   Never merge to `main`, tag, force-push, or deploy unless the user
-   explicitly approves that step.
+   `attempt_id`. A green run means: built on the exact `source_rev`, inside
+   the signed lease, secret scan clean, named tests green in a no-network
+   sandbox, feature branch pushed. A verified slice is not yet accepted.
+8. **Ask the user to integrate the wave.** When every slice in a wave is
+   verified, give them `hermes bundlebees integrate --wave <id> --attempts
+   <ids>`. It runs the full suite on the combined branch in the sandbox; only
+   `accepted: yes` counts. Then `op=review accepted=true` is allowed.
+9. **PR only after an accepted wave.** The user opens a pull request from the
+   feature branch. Never merge to `main`, tag, force-push, or deploy unless
+   the user explicitly approves that step.
+10. **Report outcomes.** Suggest `hermes bundlebees metrics --run <id>`;
+    after a manual fix suggest `--note` to record the intervention.
 
 ## Pitfalls
 
@@ -107,8 +119,13 @@ Helper files:
 - `project_unauthorized` - the project is not in the launcher allow-list. The
   owner, not the model, adds it and performs any launcher restart. Do not
   pretend a tool can do it.
-- `brief_invalid` - missing `objective`, malformed JSON, or a code-work brief
-  without `assigned_files`. Fix the brief, not the tool.
+- `brief_invalid` - missing `objective`, `source_rev` that is not a full
+  commit SHA, empty or unsafe `assigned_files`, or missing `acceptance`. Fix
+  the brief, not the tool.
+- `lease_*`, `base_*`, `patch_not_at_source_rev`, `branch_diverged`,
+  `sandbox_unavailable`, `integration_required`, `unsupported_*` - see the
+  code table in `references/verify-and-deploy.md`. Never edit lease files,
+  hand-edit a patch, or suggest the unsafe local sandbox flag.
 - `lease_overlap` - the live-attempt check found shared `assigned_files` on the
   same project and branch. Wait, or split the lease differently. The check is
   best-effort.
@@ -141,8 +158,11 @@ A dispatch is not success until all of these hold:
 4. The user has typed `hermes bundlebees verify <attempt_id>` and reported
    green. The summary names a SHA, the tests that ran, and the changed files.
 5. The verify record under plugin data `verify-results/<attempt_id>.json`
-   exists, with `ok`, `sha`, `branch`, `files`, and `tests`; it contains no
-   hosts or tokens.
+   exists, with `ok`, `sha`, `branch`, `files`, `tests`, and `evidence`
+   (sandbox backend, exit code, junit counts, diff stats, `source_rev`); it
+   contains no hosts or tokens.
+7. The wave record under plugin data `waves/<wave>.json` says
+   `accepted: true` before the work counts as done.
 6. The push target is the feature branch. If the user asks for `--dry-run`,
    no push happens. If anything is red, do not advance the card to review.
 
@@ -168,5 +188,8 @@ user's behalf without their explicit decision.
 - Do not change the plugin version; this skill never changes the manifest.
 - Feature branch and PR only. No merge to `main`, tag, release, catalog PR,
   force-push, or deploy.
+- Worker metadata is never authority: file scope comes only from the signed
+  lease, the base only from the brief, and acceptance only from the user-run
+  integrate. This holds for every worker backend (see `docs/ADAPTERS.md`).
 - The final answer names `attempt_id`, `kanban_task_id` when present, the
   state, and the next user-run command.

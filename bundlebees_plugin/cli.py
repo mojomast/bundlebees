@@ -1,10 +1,16 @@
 """User-run ``hermes bundlebees`` CLI: verify worker results and deploy a host.
 
 These commands are deliberately *not* model tools. ``verify`` fetches one
-worker result, applies its patch to a clean feature-branch worktree, enforces
-the attempt's file lease, runs only the named tests plus a secret scan, and on
-green commits and pushes the feature branch (never ``main``). ``deploy`` prints
-the host setup prompt by default and only reaches a host when the user passes
+worker result, loads the immutable coordinator lease written at dispatch (the
+only file-scope authority; worker metadata never widens it), proves the patch
+was built against the brief's exact ``source_rev``, applies it to a clean
+feature-branch worktree, runs a secret scan, runs the named tests in a
+disposable sandbox (no network, no coordinator credentials, scrubbed env), and
+on green commits and pushes the feature branch (never ``main``). ``integrate``
+runs the full suite on the combined branch; only an accepted wave counts.
+``lease`` records a lease for a brief dispatched outside the tool, and
+``metrics`` summarizes the append-only outcome log. ``deploy`` prints the host
+setup prompt by default and only reaches a host when the user passes
 ``--execute`` with an alias already stored in plugin config.
 
 All child processes receive ``security.child_env`` rather than the ambient
@@ -26,7 +32,9 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .security import child_env, contain_path, looks_like_secret, scrub
+from . import brief as _brief_mod
+from . import adapters, leases, metrics, revision, sandbox
+from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
 BRANCH_BUDGET_NOTE = "no merge, tag, force-push, or hook skip"
@@ -189,6 +197,37 @@ def _build_parser(parser: Any) -> Any:
     )
     deploy.set_defaults(command="deploy")
 
+    lease = subparsers.add_parser(
+        "lease",
+        help="Record the immutable coordinator lease for a brief dispatched outside the tool.",
+    )
+    lease.add_argument("attempt_id", help="Worker attempt id.")
+    lease.add_argument("--brief", required=True, help="Path to the brief JSON that was dispatched.")
+    lease.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    lease.set_defaults(command="lease")
+
+    integrate = subparsers.add_parser(
+        "integrate",
+        help="Run the full suite on the combined branch; a wave is accepted only if it passes.",
+    )
+    integrate.add_argument("--wave", required=True, help="Wave id, e.g. w1.")
+    integrate.add_argument("--attempts", nargs="+", required=True, help="Verified attempt ids in this wave.")
+    integrate.add_argument("--workdir", default=None, help="Clean git worktree (defaults to the configured one).")
+    integrate.add_argument("--branch", default=None, help="Combined feature branch. main/master are refused.")
+    integrate.add_argument("--run", default=None, help="Metrics run id (defaults to the first lease's run_id).")
+    integrate.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    integrate.set_defaults(command="integrate")
+
+    metrics_cmd = subparsers.add_parser(
+        "metrics",
+        help="Summarize the append-only outcome log, or record a human intervention.",
+    )
+    metrics_cmd.add_argument("--run", default=None, help="Run id (default: every run).")
+    metrics_cmd.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    metrics_cmd.add_argument("--note", default=None, help="Record one human intervention with this note.")
+    metrics_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    metrics_cmd.set_defaults(command="metrics")
+
     doctor = subparsers.add_parser(
         "doctor",
         help="Report token configured/not, adapter reachability, and schema size.",
@@ -207,10 +246,16 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_deploy(ctx, args)
         if command == "doctor":
             return _cmd_doctor(ctx, args)
+        if command == "lease":
+            return _cmd_lease(ctx, args)
+        if command == "integrate":
+            return _cmd_integrate(ctx, args)
+        if command == "metrics":
+            return _cmd_metrics(ctx, args)
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, deploy, doctor.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -271,10 +316,8 @@ def _client_for(ctx: Any) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
-    from .client import client_from_config
-
     try:
-        return client_from_config(_config(ctx))
+        return adapters.adapter_from_config(_config(ctx))
     except Exception as exc:  # noqa: BLE001 - map client configuration errors
         code = getattr(exc, "code", "not_configured")
         fix = getattr(
@@ -828,37 +871,92 @@ def _secret_scan(workdir: Path, files: Iterable[str]) -> list[str]:
     return sorted(set(flagged))
 
 
-def _run_tests(workdir: Path, tests: list[str]) -> None:
-    for target in tests:
-        try:
-            proc = _run_subprocess(
-                [
-                    sys.executable,
-                    "-B",
-                    "-m",
-                    "pytest",
-                    "-p",
-                    "no:cacheprovider",
-                    "-q",
-                    target,
-                ],
-                cwd=workdir,
-                env=child_env(),
-                timeout=900,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise CliError(
-                "tests_failed",
-                f"test run failed for {target}: {exc}",
-                "Fix the test environment or rerun verify; nothing was pushed.",
-            ) from exc
-        if proc.returncode != 0:
-            detail = _tail(proc.stdout or proc.stderr)
-            raise CliError(
-                "tests_failed",
-                f"test target failed: {target}\n{detail}",
-                "Fix the failure in the worktree, then rerun verify; nothing was pushed.",
-            )
+def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    backend = str(config.get("verify_isolation") or "auto").strip().lower()
+    try:
+        timeout = int(config.get("verify_timeout_s") or 900)
+    except (TypeError, ValueError):
+        timeout = 900
+    return {
+        "backend": backend,
+        "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
+        "timeout": max(30, min(timeout, 7200)),
+    }
+
+
+def _run_sandboxed(workdir: Path, targets: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
+    """Run pytest on a disposable copy of *workdir*; return evidence only."""
+    try:
+        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(list(targets)), **_sandbox_options(config))
+    except sandbox.SandboxUnavailable as exc:
+        raise CliError(exc.code, exc.error, exc.fix) from exc
+    except ValueError as exc:
+        raise CliError(
+            "invalid_argument",
+            f"unknown verify_isolation backend: {exc}",
+            "Set verify_isolation to auto, bwrap, firejail or unshare.",
+        ) from exc
+
+
+def _run_tests(workdir: Path, tests: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = _run_sandboxed(workdir, tests, config)
+    if evidence.get("timed_out") or evidence.get("exit_code") != 0:
+        detail = _tail(evidence.get("output_tail"))
+        raise CliError(
+            "tests_failed",
+            f"sandboxed tests failed ({evidence.get('backend')}): {', '.join(tests)}\n{detail}",
+            "Fix the failure in the worktree, then rerun verify; nothing was pushed.",
+        )
+    return evidence
+
+
+def _diffstat(workdir: Path, patch: str) -> dict[str, int]:
+    proc = _run_git(["apply", "--numstat", "-"], workdir, input_text=patch, check=False)
+    added = deleted = files = 0
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        added += int(parts[0]) if parts[0].isdigit() else 0
+        deleted += int(parts[1]) if parts[1].isdigit() else 0
+    return {"files": files, "added": added, "deleted": deleted}
+
+
+def _usage(worker: Mapping[str, Any]) -> dict[str, Any]:
+    """Token/cost usage from the adapter-normalized result (untrusted, metrics only)."""
+    usage = worker.get("usage") if isinstance(worker.get("usage"), Mapping) else {}
+    out: dict[str, Any] = {}
+    tokens = usage.get("tokens")
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+        out["tokens"] = tokens
+    cost = usage.get("cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+        out["cost_usd"] = float(cost)
+    return out
+
+
+def _as_cli_error(exc: Exception) -> CliError:
+    return CliError(
+        str(getattr(exc, "code", "invalid_argument")),
+        str(getattr(exc, "error", exc)),
+        str(getattr(exc, "fix", "Check the inputs and retry.")),
+    )
+
+
+def _metric(state_dir: Path, run_id: str, event: str, **fields: Any) -> None:
+    try:
+        metrics.append_event(state_dir, run_id, event, **fields)
+    except Exception:  # noqa: BLE001 - metrics never block verify or integrate
+        pass
+
+
+def _first_verify(state_dir: Path, run_id: str, attempt_id: str) -> bool:
+    try:
+        events = metrics.read_events(state_dir, run_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return not any(e.get("event") == "verify" and e.get("attempt_id") == attempt_id for e in events)
 
 
 def _push_branch(workdir: Path, branch: str) -> None:
@@ -905,6 +1003,7 @@ def _write_verify_result(
     branch: str,
     files: list[str],
     tests: list[str],
+    evidence: Mapping[str, Any] | None = None,
 ) -> Path:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = Path(contain_path(f"verify-results/{attempt_id}.json", str(state_dir)))
@@ -917,8 +1016,12 @@ def _write_verify_result(
         "files": list(files),
         "tests": list(tests),
         "at": _now(),
+        "evidence": dict(evidence or {}),
     }
+    source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
+    if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
+        clean["evidence"]["source_rev"] = source_rev
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
@@ -1021,13 +1124,29 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
     files: list[str] = []
     tests: list[str] = []
     sha: str | None = None
+    run_id = "default"
+    evidence: dict[str, Any] = {}
 
     try:
+        # 1. Lease authority: only the coordinator record written at dispatch.
+        try:
+            record = leases.load_lease(state_dir, attempt_id)
+        except leases.LeaseError as exc:
+            raise _as_cli_error(exc) from exc
+        run_id = str(record.get("run_id") or "default")
+        source_rev = str(record.get("source_rev") or "")
+        evidence["source_rev"] = source_rev
+
         client = _client_for(ctx)
         result = _fetch_result(client, attempt_id)
-        brief = _brief_from(result)
+        warnings = leases.ignored_worker_claims(record, result)
+        if warnings:
+            evidence["ignored_worker_claims"] = warnings
 
-        patch = _result_patch(result)
+        # Agent-agnostic boundary: every runtime's output is reduced to the
+        # adapter result contract (patch, declared base, usage, worker claims).
+        worker = adapters.normalize_result(result)
+        patch = worker.get("patch")
         if not patch:
             raise CliError(
                 "no_result_yet",
@@ -1035,10 +1154,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "Wait for the worker to finish and collect a result with a patch.",
             )
 
+        # Branch comes from the user or the lease, never from worker metadata.
         branch = _safe_branch(
             getattr(args, "branch", None)
-            or result.get("branch")
-            or brief.get("branch")
+            or record.get("branch")
             or config.get("branch")
             or config.get("sync_branch")
         )
@@ -1050,32 +1169,29 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             or config.get("repo_path")
         )
         workdir = _prepare_worktree(workdir_value, branch)
-
-        observed = result.get("observed")
-        assigned_values = result.get("assigned_files") or brief.get("assigned_files")
-        if not assigned_values and isinstance(observed, Mapping):
-            assigned_values = observed.get("assigned_files")
-        files = _assigned_files(assigned_values, workdir)
+        files = _assigned_files(leases.lease_files(record), workdir)
 
         requested_tests = getattr(args, "tests", None)
+        acceptance = record.get("acceptance") if isinstance(record.get("acceptance"), Mapping) else {}
         if requested_tests:
             tests = _test_targets(requested_tests, workdir)
         else:
-            observed_tests = observed.get("tests") if isinstance(observed, Mapping) else None
-            for candidate in (result.get("tests"), brief.get("tests"), observed_tests):
-                tests = _test_targets(candidate, workdir)
-                if tests:
-                    break
+            tests = _test_targets(record.get("tests"), workdir) or _test_targets(
+                acceptance.get("tests"), workdir
+            )
             if not tests:
+                tests = _tests_from_commands(acceptance.get("commands"), workdir)
+            if not tests:
+                brief = record.get("brief") if isinstance(record.get("brief"), Mapping) else {}
                 tests = _tests_from_commands(brief.get("commands"), workdir)
         if not tests:
             raise CliError(
                 "no_tests",
                 "no tests were named for this attempt",
-                "Pass --tests with the brief's test targets; verify does not run full suites.",
+                "Pass --tests or put test targets in the brief's acceptance.tests.",
             )
 
-        kanban_id = result.get("kanban_task_id") or brief.get("kanban_task_id")
+        kanban_id = (record.get("brief") or {}).get("kanban_task_id") if isinstance(record.get("brief"), Mapping) else None
         if getattr(args, "kanban_comment", False) and not kanban_id:
             raise CliError(
                 "missing_kanban_task",
@@ -1083,6 +1199,17 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "Dispatch with kanban_task_id or omit --kanban-comment.",
             )
 
+        # 2. Revision guarantees: declared base, exact-commit apply, ancestry.
+        try:
+            revision.check_declared_base({"base_rev": worker.get("base_rev")}, source_rev)
+            revision.check_source_rev(workdir, source_rev)
+            revision.check_applies_at(workdir, source_rev, patch)
+            revision.check_branch_descends(workdir, source_rev)
+        except revision.RevisionError as exc:
+            raise _as_cli_error(exc) from exc
+
+        # 3. Scope + apply to the feature branch (git apply never runs code).
+        evidence["diffstat"] = _diffstat(workdir, patch)
         changed = _apply_patch(workdir, patch, files)
         files = changed
 
@@ -1095,23 +1222,31 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "Remove secrets from the worker output; nothing was committed or pushed.",
             )
 
-        _run_tests(workdir, tests)
+        # 4. Worker-produced code runs only in the disposable sandbox.
+        try:
+            test_evidence = _run_tests(workdir, tests, config)
+        except CliError:
+            _reset_patch(workdir)
+            raise
+        evidence.update(
+            backend=test_evidence.get("backend"),
+            exit_code=test_evidence.get("exit_code"),
+            junit=test_evidence.get("junit"),
+            duration_s=test_evidence.get("duration_s"),
+        )
 
         if dry_run:
             target = _write_verify_result(
-                state_dir,
-                attempt_id,
-                ok=True,
-                sha=None,
-                branch=branch,
-                files=files,
-                tests=tests,
+                state_dir, attempt_id, ok=True, sha=None, branch=branch,
+                files=files, tests=tests, evidence=evidence,
             )
+            _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
             _print(f"attempt: {attempt_id}")
             _print(f"branch: {branch}")
             _print(f"files: {', '.join(files)}")
             _print(f"tests: {', '.join(tests)}")
+            _print(f"sandbox: {evidence.get('backend')}")
             _print("result: dry-run passed; nothing was committed or pushed")
             _print(f"verify result: {target}")
             if kanban_id:
@@ -1130,14 +1265,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _push_branch(workdir, branch)
 
         target = _write_verify_result(
-            state_dir,
-            attempt_id,
-            ok=True,
-            sha=sha,
-            branch=branch,
-            files=files,
-            tests=tests,
+            state_dir, attempt_id, ok=True, sha=sha, branch=branch,
+            files=files, tests=tests, evidence=evidence,
         )
+        _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="verified", sha=sha)
 
         _print("bundlebees verify")
         _print(f"attempt: {attempt_id}")
@@ -1145,8 +1276,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _print_sha(sha)
         _print(f"files: {', '.join(files)}")
         _print(f"tests: {', '.join(tests)}")
+        _print(f"sandbox: {evidence.get('backend')}")
         _print(f"pushed: feature branch only ({BRANCH_BUDGET_NOTE})")
         _print(f"verify result: {target}")
+        _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")
         suggested = (
             f'hermes kanban comment {kanban_id} '
             f'"bundlebees verify passed for {attempt_id}"'
@@ -1166,17 +1299,145 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
     except CliError as exc:
         try:
             _write_verify_result(
-                state_dir,
-                attempt_id,
-                ok=False,
-                sha=sha,
-                branch=branch,
-                files=files,
-                tests=tests,
+                state_dir, attempt_id, ok=False, sha=sha, branch=branch,
+                files=files, tests=tests, evidence=evidence,
             )
         except Exception:  # noqa: BLE001 - preserve the original CLI error
             pass
+        if exc.code not in ("lease_missing", "lease_tampered", "lease_invalid"):
+            _metric(state_dir, run_id, "verify", attempt_id=attempt_id, ok=False, code=exc.code)
         raise exc
+
+
+def _record_verify(
+    state_dir: Path,
+    run_id: str,
+    attempt_id: str,
+    record: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    *,
+    ok: bool,
+    code: str,
+    sha: str | None = None,
+) -> None:
+    fields: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "ok": ok,
+        "code": code,
+        "first_pass": _first_verify(state_dir, run_id, attempt_id),
+        **_usage(worker),
+    }
+    if sha:
+        fields["sha"] = sha
+    _metric(state_dir, run_id, "verify", **fields)
+    retry_of = record.get("retry_of")
+    if ok and isinstance(retry_of, str) and retry_of:
+        _metric(state_dir, run_id, "recovery", attempt_id=attempt_id, retry_of=retry_of)
+
+
+def _cmd_lease(ctx: Any, args: Any) -> int:
+    attempt_id = _safe_attempt_id(getattr(args, "attempt_id", None))
+    state_dir = _state_dir(ctx, args)
+    path = Path(str(getattr(args, "brief", "") or "")).expanduser()
+    try:
+        if path.stat().st_size > 1_000_000:
+            raise CliError("brief_invalid", "brief file is larger than 1 MB", "Pass the dispatched brief JSON.")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except CliError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise CliError("brief_invalid", "brief file could not be read as JSON", "Pass the dispatched brief JSON file.") from exc
+    if not isinstance(data, Mapping):
+        raise CliError("brief_invalid", "brief must be a JSON object", "Pass the dispatched brief JSON file.")
+    try:
+        brief = _brief_mod.validate_brief(data)
+        record = leases.record_lease(state_dir, attempt_id, brief)
+    except (_brief_mod.BriefError, leases.LeaseError) as exc:
+        raise _as_cli_error(exc) from exc
+    _metric(state_dir, str(record.get("run_id") or "default"), "dispatch", attempt_id=attempt_id)
+    _print("bundlebees lease")
+    _print(f"attempt: {attempt_id}")
+    print(f"source_rev: {record['source_rev']}")
+    _print(f"files: {', '.join(record['assigned_files'])}")
+    _print("lease: recorded (read-only, HMAC-signed); verify trusts only this record")
+    return 0
+
+
+def _cmd_integrate(ctx: Any, args: Any) -> int:
+    state_dir = _state_dir(ctx, args)
+    config = _config(ctx)
+    attempt_ids = [_safe_attempt_id(a) for a in (getattr(args, "attempts", None) or [])]
+    branch = _safe_branch(getattr(args, "branch", None) or config.get("branch"))
+    workdir_value = getattr(args, "workdir", None) or config.get("worktree")
+    workdir = _prepare_worktree(workdir_value, branch)
+    run_id = getattr(args, "run", None)
+    if not run_id:
+        try:
+            run_id = str(leases.load_lease(state_dir, attempt_ids[0]).get("run_id") or "default")
+        except (leases.LeaseError, IndexError):
+            run_id = "default"
+    try:
+        record = revision.integrate_wave(
+            state_dir,
+            str(getattr(args, "wave", "")),
+            workdir,
+            attempt_ids,
+            lambda wd: _run_sandboxed(wd, [], config),
+        )
+    except revision.RevisionError as exc:
+        raise _as_cli_error(exc) from exc
+    accepted = bool(record.get("accepted"))
+    _metric(
+        state_dir, str(run_id), "integrate",
+        wave_id=record.get("wave_id"), ok=accepted, attempts=list(record.get("attempts") or []),
+        regressions=int(record.get("regressions") or 0), sha=record.get("head_sha"),
+    )
+    suite = record.get("suite") if isinstance(record.get("suite"), Mapping) else {}
+    _print("bundlebees integrate")
+    _print(f"wave: {record.get('wave_id')}")
+    _print(f"branch: {branch}")
+    _print_sha(record.get("head_sha"))
+    _print(f"attempts: {', '.join(record.get('attempts') or [])}")
+    for attempt, problem in sorted((record.get("problems") or {}).items()):
+        _print(f"problem: {attempt}: {problem}")
+    if suite:
+        _print(f"suite: exit {suite.get('exit_code')} via {suite.get('backend')} junit={json.dumps(suite.get('junit'))}")
+    _print(f"accepted: {'yes' if accepted else 'no'}")
+    if not accepted and suite.get("output_tail"):
+        _print(_tail(suite.get("output_tail"), 1500))
+    return 0 if accepted else 1
+
+
+def _cmd_metrics(ctx: Any, args: Any) -> int:
+    state_dir = _state_dir(ctx, args)
+    run = getattr(args, "run", None)
+    note = getattr(args, "note", None)
+    if note is not None:
+        try:
+            metrics.append_event(state_dir, run or "default", "intervention", note=str(note)[:500])
+        except metrics.MetricsError as exc:
+            raise _as_cli_error(exc) from exc
+        _print("bundlebees metrics: human intervention recorded")
+        return 0
+    try:
+        runs = [run] if run else metrics.list_runs(state_dir)
+        summaries = [metrics.summarize(metrics.read_events(state_dir, r)) for r in runs]
+    except metrics.MetricsError as exc:
+        raise _as_cli_error(exc) from exc
+    for summary, name in zip(summaries, runs):
+        summary["run_id"] = summary.get("run_id") or name
+    if getattr(args, "json", False):
+        # Summaries hold only counts, rates and validated run ids; scrub() would
+        # mask keys such as tokens_per_accepted.
+        print(json.dumps(summaries, indent=2, sort_keys=True))
+        return 0
+    if not summaries:
+        _print("bundlebees metrics: no runs recorded yet")
+        return 0
+    for summary in summaries:
+        _print(metrics.format_summary(summary))
+        _print("")
+    return 0
 
 
 def _cmd_deploy(ctx: Any, args: Any) -> int:
@@ -1268,6 +1529,18 @@ def _cmd_doctor(ctx: Any, args: Any) -> int:
     else:
         detail = "unavailable"
     _print(f"adapter: {detail}")
+
+    options = _sandbox_options(_config(ctx))
+    try:
+        backend = sandbox.detect_backend(options["backend"])
+    except ValueError:
+        backend = None
+    if backend:
+        _print(f"sandbox: {backend}")
+    elif options["allow_unsafe_local"]:
+        _print("sandbox: none (verify_allow_unsafe_local=true: tests run UNISOLATED)")
+    else:
+        _print("sandbox: none (verify and integrate will refuse; install bubblewrap)")
 
     measured = _measure_schema_tokens()
     if measured is None:

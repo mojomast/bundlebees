@@ -1,0 +1,2 @@
+# False positive: a fake literal in an adapters scrub test, replaced by a runtime-built value in a later commit.
+7ca6cc485c60c832bcf61c6e8c24796582b02bde:tests/test_adapters.py:generic-api-key:220

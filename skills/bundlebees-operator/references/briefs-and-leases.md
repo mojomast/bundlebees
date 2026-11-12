@@ -1,8 +1,8 @@
 # Briefs, leases, and budgets
 
 A brief is the whole contract between the coordinator and one bee. The tool
-validates it in code against the bundled launcher schema before any create
-request. Pass an object (preferred) or a JSON object string; the schema is
+validates it in code against the bundled strict schema before any launcher
+call; an invalid brief never reaches a worker. Pass an object (preferred) or a JSON object string; the schema is
 not embedded in the tool definition.
 
 ## Required and important fields
@@ -10,17 +10,20 @@ not embedded in the tool definition.
 | Field | Type | Notes |
 |---|---|---|
 | `objective` | string | **Required.** One concrete outcome. No secrets or addresses. |
+| `source_rev` | string | **Required.** Full 40-hex (or 64-hex) commit SHA the worker starts from. Branch names, tags and short SHAs are rejected. |
+| `assigned_files` | string list | **Required, non-empty.** Exact repository-relative files the bee may change. No absolute paths, `..`, or `.git`. |
+| `acceptance` | list or object | **Required.** Either criteria strings, or `{criteria, commands, tests}` with criteria or commands non-empty. Normalized to the object form. |
 | `project` | string | Launcher-authorized project key. Must be in `bundlebees_status` `op=projects`. |
 | `branch` | string | Feature branch only. Never `main`. |
-| `source_rev` | string | Starting revision or tag for the slice. |
-| `assigned_files` | string list | Exact files the bee may change. Required for code-work briefs. |
 | `commands` | string list | Commands the bee may run, ideally the narrow test command. |
-| `acceptance` | string list | Observable checks the user-run verify will look for. |
 | `deliverables` | string list | Files or artifacts the bee must leave behind. |
 | `deps` | string list | Sibling task ids or prerequisites. |
 | `budget.timeout_s` | integer >= 1 | Wall-clock cap in seconds. |
 | `budget.max_tool_calls` | integer >= 1 | Tool-call cap. |
 | `kanban_task_id` | string | Optional Hermes card id; recorded and returned, not called. |
+| `tests` | string list | Optional test targets for verify (or use `acceptance.tests`). |
+| `run_id` / `wave` | string | Optional metrics run and wave ids (`[A-Za-z0-9._-]`). |
+| `retry_of` | string | Attempt id this brief re-does; a green verify records a recovery. |
 
 `additionalProperties` is allowed by the launcher schema, but keep the brief
 small. Anything you add is still subject to scrubbing and review.
@@ -52,10 +55,12 @@ small. Anything you add is still subject to scrubbing and review.
 3. **Parallel bees get disjoint leases.** If two bees run at once, their file
    sets must not intersect. Branch alone is not enough when the same files can
    be edited twice.
-4. **Verify enforces the lease.** The user-typed `hermes bundlebees verify`
-   rejects a patch that touches anything outside `assigned_files` with
-   `scope_violation`. A worker that ignores the lease fails verification even
-   if its tests pass.
+4. **The lease is a signed coordinator record.** Dispatch writes
+   `leases/<attempt_id>.json` under plugin data, read-only and HMAC-signed,
+   and never overwrites it. The user-typed `hermes bundlebees verify` trusts
+   only that record: a patch outside it fails with `scope_violation`, an
+   edited record with `lease_tampered`, and anything the worker returns
+   about its own scope is ignored.
 5. **Dependencies are ordered.** Use `deps` and the kanban card link so a
    dependent bee does not start until its parent is done and verified.
 6. **No lease inheritance.** A card that follows another does not inherit its
