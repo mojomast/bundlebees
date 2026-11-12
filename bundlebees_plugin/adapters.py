@@ -62,6 +62,7 @@ Runtime-specific result shapes (for example the Orbit launcher's
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .client import client_from_config
@@ -383,10 +384,14 @@ def _client_adapter(name: str) -> Callable[..., WorkerAdapter]:
     def build(
         config: Mapping[str, Any] | None = None,
         token_provider: Callable[[], str | None] | None = None,
+        *,
+        state_dir: Path | None = None,
     ) -> WorkerAdapter:
         settings = dict(config or {})
         settings["adapter"] = name
-        client = client_from_config(settings, token_provider=token_provider)
+        client = client_from_config(
+            settings, token_provider=token_provider, state_dir=state_dir
+        )
         client.name = name
         return client
 
@@ -397,15 +402,15 @@ def _stub_adapter(adapter_cls: type[StubAdapter]) -> Callable[..., WorkerAdapter
     def build(
         config: Mapping[str, Any] | None = None,
         token_provider: Callable[[], str | None] | None = None,
+        *,
+        state_dir: Path | None = None,
     ) -> WorkerAdapter:
         return adapter_cls()
 
     return build
 
 
-ADAPTERS: dict[
-    str, Callable[[Mapping[str, Any], Callable[[], str | None] | None], WorkerAdapter]
-] = {
+ADAPTERS: dict[str, Callable[..., WorkerAdapter]] = {
     "orbit-loopback": _client_adapter("orbit-loopback"),
     "launcher": _client_adapter("launcher"),
     "opencode": _stub_adapter(OpenCodeAdapter),
@@ -417,6 +422,7 @@ def adapter_from_config(
     config: Mapping[str, Any] | None = None,
     *,
     token_provider: Callable[[], str | None] | None = None,
+    state_dir: Path | None = None,
 ) -> WorkerAdapter:
     """Pick the configured adapter, defaulting to the loopback Orbit client."""
     settings = config or {}
@@ -434,7 +440,7 @@ def adapter_from_config(
                 f"See {_ADAPTER_DOC}."
             ),
         )
-    return factory(settings, token_provider)
+    return factory(settings, token_provider, state_dir=state_dir)
 
 
 def available_adapters() -> list[dict[str, Any]]:
