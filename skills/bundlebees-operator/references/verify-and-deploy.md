@@ -76,7 +76,7 @@ hermes bundlebees contract freeze contract.json --approved-by <name>
 hermes bundlebees tdd red contract.json --workdir <repo>
 ```
 
-Put the frozen contract in `brief.contract`, with `source_rev` = the tests-only commit. Approved test files are never in `assigned_files`. Verify then refuses edits to approved tests (`tests_tampered`), needs that RED (`red_missing`), and records GREEN. `hermes bundlebees tdd refactor contract.json --workdir <repo> --rev <sha>` (or `--none --note <why>`) records REFACTOR. Integrate records the integration evidence. `hermes bundlebees tdd report contract.json` shows each phase as valid, a failure code or not run. Never edit evidence files, and never call a check passed when it did not run.
+Put the frozen contract in `brief.contract`, with `source_rev` = the tests-only commit. Approved test files are never in `assigned_files`. Verify then refuses edits to approved tests (`tests_tampered`), needs that RED (`red_missing`), and records GREEN. `hermes bundlebees tdd refactor contract.json --workdir <repo> --rev <sha>` (or `--none --note <why>`) records REFACTOR. `hermes bundlebees tdd review contract.json --reviewer <name> --approve --note <why>` records REVIEW (only a reviewer or human, never a worker). Integrate needs REFACTOR when the contract lists it, and records the integration evidence. `hermes bundlebees tdd report contract.json` shows each phase as valid, a failure code or not run. Never edit evidence files, and never call a check passed when it did not run.
 
 ## Integrate (wave acceptance)
 

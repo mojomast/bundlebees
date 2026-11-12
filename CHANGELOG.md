@@ -24,7 +24,7 @@ one pull request.
   in `brief.contract` and returns an `acdd` block. Briefs without one run in
   legacy mode ("no ACDD contract; TDD evidence not required"). The new
   `require_contract` setting makes a contract mandatory.
-- **CLI:** `contract validate|freeze`, `tdd red|refactor|report`. With a contract,
+- **CLI:** `contract validate|freeze`, `tdd red|refactor|review|report`. With a contract,
   `verify` refuses edits to approved tests, requires a valid RED and records a
   signed GREEN. `integrate` requires GREEN and records an `integration` record.
   Sandboxed runs now return per-case results (`cases`).
@@ -38,8 +38,14 @@ one pull request.
   (`refactor_failed`, `tests_tampered`, `scope_violation`, `stale_revision`);
   `tdd refactor --none --note <text>` records "no refactor needed". Built
   test-first by a DeepSeek bee against coordinator-approved tests.
-- Not yet: REVIEW records from the CLI; `integrate` requires GREEN, not
-  REFACTOR.
+- `tdd review --reviewer <name> [--role reviewer|human] (--approve|--reject)
+  --note <text>` records a signed REVIEW for the GREEN (or required
+  REFACTOR) revision; review and manual criteria take its outcome, and a
+  rejection exits with `review_failed`. Workers can never record a review.
+- `integrate` now also requires a valid REFACTOR record (a real one or an
+  explicit `--none` skip) when the contract lists `refactor`.
+- The shared evidence schema allows `classification: "failed"`, for review
+  records only (a rejected review).
 
 ### Fixed
 

@@ -43,7 +43,7 @@
         }
       }
     },
-    "classification": {"enum": ["behavioral_failure", "passed", "syntax_error", "collection_error", "environment_error", "unrelated_failure", "timeout", "not_run"]},
+    "classification": {"enum": ["behavioral_failure", "passed", "syntax_error", "collection_error", "environment_error", "unrelated_failure", "timeout", "not_run", "failed"], "description": "Test-run phases use the docs/16 §4 table. \"failed\" is only for a review record whose reviewer rejected the change."},
     "criteria": {
       "type": "object",
       "propertyNames": {"pattern": "^AC-[0-9]{3,}$"},
@@ -61,7 +61,7 @@
     "at": {"type": "string", "minLength": 1},
     "log_path": {"type": "string"},
     "notes": {"type": "string"},
-    "signature": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional coordinator HMAC-SHA256 over the canonical record without this field. The reference demo leaves it out (teaching only)."}
+    "signature": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional coordinator HMAC-SHA256 over the canonical record without this field. bundlebees signs with a key derived from its private lease key; the reference demo signs with a demo key kept in its run directory (teaching only)."}
   },
   "additionalProperties": true
 }
