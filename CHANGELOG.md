@@ -41,6 +41,15 @@ one pull request.
 - Not yet: REVIEW records from the CLI; `integrate` requires GREEN, not
   REFACTOR.
 
+### Fixed
+
+- Concurrent first dispatches on a fresh state directory could fail with
+  `lease_invalid: the lease key is not 32 bytes`: one thread opened the key
+  file after another created it but before the bytes were written (seen in
+  the workflow cold-start acceptance on CI). The key is now written to a
+  private temporary file and published with `os.link`, so readers only ever
+  see a complete key. Regression test written first and seen failing.
+
 ### Security
 
 - **No automatic weak sandbox.** `verify_isolation=auto` now picks only a
