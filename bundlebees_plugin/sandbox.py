@@ -14,17 +14,24 @@ Strategy
 * Copy the worktree to a fresh ``mkdtemp`` directory (symlinks copied, never
   followed), bind that copy and a throwaway home into a filesystem/namespace
   wrapper, and delete the whole tree in ``finally``.
-* Prefer bubblewrap, then firejail, then plain ``unshare``. Detection runs
-  ``true`` through the wrapper, so a host with user namespaces disabled is
-  treated as unavailable instead of silently running "sandboxed" code.
-* Fail closed when no wrapper works. The only escape hatch is the explicit
-  ``verify_allow_unsafe_local`` setting, which still uses a scrubbed
-  environment and the disposable copy but provides no kernel isolation.
+* ``auto`` only ever picks a *strong* backend: bubblewrap, then firejail.
+  Detection runs ``true`` through the wrapper, so a host with user namespaces
+  disabled is treated as unavailable instead of silently running "sandboxed"
+  code.
+* ``unshare`` is never auto-selected. It runs only when ``verify_isolation``
+  is explicitly ``unshare`` *and* the weak-isolation override is on (the
+  ``verify_allow_weak_unshare`` setting or ``BUNDLEBEES_ALLOW_WEAK_UNSHARE=1``).
+* Fail closed when no allowed wrapper works. The only other escape hatch is
+  the explicit ``verify_allow_unsafe_local`` setting, which still uses a
+  scrubbed environment and the disposable copy but provides no kernel
+  isolation.
 * Every child gets ``sandbox_env``: an exact, from-scratch environment. No
   ``os.environ`` value (token, SSH agent, git config, proxy) is inherited.
 * ``unshare`` is the weakest backend: it isolates network, IPC, UTS and PID
-  namespaces with a scrubbed environment, but the filesystem remains readable
-  as the invoking uid. Do not treat it as a filesystem sandbox.
+  namespaces with a scrubbed environment, but the coordinator's filesystem
+  (home, credentials, ``.env`` files) remains readable as the invoking uid.
+  It is not a filesystem sandbox and is UNSAFE for untrusted worker tests on
+  any machine holding credentials.
 """
 
 from __future__ import annotations
@@ -44,6 +51,12 @@ from typing import Callable, Iterable, Mapping, Sequence
 from .security import scrub
 
 BACKENDS: tuple[str, ...] = ("bwrap", "firejail", "unshare")
+#: Backends ``auto`` may pick: both hide the coordinator's filesystem.
+STRONG_BACKENDS: tuple[str, ...] = ("bwrap", "firejail")
+#: Namespace-only backends that need an explicit, documented-unsafe override.
+WEAK_BACKENDS: tuple[str, ...] = ("unshare",)
+#: Environment override that permits an explicitly requested weak backend.
+WEAK_OVERRIDE_ENV = "BUNDLEBEES_ALLOW_WEAK_UNSHARE"
 
 _IGNORED_COPY_NAMES = frozenset(
     {
@@ -66,9 +79,16 @@ _PROBE_TIMEOUT = 10
 _MAX_EVIDENCE_BYTES = 2_000_000
 _MAX_OUTPUT_TAIL = 4000
 _FIX_UNAVAILABLE = (
-    "Install bubblewrap (the bubblewrap package) so a sandbox backend is "
-    "available, or set verify_allow_unsafe_local=true in the bundlebees plugin "
-    "settings to run without kernel isolation."
+    "Install bubblewrap (the bubblewrap package) or firejail so a strong "
+    "sandbox backend is available. unshare is never picked automatically "
+    "because it does not hide the coordinator's filesystem. Only on a "
+    "disposable machine with no credentials: set verify_allow_unsafe_local=true "
+    "in the bundlebees plugin settings to run without kernel isolation."
+)
+_FIX_WEAK_REFUSED = (
+    "Use verify_isolation=auto (bubblewrap or firejail). unshare does not hide "
+    "the coordinator's filesystem; to accept that risk on a disposable host, "
+    "set verify_allow_weak_unshare=true or BUNDLEBEES_ALLOW_WEAK_UNSHARE=1."
 )
 _XML_DANGER_RE = re.compile(r"<!\s*(DOCTYPE|ENTITY)", re.IGNORECASE)
 _EVIDENCE_NAME = ".bundlebees-evidence"
@@ -146,17 +166,35 @@ def _default_probe(backend: str) -> bool:
     return proc.returncode == 0
 
 
+def weak_override_enabled(
+    setting: bool = False, environ: Mapping[str, str] | None = None
+) -> bool:
+    """True when the weak-backend override is on (setting or env var)."""
+    if setting is True:
+        return True
+    env = os.environ if environ is None else environ
+    return str(env.get(WEAK_OVERRIDE_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def detect_backend(
     preferred: str = "auto",
     *,
+    allow_weak: bool = False,
     which: Which = shutil.which,
     probe: Probe | None = None,
 ) -> str | None:
-    """Return a usable backend name, or ``None`` when none works here."""
+    """Return a usable backend name, or ``None`` when none is usable here.
+
+    ``auto`` only considers :data:`STRONG_BACKENDS`; a weak backend is never
+    auto-selected. A weak backend named explicitly is returned only when
+    *allow_weak* is true; otherwise ``None`` (fail closed).
+    """
     if preferred != "auto" and preferred not in BACKENDS:
         raise ValueError(f"unknown sandbox backend: {preferred!r}")
+    if preferred in WEAK_BACKENDS and not allow_weak:
+        return None
     check = probe or _default_probe
-    names: Sequence[str] = BACKENDS if preferred == "auto" else (preferred,)
+    names: Sequence[str] = STRONG_BACKENDS if preferred == "auto" else (preferred,)
     for name in names:
         if not which(name):
             continue
@@ -441,6 +479,7 @@ def run_in_sandbox(
     *,
     backend: str = "auto",
     allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
     timeout: int = 900,
     which: Which = shutil.which,
     probe: Probe | None = None,
@@ -449,7 +488,10 @@ def run_in_sandbox(
 
     The real worktree is never modified or executed in place. The disposable
     copy is always deleted, even on timeout or an unavailable backend.
+    ``allow_weak`` (or ``BUNDLEBEES_ALLOW_WEAK_UNSHARE=1``) is required before an
+    explicitly requested ``unshare`` backend runs; ``auto`` never picks it.
     """
+    weak_ok = weak_override_enabled(allow_weak)
     source = Path(workdir)
     root = Path(tempfile.mkdtemp(prefix="bundlebees-verify-"))
     copy_dir = root / "work"
@@ -460,10 +502,18 @@ def run_in_sandbox(
         home.mkdir(parents=True, exist_ok=True)
         tmp.mkdir(parents=True, exist_ok=True)
 
-        chosen = detect_backend(backend, which=which, probe=probe)
+        if backend in WEAK_BACKENDS and not weak_ok:
+            raise SandboxUnavailable(
+                f"verify_isolation={backend} is a weak, namespace-only backend that "
+                "does not hide the coordinator's filesystem; refusing without the "
+                "explicit weak-isolation override",
+                _FIX_WEAK_REFUSED,
+            )
+        chosen = detect_backend(backend, allow_weak=weak_ok, which=which, probe=probe)
         if chosen is None and not allow_unsafe_local:
             raise SandboxUnavailable(
-                "no usable sandbox backend was detected on this host"
+                "no strong sandbox backend (bubblewrap or firejail) is usable on "
+                "this host; refusing to run worker-produced code"
             )
 
         evidence_host = copy_dir / _EVIDENCE_NAME

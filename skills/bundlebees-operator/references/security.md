@@ -63,10 +63,12 @@ Event bodies, progress lines, command output, result details, and
 - The model does not apply a patch, run a test suite, push a branch, or reach
   a host. Those are the user-run verify, integrate and deploy commands.
 - Worker-produced code never runs directly on the coordinator: verify and
-  integrate copy the worktree to a temp dir and run tests under bubblewrap,
-  firejail or unshare with no network and a scrubbed environment, and fail
-  closed without one. `verify_allow_unsafe_local` disables that isolation and
-  is for disposable single-user machines only.
+  integrate copy the worktree to a temp dir and run tests under bubblewrap
+  or firejail with no network and a scrubbed environment, and fail closed
+  without one. `unshare` is never auto-selected because the coordinator's
+  filesystem stays readable; `verify_allow_weak_unshare` (or
+  `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1`) and `verify_allow_unsafe_local` weaken or
+  disable isolation and are for disposable single-user machines only.
 - The model does not import or execute untrusted code: no worker patch, no
   third-party plugin, no remote setup script.
 - Do not shell out to a launcher with an ad-hoc HTTP client. Use the four

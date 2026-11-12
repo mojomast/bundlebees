@@ -125,7 +125,7 @@ def _repo(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def _ctx(client: FakeClient, config: dict | None = None) -> FakeCtx:
     plugin = load_plugin()
-    # Sandbox stays "auto" (bwrap/firejail/unshare when present); the unsafe
+    # Sandbox stays "auto" (bwrap/firejail when present; never unshare); the unsafe
     # local fallback only keeps these git-flow tests runnable on hosts with no
     # backend. Real isolation is asserted in test_sandbox.py and below.
     settings = {"verify_allow_unsafe_local": True, **(config or {})}
@@ -248,7 +248,7 @@ def test_verify_dry_run_applies_lease_runs_test_and_does_not_push(
     assert payload["evidence"]["exit_code"] == 0
     assert payload["evidence"]["source_rev"] == base_sha
     assert payload["evidence"]["diffstat"] == {"files": 1, "added": 1, "deleted": 0}
-    assert payload["evidence"]["backend"] in ("bwrap", "firejail", "unshare", "none-unsafe-local")
+    assert payload["evidence"]["backend"] in ("bwrap", "firejail", "none-unsafe-local")
     assert payload["attempt_id"] == ATTEMPT_ID
     assert payload["ok"] is True
     assert payload["sha"] is None
@@ -544,6 +544,25 @@ def test_doctor_token_line_is_readable(capsys: pytest.CaptureFixture[str], monke
         out = capsys.readouterr().out
         assert expected in out.splitlines()
         assert "[redacted]" not in out
+
+
+def test_sandbox_options_weak_override_from_setting_or_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("BUNDLEBEES_ALLOW_WEAK_UNSHARE", raising=False)
+    assert cli._sandbox_options({})["allow_weak"] is False
+    assert cli._sandbox_options({"verify_allow_weak_unshare": "false"})["allow_weak"] is False
+    assert cli._sandbox_options({"verify_allow_weak_unshare": True})["allow_weak"] is True
+    monkeypatch.setenv("BUNDLEBEES_ALLOW_WEAK_UNSHARE", "1")
+    assert cli._sandbox_options({})["allow_weak"] is True
+
+
+def test_doctor_reports_refused_unshare(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("BUNDLEBEES_ALLOW_WEAK_UNSHARE", raising=False)
+    monkeypatch.setattr(cli, "_measure_schema_tokens", lambda: 0)
+    _invoke(_ctx(FakeClient(), {"verify_isolation": "unshare"}), ["doctor"])
+    out = capsys.readouterr().out
+    assert "verify_isolation=unshare refused without the weak override" in out
 
 
 # ---------------------------------------------------------------------------

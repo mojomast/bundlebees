@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
     "deploy_host_alias": "",
     "verify_isolation": "auto",
     "verify_allow_unsafe_local": False,
+    "verify_allow_weak_unshare": False,
     "verify_timeout_s": 900,
 }
 

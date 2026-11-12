@@ -1,2 +1,7 @@
 # False positive: a fake literal in an adapters scrub test, replaced by a runtime-built value in a later commit.
 7ca6cc485c60c832bcf61c6e8c24796582b02bde:tests/test_adapters.py:generic-api-key:220
+# False positive: the obviously fake AWS-shaped placeholder fixture in a scrub test (history).
+031d78be384a4cd7cbb2a51248b7a3360288028f:tests/test_security.py:aws-access-token:41
+031d78be384a4cd7cbb2a51248b7a3360288028f:tests/test_security.py:aws-access-token:43
+# False positive: an earlier revision of this comment quoted that same fake placeholder.
+03681f33a07eb0d7a89966f92b917c96d09f65de:.gitleaksignore:aws-access-token:3

@@ -34,25 +34,110 @@ def _write_script(path: Path, body: str) -> Path:
 
 
 def test_detect_backend_auto_prefers_the_strongest_available():
-    installed = {"unshare"}
+    installed = {"firejail"}
 
     def which(name: str) -> str | None:
         return f"/usr/bin/{name}" if name in installed else None
 
-    assert sandbox.detect_backend(which=which, probe=lambda name: True) == "unshare"
+    assert sandbox.detect_backend(which=which, probe=lambda name: True) == "firejail"
 
-    installed.update({"bwrap", "firejail"})
+    installed.update({"bwrap", "unshare"})
     assert sandbox.detect_backend(which=which, probe=lambda name: True) == "bwrap"
 
     # A binary that exists but whose probe fails is skipped.
-    installed.update({"bwrap", "firejail", "unshare"})
     assert (
-        sandbox.detect_backend(
-            which=which,
-            probe=lambda name: name != "bwrap" and name != "firejail",
+        sandbox.detect_backend(which=which, probe=lambda name: name != "bwrap")
+        == "firejail"
+    )
+
+
+def test_detect_backend_auto_never_selects_unshare():
+    every = lambda name: f"/usr/bin/{name}"  # noqa: E731
+    # Only unshare works: auto must fail closed, even with the weak override.
+    for allow_weak in (False, True):
+        assert (
+            sandbox.detect_backend(
+                which=every,
+                probe=lambda name: name == "unshare",
+                allow_weak=allow_weak,
+            )
+            is None
         )
+    probed: list[str] = []
+    sandbox.detect_backend(which=every, probe=lambda n: probed.append(n) or False)
+    assert "unshare" not in probed
+    assert "unshare" not in sandbox.STRONG_BACKENDS
+    assert "unshare" in sandbox.WEAK_BACKENDS
+
+
+def test_detect_backend_explicit_unshare_needs_the_override():
+    every = lambda name: f"/usr/bin/{name}"  # noqa: E731
+    assert sandbox.detect_backend("unshare", which=every, probe=lambda n: True) is None
+    assert (
+        sandbox.detect_backend("unshare", allow_weak=True, which=every, probe=lambda n: True)
         == "unshare"
     )
+
+
+def test_weak_override_reads_setting_and_env():
+    assert sandbox.weak_override_enabled(False, {}) is False
+    assert sandbox.weak_override_enabled(True, {}) is True
+    assert sandbox.weak_override_enabled(False, {sandbox.WEAK_OVERRIDE_ENV: "1"}) is True
+    assert sandbox.weak_override_enabled(False, {sandbox.WEAK_OVERRIDE_ENV: "true"}) is True
+    assert sandbox.weak_override_enabled(False, {sandbox.WEAK_OVERRIDE_ENV: "0"}) is False
+    assert sandbox.weak_override_enabled(False, {sandbox.WEAK_OVERRIDE_ENV: ""}) is False
+
+
+def test_run_in_sandbox_refuses_explicit_unshare_without_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv(sandbox.WEAK_OVERRIDE_ENV, raising=False)
+    with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+        sandbox.run_in_sandbox(
+            tmp_path,
+            [sys.executable, "-c", "print('never runs')"],
+            backend="unshare",
+            which=lambda name: f"/usr/bin/{name}",
+            probe=lambda name: True,
+        )
+    exc = excinfo.value
+    assert exc.code == "sandbox_unavailable"
+    assert "filesystem" in exc.error
+    assert "verify_allow_weak_unshare" in exc.fix
+    assert sandbox.WEAK_OVERRIDE_ENV in exc.fix
+
+
+def test_run_in_sandbox_refuses_unshare_even_with_unsafe_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Asking for unshare by name is a configuration error, not a reason to
+    # fall through to the unisolated path.
+    monkeypatch.delenv(sandbox.WEAK_OVERRIDE_ENV, raising=False)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        sandbox.run_in_sandbox(
+            tmp_path,
+            [sys.executable, "-c", "print('never runs')"],
+            backend="unshare",
+            allow_unsafe_local=True,
+            which=lambda name: f"/usr/bin/{name}",
+            probe=lambda name: True,
+        )
+
+
+def test_run_in_sandbox_auto_fails_closed_when_only_unshare_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(sandbox.WEAK_OVERRIDE_ENV, "1")
+    with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+        sandbox.run_in_sandbox(
+            tmp_path,
+            [sys.executable, "-c", "print('never runs')"],
+            backend="auto",
+            which=lambda name: "/usr/bin/unshare" if name == "unshare" else None,
+            probe=lambda name: True,
+        )
+    assert "bubblewrap or firejail" in excinfo.value.error
+    assert "never picked automatically" in excinfo.value.fix
 
 
 def test_detect_backend_auto_returns_none_when_no_probe_succeeds():

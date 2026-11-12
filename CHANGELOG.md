@@ -15,6 +15,14 @@ one pull request.
 
 ### Security
 
+- **No automatic weak sandbox.** `verify_isolation=auto` now picks only a
+  strong backend (bubblewrap, then firejail). `unshare`, which isolates
+  network and PIDs but leaves the coordinator's filesystem readable, is never
+  auto-selected: it runs only when `verify_isolation=unshare` is set *and* the
+  new, documented-unsafe `verify_allow_weak_unshare` setting (or
+  `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1`) is on. With no strong backend, verify and
+  integrate fail closed with `sandbox_unavailable` and a message naming
+  bubblewrap/firejail. `doctor` reports a refused or overridden unshare.
 - **Sandboxed verification.** `hermes bundlebees verify` no longer runs pytest
   in the coordinator worktree. Tests run on a disposable copy (no `.git`) under
   bubblewrap (unprivileged uid, all namespaces unshared, no network, only
@@ -89,6 +97,14 @@ Fixes from the Hermes catalog review of 0.1.0 (NousResearch/hermes-agent#153888)
 
 ### Security
 
+- **No automatic weak sandbox.** `verify_isolation=auto` now picks only a
+  strong backend (bubblewrap, then firejail). `unshare`, which isolates
+  network and PIDs but leaves the coordinator's filesystem readable, is never
+  auto-selected: it runs only when `verify_isolation=unshare` is set *and* the
+  new, documented-unsafe `verify_allow_weak_unshare` setting (or
+  `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1`) is on. With no strong backend, verify and
+  integrate fail closed with `sandbox_unavailable` and a message naming
+  bubblewrap/firejail. `doctor` reports a refused or overridden unshare.
 - Cross-origin launcher redirects (any change of scheme, host, or port) are refused with `unsafe_redirect` before a request is sent, and `Authorization` is stripped from any non-origin URL as defence in depth.
 - `bundlebees_attempt` with `op` cancel or review now goes through a `pre_tool_call` approval (`provides_hooks: [pre_tool_call]`), not only the model-set `confirm=true` argument.
 - `child_env()` keeps the user's `HOME`, `PATH`, `USER`, `LOGNAME`, `LANG`, `TZ`, and `TMPDIR` (exact names) so a user-run `git push` finds its config and credential helper. Nothing else is inherited.
@@ -109,6 +125,14 @@ First public release of the bundlebees Hermes plugin.
 
 ### Security
 
+- **No automatic weak sandbox.** `verify_isolation=auto` now picks only a
+  strong backend (bubblewrap, then firejail). `unshare`, which isolates
+  network and PIDs but leaves the coordinator's filesystem readable, is never
+  auto-selected: it runs only when `verify_isolation=unshare` is set *and* the
+  new, documented-unsafe `verify_allow_weak_unshare` setting (or
+  `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1`) is on. With no strong backend, verify and
+  integrate fail closed with `sandbox_unavailable` and a message naming
+  bubblewrap/firejail. `doctor` reports a refused or overridden unshare.
 - Connections to a user-configured launcher are pinned to a pre-resolved, policy-checked address so a later DNS lookup cannot steer the socket. Redirects are re-validated and re-pinned before the next hop.
 - Private or LAN launcher URLs require `allow_private=true` in plugin settings (default `false`). The default `orbit-loopback` adapter stays loopback-only.
 - The Desktop data-directory fallback uses `plugin_data_dir` / `get_hermes_home()` and does not read `HERMES_HOME` from the process environment.
