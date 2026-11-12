@@ -38,7 +38,7 @@ from typing import Any
 
 from .security import child_env, scrub
 
-BASE_KEYS = ("base_rev", "source_rev", "base_sha", "base", "repo_rev")
+BASE_KEYS = ("base_rev", "source_rev", "base_sha", "base")
 
 _WAVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -149,17 +149,18 @@ def declared_base(result: Mapping) -> str | None:
     """Find the worker's declared base revision, if any.
 
     Looks for the first full 40/64-character hex value under ``BASE_KEYS`` at
-    the top level, then inside ``result["observed"]``, ``result["result"]``
-    and ``result["source"]`` (the Orbit launcher's ``source.repo_rev``),
-    including one nested observed/result level.
+    the top level, then inside ``result["observed"]``, then inside
+    ``result["result"]`` (including one nested observed/result level).
+    Callers normally pass the adapter-normalized result
+    (``adapters.normalize_result``), so runtime-specific shapes never reach
+    this module.
     """
     found = _declared_in(result)
     if found is not None:
         return found
     if not isinstance(result, Mapping):
         return None
-    # "source" is where the Orbit local-workers launcher reports repo_rev.
-    for container_key in ("observed", "result", "source"):
+    for container_key in ("observed", "result"):
         container = result.get(container_key)
         found = _full_hex(container)
         if found is not None:

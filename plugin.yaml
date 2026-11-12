@@ -11,7 +11,11 @@ description: >-
   (hermes bundlebees verify / deploy) can push a feature branch and, when you
   invoke it, reach a remote host. Cancelling or reviewing an attempt asks
   for Hermes approval first. A Cua sandbox is not a sandbox for the Hermes
-  process. The Desktop pane never shows tokens or host addresses.
+  process. verify and integrate run worker-produced tests in a disposable
+  bubblewrap/firejail/unshare sandbox with no network and no coordinator
+  credentials, and refuse to run when none is available unless
+  verify_allow_unsafe_local is set. The Desktop pane never shows tokens or
+  host addresses.
 author: mojomast
 license: MIT
 homepage: https://github.com/mojomast/bundlebees
@@ -39,7 +43,9 @@ config_schema:
   adapter:
     type: str
     default: orbit-loopback
-    description: How to reach workers (orbit-loopback or launcher). The pane never displays the URL.
+    description: >-
+      Worker backend: orbit-loopback (default) or launcher. opencode and codex
+      are documented stubs (docs/ADAPTERS.md). The pane never displays the URL.
   launcher_url:
     type: str
     default: ""

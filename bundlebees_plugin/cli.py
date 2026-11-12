@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
-from . import leases, metrics, revision, sandbox
+from . import adapters, leases, metrics, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
@@ -316,10 +316,8 @@ def _client_for(ctx: Any) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
-    from .client import client_from_config
-
     try:
-        return client_from_config(_config(ctx))
+        return adapters.adapter_from_config(_config(ctx))
     except Exception as exc:  # noqa: BLE001 - map client configuration errors
         code = getattr(exc, "code", "not_configured")
         fix = getattr(
@@ -925,22 +923,17 @@ def _diffstat(workdir: Path, patch: str) -> dict[str, int]:
     return {"files": files, "added": added, "deleted": deleted}
 
 
-def _usage(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Best-effort token/cost usage reported by the launcher (untrusted, metrics only)."""
-    for container in (result, result.get("observed"), result.get("result")):
-        if not isinstance(container, Mapping):
-            continue
-        usage = container.get("usage")
-        if isinstance(usage, Mapping):
-            out: dict[str, Any] = {}
-            tokens = usage.get("tokens", usage.get("total_tokens"))
-            if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
-                out["tokens"] = tokens
-            cost = usage.get("cost_usd")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
-                out["cost_usd"] = float(cost)
-            return out
-    return {}
+def _usage(worker: Mapping[str, Any]) -> dict[str, Any]:
+    """Token/cost usage from the adapter-normalized result (untrusted, metrics only)."""
+    usage = worker.get("usage") if isinstance(worker.get("usage"), Mapping) else {}
+    out: dict[str, Any] = {}
+    tokens = usage.get("tokens")
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+        out["tokens"] = tokens
+    cost = usage.get("cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+        out["cost_usd"] = float(cost)
+    return out
 
 
 def _as_cli_error(exc: Exception) -> CliError:
@@ -1150,7 +1143,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         if warnings:
             evidence["ignored_worker_claims"] = warnings
 
-        patch = _result_patch(result)
+        # Agent-agnostic boundary: every runtime's output is reduced to the
+        # adapter result contract (patch, declared base, usage, worker claims).
+        worker = adapters.normalize_result(result)
+        patch = worker.get("patch")
         if not patch:
             raise CliError(
                 "no_result_yet",
@@ -1205,7 +1201,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
 
         # 2. Revision guarantees: declared base, exact-commit apply, ancestry.
         try:
-            revision.check_declared_base(result, source_rev)
+            revision.check_declared_base({"base_rev": worker.get("base_rev")}, source_rev)
             revision.check_source_rev(workdir, source_rev)
             revision.check_applies_at(workdir, source_rev, patch)
             revision.check_branch_descends(workdir, source_rev)
@@ -1244,7 +1240,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 state_dir, attempt_id, ok=True, sha=None, branch=branch,
                 files=files, tests=tests, evidence=evidence,
             )
-            _record_verify(state_dir, run_id, attempt_id, record, result, ok=True, code="dry_run")
+            _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
             _print(f"attempt: {attempt_id}")
             _print(f"branch: {branch}")
@@ -1272,7 +1268,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             state_dir, attempt_id, ok=True, sha=sha, branch=branch,
             files=files, tests=tests, evidence=evidence,
         )
-        _record_verify(state_dir, run_id, attempt_id, record, result, ok=True, code="verified", sha=sha)
+        _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="verified", sha=sha)
 
         _print("bundlebees verify")
         _print(f"attempt: {attempt_id}")
@@ -1318,7 +1314,7 @@ def _record_verify(
     run_id: str,
     attempt_id: str,
     record: Mapping[str, Any],
-    result: Mapping[str, Any],
+    worker: Mapping[str, Any],
     *,
     ok: bool,
     code: str,
@@ -1329,7 +1325,7 @@ def _record_verify(
         "ok": ok,
         "code": code,
         "first_pass": _first_verify(state_dir, run_id, attempt_id),
-        **_usage(result),
+        **_usage(worker),
     }
     if sha:
         fields["sha"] = sha

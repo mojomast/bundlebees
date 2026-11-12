@@ -676,3 +676,34 @@ def test_dispatch_refuses_without_a_state_dir(monkeypatch):
     assert payload["ok"] is False
     assert payload["code"] == "not_configured"
     assert not any(call[0] == "create" for call in client.calls)
+
+
+class MinimalBackend:
+    """Only the required WorkerBackend calls: create + result."""
+
+    name = "minimal"
+
+    def __init__(self):
+        self.created = []
+
+    def create(self, brief, *, model, kanban_task_id=None):
+        self.created.append(brief)
+        return {"attempt_id": "m1", "state": "queued"}
+
+    def result(self, attempt_id):
+        return {"attempt_id": attempt_id, "patch": None}
+
+
+def test_a_minimal_worker_backend_can_dispatch_and_reports_unsupported_ops():
+    backend = MinimalBackend()
+    ctx = _ctx()
+    brief = _brief()
+    brief.pop("project")
+    dispatched = _call(ctx, "bundlebees_dispatch", {"brief": brief}, client=backend)
+    assert dispatched["ok"] is True, dispatched
+    assert dispatched["attempt_id"] == "m1"
+    assert dispatched["lease_recorded"] is True
+
+    status = _call(ctx, "bundlebees_status", {"op": "containers"}, client=backend)
+    assert status["ok"] is False
+    assert status["code"] == "unsupported_operation"

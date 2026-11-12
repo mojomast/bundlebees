@@ -21,6 +21,7 @@ from .client import (
     client_from_config,
 )
 from .settings import settings_from_ctx
+from .adapters import UnsupportedAdapter
 from . import leases as _leases
 from . import metrics as _metrics
 from . import revision as _revision
@@ -108,7 +109,9 @@ def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
-    return client_from_config(_ctx_config(ctx))
+    from .adapters import adapter_from_config
+
+    return adapter_from_config(_ctx_config(ctx))
 
 
 def _project_key(project: Any) -> str | None:
@@ -706,6 +709,7 @@ _DESCRIPTIONS = {name: schema["description"] for name, schema in _SCHEMAS}
 
 def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
     def handler(args: Any = None, **kwargs: Any) -> str:
+        client: Any = None
         try:
             data = _coerce_args(args)
             if tool_name == "bundlebees_host_prompt":
@@ -718,6 +722,21 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             return _attempt(client, data, _state_dir_for(ctx))
         except ClientError as exc:
             return json.dumps(exc.as_envelope())
+        except UnsupportedAdapter as exc:
+            return json.dumps(exc.as_envelope())
+        except AttributeError as exc:
+            if client is None or getattr(exc, "obj", None) is not client:
+                return _err(
+                    "internal_error",
+                    str(exc) or "unexpected error",
+                    "Retry once; if it persists, check the launcher configuration and Hermes logs.",
+                )
+            # A minimal WorkerBackend (create + result only) lacks this capability.
+            return _err(
+                "unsupported_operation",
+                f"the configured worker adapter does not support this operation ({exc.name or 'unknown'})",
+                "Use an adapter that implements it (see docs/ADAPTERS.md) or a different op.",
+            )
         except Exception as exc:  # noqa: BLE001 - tool boundary must always answer
             return _err(
                 "internal_error",
