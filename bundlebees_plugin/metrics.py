@@ -519,13 +519,21 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     failures are counted apart from regressions. Missing usage is ``None``, never 0. Per-attempt
     usage is cumulative (the last report per attempt counts). First-pass rates carry their
     denominator and exclusions. Historical events without test ids are reported as legacy.
+
+    Dispatch counting publishes three numbers: ``attempts_dispatched`` is the number of unique
+    attempts dispatched, counting each distinct string ``attempt_id`` once plus one for every
+    dispatch event without such an id (a legacy event cannot be de-duplicated); ``dispatch_events``
+    is the raw number of dispatch events; and ``dispatch_events_without_attempt_id`` is how many of
+    those events carried no string ``attempt_id``.
     """
     ordered = _ordered(events)
     run_id = next((item.get("run_id") for item in ordered), None)
     if not isinstance(run_id, str):
         run_id = None
 
-    dispatched = 0
+    dispatched_ids: set[str] = set()
+    dispatch_events = 0
+    dispatch_events_without_attempt_id = 0
     verified_attempts: set[str] = set()
     first_verdict: dict[str, bool] = {}
     non_verdict: dict[str, str] = {}
@@ -570,7 +578,11 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
                 loose_cost_known = True
 
         if name == "dispatch":
-            dispatched += 1
+            dispatch_events += 1
+            if isinstance(attempt_id, str):
+                dispatched_ids.add(attempt_id)
+            else:
+                dispatch_events_without_attempt_id += 1
         elif name == "verify":
             if attempt_key is not None:
                 verified_attempts.add(attempt_key)
@@ -622,7 +634,9 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "run_id": run_id,
-        "attempts_dispatched": dispatched,
+        "attempts_dispatched": len(dispatched_ids) + dispatch_events_without_attempt_id,
+        "dispatch_events": dispatch_events,
+        "dispatch_events_without_attempt_id": dispatch_events_without_attempt_id,
         "attempts_verified": len(verified_attempts),
         "first_pass_rate": _rate(first_pass, denominator),
         "first_pass": {"passed": first_pass, "denominator": denominator, "excluded": excluded,
@@ -664,6 +678,8 @@ def format_summary(summary: Mapping[str, Any]) -> str:
     lines = [
         f"run_id: {render(summary.get('run_id'))}",
         f"attempts_dispatched: {render(summary.get('attempts_dispatched'))}",
+        f"dispatch_events: {render(summary.get('dispatch_events'))}",
+        f"dispatch_events_without_attempt_id: {render(summary.get('dispatch_events_without_attempt_id'))}",
         f"attempts_verified: {render(summary.get('attempts_verified'))}",
         f"first_pass_rate: {render(summary.get('first_pass_rate'))}",
         f"accepted_changes: {render(summary.get('accepted_changes'))}",
