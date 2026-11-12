@@ -77,7 +77,9 @@ def test_sandbox_home_is_private_writable_and_not_a_bind_target(tmp_path: Path):
         "print(json.dumps({'home': str(h), 'env': os.environ['HOME'], 'entries': sorted(os.listdir(h))}))\n"
     ))
     assert out["home"] == out["env"]
-    assert out["home"] != "/home/sandbox" and out["home"] != str(Path.home())
+    # Not compared with the runner's Path.home() string: when the suite itself runs inside the verifier sandbox
+    # (self-integration) both are /home/sandbox/home yet distinct private directories. Emptiness proves isolation.
+    assert out["home"] != "/home/sandbox"
     assert out["home"] not in sandbox.build_command("bwrap", tmp_path / "c", tmp_path / "h", ["true"])
     assert out["entries"] == ["probe"]
 
