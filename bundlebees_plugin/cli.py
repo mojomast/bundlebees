@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
-from . import adapters, leases, metrics, revision, sandbox
+from . import acdd_cli, adapters, leases, metrics, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
@@ -234,6 +234,7 @@ def _build_parser(parser: Any) -> Any:
     )
     doctor.set_defaults(command="doctor")
 
+    acdd_cli.add_parsers(subparsers)
     return group
 
 
@@ -252,10 +253,14 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_integrate(ctx, args)
         if command == "metrics":
             return _cmd_metrics(ctx, args)
+        if command == "contract":
+            return acdd_cli.cmd_contract(ctx, args)
+        if command == "tdd":
+            return acdd_cli.cmd_tdd(ctx, args)
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -1157,6 +1162,12 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "Wait for the worker to finish and collect a result with a patch.",
             )
 
+        # ACDD: a contract in the lease makes approved tests read-only and
+        # requires a valid RED before anything is applied. None = legacy.
+        acdd_state = acdd_cli.verify_preflight(record, state_dir, _patch_files(patch))
+        if acdd_state is not None:
+            evidence["contract_id"] = acdd_state["contract"]["id"]
+
         # Branch comes from the user or the lease, never from worker metadata.
         branch = _safe_branch(
             getattr(args, "branch", None)
@@ -1178,6 +1189,8 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         acceptance = record.get("acceptance") if isinstance(record.get("acceptance"), Mapping) else {}
         if requested_tests:
             tests = _test_targets(requested_tests, workdir)
+        elif acdd_state is not None:
+            tests = _test_targets(acdd_state["tests"], workdir)
         else:
             tests = _test_targets(record.get("tests"), workdir) or _test_targets(
                 acceptance.get("tests"), workdir
@@ -1226,11 +1239,26 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             )
 
         # 4. Worker-produced code runs only in the disposable sandbox.
-        try:
-            test_evidence = _run_tests(workdir, tests, config)
-        except CliError:
-            _reset_patch(workdir)
-            raise
+        green: dict[str, Any] | None = None
+        if acdd_state is not None:
+            test_evidence = _run_sandboxed(workdir, tests, config)
+            passed = not test_evidence.get("timed_out") and test_evidence.get("exit_code") == 0
+            if not passed or dry_run:
+                # Record against source_rev: the patch is applied but not committed.
+                try:
+                    green = acdd_cli.record_green(
+                        state_dir, acdd_state, workdir, test_evidence, source_rev,
+                        note="patch applied on source_rev, not committed",
+                    )
+                except CliError:
+                    _reset_patch(workdir)
+                    raise
+        else:
+            try:
+                test_evidence = _run_tests(workdir, tests, config)
+            except CliError:
+                _reset_patch(workdir)
+                raise
         evidence.update(
             backend=test_evidence.get("backend"),
             exit_code=test_evidence.get("exit_code"),
@@ -1250,6 +1278,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _print(f"files: {', '.join(files)}")
             _print(f"tests: {', '.join(tests)}")
             _print(f"sandbox: {evidence.get('backend')}")
+            acdd_cli.print_mode(acdd_state, green)
             _print("result: dry-run passed; nothing was committed or pushed")
             _print(f"verify result: {target}")
             if kanban_id:
@@ -1265,6 +1294,8 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             return 0
 
         sha = _commit_changes(workdir, attempt_id, files)
+        if acdd_state is not None:
+            green = acdd_cli.record_green(state_dir, acdd_state, workdir, test_evidence, sha)
         _push_branch(workdir, branch)
 
         target = _write_verify_result(
@@ -1280,6 +1311,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _print(f"files: {', '.join(files)}")
         _print(f"tests: {', '.join(tests)}")
         _print(f"sandbox: {evidence.get('backend')}")
+        acdd_cli.print_mode(acdd_state, green)
         _print(f"pushed: feature branch only ({BRANCH_BUDGET_NOTE})")
         _print(f"verify result: {target}")
         _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")

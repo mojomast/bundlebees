@@ -557,3 +557,25 @@ def ignored_worker_claims(
         claims.append("lease")
 
     return claims
+
+
+_EVIDENCE_KEY_LABEL = b"bundlebees/tdd-evidence/1"
+
+
+def evidence_key(state_dir: Path | str) -> bytes:
+    """32-byte HMAC key for signing ``tdd-evidence/1`` records.
+
+    Derived from the coordinator's private lease key with a fixed label, so
+    evidence and leases share one ``0600`` secret but never the same key.
+    Workers never see either: both live only in the coordinator state dir.
+    """
+    path = Path(state_dir)
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise LeaseError(
+            "lease_invalid",
+            "the plugin state directory could not be created safely",
+            "Use a writable plugin state directory and retry.",
+        ) from exc
+    return hmac.new(_ensure_key(path), _EVIDENCE_KEY_LABEL, hashlib.sha256).digest()
