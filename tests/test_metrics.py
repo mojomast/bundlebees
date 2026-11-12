@@ -238,6 +238,9 @@ def test_summarize_has_exact_numbers_for_a_synthetic_run(tmp_path: Path):
         "environmental_failures",
         "pre_existing_failures",
         "legacy_unclassified_failures",
+        # BM2: unique attempts vs raw dispatch events
+        "dispatch_events",
+        "dispatch_events_without_attempt_id",
     }
     assert summary["run_id"] == "default"
     assert summary["attempts_dispatched"] == 3
