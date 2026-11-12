@@ -333,3 +333,67 @@ def print_mode(acdd_state: Mapping[str, Any] | None, green: Mapping[str, Any] | 
         print("green: valid")
     if not _test_first(acdd_state["contract"]):
         print("test-first: no (tests were written after the code)")
+
+
+# --------------------------------------------------------------------------- integrate hooks
+
+
+def integrate_preflight(state_dir: Path, attempt_ids: list[str]) -> list[dict[str, Any]]:
+    """For each contract attempt, require a valid signed GREEN before the wave runs."""
+    out: list[dict[str, Any]] = []
+    key = None
+    for attempt_id in attempt_ids:
+        try:
+            record = leases.load_lease(state_dir, attempt_id)
+        except leases.LeaseError:
+            continue  # integrate itself reports unverified or missing leases
+        brief = record.get("brief") if isinstance(record.get("brief"), Mapping) else {}
+        raw = acdd.contract_from_brief(brief)
+        if raw is None:
+            continue
+        contract, sha = _frozen(raw)
+        key = key or leases.evidence_key(state_dir)
+        try:
+            records = tdd.load_records(state_dir, str(contract["id"]), key)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        red, green = _latest(records, "red", sha), _latest(records, "green", sha)
+        if green is None:
+            raise _error("green_failed", f"no GREEN evidence for contract {contract['id']} ({attempt_id})",
+                         "Verify the attempt with `hermes bundlebees verify` before integrating.")
+        try:
+            tdd.check_green(contract, sha, red, green)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        out.append({"attempt_id": attempt_id, "contract": contract, "sha": sha, "key": key,
+                    "tests": _test_files(contract)})
+    return out
+
+
+def record_integration(state_dir: Path, items: list[dict[str, Any]], workdir: Path,
+                       suite: Mapping[str, Any] | None, head: Any) -> list[tuple[str, str]]:
+    """Write one signed integration record per contract; return (id, status) pairs."""
+    statuses: list[tuple[str, str]] = []
+    revision = str(head) if isinstance(head, str) and _HEX.match(head) else None
+    for item in items:
+        contract, sha = item["contract"], item["sha"]
+        if revision is None:
+            statuses.append((str(contract["id"]), "unrun"))
+            continue
+        try:
+            fingerprints = tdd.fingerprint_files(workdir, item["tests"])
+        except tdd.TddError:
+            fingerprints = {}
+        record = tdd.make_record(
+            contract, sha, phase="integration", revision=revision, test_fingerprints=fingerprints,
+            command=["pytest", "(full suite on the combined branch)"],
+            result=_result(suite) if suite else None,
+            produced_by={"role": "verifier", "name": "bundlebees integrate"}, test_first=_test_first(contract),
+            environment=_environment(suite or {}),
+        )
+        try:
+            tdd.write_record(state_dir, record, item["key"])
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        statuses.append((str(contract["id"]), "valid" if record["classification"] == "passed" else "integration_failed"))
+    return statuses

@@ -1411,6 +1411,7 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
             run_id = str(leases.load_lease(state_dir, attempt_ids[0]).get("run_id") or "default")
         except (leases.LeaseError, IndexError):
             run_id = "default"
+    contract_items = acdd_cli.integrate_preflight(state_dir, attempt_ids)
     try:
         record = revision.integrate_wave(
             state_dir,
@@ -1428,6 +1429,7 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
         regressions=int(record.get("regressions") or 0), sha=record.get("head_sha"),
     )
     suite = record.get("suite") if isinstance(record.get("suite"), Mapping) else {}
+    integration = acdd_cli.record_integration(state_dir, contract_items, workdir, suite, record.get("head_sha"))
     _print("bundlebees integrate")
     _print(f"wave: {record.get('wave_id')}")
     _print(f"branch: {branch}")
@@ -1437,6 +1439,9 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
         _print(f"problem: {attempt}: {problem}")
     if suite:
         _print(f"suite: exit {suite.get('exit_code')} via {suite.get('backend')} junit={json.dumps(suite.get('junit'))}")
+    for contract_id, status in integration:
+        _print(f"contract: {contract_id}")
+        _print(f"integration: {'not run' if status == 'unrun' else status}")
     _print(f"accepted: {'yes' if accepted else 'no'}")
     if not accepted and suite.get("output_tail"):
         _print(_tail(suite.get("output_tail"), 1500))
