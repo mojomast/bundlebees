@@ -880,6 +880,9 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "backend": backend,
         "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
+        "allow_weak": sandbox.weak_override_enabled(
+            config_flag(config.get("verify_allow_weak_unshare"), False)
+        ),
         "timeout": max(30, min(timeout, 7200)),
     }
 
@@ -894,7 +897,7 @@ def _run_sandboxed(workdir: Path, targets: list[str], config: Mapping[str, Any])
         raise CliError(
             "invalid_argument",
             f"unknown verify_isolation backend: {exc}",
-            "Set verify_isolation to auto, bwrap, firejail or unshare.",
+            "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
         ) from exc
 
 
@@ -1532,11 +1535,15 @@ def _cmd_doctor(ctx: Any, args: Any) -> int:
 
     options = _sandbox_options(_config(ctx))
     try:
-        backend = sandbox.detect_backend(options["backend"])
+        backend = sandbox.detect_backend(options["backend"], allow_weak=options["allow_weak"])
     except ValueError:
         backend = None
-    if backend:
+    if backend in sandbox.WEAK_BACKENDS:
+        _print(f"sandbox: {backend} (WEAK override on: coordinator filesystem stays readable)")
+    elif backend:
         _print(f"sandbox: {backend}")
+    elif options["backend"] in sandbox.WEAK_BACKENDS:
+        _print("sandbox: none (verify_isolation=unshare refused without the weak override)")
     elif options["allow_unsafe_local"]:
         _print("sandbox: none (verify_allow_unsafe_local=true: tests run UNISOLATED)")
     else:

@@ -48,10 +48,13 @@ What verify does, in order:
    `scope_violation`; nothing is committed or pushed. Then the secret scan.
 6. Run the named tests in a **disposable sandbox**: a throwaway copy of the
    worktree (no `.git`), run as an unprivileged user under bubblewrap
-   (or firejail, or unshare) with no network and a scrubbed environment that
-   has no coordinator credentials or home dotfiles. Only evidence returns:
-   backend, exit code, junit counts, an output tail. With no backend verify
-   refuses (`sandbox_unavailable`) unless `verify_allow_unsafe_local` is set.
+   (or firejail) with no network and a scrubbed environment that has no
+   coordinator credentials or home dotfiles. Only evidence returns: backend,
+   exit code, junit counts, an output tail. `unshare` is never picked
+   automatically (it leaves the coordinator's files readable); it needs
+   `verify_isolation: unshare` plus the unsafe `verify_allow_weak_unshare`
+   override. With no strong backend verify refuses (`sandbox_unavailable`)
+   unless `verify_allow_unsafe_local` is set.
 7. On green, commit and push the **feature branch only**. No merge, tag,
    force-push, or hook skip.
 8. Print a summary with the SHA, tests, files and sandbox backend, and a note
@@ -94,7 +97,7 @@ If verify or integrate is red:
 | `lease_missing` / `lease_tampered` | No valid coordinator lease. Never edit lease files; record one from the dispatched brief or re-dispatch. |
 | `base_undeclared` / `base_mismatch` / `source_rev_missing` / `patch_not_at_source_rev` / `branch_diverged` | Not built on the brief's exact revision. Re-dispatch with the right `source_rev` and `retry_of`. |
 | `scope_violation` | The bee exceeded its lease. Stop; no repair dispatch until the user decides. |
-| `sandbox_unavailable` | Install bubblewrap (or firejail). Do not suggest the unsafe local flag on a shared or credentialed host. |
+| `sandbox_unavailable` | Install bubblewrap (or firejail). Do not suggest the unsafe local or weak unshare overrides on a shared or credentialed host. |
 | `tests_failed` | Report the test names and output tail; ask whether to dispatch a fresh narrow brief. |
 | `secret_detected` | Stop immediately. Do not echo the matched value. |
 | `integration_required` | Run integrate for the wave first. |

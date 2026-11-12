@@ -12,8 +12,8 @@ description: >-
   invoke it, reach a remote host. Cancelling or reviewing an attempt asks
   for Hermes approval first. A Cua sandbox is not a sandbox for the Hermes
   process. verify and integrate run worker-produced tests in a disposable
-  bubblewrap/firejail/unshare sandbox with no network and no coordinator
-  credentials, and refuse to run when none is available unless
+  bubblewrap or firejail sandbox with no network and no coordinator
+  credentials (unshare only with an explicit unsafe override), and refuse to run when none is available unless
   verify_allow_unsafe_local is set. The Desktop pane never shows tokens or
   host addresses.
 author: mojomast
@@ -90,8 +90,9 @@ config_schema:
     default: auto
     description: >-
       Sandbox for worker-produced code during verify and integrate: auto
-      (bwrap, then firejail, then unshare), or one of bwrap, firejail,
-      unshare. Verify fails closed when none is usable.
+      (bwrap, then firejail; never unshare), or one of bwrap, firejail,
+      unshare. unshare also needs verify_allow_weak_unshare. Verify fails
+      closed when none is usable.
   verify_allow_unsafe_local:
     type: bool
     default: false
@@ -99,6 +100,13 @@ config_schema:
       UNSAFE. Allow verify/integrate to run worker tests with no isolation
       (temp copy and scrubbed env only, same user, network on) when no
       sandbox backend is available. Leave false on shared or credentialed hosts.
+  verify_allow_weak_unshare:
+    type: bool
+    default: false
+    description: >-
+      UNSAFE. Permit verify_isolation=unshare, which isolates network and
+      PIDs but leaves the coordinator's filesystem readable. Never picked
+      by auto. Env BUNDLEBEES_ALLOW_WEAK_UNSHARE=1 does the same.
   verify_timeout_s:
     type: int
     default: 900
