@@ -7,6 +7,7 @@ builds a fresh exact-name environment instead of copying ``os.environ``.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 from pathlib import Path
@@ -149,13 +150,25 @@ _SAFE_BASE_ENV = {
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+# Non-secret names copied from the user's environment so a user-run
+# ``git push`` finds ~/.gitconfig, its credential helper and the user's PATH.
+_INHERITED_ENV_NAMES = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TMPDIR")
+
+
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Return a fresh minimal environment for a subprocess.
 
-    ``extra`` may only set names from the exact-name allowlist. ``os.environ``
-    is never consulted.
+    Starts from a fixed base, then copies only the exact non-secret names in
+    ``_INHERITED_ENV_NAMES`` (PATH, HOME, USER, LOGNAME, LANG, TZ, TMPDIR) so
+    git's credential helper and config still work. Nothing else from
+    ``os.environ`` is copied: no provider keys, no tokens, no prefix matches.
+    ``extra`` may only set names from the exact-name allowlist.
     """
     env = dict(_SAFE_BASE_ENV)
+    for name in _INHERITED_ENV_NAMES:
+        value = os.environ.get(name)
+        if isinstance(value, str) and value and "\x00" not in value:
+            env[name] = value
     if not extra:
         return env
     for name, value in extra.items():

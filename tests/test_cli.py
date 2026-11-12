@@ -125,8 +125,7 @@ def _repo(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def _ctx(client: FakeClient, config: dict | None = None) -> FakeCtx:
     plugin = load_plugin()
-    ctx = FakeCtx()
-    ctx.config = dict(config or {})
+    ctx = FakeCtx(settings=config)
     ctx.bundlebees_client = client
     plugin.register(ctx)
     return ctx
@@ -465,13 +464,14 @@ def test_deploy_execute_uses_stored_alias_without_printing_it(
 
     monkeypatch.setattr(cli, "_run_ssh", fake_ssh)
 
-    rc = _invoke(_ctx(FakeClient(), {"deploy_host": alias}), ["deploy", "--execute"])
+    rc = _invoke(_ctx(FakeClient(), {"deploy_host_alias": alias}), ["deploy", "--execute"])
     out = capsys.readouterr().out
 
     assert rc == 0
     assert len(calls) == 1
     assert calls[0][0] == alias
-    assert set(calls[0][1]) == {"PATH", "LANG", "LC_ALL"}
+    assert {"PATH", "LANG", "LC_ALL"} <= set(calls[0][1])
+    assert set(calls[0][1]) <= {"PATH", "LANG", "LC_ALL", "HOME", "USER", "LOGNAME", "TZ", "TMPDIR"}
     assert alias not in out
 
 
@@ -499,3 +499,13 @@ def test_doctor_reports_configured_without_values(
     assert rc in (0, 1)
     assert "token" in out.lower()
     assert "configured" in out.lower()
+
+
+def test_doctor_token_line_is_readable(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch):
+    for configured, expected in ((False, "token: not configured"), (True, "token: configured")):
+        ctx = _ctx(FakeClient(), {})
+        ctx.bundlebees_token_configured = (lambda value=configured: value)
+        _invoke(ctx, ["doctor"])
+        out = capsys.readouterr().out
+        assert expected in out.splitlines()
+        assert "[redacted]" not in out

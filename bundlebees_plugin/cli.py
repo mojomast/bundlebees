@@ -8,9 +8,10 @@ the host setup prompt by default and only reaches a host when the user passes
 ``--execute`` with an alias already stored in plugin config.
 
 All child processes receive ``security.child_env`` rather than the ambient
-environment. Nothing here reads credentials from the environment; the optional
-``doctor`` command asks the client's secret-scope helper whether a token is
-configured and never prints its value.
+environment. Nothing here reads credentials from the environment; the
+``doctor`` command asks Hermes's ``agent.secret_scope.get_secret`` whether a
+token is configured and never prints its value. Settings come from
+``ctx.get_config``; state lives in ``plugin_data_dir("bundlebees")``.
 """
 
 from __future__ import annotations
@@ -231,64 +232,49 @@ def _dispatch(ctx: Any, args: Any) -> int:
 
 
 def _config(ctx: Any) -> dict[str, Any]:
-    config = getattr(ctx, "config", None)
-    if callable(config):
-        try:
-            config = config()
-        except Exception:
-            config = None
-    if isinstance(config, Mapping):
-        return dict(config)
-    getter = getattr(ctx, "get_config", None)
-    if callable(getter):
-        try:
-            value = getter()
-        except Exception:
-            value = None
-        if isinstance(value, Mapping):
-            return dict(value)
-    return {}
+    """Settings via ``ctx.get_config(key, default)`` for each declared key."""
+    from .settings import settings_from_ctx
+
+    return settings_from_ctx(ctx)
+
+
+def plugin_state_dir() -> Path | None:
+    """``plugins.plugin_storage.plugin_data_dir("bundlebees")``, or None outside Hermes.
+
+    That is ``<hermes home>/plugin-data/bundlebees`` for the active profile.
+    """
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+    except Exception:
+        return None
+    try:
+        return Path(plugin_data_dir("bundlebees")).resolve()
+    except Exception:
+        return None
 
 
 def _state_dir(ctx: Any, args: Any) -> Path:
     explicit = getattr(args, "state_dir", None)
     if explicit:
         return Path(str(explicit)).expanduser().resolve()
-    for name in ("plugin_data_dir", "get_plugin_data_dir"):
-        getter = getattr(ctx, name, None)
-        value: Any = None
-        if callable(getter):
-            try:
-                value = getter("bundlebees")
-            except TypeError:
-                try:
-                    value = getter()
-                except Exception:
-                    value = None
-            except Exception:
-                value = None
-        elif getter:
-            value = getter
-        if value:
-            return Path(str(value)).expanduser().resolve()
-    return (Path.home() / ".local" / "share" / "hermes" / "bundlebees").resolve()
+    found = plugin_state_dir()
+    if found is not None:
+        return found
+    raise CliError(
+        "not_configured",
+        "the Hermes plugin data directory is not available",
+        "Run this command through `hermes bundlebees`, or pass --state-dir.",
+    )
 
 
 def _client_for(ctx: Any) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
+    from .client import client_from_config
+
     try:
-        from .client import client_from_agent
-    except ImportError as exc:  # pragma: no cover - skeleton without client.py
-        raise CliError(
-            "not_configured",
-            "the bundlebees launcher client is not available",
-            "Install the full bundlebees plugin and configure the launcher endpoint.",
-        ) from exc
-    agent = getattr(ctx, "agent", None)
-    try:
-        return client_from_agent(agent, _config(ctx))
+        return client_from_config(_config(ctx))
     except Exception as exc:  # noqa: BLE001 - map client configuration errors
         code = getattr(exc, "code", "not_configured")
         fix = getattr(
@@ -300,20 +286,17 @@ def _client_for(ctx: Any) -> Any:
 
 
 def _token_configured(ctx: Any) -> bool:
-    try:
-        from .client import token_from_agent
-    except ImportError:
-        agent = getattr(ctx, "agent", None)
-        scope = getattr(agent, "secret_scope", None)
-        getter = getattr(scope, "get_secret", None)
-        if not callable(getter):
-            return False
+    """Whether Hermes has the launcher token. Never prints the value."""
+    injected = getattr(ctx, "bundlebees_token_configured", None)
+    if callable(injected):
         try:
-            return bool(getter(TOKEN_SECRET_NAME))
+            return bool(injected())
         except Exception:
             return False
+    from .client import token_configured
+
     try:
-        return bool(token_from_agent(getattr(ctx, "agent", None)))
+        return token_configured()
     except Exception:
         return False
 
@@ -1261,7 +1244,9 @@ def _measure_schema_tokens() -> int | None:
 def _cmd_doctor(ctx: Any, args: Any) -> int:
     _print("bundlebees doctor")
     configured = _token_configured(ctx)
-    _print(f"token: {'configured' if configured else 'not configured'}")
+    # Fixed text, never a value: printed directly so scrub() does not mask
+    # the word after "token:" (0.1.0 printed "token: [redacted] configured").
+    print(f"token: {'configured' if configured else 'not configured'}")
 
     reachable = False
     detail = "not checked"

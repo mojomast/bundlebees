@@ -1,12 +1,15 @@
 /**
  * bundlebees Desktop pane.
  *
- * SDK-only, dark mode. Every request is namespace-relative and goes through
+ * Loaded by the Hermes Desktop runtime loader, which allows only
+ * "@hermes/plugin-sdk" and "react" imports and requires a default
+ * HermesPlugin export ({ id, name, register(ctx) }). The pane is contributed
+ * with ctx.register({ id, area: "panes", title, data, render }). Dark mode. Every request is namespace-relative and goes through
  * ctx.rest; the pane never builds an absolute URL, never calls a raw fetch
  * helper, and never asks for or renders a launcher token, bind address, or SSH host.
  */
 
-import * as sdk from "@hermes/plugin-sdk";
+import * as React from "react";
 
 const PLUGIN_ID = "bundlebees";
 const TITLE = "Bundlebees";
@@ -213,7 +216,6 @@ function valueText(value) {
 }
 
 function makeElement(ctx) {
-  const React = sdk.React || (sdk.default && sdk.default.React);
   if (!React || typeof React.createElement !== "function") return null;
   const h = React.createElement;
 
@@ -724,22 +726,28 @@ export function createPane(ctx) {
   return makeElement(ctx);
 }
 
-export function register(ctx) {
-  injectStyles();
-  const pane = {
-    id: PLUGIN_ID,
-    title: TITLE,
-    description:
-      "Launcher health, containers, models, concurrency, projects, attempts, verify results, and the host prompt.",
-    darkMode: true,
-    component: makeElement(ctx),
-  };
-  const registerView =
-    ctx && (ctx.registerView || ctx.registerPane || ctx.registerPage);
-  if (typeof registerView === "function") {
-    return registerView.call(ctx, pane);
+/** Contribute the pane through the SDK's ctx.register. */
+export function registerBundlebees(ctx) {
+  if (!ctx || typeof ctx.register !== "function") return false;
+  const Pane = makeElement(ctx);
+  if (!Pane) return false;
+  if (typeof ctx.onDispose === "function") {
+    ctx.onDispose(() => {
+      if (typeof document === "undefined") return;
+      const style = document.getElementById(STYLE_ID);
+      if (style) style.remove();
+    });
   }
-  return pane;
+  injectStyles();
+  ctx.register({
+    id: "pane",
+    area: "panes",
+    title: TITLE,
+    order: 44,
+    data: { placement: "right", width: "560px" },
+    render: () => React.createElement(Pane, {}),
+  });
+  return true;
 }
 
 export const manifest = Object.freeze({
@@ -750,4 +758,12 @@ export const manifest = Object.freeze({
   deployCommand: DEPLOY_COMMAND,
 });
 
-export default register;
+const plugin = {
+  id: PLUGIN_ID,
+  name: TITLE,
+  description:
+    "Launcher health, containers, models, concurrency, projects, attempts, verify results, and the host prompt.",
+  register: registerBundlebees,
+};
+
+export default plugin;

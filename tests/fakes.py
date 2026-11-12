@@ -1,17 +1,28 @@
-"""Fake PluginContext and plugin loader for unit tests. No network, no secrets."""
+"""Fake PluginContext and plugin loader for unit tests. No network, no secrets.
+
+The fake mirrors the real Hermes 0.23 ``PluginContext`` surface the plugin
+uses: ``register_tool``, ``register_skill``, ``register_hook``,
+``register_cli_command`` and ``get_config(key, default=None)``. It has no
+``config`` attribute and no ``agent``, because real Hermes has neither.
+Secrets come from a fake ``agent.secret_scope`` module (``secret_scope``),
+the same import path real Hermes provides.
+"""
 
 from __future__ import annotations
 
 import importlib
 import sys
+import types
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeCtx:
-    def __init__(self) -> None:
+    def __init__(self, settings: Mapping[str, Any] | None = None) -> None:
+        self.settings: dict[str, Any] = dict(settings or {})
         self.tools: dict[str, dict[str, Any]] = {}
         self.skills: dict[str, Path] = {}
         self.hooks: dict[str, Callable[..., Any]] = {}
@@ -26,6 +37,12 @@ class FakeCtx:
             "emoji": emoji,
         }
         return name
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Same contract as Hermes: one plugin-relative key, required."""
+        if not isinstance(key, str) or not key:
+            raise TypeError("get_config() needs a plugin-relative key")
+        return self.settings.get(key, default)
 
     def register_skill(self, name: str, skill_md: Path) -> None:
         self.skills[name] = Path(skill_md)
@@ -52,3 +69,33 @@ def load_plugin():
         raise RuntimeError(f"plugin directory must be named bundlebees, got {ROOT.name}")
     sys.modules.pop("bundlebees", None)
     return importlib.import_module("bundlebees")
+
+
+@contextmanager
+def secret_scope(values: Mapping[str, str | None] | None = None, *, raises: bool = False) -> Iterator[dict]:
+    """Install a fake ``agent.secret_scope`` with ``get_secret(name, default=None)``."""
+    store = dict(values or {})
+    calls: dict[str, int] = {}
+
+    def get_secret(name: str, default: str | None = None) -> str | None:
+        calls[name] = calls.get(name, 0) + 1
+        if raises:
+            raise RuntimeError("no profile secret scope active")
+        value = store.get(name)
+        return default if value is None else value
+
+    saved = {key: sys.modules.get(key) for key in ("agent", "agent.secret_scope")}
+    agent_mod = types.ModuleType("agent")
+    scope_mod = types.ModuleType("agent.secret_scope")
+    scope_mod.get_secret = get_secret
+    agent_mod.secret_scope = scope_mod
+    sys.modules["agent"] = agent_mod
+    sys.modules["agent.secret_scope"] = scope_mod
+    try:
+        yield calls
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value

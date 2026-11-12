@@ -1,7 +1,10 @@
 """HTTP clients for the Orbit loopback adapter and a user-configured launcher.
 
-The target URL is always configuration, never a tool argument. Tokens come only
-from a caller-supplied ``get_secret`` provider. Results are mapped through the
+The target URL is always configuration, never a tool argument. The token comes
+only from Hermes's ``agent.secret_scope.get_secret("BUNDLEBEES_LAUNCHER_TOKEN")``
+(or a caller-supplied provider in tests). The ``Authorization`` header is sent
+only to the configured origin; a redirect to another scheme, host or port is
+refused. Results are mapped through the
 ``public_*`` helpers so upstream token files, bind addresses, hosts, and private
 paths cannot reach a model-visible envelope.
 """
@@ -33,7 +36,7 @@ DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_TIMEOUT = 10.0
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_REDIRECTS = 5
-USER_AGENT = "bundlebees/0.1.0"
+USER_AGENT = "bundlebees/0.1.1"
 
 _FIX_LAUNCHER = (
     "Confirm the worker launcher is running and that the endpoint and token are "
@@ -461,6 +464,10 @@ class _BaseClient:
             return path
         return self._base_url + "/" + path.lstrip("/")
 
+    def _same_origin(self, url: str) -> bool:
+        """True when ``url`` has the configured endpoint's scheme, host and port."""
+        return _origin(url) == _origin(self._base_url)
+
     # -- transport ---------------------------------------------------------
 
     def _decode(self, data: bytes) -> Any:
@@ -509,11 +516,14 @@ class _BaseClient:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         for _ in range(MAX_REDIRECTS + 1):
             self._validate(url)
+            headers = self._headers()
+            if not self._same_origin(url):  # defence in depth
+                headers.pop("Authorization", None)
             request = urllib.request.Request(
                 url,
                 data=body,
                 method=method.upper(),
-                headers=self._headers(),
+                headers=headers,
             )
             try:
                 status, response_headers, data = _pinned_request(
@@ -550,6 +560,16 @@ class _BaseClient:
                         _FIX_LAUNCHER,
                     )
                 url = urllib.parse.urljoin(url, location)
+                # The bearer token belongs to the configured endpoint only.
+                # A redirect that changes scheme, host or port is refused
+                # before any request (and any Authorization header) is sent.
+                if not self._same_origin(url):
+                    raise ClientError(
+                        "launcher redirected to a different origin; refusing to follow it",
+                        "unsafe_redirect",
+                        "Point launcher_url at the final launcher address. "
+                        "Cross-origin redirects are never followed.",
+                    )
                 # Re-validate immediately; the next loop also validates
                 # and pins the new address before connecting.
                 self._validate(url)
@@ -567,6 +587,20 @@ class _BaseClient:
             "launcher_unavailable",
             _FIX_LAUNCHER,
         )
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    """``(scheme, host, port)`` with the default port filled in."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
 
 
 def _quote_id(attempt_id: str) -> str:
@@ -778,29 +812,41 @@ class OrbitAdapterClient(_BaseClient):
 # ---------------------------------------------------------------------------
 
 
-def token_from_agent(
-    agent: Any, name: str = TOKEN_SECRET_NAME
-) -> str | None:
-    """Read a secret only through ``agent.secret_scope.get_secret``."""
-    scope = getattr(agent, "secret_scope", None)
-    if scope is None:
-        return None
-    getter = getattr(scope, "get_secret", None)
-    if not callable(getter):
+def get_launcher_token(name: str = TOKEN_SECRET_NAME) -> str | None:
+    """Read the launcher token with Hermes's ``agent.secret_scope.get_secret``.
+
+    This is the only credential read in the plugin. Outside Hermes (no
+    ``agent.secret_scope``) or with no profile scope while multiplexing is
+    on, it fails closed and returns None. It never reads ``os.environ``,
+    dotenv files, keychains or credential files itself.
+    """
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
         return None
     try:
-        return getter(name)
-    except Exception:  # fail closed; never fall back to env/files
+        value = get_secret(name)
+    except Exception:  # UnscopedSecretError and friends: fail closed
         return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
-def client_from_agent(
-    agent: Any = None,
+def token_configured() -> bool:
+    """Whether the launcher token is set. Never returns or logs the value."""
+    return bool(get_launcher_token())
+
+
+def client_from_config(
     config: Mapping[str, Any] | None = None,
+    *,
+    token_provider: Callable[[], str | None] | None = None,
 ) -> _BaseClient:
-    """Build the preferred client from non-secret config plus ``get_secret``."""
+    """Build the preferred client from non-secret settings plus the secret scope."""
     config = config or {}
-    provider = lambda: token_from_agent(agent)  # noqa: E731
+    provider = token_provider or get_launcher_token
     adapter = str(config.get("adapter") or "orbit-loopback").strip().lower()
     if adapter in {"launcher", "direct", "http", "https"}:
         url = config.get("launcher_url") or config.get("url")

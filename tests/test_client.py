@@ -375,7 +375,8 @@ def test_redirect_is_revalidated_without_contacting_metadata(base_url: str):
     client = _launcher(base_url)
     with pytest.raises(ClientError) as excinfo:
         client.request_json("GET", "/v1/redirect")
-    assert excinfo.value.code == "unsafe_url"
+    # 0.1.1: a cross-origin redirect is refused before any request is sent.
+    assert excinfo.value.code in {"unsafe_redirect", "unsafe_url"}
 
 
 def test_response_size_limit(base_url: str):
@@ -465,21 +466,67 @@ def test_launcher_pins_resolved_ip_and_sends_hostname_host_header(monkeypatch):
         thread.join(timeout=2)
 
 
-def test_client_from_agent_requires_allow_private_for_lan_launcher():
-    from bundlebees_plugin.client import client_from_agent, ClientError
+def test_client_from_config_requires_allow_private_for_lan_launcher():
+    from bundlebees_plugin.client import client_from_config, ClientError
 
-    class Agent:
-        secret_scope = type("S", (), {"get_secret": staticmethod(lambda name: TOKEN)})()
-
+    provider = lambda: TOKEN  # noqa: E731
     with pytest.raises(ClientError) as excinfo:
-        client_from_agent(
-            Agent(),
+        client_from_config(
             {"adapter": "launcher", "launcher_url": "http://10.0.0.5:8080", "allow_private": "false"},
+            token_provider=provider,
         )
     assert excinfo.value.code == "unsafe_url"
 
-    client = client_from_agent(
-        Agent(),
+    client = client_from_config(
         {"adapter": "launcher", "launcher_url": "http://10.0.0.5:8080", "allow_private": True},
+        token_provider=provider,
     )
     assert client._allow_private is True
+
+
+def test_cross_origin_redirect_is_refused_before_auth_leaves(base_url: str):
+    """A redirect to another port (same host) is a new origin: refuse it."""
+    seen: list[dict] = []
+
+    class Other(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append(dict(self.headers))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):  # noqa: D401
+            return
+
+    other = ThreadingHTTPServer(("127.0.0.1", 0), Other)
+    thread = threading.Thread(target=other.serve_forever, daemon=True)
+    thread.start()
+    try:
+        target = f"http://127.0.0.1:{other.server_address[1]}/v1/health"
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                return
+
+        first = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        t2 = threading.Thread(target=first.serve_forever, daemon=True)
+        t2.start()
+        try:
+            client = _launcher(f"http://127.0.0.1:{first.server_address[1]}")
+            with pytest.raises(ClientError) as excinfo:
+                client.request_json("GET", "/v1/health")
+            assert excinfo.value.code == "unsafe_redirect"
+        finally:
+            first.shutdown()
+            first.server_close()
+    finally:
+        other.shutdown()
+        other.server_close()
+    assert seen == []

@@ -1,8 +1,9 @@
 """The four model-facing bundlebees tools.
 
 Every handler returns ``json.dumps(envelope)`` on success, validation failure,
-and exception. Secrets are read only through the client's ``get_secret``
-provider; target URLs never come from tool arguments.
+and exception. Settings come from ``ctx.get_config(key, default)``; the token
+comes only from ``agent.secret_scope.get_secret``. Target URLs never come from
+tool arguments.
 """
 
 from __future__ import annotations
@@ -16,8 +17,9 @@ from typing import Any, Callable, Mapping
 from .client import (
     DEFAULT_MODEL,
     ClientError,
-    client_from_agent,
+    client_from_config,
 )
+from .settings import settings_from_ctx
 from .security import contains_address, is_public_git_url, looks_like_secret, scrub
 
 TOOL_NAMES = (
@@ -91,23 +93,8 @@ def _coerce_args(args: Any) -> dict[str, Any]:
 
 
 def _ctx_config(ctx: Any) -> dict[str, Any]:
-    config = getattr(ctx, "config", None)
-    if callable(config):
-        try:
-            config = config()
-        except Exception:
-            config = None
-    if isinstance(config, Mapping):
-        return dict(config)
-    getter = getattr(ctx, "get_config", None)
-    if callable(getter):
-        try:
-            value = getter()
-        except Exception:
-            value = None
-        if isinstance(value, Mapping):
-            return dict(value)
-    return {}
+    """Settings via ``ctx.get_config(key, default)`` for each declared key."""
+    return settings_from_ctx(ctx)
 
 
 def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
@@ -117,10 +104,7 @@ def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
-    agent = kwargs.get("agent")
-    if agent is None:
-        agent = getattr(ctx, "agent", None)
-    return client_from_agent(agent, _ctx_config(ctx))
+    return client_from_config(_ctx_config(ctx))
 
 
 # ---------------------------------------------------------------------------

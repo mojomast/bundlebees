@@ -426,15 +426,22 @@ def test_desktop_pane_uses_namespace_relative_rest_and_dark_styles():
     assert "acepted" not in lowered
 
 
-def test_manifest_lists_all_expected_routes_and_dark_mode():
+def test_manifest_matches_the_hermes_dashboard_contract():
     manifest = json.loads(
         (ROOT / "dashboard" / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["name"] == "bundlebees"
-    assert manifest["version"] == "0.1.0"
-    assert manifest.get("dark_mode") is True
-    assert manifest["router"] == "router"
-    routes = set(manifest["routes"])
+    assert manifest["version"] == "0.1.1"
+    # Hermes mounts dashboard/<api> at /api/plugins/<name>/ only when "api" is set.
+    assert manifest["api"] == "plugin_api.py"
+    assert (ROOT / "dashboard" / manifest["api"]).is_file()
+    assert manifest["tab"]["hidden"] is True
+    for stale in ("router", "module", "mount", "routes", "tabs", "entry"):
+        assert stale not in manifest
+
+
+def test_router_serves_every_pane_route():
+    paths = {getattr(route, "path", "") for route in API.router.routes}
     expected = {
         "/health",
         "/containers",
@@ -449,15 +456,38 @@ def test_manifest_lists_all_expected_routes_and_dark_mode():
         "/verify-results",
         "/host-prompt",
     }
-    assert expected <= routes
+    assert expected <= paths
 
 
+def test_default_data_dir_uses_plugin_data_dir(monkeypatch, tmp_path):
+    import sys
+    import types
 
-def test_default_data_dir_does_not_read_hermes_home_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "secret-home"))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    monkeypatch.setattr(API, "_hermes_plugin_data_dir", lambda: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+    storage = types.ModuleType("plugins.plugin_storage")
+    called = []
+
+    def plugin_data_dir(name):
+        called.append(name)
+        path = tmp_path / "profile-home" / "plugin-data" / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    storage.plugin_data_dir = plugin_data_dir
+    pkg = types.ModuleType("plugins")
+    pkg.plugin_storage = storage
+    monkeypatch.setitem(sys.modules, "plugins", pkg)
+    monkeypatch.setitem(sys.modules, "plugins.plugin_storage", storage)
     path = API._default_data_dir()
-    assert "secret-home" not in str(path)
-    assert path.name == "bundlebees"
-    assert "hermes-plugins" in path.parts
+    assert called == ["bundlebees"]
+    assert path == (tmp_path / "profile-home" / "plugin-data" / "bundlebees").resolve()
+    assert "env-home" not in str(path)
+
+
+def test_no_data_dir_outside_hermes_means_no_results(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "plugins.plugin_storage", None)
+    API.reset_state()
+    assert API._default_data_dir() is None
+    assert API._load_verify_results() == []
