@@ -66,6 +66,15 @@ A validator rejects a contract, with the failing field and a fix, when:
 
 `contract_sha256` is the SHA-256 of the contract's canonical JSON (keys sorted, separators `,` and `:`, ASCII escapes) **with the `review` object removed**. Review sets `status: approved`, `approved_by`, `approved_at` and that hash. A frozen contract is one whose stored hash matches a recomputation. Any later edit (a widened lease, a relaxed criterion, an easier test list) changes the hash, and every evidence record carries the hash it was produced against, so stale evidence cannot be reused.
 
+### Collected test ids (before freeze and dispatch)
+
+A reference in `acceptance_criteria[].tests` must resolve to a test that actually exists. `contract freeze --workdir REPO` checks out `source_rev` (the approved test revision), runs a bounded `pytest --collect-only` of `scope.test_files` in the verify sandbox (at most 300 s, 20,000 ids), and refuses to freeze unless every reference resolves:
+
+- exactly to a collected id, or to its parametrized (`id[...]`) or class (`path::Class`) children;
+- never as a bare file: `tests/test_x.py` alone is refused as too broad (`test_unresolved`).
+
+A test-first file that can't be imported yet (ImportError, ModuleNotFoundError, AttributeError or NameError, because the interface doesn't exist) is read from its syntax tree instead and labelled `static` in the manifest. Any other collection error refuses the contract (`tests_uncollectable`). The result is a `test-collection/1` manifest: the contract hash, `source_rev`, the test-file fingerprints, every collected id and how each reference resolved. It's HMAC-signed with the evidence key and stored under `collections/<contract_id>/<contract_sha256>.json` in the coordinator state dir. The frozen contract records its digest in `review.test_collection`. `bundlebees_dispatch`, `verify` and `tdd red` refuse a contract whose manifest is missing, unsigned, for another hash or revision, or doesn't resolve every reference (`tests_not_collected`, `test_unresolved`, `evidence_tampered`). For a contract frozen without the CLI, `tdd red` collects first. `tdd red` also refuses test files that differ from the collected ones (`tests_tampered`).
+
 ## 3. Evidence records (`tdd-evidence/1`)
 
 Schema: [`schemas/tdd-evidence.schema.json`](https://github.com/mojomast/workflow/blob/main/bundlebees_plugin/schemas/evidence.schema.json). One record is one check on one revision:
@@ -75,7 +84,9 @@ Schema: [`schemas/tdd-evidence.schema.json`](https://github.com/mojomast/workflo
 - `test_fingerprints`: SHA-256 of every file in `scope.test_files` as tested;
 - `command`, `environment`, `result` (exit code, counts, per-case outcomes with `error_type`);
 - `classification` ([§4](#4-classifying-a-run)) and `criteria` (`AC-NNN` → `passed`, `failed`, `not_run`, `review_required`);
-- `produced_by` (`verifier`, `worker`, `reviewer`, `human`) and `test_first`.
+- `produced_by` (`verifier`, `worker`, `reviewer`, `human`) and `test_first`;
+- `sequence` and `prev_sha256`, set when the record is written: its position in this contract's history (1..N) and the digest of the previous signed record. Both are inside the signature, so records written in the same second keep a provable order, and a removed or reordered record breaks the chain;
+- on review records, `attestation` ([§5](#5-red-green-refactor)).
 
 Only records produced by the verifier count for acceptance. A worker may attach its own RED output, but it is labelled `produced_by.role: worker` and never authorizes anything (AC-006). In bundlebees the coordinator signs records with its existing lease key; the reference demo does not sign (teaching only).
 
@@ -105,7 +116,9 @@ A *missing declared interface* is `NotImplementedError`, or `ImportError` / `Mod
 
 **REFACTOR is valid** when it follows a valid GREEN, fingerprints still match, the classification is `passed`, and the contract hash is unchanged. "No refactor needed" is recorded as a refactor record on the GREEN revision with a note, not silently skipped, when `refactor` is in `evidence_required`.
 
-**REVIEW is valid** when a named reviewer or human (role `reviewer` or `human`, never `worker` or `verifier`) recorded it after a valid GREEN, and after a valid REFACTOR when the contract requires one, for that revision, with classification `passed` and a note. A rejection is recorded too, with classification `failed` (the only use of `failed`; test runs always use the §4 table), and makes the phase `review_failed`. Criteria with `verification: review` or `manual` count as passed only when REVIEW is valid. Integration requires REFACTOR as well as GREEN when `refactor` is in `evidence_required`.
+**A REVIEW is a coordinator-recorded review, not an authenticated human sign-off.** `tdd review --reviewer NAME [--role human]` writes `produced_by.role: reviewer` and an `attestation` of kind `coordinator_recorded_review` with `reviewer_label`, `claimed_reviewer_kind` and `identity_verified: false`. The HMAC proves the coordinator wrote the record, not who reviewed. A review record may only carry role `human` with a `human_authorization` receipt from an external identity provider. That kind is reserved: bundlebees can't verify one yet and never reports one as authenticated. `tdd report` shows `review_identity` (`coordinator_recorded`, or `coordinator_recorded (legacy human label)` for older records) and `human_authorization: not_recorded`. Merge, tag, release, deploy and publish stay human gates outside bundlebees.
+
+**REVIEW is valid** when a named reviewer (role `reviewer`, or `human` on older records; never `worker` or `verifier`) recorded it after a valid GREEN, and after a valid REFACTOR when the contract requires one, for that revision, with classification `passed` and a note. A rejection is recorded too, with classification `failed` (the only use of `failed`; test runs always use the §4 table), and makes the phase `review_failed`. Criteria with `verification: review` or `manual` count as passed only when REVIEW is valid. Integration requires REFACTOR as well as GREEN when `refactor` is in `evidence_required`.
 
 **REVIEW is valid** when it was produced by a `reviewer` or `human` and is classified `passed`; it is what turns `review_required` criteria into acceptable ones. **INTEGRATION is valid** when the combined-branch run is `passed`.
 

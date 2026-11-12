@@ -106,7 +106,17 @@
         "status": {"enum": ["draft", "approved"]},
         "approved_by": {"type": "string", "minLength": 1},
         "approved_at": {"type": "string", "minLength": 1},
-        "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "test_collection": {
+          "type": "object",
+          "description": "Binds the frozen contract to the signed test-collection/1 manifest written by `contract freeze --workdir`: every AC test reference resolved to a collected test id at source_rev.",
+          "required": ["manifest_sha256", "source_rev", "collected"],
+          "properties": {
+            "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "source_rev": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+            "collected": {"type": "integer", "minimum": 0}
+          }
+        }
       }
     }
   },

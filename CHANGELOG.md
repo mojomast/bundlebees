@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Fixes for the independent engineering review of Nov 12, 2026 (on top of #5).
+
+### Added
+
+- **Collected test ids before freeze and dispatch (review C1).** `contract
+  freeze --workdir` runs a bounded, sandboxed `pytest --collect-only` of the
+  approved tests at `source_rev` and refuses unless every AC test reference
+  resolves to a collected id (bare file references are refused). The signed
+  `test-collection/1` manifest is bound to the contract hash, `source_rev` and
+  test fingerprints, and `bundlebees_dispatch`, `verify` and `tdd red` require
+  it. New `bundlebees_plugin/collection.py`; `run_in_sandbox(collect_file=)`.
+- **Signed record order (review C2, producer side).** Every `tdd-evidence/1`
+  record written now carries `sequence` and `prev_sha256` inside its
+  signature.
+
+### Changed
+
+- **Reviews no longer imply authenticated human identity (review C6).** `tdd
+  review` writes role `reviewer` with a `coordinator_recorded_review`
+  attestation (`identity_verified: false`); `--role human` is only a claimed
+  label. A review record with role `human` now needs a `human_authorization`
+  receipt, which is reserved (no verifier yet). `tdd report` adds
+  `review_identity` and `human_authorization`.
+- **CI runs the jsonschema checks instead of skipping them.** jsonschema is
+  installed in CI and in the `dev` extra; under `CI` the schema tests import it
+  directly, and a CI step fails if they are skipped.
+
 ## [0.2.0] - Unreleased
 
 Verifier and contract hardening from an external review of the workflow. The

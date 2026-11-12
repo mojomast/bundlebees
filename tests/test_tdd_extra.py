@@ -156,3 +156,18 @@ def test_records_are_canonical_json_without_private_fields_in_signature(tmp_path
     assert set(json.loads(json.dumps(signed))) >= {"signature", "classification"}
     with pytest.raises(tdd.TddError):
         tdd.write_record(tmp_path, dict(signed, contract_id="../x"), KEY)
+
+
+# Review C2 (producer side): records carry a signed sequence and predecessor digest.
+def test_written_records_carry_a_signed_sequence_chain(tmp_path):
+    from bundlebees_plugin import tdd as mod
+
+    key = b"k" * 32
+    contract = {"id": "C-seq", "source_rev": "a" * 40, "acceptance_criteria": [], "tdd": {"applicable": False}}
+    base = dict(revision="a" * 40, test_fingerprints={}, command=["x"], result=None,
+                produced_by={"role": "verifier", "name": "t"}, test_first=False, now="2026-11-12T18:00:00Z")
+    mod.write_record(tmp_path, mod.make_record(contract, "b" * 64, phase="red", **base), key)
+    mod.write_record(tmp_path, mod.make_record(contract, "b" * 64, phase="green", **base), key)
+    first, second = mod.load_records(tmp_path, "C-seq", key)
+    assert first["sequence"] == 1 and first["prev_sha256"] is None
+    assert second["sequence"] == 2 and second["prev_sha256"] == mod.record_digest(first)

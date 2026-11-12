@@ -101,8 +101,17 @@ def test_constants(tdd):
         assert code in tdd.FAILURE_CODES
 
 
+def _jsonschema():
+    """jsonschema is optional locally but required in CI, where a skip would hide a gap."""
+    if os.environ.get("CI"):
+        import jsonschema
+
+        return jsonschema
+    return pytest.importorskip("jsonschema")
+
+
 def test_records_match_the_evidence_schema(tdd):
-    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema = _jsonschema()
     schema = json.loads((Path(__file__).resolve().parents[1] / "bundlebees_plugin/schemas/evidence.schema.json").read_text())
     rec = _record(tdd, "red", RED_CASES)
     jsonschema.Draft202012Validator(schema).validate(rec)

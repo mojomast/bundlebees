@@ -330,6 +330,26 @@ def _dispatch_acdd(
     }
 
 
+def _dispatch_collection(brief: Mapping[str, Any], state_dir: Path) -> int | None | str:
+    """Refuse a contract whose test references were never collected and resolved."""
+    from . import collection
+    from .leases import LeaseError, evidence_key
+
+    contract = _contract.contract_from_brief(brief) or {}
+    if not collection.needs_collection(contract):
+        return None
+    try:
+        manifest = collection.load_manifest(
+            state_dir, contract, _contract.check_frozen(contract), evidence_key(state_dir)
+        )
+    except collection.CollectionError as exc:
+        return _err(exc.code, exc.error, exc.fix)
+    except (LeaseError, _contract.ContractError) as exc:
+        return _err(getattr(exc, "code", "not_configured"), getattr(exc, "error", str(exc)),
+                    getattr(exc, "fix", "Check the plugin state directory."))
+    return len(manifest.get("collected_ids") or [])
+
+
 def _state_dir_for(ctx: Any) -> Path | None:
     """Plugin data dir for leases, waves and metrics (profile-aware)."""
     injected = getattr(ctx, "bundlebees_state_dir", None)
@@ -379,6 +399,12 @@ def _dispatch(
             "the plugin data directory is unavailable, so the coordinator lease cannot be recorded",
             "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
         )
+
+    if acdd.get("mode") == "contract":
+        collected = _dispatch_collection(brief, state_dir)
+        if isinstance(collected, str):
+            return collected
+        acdd["tests_collected"] = collected
 
     project = brief.get("project")
     if isinstance(project, str) and project:

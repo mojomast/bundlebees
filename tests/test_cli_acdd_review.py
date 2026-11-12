@@ -14,6 +14,7 @@ or an explicit ``--none`` skip) before it runs the wave.
 from __future__ import annotations
 
 import json
+import pytest
 
 from tests.test_cli_acdd import (
     APPROVED_TEST, ATTEMPT_ID, BRANCH, CID, GOOD_PATCH, FakeClient, TEST_ID, _ctx, _frozen, _git,
@@ -69,7 +70,9 @@ def test_approved_review_is_recorded_and_accepts_review_criteria(tmp_path, capsy
     review = _records(state)[-1]
     assert review["phase"] == "review"
     assert review["classification"] == "passed"
-    assert review["produced_by"] == {"role": "reviewer", "name": "kyle"}
+    assert review["produced_by"] == {"role": "reviewer", "name": "bundlebees tdd review (coordinator-recorded)"}
+    assert review["attestation"]["reviewer_label"] == "kyle"
+    assert review["attestation"]["identity_verified"] is False
     assert review["revision"] == green["revision"]
     assert review["test_fingerprints"] == green["test_fingerprints"]
     assert "read the diff; fine" in review.get("notes", "")
@@ -103,11 +106,17 @@ def test_rejected_review_is_recorded_and_fails(tmp_path, capsys):
     assert report["accepted"] is False
 
 
-def test_human_role_is_recorded(tmp_path, capsys):
+def test_human_role_is_only_an_unverified_label(tmp_path, capsys):
     repo, state, path = _verified(tmp_path, capsys, ["red", "green", "review"])
     rc = _review(state, path, "--reviewer", "kyle", "--role", "human", "--approve", "--note", "ok")
     assert rc == 0, capsys.readouterr().out
-    assert _records(state)[-1]["produced_by"] == {"role": "human", "name": "kyle"}
+    # Review C6: a coordinator-recorded review never claims authenticated human identity.
+    last = _records(state)[-1]
+    assert last["produced_by"]["role"] == "reviewer"
+    assert last["attestation"] == {
+        "kind": "coordinator_recorded_review", "recorded_by": "coordinator", "reviewer_label": "kyle",
+        "claimed_reviewer_kind": "human", "identity_verified": False,
+    }
 
 
 def test_review_requires_a_note_and_a_reviewer_name(tmp_path, capsys):
@@ -184,3 +193,23 @@ def test_integrate_accepts_an_explicit_refactor_skip(tmp_path, capsys):
     assert [r["phase"] for r in _records(state)] == ["red", "green", "refactor", "integration"]
     report = _report(state, path, capsys)
     assert report["accepted"] is True
+
+
+# Review C6: the report separates a coordinator-recorded review from human authorization.
+def test_report_says_review_identity_is_not_authenticated(tmp_path, capsys):
+    repo, state, path = _verified(tmp_path, capsys, ["red", "green", "review"])
+    assert _review(state, path, "--reviewer", "kyle", "--role", "human", "--approve", "--note", "ok") == 0
+    capsys.readouterr()
+    report = _report(state, path, capsys)
+    assert report["review_identity"] == "coordinator_recorded"
+    assert report["human_authorization"]["status"] == "not_recorded"
+
+
+def test_a_review_record_cannot_claim_role_human_without_a_receipt():
+    from bundlebees_plugin import tdd
+
+    contract = {"id": "C-1", "source_rev": "a" * 40, "acceptance_criteria": []}
+    with pytest.raises(tdd.TddError):
+        tdd.make_record(contract, "b" * 64, phase="review", revision="a" * 40, test_fingerprints={},
+                        command=["review"], result=None, produced_by={"role": "human", "name": "kyle"},
+                        test_first=True, review_outcome="passed")

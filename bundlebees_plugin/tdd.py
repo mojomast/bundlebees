@@ -530,6 +530,18 @@ def _validate_record(record: Mapping[str, Any]) -> None:
     produced_by = record.get("produced_by")
     if not isinstance(produced_by, Mapping) or produced_by.get("role") not in _ROLES:
         raise bad("produced_by.role is not verifier, worker, reviewer, or human")
+    attestation = record.get("attestation")
+    if attestation is not None:
+        if not isinstance(attestation, Mapping) or attestation.get("kind") not in ATTESTATION_KINDS:
+            raise bad("attestation.kind is not coordinator_recorded_review or human_authorization")
+        if record.get("phase") != "review":
+            raise bad("attestation is only valid on review records")
+        if attestation.get("kind") == "coordinator_recorded_review" and attestation.get("identity_verified") is not False:
+            raise bad("a coordinator-recorded review must say identity_verified: false")
+    if produced_by.get("role") == "human" and record.get("phase") == "review":
+        if not isinstance(attestation, Mapping) or attestation.get("kind") != "human_authorization":
+            raise bad("role human on a review needs a human_authorization receipt; "
+                      "a coordinator-recorded review uses role reviewer")
     if not isinstance(record.get("test_first"), bool):
         raise bad("test_first must be a boolean")
     if not isinstance(record.get("at"), str) or not record.get("at"):
@@ -551,6 +563,7 @@ def make_record(
     notes: str | None = None,
     now: str | None = None,
     review_outcome: str | None = None,
+    attestation: Mapping[str, Any] | None = None,
 ) -> dict:
     """Build one signed-ready ``tdd-evidence/1`` record for a contract phase."""
     if review_outcome is not None:
@@ -607,8 +620,43 @@ def make_record(
         record["environment"] = dict(environment)
     if notes is not None:
         record["notes"] = str(notes)
+    if attestation is not None:
+        record["attestation"] = dict(attestation)
     _validate_record(record)
     return record
+
+
+ATTESTATION_KINDS = ("coordinator_recorded_review", "human_authorization")
+
+
+def coordinator_review_attestation(reviewer: str, claimed_kind: str) -> dict[str, Any]:
+    """Labels for a coordinator-recorded review; identity is never verified here."""
+    return {
+        "kind": "coordinator_recorded_review",
+        "recorded_by": "coordinator",
+        "reviewer_label": str(reviewer),
+        "claimed_reviewer_kind": "human" if claimed_kind == "human" else "reviewer",
+        "identity_verified": False,
+    }
+
+
+def review_identity(record: Mapping[str, Any]) -> str:
+    """How much a REVIEW record says about who reviewed (never more than it proves).
+
+    Every record bundlebees writes today is ``coordinator_recorded``: the HMAC
+    shows the coordinator wrote it. Older records that carry role ``human`` are
+    reported as ``coordinator_recorded (legacy human label)``. A
+    ``human_authorization`` attestation is reserved for a receipt verified by an
+    external identity provider; bundlebees has no such verifier yet, so it is
+    reported as ``unverified_human_authorization`` and never as authenticated.
+    """
+    attestation = record.get("attestation") if isinstance(record.get("attestation"), Mapping) else None
+    if attestation is not None and attestation.get("kind") == "human_authorization":
+        return "unverified_human_authorization"
+    role = (record.get("produced_by") or {}).get("role")
+    if attestation is None and role == "human":
+        return "coordinator_recorded (legacy human label)"
+    return "coordinator_recorded"
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +676,11 @@ def _unsigned(record: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in record.items()
         if key != "signature" and not str(key).startswith("_")
     }
+
+
+def record_digest(record: Mapping[str, Any]) -> str:
+    """sha256 of a whole signed record (signature included) for ``prev_sha256``."""
+    return hashlib.sha256(_canonical({k: v for k, v in record.items() if not str(k).startswith("_")})).hexdigest()
 
 
 def sign_record(record: Mapping[str, Any], key: bytes) -> dict:
@@ -694,6 +747,23 @@ def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], k
     )
     number = len(existing) + 1
     path = contract_dir / f"{number:04d}-{phase}.json"
+    # Signed order (review C2): the position and the previous record's digest
+    # go inside the signed body, so records written in the same second are
+    # ordered by the signer and a removed or reordered record breaks the chain.
+    previous = None
+    if existing:
+        last = existing[-1]
+        if last.is_symlink():
+            raise TddError("evidence_tampered", f"evidence record is unsafe: {last.name}")
+        try:
+            previous = json.loads(last.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise TddError("evidence_tampered", f"evidence record is unreadable: {last.name}") from exc
+        if not isinstance(previous, dict) or not verify_signature(previous, key):
+            raise TddError("evidence_tampered", f"evidence record signature is invalid: {last.name}")
+    record = dict(record)
+    record["sequence"] = number
+    record["prev_sha256"] = record_digest(previous) if previous is not None else None
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
@@ -1020,6 +1090,7 @@ def acceptance_report(
         or (item["status"] == "review_required" and review_valid)
         for item in criteria.values()
     )
+    review = latest.get("review")
     return {
         "contract_id": str(contract.get("id") or ""),
         "contract_sha256": str(contract_sha256),
@@ -1027,5 +1098,11 @@ def acceptance_report(
         "test_first": _test_first(contract, contract_sha256, records),
         "phases": phases,
         "criteria": criteria,
+        "review_identity": review_identity(review) if review is not None else None,
+        "human_authorization": {
+            "status": "not_recorded",
+            "note": "bundlebees records reviews but does not authenticate human identity; "
+                    "the contract's human_gates stay with a human, outside bundlebees",
+        },
         "accepted": bool(phases_ok and criteria_ok),
     }

@@ -78,12 +78,28 @@ def _frozen():
     return contract.freeze_contract(_contract(), approved_by="kyle")
 
 
+def _collected(state, frozen, ids=("tests/test_pricing.py::test_apply_tax",)):
+    """Store a signed test-collection/1 manifest the way `contract freeze` does."""
+    from bundlebees_plugin import collection, contract, leases
+
+    sha = contract.check_frozen(frozen)
+    manifest = {
+        "collection_version": collection.COLLECTION_VERSION, "contract_id": frozen["id"],
+        "contract_sha256": sha, "source_rev": frozen["source_rev"], "test_fingerprints": {},
+        "methods": {"tests/test_pricing.py": "pytest"}, "collected_ids": sorted(ids), "resolved": {},
+        "environment": {"isolation": "test"}, "at": "2026-11-12T22:00:00Z",
+    }
+    return collection.write_manifest(state, manifest, leases.evidence_key(state))
+
+
 # AC-007: a frozen, matching contract dispatches and the envelope says so.
 def test_contract_brief_dispatches_with_acdd_envelope(tools, tmp_path):
     client = _Client()
+    _collected(tmp_path, _frozen())
     out = _call(tools, client, _brief(_frozen()), tmp_path)
     assert out.get("ok", True) is not False, out
     assert out["acdd"]["mode"] == "contract"
+    assert out["acdd"]["tests_collected"] == 1
     assert out["acdd"]["contract_id"] == "W1-pricing"
     assert len(out["acdd"]["contract_sha256"]) == 64
     assert out["acdd"]["tdd_applicable"] is True
@@ -137,3 +153,30 @@ def test_tool_schema_budget():
     plugin.register(ctx)
     body = json.dumps([rec["schema"] for rec in ctx.tools.values()], separators=(",", ":"), ensure_ascii=False)
     assert len(tiktoken.get_encoding("o200k_base").encode(body)) <= 600
+
+
+# Review C1: dispatch refuses a contract whose test references were never collected.
+def test_dispatch_refuses_a_contract_without_a_collected_test_manifest(tools, tmp_path):
+    client = _Client()
+    out = _call(tools, client, _brief(_frozen()), tmp_path)
+    assert out.get("ok") is False and out.get("code") == "tests_not_collected", out
+    assert client.created == []
+
+
+def test_dispatch_refuses_a_manifest_that_does_not_resolve_every_reference(tools, tmp_path):
+    client = _Client()
+    _collected(tmp_path, _frozen(), ids=("tests/test_pricing.py::test_something_else",))
+    out = _call(tools, client, _brief(_frozen()), tmp_path)
+    assert out.get("ok") is False and out.get("code") == "test_unresolved", out
+    assert client.created == []
+
+
+def test_dispatch_refuses_a_tampered_manifest(tools, tmp_path):
+    client = _Client()
+    path, _ = _collected(tmp_path, _frozen())
+    data = json.loads(path.read_text())
+    data["collected_ids"].append("tests/test_pricing.py::test_injected")
+    path.write_text(json.dumps(data))
+    out = _call(tools, client, _brief(_frozen()), tmp_path)
+    assert out.get("ok") is False and out.get("code") == "evidence_tampered", out
+    assert client.created == []

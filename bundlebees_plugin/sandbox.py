@@ -483,8 +483,13 @@ def run_in_sandbox(
     timeout: int = 900,
     which: Which = shutil.which,
     probe: Probe | None = None,
+    collect_file: str | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
+
+    With *collect_file*, the JSON object the child wrote to
+    ``{evidence}/<collect_file>`` is returned as ``collected`` (bounded,
+    regular file only, ``None`` when absent or malformed).
 
     The real worktree is never modified or executed in place. The disposable
     copy is always deleted, even on timeout or an unavailable backend.
@@ -572,7 +577,11 @@ def run_in_sandbox(
         except Exception:
             cases = []
 
-        return {
+        collected = None
+        if collect_file:
+            collected = _read_collected(evidence_host / collect_file)
+
+        out = {
             "backend": label,
             "exit_code": int(exit_code),
             "timed_out": timed_out,
@@ -581,5 +590,21 @@ def run_in_sandbox(
             "junit": _junit_summary(evidence_host),
             "cases": cases,
         }
+        if collect_file:
+            out["collected"] = collected
+        return out
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _read_collected(path: Path) -> dict | None:
+    """Parse a child-written JSON object, refusing symlinks and oversized files."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_EVIDENCE_BYTES:
+            return None
+        import json
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None

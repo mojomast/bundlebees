@@ -552,8 +552,15 @@ def freeze_contract(
     *,
     approved_by: str,
     approved_at: str | None = None,
+    test_collection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate *contract* and return a copy approved and bound to its hash."""
+    """Validate *contract* and return a copy approved and bound to its hash.
+
+    *test_collection* (from :mod:`collection`) binds the frozen contract to the
+    signed collected-test manifest by digest. The review block is excluded
+    from the contract hash, so the manifest and the contract can name each
+    other.
+    """
     if not isinstance(approved_by, str) or not approved_by.strip():
         raise _invalid(
             "approved_by must be a non-empty string",
@@ -574,6 +581,8 @@ def freeze_contract(
         "approved_at": timestamp,
         "contract_sha256": contract_sha256(frozen),
     }
+    if test_collection is not None:
+        frozen["review"]["test_collection"] = dict(test_collection)
     return frozen
 
 

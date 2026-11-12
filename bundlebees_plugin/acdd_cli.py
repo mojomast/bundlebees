@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import collection
 from . import contract as acdd
 from . import leases, tdd
 from .security import child_env, scrub
@@ -52,7 +53,7 @@ def _print_hex(label: str, value: str) -> None:
 
 
 def _as_error(exc: Exception) -> Exception:
-    if isinstance(exc, (acdd.ContractError, tdd.TddError)):
+    if isinstance(exc, (acdd.ContractError, tdd.TddError, collection.CollectionError)):
         return _error(exc.code, exc.error, exc.fix)
     return exc
 
@@ -125,6 +126,9 @@ def add_parsers(subparsers: Any) -> None:
     freeze.add_argument("path", help="Contract JSON file.")
     freeze.add_argument("--approved-by", required=True, help="Who approved the contract.")
     freeze.add_argument("--out", default=None, help="Where to write the frozen contract (default: overwrite path).")
+    freeze.add_argument("--workdir", default=None,
+                        help="Git repository with source_rev; its approved tests are collected in the sandbox first.")
+    freeze.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     contract_cmd.set_defaults(command="contract")
 
     tdd_cmd = subparsers.add_parser("tdd", help="Record RED evidence or print the acceptance report.")
@@ -145,12 +149,13 @@ def add_parsers(subparsers: Any) -> None:
     target.add_argument("--rev", default=None, help="Later commit that keeps the approved tests green.")
     target.add_argument("--none", action="store_true", help="Record explicitly that no refactor is needed.")
     refactor.add_argument("--note", default=None, help="Note stored with the refactor record.")
-    review = tdd_sub.add_parser("review", help="Record signed REVIEW evidence from a reviewer or human.")
+    review = tdd_sub.add_parser("review", help="Record a coordinator-recorded REVIEW (not an authenticated human sign-off).")
     review.add_argument("path", help="Frozen contract JSON file.")
     review.add_argument("--state-dir", default=None, help="Plugin data directory override.")
-    review.add_argument("--reviewer", required=True, help="Name of the reviewer or human.")
+    review.add_argument("--reviewer", required=True,
+                        help="Label for who reviewed. Recorded as given; bundlebees does not verify identity.")
     review.add_argument("--role", choices=("reviewer", "human"), default="reviewer",
-                        help="Whether the reviewer is a reviewer or a human (default: reviewer).")
+                        help="Claimed kind of reviewer, stored as an unverified label (default: reviewer).")
     verdict = review.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--approve", action="store_true", help="Accept the change.")
     verdict.add_argument("--reject", action="store_true", help="Reject the change.")
@@ -181,7 +186,33 @@ def cmd_contract(ctx: Any, args: Any) -> int:
     if sub == "freeze":
         approved_by = str(getattr(args, "approved_by", "") or "")
         try:
-            frozen = acdd.freeze_contract(data, approved_by=approved_by)
+            validated = acdd.validate_contract(data)
+        except acdd.ContractError as exc:
+            raise _as_error(exc) from exc
+        test_collection = None
+        manifest = None
+        if collection.needs_collection(validated):
+            workdir_value = getattr(args, "workdir", None) or _cli()._config(ctx).get("worktree")
+            if not workdir_value:
+                raise _error("collection_required",
+                             "this contract names tests; they must be collected at source_rev before freezing",
+                             "Pass --workdir with the repository that contains source_rev.")
+            sha = acdd.contract_sha256(validated)
+            state_dir = _cli()._state_dir(ctx, args)
+            manifest = collect_manifest(ctx, validated, sha, Path(str(workdir_value)).expanduser().resolve())
+            try:
+                _path, digest = collection.write_manifest(state_dir, manifest, leases.evidence_key(state_dir))
+            except (collection.CollectionError, OSError) as exc:
+                raise _as_error(exc) if isinstance(exc, collection.CollectionError) else _error(
+                    "tests_not_collected", f"could not store the collected-test manifest: {exc}",
+                    "Check the plugin state directory.") from exc
+            test_collection = {
+                "manifest_sha256": digest,
+                "source_rev": str(validated["source_rev"]),
+                "collected": len(manifest["collected_ids"]),
+            }
+        try:
+            frozen = acdd.freeze_contract(data, approved_by=approved_by, test_collection=test_collection)
         except acdd.ContractError as exc:
             raise _as_error(exc) from exc
         target = Path(str(getattr(args, "out", None) or getattr(args, "path"))).expanduser()
@@ -202,6 +233,11 @@ def cmd_contract(ctx: Any, args: Any) -> int:
         print("bundlebees contract freeze")
         print(f"contract: {scrub(str(frozen.get('id')))} approved")
         _print_hex("contract_sha256", frozen["review"]["contract_sha256"])
+        if manifest is not None:
+            static = sorted(path for path, how in manifest["methods"].items() if how == "static")
+            print(f"tests collected: {len(manifest['collected_ids'])} ids at source_rev, every AC reference resolved")
+            if static:
+                print("read statically (import-type collection error at source_rev): " + scrub(", ".join(static)))
         print(f"written: {scrub(str(target))}")
         return 0
     raise _error("invalid_argument", "unknown contract command", "Use: contract validate|freeze.")
@@ -219,6 +255,53 @@ def _checkout(workdir: Path, rev: str, into: Path) -> Path:
             raise _error("stale_revision", f"could not check out source_rev: {scrub(proc.stderr.strip())[:300]}",
                          "Fetch the commit named by contract.source_rev into the workdir and retry.")
     return target
+
+
+def collect_manifest(ctx: Any, contract: Mapping[str, Any], sha: str, workdir: Path) -> dict[str, Any]:
+    """Collect the approved tests at ``source_rev`` in the sandbox (bounded)."""
+    import sys
+
+    cli = _cli()
+    options = cli._sandbox_options(cli._config(ctx))
+    options["timeout"] = min(int(options.get("timeout") or 300), 300)
+    tests = _test_files(contract)
+
+    def run(repo: Path, argv: list[str]) -> Mapping[str, Any]:
+        from . import sandbox
+
+        try:
+            return sandbox.run_in_sandbox(repo, argv, collect_file=collection.COLLECT_FILE, **options)
+        except sandbox.SandboxUnavailable as exc:
+            raise _error(exc.code, exc.error, exc.fix) from exc
+
+    with tempfile.TemporaryDirectory(prefix="bundlebees-collect-") as tmp:
+        repo = _checkout(workdir, str(contract["source_rev"]), Path(tmp))
+        try:
+            fingerprints = tdd.fingerprint_files(repo, tests)
+            return collection.build_manifest(contract, sha, repo, run, python=sys.executable,
+                                             fingerprints=fingerprints)
+        except (tdd.TddError, collection.CollectionError) as exc:
+            raise _as_error(exc) from exc
+
+
+def _require_manifest(ctx: Any, contract: Mapping[str, Any], sha: str, state_dir: Path, key: bytes,
+                      workdir: Path | None) -> dict[str, Any] | None:
+    """Load the signed manifest; with *workdir*, collect it first when absent."""
+    if not collection.needs_collection(contract):
+        return None
+    try:
+        return collection.load_manifest(state_dir, contract, sha, key)
+    except collection.CollectionError as exc:
+        if exc.code != "tests_not_collected" or workdir is None or (
+            isinstance(contract.get("review"), Mapping) and "test_collection" in contract["review"]
+        ):
+            raise _as_error(exc) from exc
+    manifest = collect_manifest(ctx, contract, sha, workdir)
+    try:
+        collection.write_manifest(state_dir, manifest, key)
+        return collection.load_manifest(state_dir, contract, sha, key)
+    except collection.CollectionError as exc:
+        raise _as_error(exc) from exc
 
 
 def _changed_paths(repo: Path, older: str, newer: str) -> list[str]:
@@ -376,12 +459,16 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
             raise _as_error(exc) from exc
 
     target = refactor or green
+    # Review C6: this is a review the coordinator *recorded*. The HMAC proves
+    # the coordinator wrote it, not who the reviewer is, so the record never
+    # carries role "human"; the reviewer and their claimed kind are labels.
     record = tdd.make_record(
         contract, sha, phase="review", revision=str(target["revision"]),
         test_fingerprints=target["test_fingerprints"], command=["review"],
-        result=None, produced_by={"role": role, "name": scrub(reviewer)},
+        result=None, produced_by={"role": "reviewer", "name": "bundlebees tdd review (coordinator-recorded)"},
         test_first=green["test_first"], notes=scrub(note),
         review_outcome="passed" if approve else "failed",
+        attestation=tdd.coordinator_review_attestation(scrub(reviewer), role),
     )
     try:
         tdd.write_record(state_dir, record, key)
@@ -393,7 +480,7 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
     print("bundlebees tdd review")
     print(f"contract: {scrub(str(contract['id']))}")
     _print_hex("revision", str(target["revision"]))
-    print("review: valid")
+    print("review: valid (coordinator-recorded; reviewer identity not authenticated)")
     return 0
 
 
@@ -421,6 +508,9 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
             for cid, item in report["criteria"].items():
                 print(f"{cid}: {'not run' if item['status'] in ('unrun', 'not_run') else item['status']}")
             print(f"test-first: {'yes' if report['test_first'] else 'no'}")
+            if report.get("review_identity"):
+                print(f"review identity: {report['review_identity']}")
+            print(f"human authorization: {report['human_authorization']['status']}")
             print(f"accepted: {'yes' if report['accepted'] else 'no'}")
         return 0 if report["accepted"] else 1
     if sub == "refactor":
@@ -437,13 +527,16 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
         raise _error("invalid_argument", "no workdir", "Pass --workdir with the repository that contains source_rev.")
     workdir = Path(str(workdir_value)).expanduser().resolve()
     tests = _test_files(contract)
+    manifest = _require_manifest(ctx, contract, sha, state_dir, key, workdir)
     with tempfile.TemporaryDirectory(prefix="bundlebees-red-") as tmp:
         repo = _checkout(workdir, str(contract["source_rev"]), Path(tmp))
-        evidence = cli._run_sandboxed(repo, list(tests), cli._config(ctx))
         try:
             fingerprints = tdd.fingerprint_files(repo, tests)
-        except tdd.TddError as exc:
+            if manifest is not None:
+                collection.check_fingerprints(manifest, fingerprints)
+        except (tdd.TddError, collection.CollectionError) as exc:
             raise _as_error(exc) from exc
+        evidence = cli._run_sandboxed(repo, list(tests), cli._config(ctx))
     record = tdd.make_record(
         contract, sha, phase="red", revision=str(contract["source_rev"]),
         test_fingerprints=fingerprints, command=["pytest", *tests], result=_result(evidence),
@@ -495,6 +588,11 @@ def verify_preflight(record: Mapping[str, Any], state_dir: Path, patch_files: li
     if red is None and _test_first(contract):
         raise _error("red_missing", "no RED evidence for this contract",
                      "Run `hermes bundlebees tdd red <contract>` on source_rev first.")
+    if collection.needs_collection(contract):
+        try:
+            collection.load_manifest(state_dir, contract, sha, key)
+        except collection.CollectionError as exc:
+            raise _as_error(exc) from exc
     if red is not None:
         try:
             tdd.check_red(contract, sha, red)

@@ -195,19 +195,25 @@ def test_contract_validate_prints_hash_and_rejects_invalid(tmp_path, capsys):
 
 def test_contract_freeze_writes_an_approved_contract(tmp_path, capsys):
     ctx = _ctx()
-    src = _write(tmp_path / "c.json", _contract("b" * 40))
+    repo, base = _repo(tmp_path)
+    state = tmp_path / "state"
+    src = _write(tmp_path / "c.json", _contract(base))
     out_path = tmp_path / "frozen.json"
-    rc = _invoke(ctx, ["contract", "freeze", str(src), "--approved-by", "Kyle", "--out", str(out_path)])
-    assert rc == 0
+    rc = _invoke(ctx, ["contract", "freeze", str(src), "--approved-by", "Kyle", "--out", str(out_path),
+                       "--workdir", str(repo), "--state-dir", str(state)])
+    assert rc == 0, capsys.readouterr().out
     frozen = json.loads(out_path.read_text(encoding="utf-8"))
     assert frozen["review"]["status"] == "approved"
     assert frozen["review"]["approved_by"] == "Kyle"
-    assert acdd.check_frozen(frozen) == acdd.contract_sha256(_contract("b" * 40))
+    assert acdd.check_frozen(frozen) == acdd.contract_sha256(_contract(base))
+    assert frozen["review"]["test_collection"]["source_rev"] == base
+    assert frozen["review"]["test_collection"]["collected"] >= 1
 
-    bad = _contract("b" * 40, evidence_required=["green"])  # test-first but no red
+    bad = _contract(base, evidence_required=["green"])  # test-first but no red
     bad_src = _write(tmp_path / "bad.json", bad)
     bad_out = tmp_path / "bad-frozen.json"
-    assert _invoke(ctx, ["contract", "freeze", str(bad_src), "--approved-by", "Kyle", "--out", str(bad_out)]) != 0
+    assert _invoke(ctx, ["contract", "freeze", str(bad_src), "--approved-by", "Kyle", "--out", str(bad_out),
+                         "--workdir", str(repo), "--state-dir", str(state)]) != 0
     assert not bad_out.exists()
 
 
