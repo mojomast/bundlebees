@@ -1,6 +1,6 @@
 # ACDD and TDD in bundlebees
 
-> This is bundlebees' copy of the protocol in [workflow chapter 16](https://github.com/mojomast/workflow/blob/main/docs/16-acdd-tdd.md). The schemas in `bundlebees_plugin/schemas/contract.schema.json` and `evidence.schema.json` are byte-identical copies of the workflow repository's `schemas/` files; `tests/test_contract.py` pins their `$id` and version strings.
+> This is bundlebees' copy of the protocol in [workflow chapter 16](https://github.com/mojomast/workflow/blob/main/docs/16-acdd-tdd.md). `bundlebees_plugin/schemas/contract.schema.json` and `evidence.schema.json` are byte-identical copies of the workflow repository's `schemas/` files.
 
 
 **Status:** protocol defined here, enforced in the [reference demo](https://github.com/mojomast/workflow/blob/main/reference/README.md) (workflow repository) and, on a feature branch under review, in [bundlebees](https://github.com/mojomast/bundlebees) (`feat/acdd-tdd`, not merged, not released). Orbit display of contracts and evidence is planned; see [§9](#9-orbit). Nothing in this chapter changes who may merge, tag, release, deploy or publish.
@@ -57,7 +57,7 @@ A validator rejects a contract, with the failing field and a fix, when:
 1. two criteria share an id;
 2. `tdd.applicable` is true and a `test` criterion lists no tests, or lists a test whose file is not in `scope.test_files`;
 3. `tdd.applicable` is true and a file is in both `scope.assigned_files` and `scope.test_files` (the implementer must not be able to edit the tests that judge it);
-4. `tdd.applicable` is true and `evidence_required` lacks `red` or `green`;
+4. `tdd.applicable` is true and `evidence_required` lacks `green`, or lacks `red` while `tdd.test_first` is not `false`;
 5. `tdd.applicable` is false and `tdd.reason` is empty;
 6. a path is absolute, contains `..`, is under `.git`, or is assigned and also matches `scope.prohibited`;
 7. `authorization.human_gates` drops any of `merge`, `release`, `deploy`, `publish`;
@@ -82,28 +82,31 @@ Only records produced by the verifier count for acceptance. A worker may attach 
 
 ## 4. Classifying a run
 
-The **RED set** is every test named by a `test` criterion that is not `regression: true`. Classification, in order:
+The **RED set** is every test named by a `test` criterion that is not `regression: true`. A case *matches* a test id when the ids are equal or one is a `::` / `[` prefix of the other (a file-level collection error covers every test in that file). Classification, first match wins:
 
 | Condition | Classification |
 |---|---|
-| Timed out | `timeout` |
 | No result (the check never ran) | `not_run` |
-| Any case errored with `SyntaxError` / `IndentationError` / `TabError` | `syntax_error` |
-| Exit status says the runner itself failed (pytest 3/4, no tests collected 5) | `environment_error` |
-| A case outside the RED set failed or errored | `unrelated_failure` (the baseline is broken) |
-| A case in the RED set errored, unless it is a *missing declared interface* (see below) | `collection_error` if it happened at import/collection, else `environment_error` |
-| Exit 0, nothing failed or errored | `passed` |
-| Otherwise: every failing case is in the RED set and failed on an assertion or a missing declared interface | `behavioral_failure` |
+| Timed out | `timeout` |
+| Any case errored with `SyntaxError`, `IndentationError` or `TabError` | `syntax_error` |
+| The runner itself failed (pytest exit 3, 4 or 5 — internal error, usage error, no tests collected) | `environment_error` |
+| A failing or erroring case is outside the RED set | `unrelated_failure` (the baseline is broken) |
+| A RED-set case *errored* (setup, collection, or a non-assertion error in unittest) and it is not a missing declared interface | `collection_error` at collection, else `environment_error` |
+| Exit 0 and nothing failed or errored | `passed` |
+| Nonzero exit with no failing case | `environment_error` |
+| Otherwise (every failing case is in the RED set and *failed*, or errored with a missing declared interface) | `behavioral_failure` |
 
-A *missing declared interface* is `NotImplementedError`, or `ImportError` / `AttributeError` whose message names an interface the contract declares with `change: add`. That is the honest RED for "the function does not exist yet". A `ModuleNotFoundError` for a module the contract does not add is an environment problem, not RED.
+A *missing declared interface* is `NotImplementedError`, or `ImportError` / `ModuleNotFoundError` / `AttributeError` whose message quotes an interface the contract declares with `change: add` (its full name or last dotted segment). That is the honest RED for "the function does not exist yet". A `ModuleNotFoundError` for a module the contract does not add is an environment problem, not RED.
 
 ## 5. RED, GREEN, REFACTOR
 
 **RED is valid** when the verifier ran the approved tests on `source_rev` plus *only* the `scope.test_files` changes, the classification is `behavioral_failure`, **every** test in the RED set failed, the record's `contract_sha256` matches the frozen contract, and `revision` is not `source_rev` itself unless the tests already existed there.
 
-**GREEN is valid** when there is a valid RED for the same contract hash, the verifier ran the same tests on the implementation revision, the classification is `passed`, the `test_fingerprints` equal RED's exactly (no edited, deleted or substituted tests), `revision` descends from `base_rev`, and the patch touches only `scope.assigned_files` (plus nothing in `scope.test_files`).
+**GREEN is valid** when there is a valid RED for the same contract hash (or the contract says `tdd.test_first: false`), the verifier ran the same tests on the implementation revision, the classification is `passed`, the `test_fingerprints` equal RED's exactly (no edited, deleted or substituted tests), `revision` descends from `base_rev`, and the patch touches only `scope.assigned_files` (plus nothing in `scope.test_files`).
 
 **REFACTOR is valid** when it follows a valid GREEN, fingerprints still match, the classification is `passed`, and the contract hash is unchanged. "No refactor needed" is recorded as a refactor record on the GREEN revision with a note, not silently skipped, when `refactor` is in `evidence_required`.
+
+**REVIEW is valid** when it was produced by a `reviewer` or `human` and is classified `passed`; it is what turns `review_required` criteria into acceptable ones. **INTEGRATION is valid** when the combined-branch run is `passed`.
 
 **Tests written after the code** are allowed only with `tdd.test_first: false` (or `tdd.applicable: false` with a reason). The GREEN record then carries `test_first: false`, reports say "tests added after implementation", and no RED is claimed.
 
