@@ -2,8 +2,11 @@
 
 ``contract validate|freeze`` check and freeze ``acdd/1`` contracts.
 ``tdd red`` runs the approved tests at the contract's ``source_rev`` in the
-disposable sandbox and records a signed RED. ``tdd report`` prints the
-acceptance report. ``verify`` calls :func:`verify_preflight` and
+disposable sandbox and records a signed RED. ``tdd refactor`` reruns the same
+read-only tests on a later descendant revision (or records ``--none``) and
+refuses edited tests, out-of-scope paths, and revisions that do not descend
+from GREEN. ``tdd report`` prints the acceptance report. ``verify`` calls
+:func:`verify_preflight` and
 :func:`record_green` when the coordinator lease carries a contract; briefs
 without one keep the legacy path. Evidence is signed with a key derived from
 the coordinator's lease key and is never produced by the worker.
@@ -132,6 +135,14 @@ def add_parsers(subparsers: Any) -> None:
     report.add_argument("path", help="Frozen contract JSON file.")
     report.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     report.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    refactor = tdd_sub.add_parser("refactor", help="Record REFACTOR evidence after a valid GREEN.")
+    refactor.add_argument("path", help="Frozen contract JSON file.")
+    refactor.add_argument("--workdir", default=None, help="Git repository that contains the refactor revision.")
+    refactor.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    target = refactor.add_mutually_exclusive_group(required=True)
+    target.add_argument("--rev", default=None, help="Later commit that keeps the approved tests green.")
+    target.add_argument("--none", action="store_true", help="Record explicitly that no refactor is needed.")
+    refactor.add_argument("--note", default=None, help="Note stored with the refactor record.")
     tdd_cmd.set_defaults(command="tdd")
 
 
@@ -198,6 +209,121 @@ def _checkout(workdir: Path, rev: str, into: Path) -> Path:
     return target
 
 
+def _changed_paths(repo: Path, older: str, newer: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", older, newer],
+            capture_output=True, text=True, env=child_env(), timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _error("stale_revision", "git diff did not finish for the refactor revision",
+                     "Retry with a smaller revision range.") from exc
+    if proc.returncode != 0:
+        raise _error("stale_revision", f"could not diff the refactor revision: {scrub(proc.stderr.strip())[:300]}",
+                     "Fetch both revisions into the workdir and retry.")
+    return [line for line in proc.stdout.splitlines() if line]
+
+
+def _check_descends(repo: Path, older: str, newer: str) -> None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer],
+            capture_output=True, text=True, env=child_env(), timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _error("stale_revision", "git merge-base did not finish for the refactor revision",
+                     "Retry with a smaller revision range.") from exc
+    if proc.returncode != 0:
+        raise _error("stale_revision", "refactor revision does not descend from GREEN",
+                     "Pass a commit that is a descendant of the GREEN revision.")
+
+
+def _check_refactor_scope(contract: Mapping[str, Any], changed: list[str]) -> None:
+    approved = set(_test_files(contract))
+    tampered = [path for path in changed if path in approved]
+    if tampered:
+        raise _error("tests_tampered", "the refactor revision edits approved test files: " + ", ".join(tampered),
+                     "Approved tests are read-only; refactor only scope.assigned_files.")
+    scope = contract.get("scope") if isinstance(contract.get("scope"), Mapping) else {}
+    assigned = {str(item) for item in scope.get("assigned_files") or [] if isinstance(item, str)}
+    outside = [path for path in changed if path not in assigned or acdd.is_prohibited(path, contract)]
+    if outside:
+        raise _error("scope_violation", "the refactor revision touches files outside scope.assigned_files: "
+                     + ", ".join(outside),
+                     "Refactor only the paths in scope.assigned_files.")
+
+
+def _cmd_refactor(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
+                  state_dir: Path, key: bytes) -> int:
+    cli = _cli()
+    try:
+        records = tdd.load_records(state_dir, str(contract["id"]), key)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+    red = _latest(records, "red", sha)
+    green = _latest(records, "green", sha)
+    if green is None:
+        raise _error("green_failed", "no GREEN evidence for this contract",
+                     "Run `hermes bundlebees verify` on the implementation revision first.")
+    try:
+        tdd.check_green(contract, sha, red, green)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+
+    if getattr(args, "none", False):
+        note = str(getattr(args, "note", None) or "")
+        record = tdd.make_record(
+            contract, sha, phase="refactor", revision=str(green["revision"]),
+            test_fingerprints=green["test_fingerprints"], command=["none"],
+            result=green["result"], produced_by={"role": "verifier", "name": "bundlebees tdd refactor"},
+            test_first=green["test_first"], environment=green.get("environment"),
+            notes="no refactor needed: " + note,
+        )
+        try:
+            tdd.write_record(state_dir, record, key)
+            tdd.check_refactor(contract, sha, red, green, record)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        print(scrub("refactor: valid (no refactor needed)"))
+        return 0
+
+    rev = str(getattr(args, "rev", None) or "")
+    if not _HEX.match(rev):
+        raise _error("invalid_argument",
+                     "refactor --rev must be a full 40- or 64-character lower-case hex revision",
+                     "Pass the later commit id exactly as git prints it.")
+    workdir_value = getattr(args, "workdir", None) or cli._config(ctx).get("worktree")
+    if not workdir_value:
+        raise _error("invalid_argument", "no workdir", "Pass --workdir with the repository that contains the refactor revision.")
+    workdir = Path(str(workdir_value)).expanduser().resolve()
+    tests = _test_files(contract)
+    with tempfile.TemporaryDirectory(prefix="bundlebees-refactor-") as tmp:
+        repo = _checkout(workdir, rev, Path(tmp))
+        _check_descends(repo, str(green["revision"]), rev)
+        _check_refactor_scope(contract, _changed_paths(repo, str(green["revision"]), rev))
+        evidence = cli._run_sandboxed(repo, list(tests), cli._config(ctx))
+        try:
+            fingerprints = tdd.fingerprint_files(repo, tests)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+    record = tdd.make_record(
+        contract, sha, phase="refactor", revision=rev, test_fingerprints=fingerprints,
+        command=["pytest", *tests], result=_result(evidence),
+        produced_by={"role": "verifier", "name": "bundlebees tdd refactor"},
+        test_first=green["test_first"], environment=_environment(evidence),
+    )
+    try:
+        tdd.write_record(state_dir, record, key)
+        tdd.check_refactor(contract, sha, red, green, record)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+    print("bundlebees tdd refactor")
+    print(f"contract: {scrub(str(contract['id']))}")
+    _print_hex("revision", rev)
+    print("refactor: valid")
+    return 0
+
+
 def cmd_tdd(ctx: Any, args: Any) -> int:
     cli = _cli()
     data = load_contract_file(getattr(args, "path", None))
@@ -224,8 +350,10 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
             print(f"test-first: {'yes' if report['test_first'] else 'no'}")
             print(f"accepted: {'yes' if report['accepted'] else 'no'}")
         return 0 if report["accepted"] else 1
+    if sub == "refactor":
+        return _cmd_refactor(ctx, args, contract, sha, state_dir, key)
     if sub != "red":
-        raise _error("invalid_argument", "unknown tdd command", "Use: tdd red|report.")
+        raise _error("invalid_argument", "unknown tdd command", "Use: tdd red|report|refactor.")
     if not _test_first(contract):
         raise _error("red_invalid", "the contract says tdd.test_first: false; there is no RED to record",
                      "Record GREEN through verify; the report will say the tests came after the code.")
