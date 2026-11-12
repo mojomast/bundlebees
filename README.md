@@ -124,6 +124,7 @@ These commands are registered as `hermes bundlebees …`. They are **not** model
 | `hermes bundlebees contract validate <file>` | Check an `acdd/1` contract (schema plus the ACDD checks) and print its `contract_sha256` and whether it is frozen. |
 | `hermes bundlebees contract freeze <file> --approved-by <name> [--out <file>]` | Approve a valid contract and bind it to its hash. Refuses invalid contracts. |
 | `hermes bundlebees tdd red <contract> --workdir <repo>` | Run the approved tests at the contract's `source_rev` in the sandbox and record a signed RED. Only a `behavioral_failure` of every RED-set test is valid (`red_incomplete`, `red_invalid` otherwise). |
+| `hermes bundlebees tdd refactor <contract> --workdir <repo> (--rev <sha> \| --none --note <text>)` | After a valid GREEN, rerun the approved tests on a later descendant revision in the sandbox and record a signed REFACTOR (`refactor_failed` if they break; `tests_tampered` / `scope_violation` for edits outside `assigned_files`), or record that no refactor was needed. |
 | `hermes bundlebees tdd report <contract> [--json]` | Print the acceptance report: each required phase is `valid`, a failure code, or `not run`; never passed by default. Exit 0 only when accepted. |
 | `hermes bundlebees lease <attempt_id> --brief <file>` | Record the signed lease for a brief that was dispatched outside `bundlebees_dispatch`. Refuses to overwrite. |
 | `hermes bundlebees metrics [--run <id>] [--json] [--note <text>]` | Summarize the append-only, hash-chained outcome log, or record one human intervention. |

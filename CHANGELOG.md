@@ -24,7 +24,7 @@ one pull request.
   in `brief.contract` and returns an `acdd` block. Briefs without one run in
   legacy mode ("no ACDD contract; TDD evidence not required"). The new
   `require_contract` setting makes a contract mandatory.
-- **CLI:** `contract validate|freeze`, `tdd red|report`. With a contract,
+- **CLI:** `contract validate|freeze`, `tdd red|refactor|report`. With a contract,
   `verify` refuses edits to approved tests, requires a valid RED and records a
   signed GREEN. `integrate` requires GREEN and records an `integration` record.
   Sandboxed runs now return per-case results (`cases`).
@@ -33,8 +33,13 @@ one pull request.
   implementation, and DeepSeek bees implemented `contract.py`/`tools.py` and
   `tdd.py`/`sandbox.py` against them. The coordinator implemented the CLI
   wiring (also test-first) while bee dispatch was paused.
-- Not yet: recording REFACTOR or REVIEW from the CLI (`tdd.check_refactor`
-  exists, but no command records it).
+- `tdd refactor --rev <sha>` reruns the read-only approved tests on a
+  descendant of GREEN in the sandbox and records signed REFACTOR evidence
+  (`refactor_failed`, `tests_tampered`, `scope_violation`, `stale_revision`);
+  `tdd refactor --none --note <text>` records "no refactor needed". Built
+  test-first by a DeepSeek bee against coordinator-approved tests.
+- Not yet: REVIEW records from the CLI; `integrate` requires GREEN, not
+  REFACTOR.
 
 ### Security
 
