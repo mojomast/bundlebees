@@ -114,7 +114,7 @@ def _brief(**overrides):
         "objective": "Implement the feature",
         "project": "proj",
         "branch": "feat/x",
-        "source_rev": "abc123",
+        "source_rev": "a" * 40,
         "assigned_files": ["src/a.py"],
         "commands": ["python3 -m pytest -q"],
         "acceptance": ["tests pass"],
@@ -223,10 +223,70 @@ def test_dispatch_accepts_object_and_json_string():
     assert client.calls[-1][2]["model"] == "deepseek-v4.1-flash"
 
 
+def test_dispatch_sends_the_normalised_brief_to_create():
+    client = FakeClient()
+    brief = _brief(
+        source_rev="A" * 40,
+        assigned_files=["src\\a.py", "./src/a.py", "src/b.py"],
+        acceptance=["tests pass"],
+    )
+    payload = _call(_ctx(), "bundlebees_dispatch", {"brief": brief}, client=client)
+    assert payload["ok"] is True
+    create = next(call for call in client.calls if call[0] == "create")
+    sent = create[1][0]
+    assert sent["source_rev"] == "a" * 40
+    assert sent["assigned_files"] == ["src/a.py", "src/b.py"]
+    assert sent["acceptance"] == {
+        "criteria": ["tests pass"],
+        "commands": [],
+        "tests": [],
+    }
+    # The caller's mapping is not mutated by validation or dispatch.
+    assert brief["source_rev"] == "A" * 40
+    assert brief["assigned_files"] == ["src\\a.py", "./src/a.py", "src/b.py"]
+    assert brief["acceptance"] == ["tests pass"]
+
+
+def test_dispatch_sends_normalised_acceptance_object_to_create():
+    client = FakeClient()
+    acceptance = {
+        "criteria": ["tests pass"],
+        "commands": ["python3 -m pytest -q"],
+        "tests": ["tests/test_a.py"],
+    }
+    payload = _call(
+        _ctx(), "bundlebees_dispatch", {"brief": _brief(acceptance=acceptance)}, client=client
+    )
+    assert payload["ok"] is True
+    create = next(call for call in client.calls if call[0] == "create")
+    assert create[1][0]["acceptance"] == acceptance
+
+
 def test_dispatch_rejects_invalid_brief():
     payload = _call(_ctx(), "bundlebees_dispatch", {"brief": {}}, client=FakeClient())
     assert payload["ok"] is False
     assert payload["code"] == "brief_invalid"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"source_rev": "abc123"},
+        {"source_rev": "feat/hardening"},
+        {"assigned_files": []},
+        {"assigned_files": ["../outside.py"]},
+        {"acceptance": {"tests": ["tests/test_a.py"]}},
+        {"acceptance": []},
+    ],
+)
+def test_invalid_brief_never_reaches_the_client(overrides):
+    client = FakeClient()
+    payload = _call(
+        _ctx(), "bundlebees_dispatch", {"brief": _brief(**overrides)}, client=client
+    )
+    assert payload["ok"] is False
+    assert payload["code"] == "brief_invalid"
+    assert client.calls == []
 
 
 def test_dispatch_rejects_bad_json_string():
@@ -506,15 +566,15 @@ def test_combined_schema_budget_stays_under_900():
     assert o200k <= 900, (o200k, body)
 
 
-def test_dispatch_allows_objective_only_brief():
+def test_dispatch_rejects_loose_objective_only_brief():
     payload = _call(
         _ctx(),
         "bundlebees_dispatch",
         {"brief": {"objective": "Research options and report back"}},
         client=FakeClient(),
     )
-    assert payload["ok"] is True
-    assert payload["attempt_id"] == "a1"
+    assert payload["ok"] is False
+    assert payload["code"] == "brief_invalid"
 
 
 def test_host_prompt_needs_no_launcher_or_token():

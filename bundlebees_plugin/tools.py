@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .brief import BriefError, validate_brief
 from .client import (
     DEFAULT_MODEL,
     ClientError,
@@ -31,7 +32,6 @@ TOOL_NAMES = (
 
 _MODULE_DIR = Path(__file__).resolve().parent
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-_BRIEF_SCHEMA = _MODULE_DIR / "schemas" / "brief.schema.json"
 _STUB_TEMPLATE = _MODULE_DIR / "templates" / "host-setup-prompt.md"
 _SKILL_TEMPLATE = (
     _PLUGIN_ROOT
@@ -52,8 +52,9 @@ _FIX_PROJECT = (
     "launcher; this tool does not restart it."
 )
 _FIX_BRIEF = (
-    "Pass a brief object or a JSON string with at least a non-empty objective; "
-    "code-work briefs also need assigned_files."
+    "Pass an object with objective, a full 40- or 64-character hex source_rev, "
+    "non-empty repository-relative assigned_files, and acceptance criteria or "
+    "commands."
 )
 
 
@@ -105,76 +106,6 @@ def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
     if injected is not None:
         return injected
     return client_from_config(_ctx_config(ctx))
-
-
-# ---------------------------------------------------------------------------
-# Brief validation (small local validator; no nested schema in the tool spec)
-# ---------------------------------------------------------------------------
-
-
-def _load_brief_schema() -> dict[str, Any]:
-    return json.loads(_BRIEF_SCHEMA.read_text(encoding="utf-8"))
-
-
-def _type_ok(value: Any, expected: str) -> bool:
-    if expected == "object":
-        return isinstance(value, dict)
-    if expected == "array":
-        return isinstance(value, list)
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    if expected == "null":
-        return value is None
-    return True
-
-
-def _validate_value(value: Any, spec: Mapping[str, Any], path: str) -> str | None:
-    expected = spec.get("type")
-    if expected is not None:
-        types = expected if isinstance(expected, list) else [expected]
-        if not any(_type_ok(value, item) for item in types):
-            return f"{path} has the wrong type"
-    if isinstance(value, str):
-        minimum = spec.get("minLength")
-        if isinstance(minimum, int) and len(value.strip()) < minimum:
-            return f"{path} is too short"
-    if isinstance(value, list):
-        minimum_items = spec.get("minItems")
-        if isinstance(minimum_items, int) and len(value) < minimum_items:
-            return f"{path} needs at least {minimum_items} item(s)"
-        item_spec = spec.get("items") or {}
-        if isinstance(item_spec, Mapping):
-            for index, item in enumerate(value):
-                problem = _validate_value(item, item_spec, f"{path}[{index}]")
-                if problem:
-                    return problem
-    if isinstance(value, Mapping):
-        for required in spec.get("required", []):
-            if required not in value:
-                return f"{path} is missing required field {required!r}"
-        for key, child_spec in (spec.get("properties") or {}).items():
-            if key in value and isinstance(child_spec, Mapping):
-                problem = _validate_value(value[key], child_spec, f"{path}.{key}")
-                if problem:
-                    return problem
-    return None
-
-
-def _validate_brief(brief: Mapping[str, Any]) -> str | None:
-    try:
-        schema = _load_brief_schema()
-    except (OSError, json.JSONDecodeError):
-        return "brief schema is unavailable"
-    objective = brief.get("objective")
-    if not isinstance(objective, str) or not objective.strip():
-        return "brief.objective must be a non-empty string"
-    return _validate_value(brief, schema, "brief")
 
 
 def _project_key(project: Any) -> str | None:
@@ -290,11 +221,32 @@ def _status(client: Any, args: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _dispatched(
+    client: Any,
+    brief: Mapping[str, Any],
+    data: Mapping[str, Any],
+    args: Mapping[str, Any],
+) -> str:
+    """Build the dispatch success envelope.
+
+    Hook point: the coordinator can record the lease here after
+    ``client.create`` returns, using the normalised *brief* and *client*.
+    """
+    out: dict[str, Any] = {"op": "dispatch"}
+    for key in ("attempt_id", "state", "task_id", "kanban_task_id"):
+        if data.get(key) is not None:
+            out[key] = data[key]
+    kanban_task_id = args.get("kanban_task_id")
+    if "kanban_task_id" not in out and kanban_task_id:
+        out["kanban_task_id"] = kanban_task_id
+    return _ok(**out)
+
+
 def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
     raw = args.get("brief")
     if isinstance(raw, str):
         try:
-            brief = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             return _err(
                 "brief_invalid",
@@ -302,30 +254,14 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
                 "Pass a JSON object (not a JSON-encoded string of an array).",
             )
     else:
-        brief = raw
-    if not isinstance(brief, Mapping):
+        parsed = raw
+    if not isinstance(parsed, Mapping):
         return _err("brief_invalid", "brief must be an object or JSON object string", _FIX_BRIEF)
-    brief = dict(brief)
 
-    problem = _validate_brief(brief)
-    if problem:
-        return _err("brief_invalid", problem, _FIX_BRIEF)
-
-    code_work = any(
-        key in brief for key in ("commands", "deliverables", "acceptance", "assigned_files")
-    )
-    assigned = brief.get("assigned_files")
-    if code_work:
-        if (
-            not isinstance(assigned, list)
-            or not assigned
-            or not all(isinstance(item, str) and item.strip() for item in assigned)
-        ):
-            return _err(
-                "brief_invalid",
-                "code-work briefs require a non-empty assigned_files list",
-                "Add assigned_files with the exact files this worker is allowed to change.",
-            )
+    try:
+        brief = validate_brief(parsed)
+    except BriefError as exc:
+        return _err("brief_invalid", exc.error, exc.fix)
 
     project = brief.get("project")
     if isinstance(project, str) and project:
@@ -392,14 +328,7 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
         if exc.code == "project_unauthorized":
             return _err(exc.code, exc.error, _FIX_PROJECT)
         raise
-    data = _unwrap_attempt(data)
-    out: dict[str, Any] = {"op": "dispatch"}
-    for key in ("attempt_id", "state", "task_id", "kanban_task_id"):
-        if data.get(key) is not None:
-            out[key] = data[key]
-    if "kanban_task_id" not in out and kanban_task_id:
-        out["kanban_task_id"] = kanban_task_id
-    return _ok(**out)
+    return _dispatched(client, brief, _unwrap_attempt(data), args)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +557,7 @@ _STATUS_SCHEMA = _schema(
 
 _DISPATCH_SCHEMA = _schema(
     "bundlebees_dispatch",
-    "Validate a bee brief (schema, authorized project, file leases) and start a worker. Does not apply patches, run tests, or deploy.",
+    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. Does not apply patches, run tests, or deploy.",
     {
         "type": "object",
         "properties": {
