@@ -1,8 +1,8 @@
 # Retrieving worker patches through Orbit (orbit-loopback adapter)
 
 `hermes bundlebees verify` gets a finished worker's patch only through Orbit's coordinator-only artifact API
-(`POST /api/local-workers {op: "artifact"}`, `orbit.worker-artifact/1`). It never reads launcher or Orbit
-runtime files. The model-visible `bundlebees_attempt get` tool returns only the public result view, which
+(`POST /api/local-workers {op: "artifact"}`, `orbit.worker-artifact/1`). It never reads hyvv (formerly the
+PC launcher) or Orbit runtime files. The model-visible `bundlebees_attempt get` tool returns only the public result view, which
 never carries a patch, whatever the client returns.
 
 ## What verify checks
@@ -38,10 +38,16 @@ never printed or stored by verify.
 The `coordinator` setting (default `MR.INDIA`, Orbit's default) is sent at dispatch and with every artifact
 read. Orbit returns the patch only to the coordinator that dispatched the attempt.
 
+## hyvv
+
+hyvv (formerly the PC launcher) owns the `/v1` worker API. It plans to add `GET /v1/attempts/{id}/artifact`
+with the same codes, advertised as `artifact_fetch`. Orbit can then become a thin proxy for this op. The
+coordinator-facing artifact and codes stay the same, so this client needs no change.
+
 ## Real round trip test
 
 `tests/test_orbit_roundtrip.py` runs the real Orbit route from an orbitdesktop checkout under node, in front
-of a stand-in launcher. It covers dispatch with a signed lease, Orbit dispatch, artifact retrieval, a signed
+of a stand-in for hyvv's `/v1` API. It covers dispatch with a signed lease, Orbit dispatch, artifact retrieval, a signed
 GREEN in bubblewrap, refusal of a wrong key and of another coordinator, an Orbit restart with an identical
 hash, and refusal of a substituted result. Run it with `ORBIT_SRC=/path/to/orbitdesktop python -m pytest
 tests/test_orbit_roundtrip.py`. Without `ORBIT_SRC`, node or bwrap it is skipped with a reason, which means
