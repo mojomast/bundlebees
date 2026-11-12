@@ -132,3 +132,9 @@ config_schema:
     type: int
     default: 900
     description: Wall-clock limit in seconds for one sandboxed test run.
+  sandbox_tiktoken_cache:
+    type: str
+    default: ''
+    description: >-
+      Optional read-only tiktoken encoding cache for offline tests in the
+      verifier sandbox; must be outside your home directory.
