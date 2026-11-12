@@ -516,7 +516,10 @@ def _validate_record(record: Mapping[str, Any]) -> None:
         not isinstance(exit_code, int) or isinstance(exit_code, bool)
     ):
         raise bad("result.exit_code must be an integer or null")
-    if record.get("classification") not in CLASSIFICATIONS:
+    review_failed = (
+        record.get("phase") == "review" and record.get("classification") == "failed"
+    )
+    if record.get("classification") not in CLASSIFICATIONS and not review_failed:
         raise bad("classification is not a tdd-evidence/1 value")
     criteria = record.get("criteria")
     if not isinstance(criteria, Mapping):
@@ -547,9 +550,26 @@ def make_record(
     environment: Mapping[str, Any] | None = None,
     notes: str | None = None,
     now: str | None = None,
+    review_outcome: str | None = None,
 ) -> dict:
     """Build one signed-ready ``tdd-evidence/1`` record for a contract phase."""
-    if result is None:
+    if review_outcome is not None:
+        if str(phase) != "review":
+            raise TddError(
+                "evidence_invalid",
+                "review_outcome is only valid for the review phase",
+                "Record review evidence with phase='review'.",
+            )
+        if review_outcome not in ("passed", "failed"):
+            raise TddError(
+                "evidence_invalid",
+                "review_outcome must be 'passed' or 'failed'",
+                "Use --approve for passed or --reject for failed.",
+            )
+    if review_outcome is not None:
+        stored_result = _zero_result()
+        classification = review_outcome
+    elif result is None:
         stored_result = _zero_result()
         classification = "not_run"
     else:
@@ -557,6 +577,16 @@ def make_record(
         classification = classify(
             stored_result, _red_set(contract), _added_interfaces(contract)
         )
+    criteria = _criteria(contract, str(phase), stored_result, classification)
+    if review_outcome is not None:
+        for criterion in contract.get("acceptance_criteria") or []:
+            if not isinstance(criterion, Mapping):
+                continue
+            if criterion.get("verification") not in ("review", "manual"):
+                continue
+            ac_id = str(criterion.get("id") or "")
+            if ac_id:
+                criteria[ac_id] = review_outcome
     record: dict[str, Any] = {
         "evidence_version": EVIDENCE_VERSION,
         "contract_id": str(contract.get("id") or ""),
@@ -568,7 +598,7 @@ def make_record(
         "command": [str(item) for item in command],
         "result": stored_result,
         "classification": classification,
-        "criteria": _criteria(contract, str(phase), stored_result, classification),
+        "criteria": criteria,
         "produced_by": dict(produced_by),
         "test_first": bool(test_first),
         "at": str(now) if now else _now_utc(),

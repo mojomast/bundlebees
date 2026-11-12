@@ -5,7 +5,9 @@
 disposable sandbox and records a signed RED. ``tdd refactor`` reruns the same
 read-only tests on a later descendant revision (or records ``--none``) and
 refuses edited tests, out-of-scope paths, and revisions that do not descend
-from GREEN. ``tdd report`` prints the acceptance report. ``verify`` calls
+from GREEN. ``tdd review`` records a signed REVIEW from a named reviewer or
+human, targeting GREEN or the required REFACTOR revision.
+``tdd report`` prints the acceptance report. ``verify`` calls
 :func:`verify_preflight` and
 :func:`record_green` when the coordinator lease carries a contract; briefs
 without one keep the legacy path. Evidence is signed with a key derived from
@@ -143,6 +145,16 @@ def add_parsers(subparsers: Any) -> None:
     target.add_argument("--rev", default=None, help="Later commit that keeps the approved tests green.")
     target.add_argument("--none", action="store_true", help="Record explicitly that no refactor is needed.")
     refactor.add_argument("--note", default=None, help="Note stored with the refactor record.")
+    review = tdd_sub.add_parser("review", help="Record signed REVIEW evidence from a reviewer or human.")
+    review.add_argument("path", help="Frozen contract JSON file.")
+    review.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    review.add_argument("--reviewer", required=True, help="Name of the reviewer or human.")
+    review.add_argument("--role", choices=("reviewer", "human"), default="reviewer",
+                        help="Whether the reviewer is a reviewer or a human (default: reviewer).")
+    verdict = review.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--approve", action="store_true", help="Accept the change.")
+    verdict.add_argument("--reject", action="store_true", help="Reject the change.")
+    review.add_argument("--note", required=True, help="Why the change was approved or rejected.")
     tdd_cmd.set_defaults(command="tdd")
 
 
@@ -324,6 +336,67 @@ def _cmd_refactor(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
     return 0
 
 
+def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
+                state_dir: Path, key: bytes) -> int:
+    reviewer = str(getattr(args, "reviewer", "") or "").strip()
+    note = str(getattr(args, "note", "") or "").strip()
+    if not reviewer or not note:
+        raise _error("invalid_argument", "review needs a non-empty reviewer name and note",
+                     "Pass --reviewer NAME and --note TEXT with real content.")
+    role = str(getattr(args, "role", None) or "reviewer")
+    approve = bool(getattr(args, "approve", False))
+
+    try:
+        records = tdd.load_records(state_dir, str(contract["id"]), key)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+    red = _latest(records, "red", sha)
+    green = _latest(records, "green", sha)
+    if green is None:
+        raise _error("green_failed", "no GREEN evidence for this contract",
+                     "Run `hermes bundlebees verify` on the implementation revision first.")
+    try:
+        tdd.check_green(contract, sha, red, green)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+
+    refactor = None
+    if "refactor" in [str(phase) for phase in contract.get("evidence_required") or []]:
+        refactor = _latest(records, "refactor", sha)
+        if refactor is None:
+            raise _error(
+                "refactor_failed",
+                "no REFACTOR evidence for this contract",
+                "Record it with `hermes bundlebees tdd refactor --rev <sha>` or "
+                "`--none --note <why>`.",
+            )
+        try:
+            tdd.check_refactor(contract, sha, red, green, refactor)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+
+    target = refactor or green
+    record = tdd.make_record(
+        contract, sha, phase="review", revision=str(target["revision"]),
+        test_fingerprints=target["test_fingerprints"], command=["review"],
+        result=None, produced_by={"role": role, "name": scrub(reviewer)},
+        test_first=green["test_first"], notes=scrub(note),
+        review_outcome="passed" if approve else "failed",
+    )
+    try:
+        tdd.write_record(state_dir, record, key)
+    except tdd.TddError as exc:
+        raise _as_error(exc) from exc
+    if not approve:
+        raise _error("review_failed", "the reviewer rejected the change",
+                     "Address the review note and record a new GREEN/REFACTOR, then review again.")
+    print("bundlebees tdd review")
+    print(f"contract: {scrub(str(contract['id']))}")
+    _print_hex("revision", str(target["revision"]))
+    print("review: valid")
+    return 0
+
+
 def cmd_tdd(ctx: Any, args: Any) -> int:
     cli = _cli()
     data = load_contract_file(getattr(args, "path", None))
@@ -352,8 +425,10 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
         return 0 if report["accepted"] else 1
     if sub == "refactor":
         return _cmd_refactor(ctx, args, contract, sha, state_dir, key)
+    if sub == "review":
+        return _cmd_review(ctx, args, contract, sha, state_dir, key)
     if sub != "red":
-        raise _error("invalid_argument", "unknown tdd command", "Use: tdd red|report|refactor.")
+        raise _error("invalid_argument", "unknown tdd command", "Use: tdd red|report|refactor|review.")
     if not _test_first(contract):
         raise _error("red_invalid", "the contract says tdd.test_first: false; there is no RED to record",
                      "Record GREEN through verify; the report will say the tests came after the code.")
@@ -493,6 +568,19 @@ def integrate_preflight(state_dir: Path, attempt_ids: list[str]) -> list[dict[st
             tdd.check_green(contract, sha, red, green)
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
+        if "refactor" in [str(phase) for phase in contract.get("evidence_required") or []]:
+            refactor = _latest(records, "refactor", sha)
+            if refactor is None:
+                raise _error(
+                    "refactor_failed",
+                    f"no REFACTOR evidence for contract {contract['id']} ({attempt_id})",
+                    "Record it with `hermes bundlebees tdd refactor --rev <sha>` or "
+                    "`--none --note <why>`.",
+                )
+            try:
+                tdd.check_refactor(contract, sha, red, green, refactor)
+            except tdd.TddError as exc:
+                raise _as_error(exc) from exc
         out.append({"attempt_id": attempt_id, "contract": contract, "sha": sha, "key": key,
                     "tests": _test_files(contract)})
     return out
