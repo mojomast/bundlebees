@@ -43,7 +43,7 @@
           "then": {"type": "string", "minLength": 1},
           "statement": {"type": "string", "minLength": 1},
           "verification": {"enum": ["test", "integration", "review", "manual"]},
-          "tests": {"type": "array", "items": {"type": "string", "pattern": "^[^:\\s]+(::[A-Za-z0-9_.\\[\\]-]+)*$"}},
+          "tests": {"type": "array", "items": {"type": "string", "pattern": "^[^:\\s]+(::[^\\n]+)?$"}},
           "regression": {"type": "boolean", "description": "Existing behavior that must keep passing; its tests are expected to pass at baseline, so they are excluded from the RED set."}
         },
         "anyOf": [
