@@ -6,6 +6,11 @@ It validates the artifact version, the attempt identity, the patch sha256 and
 the coordinator's source_rev. It maps Orbit's explicit states to stable
 bundlebees codes. Raw patches never reach model-visible tool responses or
 verify output. Offline: a fake Orbit HTTP server and a temporary git repo.
+
+Amended by contract BA2-artifact-capability (review findings on bundlebees #7): ownership is the per-attempt
+``artifact_capability`` Orbit returns once from ``create``. bundlebees stores it privately (0600) under
+``<state>/artifact-caps/<attempt_id>.cap`` and sends it on ``op: artifact``. The coordinator name is an
+optional label with no default.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from bundlebees_plugin.client import ClientError, OrbitAdapterClient
 from tests.test_cli_acdd import (BRANCH, GOOD_PATCH, _ctx, _frozen, _invoke, _lease, _records, _repo, _verify, _write)
 
 TOKEN = "orbit-test-token"
+CAP = "c" * 43  # what the fake Orbit returns as the attempt capability
 ATTEMPT = "att_0123456789abcdef"
 SRC = "a" * 40
 
@@ -63,7 +69,7 @@ class Orbit:
                 elif body.get("op") == "artifact":
                     status, payload = orbit.responses.get(body.get("attempt_id"), (404, {"error": "unknown", "code": "unknown_attempt"}))
                 elif body.get("op") == "create":
-                    status, payload = 201, {"attempt_id": ATTEMPT, "state": "queued"}
+                    status, payload = 201, {"attempt_id": ATTEMPT, "state": "queued", "artifact_capability": CAP}
                 else:
                     status, payload = 400, {"error": "unsupported op in fake"}
                 data = json.dumps(payload).encode()
@@ -73,6 +79,8 @@ class Orbit:
                 self.end_headers()
                 self.wfile.write(data)
 
+        import tempfile
+        self.capdir = Path(tempfile.mkdtemp(prefix="bb-caps-"))
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -89,7 +97,11 @@ def orbit():
     o.close()
 
 
-def client(o: Orbit, **kw) -> OrbitAdapterClient:
+def client(o: Orbit, seed: bool = True, **kw) -> OrbitAdapterClient:
+    """A client whose capability store already holds the attempt capability (as after create)."""
+    if seed:
+        (o.capdir / f"{ATTEMPT}.cap").write_text(CAP)
+    kw.setdefault("capability_dir", o.capdir)
     return OrbitAdapterClient(o.url, token_provider=lambda: TOKEN, **kw)
 
 
@@ -104,13 +116,41 @@ def test_artifact_returns_the_validated_patch_and_metadata(orbit):
     assert "worker_claims_untrusted" not in art  # worker self-reports are not evidence
     req = orbit.requests[-1]
     assert req["op"] == "artifact" and req["attempt_id"] == ATTEMPT and req["coordinator"] == "bb-coordinator"
+    assert req["capability"] == CAP
 
 
-def test_create_names_the_coordinator_so_orbit_can_check_ownership(orbit):
-    client(orbit, coordinator="bb-coordinator").create({"objective": "x", "project": "p"})
+def test_create_stores_the_capability_privately_and_names_no_default_coordinator(orbit, tmp_path):
+    caps = tmp_path / "caps"
+    out = OrbitAdapterClient(orbit.url, token_provider=lambda: TOKEN, capability_dir=caps).create({"objective": "x", "project": "p"})
+    assert "coordinator" not in orbit.requests[-1]  # no default identity: the name is only a label
+    assert CAP not in json.dumps(out) and "artifact_capability" not in out
+    stored = caps / f"{ATTEMPT}.cap"
+    assert stored.read_text().strip() == CAP
+    assert stored.stat().st_mode & 0o777 == 0o600 and caps.stat().st_mode & 0o777 == 0o700
+    OrbitAdapterClient(orbit.url, token_provider=lambda: TOKEN, capability_dir=caps, coordinator="bb-coordinator").create({"objective": "x"})
     assert orbit.requests[-1]["coordinator"] == "bb-coordinator"
-    client(orbit).create({"objective": "x", "project": "p"})
-    assert orbit.requests[-1]["coordinator"] == "MR.INDIA"  # Orbit's default coordinator identity
+    from bundlebees_plugin import settings
+    assert not settings.DEFAULTS.get("coordinator")
+
+
+def test_artifact_without_a_stored_capability_fails_before_any_request(orbit):
+    orbit.responses[ATTEMPT] = (200, artifact())
+    before = len(orbit.requests)
+    with pytest.raises(ClientError) as exc:
+        client(orbit, seed=False).artifact(ATTEMPT)
+    assert exc.value.code == "capability_missing"
+    assert len(orbit.requests) == before
+
+
+def test_configured_clients_keep_capabilities_in_the_plugin_state_dir(orbit, tmp_path):
+    from bundlebees_plugin.adapters import adapter_from_config
+    from bundlebees_plugin.client import client_from_config
+    state = tmp_path / "state"
+    client_from_config({"orbit_url": orbit.url}, token_provider=lambda: TOKEN, state_dir=state).create({"objective": "x"})
+    assert (state / "artifact-caps" / f"{ATTEMPT}.cap").read_text().strip() == CAP
+    (state / "artifact-caps" / f"{ATTEMPT}.cap").unlink()
+    adapter_from_config({"orbit_url": orbit.url}, token_provider=lambda: TOKEN, state_dir=state).create({"objective": "x"})
+    assert (state / "artifact-caps" / f"{ATTEMPT}.cap").read_text().strip() == CAP
 
 
 @pytest.mark.parametrize("bad", [
@@ -141,6 +181,8 @@ def test_artifact_integrity_failures_are_refused(orbit, bad):
     (502, "artifact_malformed", "artifact_invalid"),
     (413, "artifact_oversized", "response_too_large"),
     (403, "not_owner", "forbidden"),
+    (403, "capability_required", "forbidden"),
+    (409, "revision_missing", "artifact_invalid"),
 ])
 def test_orbit_states_map_to_stable_codes(orbit, status, orbit_code, code):
     orbit.responses[ATTEMPT] = (status, {"error": "x", "code": orbit_code})

@@ -44,7 +44,8 @@ mkdirSync(runtimeRoot, { recursive: true });
 const tokenFile = path.join(runtimeRoot, 'launcher.token'); writeFileSync(tokenFile, launcherToken);
 const route = createLocalWorkersRoute({ runtimeRoot, port: 1, env: {
   ORBIT_LOCAL_WORKERS_URL: `http://127.0.0.1:${launcher.address().port}`, ORBIT_LOCAL_WORKERS_TOKEN_FILE: tokenFile,
-  ORBIT_LOCAL_WORKERS_POLL_MS: '200', ORBIT_LOCAL_WORKERS_MAX: '4' } });
+  ORBIT_LOCAL_WORKERS_POLL_MS: '200', ORBIT_LOCAL_WORKERS_MAX: '4',
+  ...(process.env.ROUNDTRIP_ARTIFACT_MAX_BYTES ? { ORBIT_WORKER_ARTIFACT_MAX_BYTES: process.env.ROUNDTRIP_ARTIFACT_MAX_BYTES } : {}) } });
 const orbit = http.createServer((req, res) => route.handle(req, res));
 await new Promise((r) => orbit.listen(Number(process.env.ROUNDTRIP_ORBIT_PORT || 0), '127.0.0.1', r));
 process.stdout.write(JSON.stringify({ url: `http://127.0.0.1:${orbit.address().port}`, launcher_port: launcher.address().port }) + '\n');
