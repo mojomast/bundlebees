@@ -107,6 +107,13 @@ config_schema:
       Security and negative test paths integrate must also pass. Empty is
       recorded as not run. A configured path that is missing or collects
       no tests fails integration.
+  integrate_base:
+    type: str
+    default: ""
+    description: >-
+      Ref the combined branch is compared with when integration fails, so
+      failures that also happen there are counted as pre-existing, not
+      regressions. Empty uses origin's default branch.
   verify_allow_unsafe_local:
     type: bool
     default: false

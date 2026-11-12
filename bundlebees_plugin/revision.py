@@ -439,6 +439,9 @@ def _clean_record(record: Mapping[str, Any], head: str) -> dict:
             for name in ("regression", "contract", "security")
             if isinstance(raw_suites.get(name), Mapping)
         }
+    raw_failures = (record.get("suite") or {}).get("failures") if isinstance(record.get("suite"), Mapping) else None
+    if isinstance(suite, dict) and isinstance(raw_failures, Mapping):
+        suite["failures"] = {k: (list(v) if isinstance(v, list) else bool(v)) for k, v in raw_failures.items()}
     return {
         "wave_id": record["wave_id"],
         "accepted": bool(record["accepted"]),

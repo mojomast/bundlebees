@@ -1524,6 +1524,85 @@ def _categorize(plan: Mapping[str, Mapping[str, Any]], suite: Mapping[str, Any])
     return out, blocking
 
 
+_ENVIRONMENTAL_RE = re.compile(
+    r"(?i)(temporary failure in name resolution|name or service not known|nodename nor servname|"
+    r"NameResolutionError|gaierror|could not be resolved|network is unreachable|"
+    r"connection refused|ConnectionError|ConnectTimeout|no route to host|"
+    r"plugin directory must be named)"
+)
+
+
+def _failed_ids(suite: Mapping[str, Any]) -> list[str]:
+    return sorted({
+        str(c["id"]) for c in suite.get("cases") or []
+        if isinstance(c, Mapping) and isinstance(c.get("id"), str) and c.get("outcome") in ("failed", "error")
+    })
+
+
+def _is_environmental(case: Mapping[str, Any]) -> bool:
+    text = f"{case.get('error_type') or ''} {case.get('message') or ''}"
+    return bool(_ENVIRONMENTAL_RE.search(text))
+
+
+def _classify_failures(
+    suite: Mapping[str, Any], base_failed: set[str] | None
+) -> dict[str, list[str]]:
+    """Split failing test ids into regressions, environmental and pre-existing (also red on base)."""
+    cases = {str(c["id"]): c for c in suite.get("cases") or [] if isinstance(c, Mapping) and isinstance(c.get("id"), str)}
+    out: dict[str, list[str]] = {"failed_tests": [], "environmental_tests": [], "pre_existing_tests": []}
+    for test_id in _failed_ids(suite):
+        if _is_environmental(cases.get(test_id) or {}):
+            out["environmental_tests"].append(test_id)
+        elif base_failed is not None and test_id in base_failed:
+            out["pre_existing_tests"].append(test_id)
+        else:
+            out["failed_tests"].append(test_id)
+    for key in out:
+        out[key] = out[key][:200]
+    return out
+
+
+def _base_failures(workdir: Path, base: str, targets: list[str], config: Mapping[str, Any]) -> set[str] | None:
+    """Failing test ids when the same targets run on the base revision (None if it cannot run)."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="bundlebees-base-") as tmp:
+            repo = acdd_cli._checkout(workdir, base, Path(tmp))
+            present = [t for t in targets if (repo / t.split("::", 1)[0]).exists()]
+            if not present:
+                return set()
+            return set(_failed_ids(_run_sandboxed(repo, present, config)))
+    except Exception:  # noqa: BLE001 - no base comparison: every failure stays a regression
+        return None
+
+
+def _integration_base(workdir: Path, config: Mapping[str, Any], state_dir: Path, attempt_ids: list[str]) -> str | None:
+    """The revision the combined branch is compared with for pre-existing failures.
+
+    ``integrate_base`` (a ref) if set, else the remote default branch (origin/HEAD, origin/main,
+    origin/master), else the first attempt's lease source_rev.
+    """
+    refs = [str(config.get("integrate_base") or "").strip()] if config.get("integrate_base") else []
+    refs += ["origin/HEAD", "origin/main", "origin/master"]
+    for ref in refs:
+        if not ref or ref.startswith("-"):
+            continue
+        proc = subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref + "^{commit}"], cwd=workdir,
+                              capture_output=True, text=True, env=child_env())
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", sha):
+            return sha
+    for attempt_id in attempt_ids:
+        try:
+            rev = str(leases.load_lease(state_dir, attempt_id).get("source_rev") or "")
+        except leases.LeaseError:
+            continue
+        if rev:
+            return rev
+    return None
+
+
 def _cmd_integrate(ctx: Any, args: Any) -> int:
     state_dir = _state_dir(ctx, args)
     config = _config(ctx)
@@ -1550,10 +1629,17 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
                 continue
             run_targets = [t for t in run_targets if not _case_in(t, target)] + [target]
 
+    base_rev = _integration_base(workdir, config, state_dir, attempt_ids)
+
     def run_suite(wd: Path) -> dict[str, Any]:
         evidence = dict(_run_sandboxed(wd, run_targets, config))
         evidence["targets"] = list(run_targets)
         evidence["suites"], evidence["blocking"] = _categorize(plan, evidence)
+        failing = _failed_ids(evidence)
+        # Only when something fails: re-run the same targets on the base to find pre-existing failures.
+        base_failed = _base_failures(wd, base_rev, run_targets, config) if failing and base_rev else None
+        evidence["failures"] = _classify_failures(evidence, base_failed)
+        evidence["failures"]["base_compared"] = base_failed is not None
         return evidence
 
     try:
@@ -1567,12 +1653,23 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
     except revision.RevisionError as exc:
         raise _as_cli_error(exc) from exc
     accepted = bool(record.get("accepted"))
+    suite = record.get("suite") if isinstance(record.get("suite"), Mapping) else {}
+    failures = suite.get("failures") if isinstance(suite.get("failures"), Mapping) else None
+    metric_fields: dict[str, Any] = {"regressions": int(record.get("regressions") or 0)}
+    if failures is not None:
+        metric_fields = {
+            "regressions": len(failures.get("failed_tests") or []),
+            "failed_tests": list(failures.get("failed_tests") or []),
+            "environmental_tests": list(failures.get("environmental_tests") or []),
+            "pre_existing_tests": list(failures.get("pre_existing_tests") or []),
+        }
+    elif record.get("problems") and not suite:
+        metric_fields = {"regressions": 0, "failed_tests": [], "environmental_tests": [], "pre_existing_tests": []}
     _metric(
         state_dir, str(run_id), "integrate",
         wave_id=record.get("wave_id"), ok=accepted, attempts=list(record.get("attempts") or []),
-        regressions=int(record.get("regressions") or 0), sha=record.get("head_sha"),
+        sha=record.get("head_sha"), **metric_fields,
     )
-    suite = record.get("suite") if isinstance(record.get("suite"), Mapping) else {}
     integration = acdd_cli.record_integration(state_dir, contract_items, workdir, suite, record.get("head_sha"))
     _print("bundlebees integrate")
     _print(f"wave: {record.get('wave_id')}")
@@ -1586,6 +1683,13 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
     for name, info in (suite.get("suites") or {}).items():
         reason = f" ({info.get('reason')})" if info.get("reason") and info.get("status") != "passed" else ""
         _print(f"suite {name}: {info.get('status')}{reason}, {info.get('tests', 0)} tests")
+    if failures is not None:
+        _print(
+            f"failures: regressions: {len(failures.get('failed_tests') or [])}, "
+            f"environmental: {len(failures.get('environmental_tests') or [])}, "
+            f"pre_existing: {len(failures.get('pre_existing_tests') or [])}"
+            + ("" if failures.get("base_compared") or not _failed_ids(suite) else " (base not compared)")
+        )
     for contract_id, status in integration:
         _print(f"contract: {contract_id}")
         _print(f"integration: {'not run' if status == 'unrun' else status}")

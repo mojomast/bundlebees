@@ -444,6 +444,17 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
             fingerprints = tdd.fingerprint_files(repo, tests)
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
+    collected = {str(c.get("id")) for c in evidence.get("cases") or [] if isinstance(c, Mapping)}
+    unknown = sorted({
+        str(ref) for ac in contract.get("acceptance_criteria") or [] if isinstance(ac, Mapping)
+        for ref in ac.get("tests") or []
+        if "::" in str(ref) and str(ref) not in collected
+        and not any(cid.startswith(str(ref) + "[") or cid.startswith(str(ref) + "::") for cid in collected)
+    })
+    if unknown:
+        raise _error("test_ref_unknown",
+                     "acceptance criteria name tests pytest did not collect: " + ", ".join(unknown[:20]),
+                     "Fix the test ids in the contract (re-freeze it) or add the tests on source_rev.")
     record = tdd.make_record(
         contract, sha, phase="red", revision=str(contract["source_rev"]),
         test_fingerprints=fingerprints, command=["pytest", *tests], result=_result(evidence),
@@ -596,10 +607,13 @@ def record_integration(state_dir: Path, items: list[dict[str, Any]], workdir: Pa
         if revision is None:
             statuses.append((str(contract["id"]), "unrun"))
             continue
-        try:
-            fingerprints = tdd.fingerprint_files(workdir, item["tests"])
-        except tdd.TddError:
-            fingerprints = {}
+        fingerprints: dict[str, str] = {}
+        missing: list[str] = []
+        for test_file in item["tests"]:  # every approved test file must be in the evidence
+            try:
+                fingerprints.update(tdd.fingerprint_files(workdir, [test_file]))
+            except tdd.TddError:
+                missing.append(str(test_file))
         targets = [str(t) for t in (suite or {}).get("targets") or []]
         record = tdd.make_record(
             contract, sha, phase="integration", revision=revision, test_fingerprints=fingerprints,
@@ -613,6 +627,10 @@ def record_integration(state_dir: Path, items: list[dict[str, Any]], workdir: Pa
             # Per-category status (regression / contract / security), signed with the record.
             record["suites"] = {str(k): dict(v) for k, v in suites.items() if isinstance(v, Mapping)}
             if (suite or {}).get("blocking") and record.get("classification") == "passed":
+                record["classification"] = "failed"
+        if missing:
+            record["missing_test_files"] = sorted(missing)
+            if record.get("classification") == "passed":
                 record["classification"] = "failed"
         try:
             tdd.write_record(state_dir, record, item["key"])
