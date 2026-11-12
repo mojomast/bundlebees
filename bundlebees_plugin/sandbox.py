@@ -92,6 +92,19 @@ _FIX_WEAK_REFUSED = (
 )
 _XML_DANGER_RE = re.compile(r"<!\s*(DOCTYPE|ENTITY)", re.IGNORECASE)
 _EVIDENCE_NAME = ".bundlebees-evidence"
+_LOOPBACK_V4_RE = re.compile(r"(?<![\d.])127\.0\.0\.1(?![\d.])")
+_LOOPBACK_V6_RE = re.compile(r"(?<![\w:])::1(?![\w:])")
+_LOOPBACK_MARKERS = (
+    (_LOOPBACK_V4_RE, "127.0.0.1", "__BUNDLEBEES_LOOPBACK_V4__"),
+    (_LOOPBACK_V6_RE, "::1", "__BUNDLEBEES_LOOPBACK_V6__"),
+)
+_TIKTOKEN_CACHE_INSIDE = "/opt/bundlebees/tiktoken-cache"
+_ETC_HOSTS = "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"
+_ETC_NSSWITCH = "hosts: files\n"
+_FIX_CACHE_DIR = (
+    "Set sandbox_tiktoken_cache to an existing directory outside your home "
+    "directory (for example a shared, read-only encoding cache)."
+)
 
 Which = Callable[[str], str | None]
 Probe = Callable[[str], bool]
@@ -102,9 +115,12 @@ class SandboxUnavailable(Exception):
 
     code = "sandbox_unavailable"
 
-    def __init__(self, error: str, fix: str = _FIX_UNAVAILABLE) -> None:
+    def __init__(
+        self, error: str, fix: str = _FIX_UNAVAILABLE, code: str | None = None
+    ) -> None:
         self.error = str(scrub(str(error)))
         self.fix = str(scrub(str(fix)))
+        self.code = code or type(self).code
         super().__init__(self.error)
 
 
@@ -268,7 +284,37 @@ def _python_prefixes() -> list[str]:
     return prefixes
 
 
-def _bwrap_command(copy_dir: Path, home: Path, argv: list[str]) -> list[str]:
+def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
+    """Resolve an operator tiktoken cache, refusing unsafe locations."""
+    if value is None:
+        return None
+    raw = os.fspath(value)
+    if not str(raw).strip():
+        return None
+    cache = Path(raw).expanduser().resolve()
+    real_home = Path.home().resolve()
+    if cache == Path("/") or cache == real_home or real_home in cache.parents:
+        raise SandboxUnavailable(
+            "sandbox_tiktoken_cache must be outside the coordinator home directory",
+            _FIX_CACHE_DIR,
+            code="unsafe_cache_dir",
+        )
+    if not cache.is_dir():
+        raise SandboxUnavailable(
+            "sandbox_tiktoken_cache is not an existing directory",
+            _FIX_CACHE_DIR,
+            code="unsafe_cache_dir",
+        )
+    return cache
+
+
+def _bwrap_command(
+    copy_dir: Path,
+    home: Path,
+    argv: list[str],
+    *,
+    extra_ro: Sequence[tuple[str, str]] = (),
+) -> list[str]:
     cmd = [
         "bwrap",
         "--unshare-all",
@@ -315,6 +361,9 @@ def _bwrap_command(copy_dir: Path, home: Path, argv: list[str]) -> list[str]:
         else:
             cmd.extend(["--ro-bind-try", path, path])
 
+    for source, target in extra_ro:
+        cmd.extend(["--ro-bind", str(source), str(target)])
+
     cmd.extend(
         [
             "--bind",
@@ -336,17 +385,22 @@ def build_command(
     copy_dir: Path,
     home: Path,
     argv: list[str],
+    *,
+    extra_ro: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
     """Return the wrapper argv for *backend* around *argv*.
 
     ``copy_dir`` is the only writable worktree visible to the child; ``home`` is
     a throwaway home. The real ``/`` and the real home are never bound. The
     ``unshare`` backend is namespace-only: the filesystem is still the host's.
+    ``extra_ro`` adds read-only bind mounts ``(source, target)`` for bwrap.
     """
     if backend not in BACKENDS:
         raise ValueError(f"unknown sandbox backend: {backend!r}")
     if backend == "bwrap":
-        return _bwrap_command(Path(copy_dir), Path(home), list(argv))
+        return _bwrap_command(
+            Path(copy_dir), Path(home), list(argv), extra_ro=extra_ro
+        )
     if backend == "firejail":
         return [
             "firejail",
@@ -409,8 +463,14 @@ def _as_text(value: object) -> str:
 
 
 def _output_tail(stdout: object, stderr: object) -> str:
-    text = (_as_text(stdout) + _as_text(stderr)).replace("\x00", "")
-    return str(scrub(text[-_MAX_OUTPUT_TAIL:])).strip()[-_MAX_OUTPUT_TAIL:]
+    text = (_as_text(stdout) + _as_text(stderr)).replace("\x00", "")[-_MAX_OUTPUT_TAIL:]
+    protected = text
+    for pattern, _literal, marker in _LOOPBACK_MARKERS:
+        protected = pattern.sub(marker, protected)
+    cleaned = str(scrub(protected))
+    for _pattern, literal, marker in _LOOPBACK_MARKERS:
+        cleaned = cleaned.replace(marker, literal)
+    return cleaned.strip()[-_MAX_OUTPUT_TAIL:]
 
 
 def _as_int(value: str | None) -> int:
@@ -483,6 +543,7 @@ def run_in_sandbox(
     timeout: int = 900,
     which: Which = shutil.which,
     probe: Probe | None = None,
+    tiktoken_cache: Path | str | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
@@ -490,7 +551,10 @@ def run_in_sandbox(
     copy is always deleted, even on timeout or an unavailable backend.
     ``allow_weak`` (or ``BUNDLEBEES_ALLOW_WEAK_UNSHARE=1``) is required before an
     explicitly requested ``unshare`` backend runs; ``auto`` never picks it.
+    ``tiktoken_cache`` names an operator-owned cache bound read-only and exposed
+    as ``TIKTOKEN_CACHE_DIR``; it must be an existing directory outside home.
     """
+    cache = _resolve_tiktoken_cache(tiktoken_cache)
     weak_ok = weak_override_enabled(allow_weak)
     source = Path(workdir)
     root = Path(tempfile.mkdtemp(prefix="bundlebees-verify-"))
@@ -519,17 +583,35 @@ def run_in_sandbox(
         evidence_host = copy_dir / _EVIDENCE_NAME
         _fresh_dir(evidence_host)
 
+        extra_ro: list[tuple[str, str]] = []
         if chosen == "bwrap":
             evidence_inside = f"/work/{_EVIDENCE_NAME}"
-            isolated_home = home / "tmp"
-            isolated_home.mkdir(parents=True, exist_ok=True)
-            env = sandbox_env(Path("/home/sandbox"), Path("/home/sandbox/tmp"))
+            (home / "home").mkdir(parents=True, exist_ok=True)
+            (home / "tmp").mkdir(parents=True, exist_ok=True)
+            env = sandbox_env(
+                Path("/home/sandbox/home"), Path("/home/sandbox/tmp")
+            )
+            hosts_file = root / "etc-hosts"
+            hosts_file.write_text(_ETC_HOSTS, encoding="utf-8")
+            nsswitch_file = root / "etc-nsswitch"
+            nsswitch_file.write_text(_ETC_NSSWITCH, encoding="utf-8")
+            extra_ro = [
+                (str(hosts_file), "/etc/hosts"),
+                (str(nsswitch_file), "/etc/nsswitch.conf"),
+            ]
+            if cache is not None:
+                extra_ro.append((str(cache), _TIKTOKEN_CACHE_INSIDE))
+                env["TIKTOKEN_CACHE_DIR"] = _TIKTOKEN_CACHE_INSIDE
         elif chosen == "firejail":
             evidence_inside = str(evidence_host)
             env = sandbox_env(copy_dir, Path("/tmp"))
+            if cache is not None:
+                env["TIKTOKEN_CACHE_DIR"] = str(cache)
         else:
             evidence_inside = str(evidence_host)
             env = sandbox_env(home, tmp)
+            if cache is not None:
+                env["TIKTOKEN_CACHE_DIR"] = str(cache)
 
         command_argv = _replace_evidence(argv, evidence_inside)
         if chosen is None:
@@ -537,7 +619,9 @@ def run_in_sandbox(
             command = command_argv
         else:
             label = chosen
-            command = build_command(chosen, copy_dir, home, command_argv)
+            command = build_command(
+                chosen, copy_dir, home, command_argv, extra_ro=extra_ro
+            )
 
         started = time.monotonic()
         timed_out = False

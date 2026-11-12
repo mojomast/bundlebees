@@ -47,6 +47,45 @@ jobs:
       - name: Measure tool-schema tokens
         run: python scripts/measure_schemas.py
 
+  orbit-roundtrip:
+    name: orbit round trip (real Orbit API, required)
+    # The real cross-repo round trip: the actual Orbit /api/local-workers route from a pinned
+    # mojomast/orbitdesktop commit, bundlebees dispatch, capability-bound artifact retrieval,
+    # impersonation and oversized-ingestion refusals, and a signed GREEN in bubblewrap.
+    # BUNDLEBEES_REQUIRE_ROUNDTRIP=1 turns a missing prerequisite into a failure, not a skip.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ORBIT_REF: d7cf47afd8c0dec34aa42e2a40b408ad8128f3ca  # orbitdesktop feat/worker-artifact-api (OA2)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mojomast/orbitdesktop
+          ref: ${{ env.ORBIT_REF }}
+          path: .orbit-src
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: Install test dependencies
+        run: python -m pip install "pytest>=8,<9" "pyyaml>=6,<7"
+      - name: Real Orbit round trip
+        env:
+          BUNDLEBEES_REQUIRE_ROUNDTRIP: "1"
+        run: |
+          ORBIT_SRC="$GITHUB_WORKSPACE/.orbit-src" python -m pytest -rA -p no:cacheprovider \
+            tests/test_orbit_roundtrip.py tests/test_orbit_artifact.py
+
   plugin-doctor:
     name: hermes plugins doctor (offline)
     runs-on: ubuntu-24.04
