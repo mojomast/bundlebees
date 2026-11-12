@@ -675,8 +675,19 @@ def _private_dir(path: Path) -> Path:
     except TddError:
         raise
     except OSError as exc:
-        raise TddError("evidence_invalid", f"could not create evidence directory: {exc}") from exc
+        detail = exc.strerror or type(exc).__name__
+        raise TddError(
+            "evidence_invalid", f"could not create evidence directory: {detail}"
+        ) from exc
     return path
+
+
+def _report_failure(contract_id: str, exc: BaseException) -> TddError:
+    detail = getattr(exc, "strerror", None) or type(exc).__name__
+    return TddError(
+        "evidence_invalid",
+        f"could not write reports/{contract_id}.json: {detail}",
+    )
 
 
 def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], key: bytes) -> Path:
@@ -749,18 +760,24 @@ def write_report(state_dir: os.PathLike[str] | str, signed: Mapping[str, Any]) -
     contract_id = str(signed.get("contract_id") or "")
     _check_id(contract_id)
     root = Path(state_dir)
-    reports = _private_dir(root / "reports")
+    try:
+        reports = _private_dir(root / "reports")
+    except (TddError, OSError) as exc:
+        raise _report_failure(contract_id, exc) from exc
     try:
         target = Path(contain_path(f"{contract_id}.json", str(reports)))
     except ValueError as exc:
-        raise TddError("evidence_invalid", f"report path is unsafe: {exc}") from exc
+        raise TddError(
+            "evidence_invalid",
+            f"report path is unsafe for reports/{contract_id}.json: {exc}",
+        ) from exc
     payload = json.dumps(signed, indent=2, sort_keys=True)
     tmp = reports / f".{contract_id}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(tmp, flags, 0o600)
     except OSError as exc:
-        raise TddError("evidence_invalid", f"could not create the report: {exc}") from exc
+        raise _report_failure(contract_id, exc) from exc
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(payload)
@@ -773,7 +790,7 @@ def write_report(state_dir: os.PathLike[str] | str, signed: Mapping[str, Any]) -
             os.unlink(tmp)
         except OSError:
             pass
-        raise TddError("evidence_invalid", f"could not write the report: {exc}") from exc
+        raise _report_failure(contract_id, exc) from exc
     return target
 
 
