@@ -855,17 +855,47 @@ def _apply_patch(workdir: Path, patch: str, assigned: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _secret_scan(workdir: Path, files: Iterable[str]) -> list[str]:
+def _added_lines(patch: str) -> dict[str, str]:
+    """Lines each file gains in a unified diff, keyed by its new path."""
+    added: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip().split("\t", 1)[0]
+            current = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
+            if current is not None:
+                added.setdefault(current, [])
+        elif line.startswith("diff --git "):
+            current = None
+        elif current is not None and line.startswith("+"):
+            added[current].append(line[1:])
+    return {path: "\n".join(lines) for path, lines in added.items()}
+
+
+def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) -> list[str]:
+    """Flag files whose patch-added lines look secret-like.
+
+    With a patch, only the lines it adds are scanned: content already on source_rev is
+    not the worker's output (and bundlebees' own sources mention tokens by design). A
+    file the diff does not describe line by line is scanned whole (fail closed).
+    """
     flagged: list[str] = []
+    added = _added_lines(patch) if patch else {}
     for rel in files:
-        path = Path(contain_path(rel, str(workdir)))
-        try:
-            if path.stat().st_size > _MAX_SCAN_BYTES:
+        if rel in added:
+            text = added[rel]
+            if len(text.encode("utf-8", errors="replace")) > _MAX_SCAN_BYTES:
                 flagged.append(rel)
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        else:
+            path = Path(contain_path(rel, str(workdir)))
+            try:
+                if path.stat().st_size > _MAX_SCAN_BYTES:
+                    flagged.append(rel)
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
         if _PRIVATE_KEY_RE.search(text):
             flagged.append(rel)
             continue
@@ -1229,7 +1259,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         changed = _apply_patch(workdir, patch, files)
         files = changed
 
-        flagged = _secret_scan(workdir, files)
+        flagged = _secret_scan(workdir, files, patch)
         if flagged:
             _reset_patch(workdir)
             raise CliError(
