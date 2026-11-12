@@ -303,11 +303,15 @@ def plugin_state_dir() -> Path | None:
         return None
 
 
-def _state_dir(ctx: Any, args: Any) -> Path:
-    explicit = getattr(args, "state_dir", None)
+def _state_dir_or_none(args: Any = None) -> Path | None:
+    explicit = getattr(args, "state_dir", None) if args is not None else None
     if explicit:
         return Path(str(explicit)).expanduser().resolve()
-    found = plugin_state_dir()
+    return plugin_state_dir()
+
+
+def _state_dir(ctx: Any, args: Any) -> Path:
+    found = _state_dir_or_none(args)
     if found is not None:
         return found
     raise CliError(
@@ -317,12 +321,14 @@ def _state_dir(ctx: Any, args: Any) -> Path:
     )
 
 
-def _client_for(ctx: Any) -> Any:
+def _client_for(ctx: Any, args: Any = None) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
     try:
-        return adapters.adapter_from_config(_config(ctx))
+        return adapters.adapter_from_config(
+            _config(ctx), state_dir=_state_dir_or_none(args)
+        )
     except Exception as exc:  # noqa: BLE001 - map client configuration errors
         code = getattr(exc, "code", "not_configured")
         fix = getattr(
@@ -1252,7 +1258,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         source_rev = str(record.get("source_rev") or "")
         evidence["source_rev"] = source_rev
 
-        client = _client_for(ctx)
+        client = _client_for(ctx, args)
         if callable(getattr(client, "artifact", None)):
             # Supported path: Orbit's coordinator-only artifact API, never launcher files.
             result, artifact_evidence = _fetch_artifact(client, attempt_id, state_dir, source_rev)
@@ -1668,7 +1674,7 @@ def _cmd_doctor(ctx: Any, args: Any) -> int:
     client = getattr(ctx, "bundlebees_client", None)
     if client is None:
         try:
-            client = _client_for(ctx)
+            client = _client_for(ctx, args)
         except CliError:
             client = None
     health = getattr(client, "health", None) if client is not None else None

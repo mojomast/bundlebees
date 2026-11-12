@@ -68,10 +68,9 @@ config_schema:
       rejected. The pane never displays the URL.
   coordinator:
     type: str
-    default: "MR.INDIA"
+    default: ""
     description: >-
-      Coordinator name sent to Orbit at dispatch. Orbit returns a worker's
-      patch through its artifact API only to this coordinator.
+      Optional label sent to Orbit; ownership is the per-attempt capability.
   worktree:
     type: str
     default: ""

@@ -14,17 +14,21 @@ from __future__ import annotations
 import http.client
 import hashlib
 import json
+import os
 import re
 import socket
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .security import (
     UnsafeURLError,
     config_flag,
+    contain_path,
     is_public_git_url,
     resolve_pinned_endpoint,
     scrub,
@@ -712,11 +716,12 @@ class LauncherClient(_BaseClient):
 
 
 ARTIFACT_VERSION = "orbit.worker-artifact/1"
-DEFAULT_COORDINATOR = "MR.INDIA"  # Orbit's default coordinator identity
 # Orbit's own artifact cap is 8 MiB of patch; allow JSON-escaping overhead.
 MAX_ARTIFACT_BYTES = 24 * 1_048_576
 _HEX40_64 = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+_CAPABILITY_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
+_COORDINATOR_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 # Orbit artifact error codes -> stable bundlebees codes and fixes.
 _ARTIFACT_CODES: dict[str, tuple[str, str]] = {
@@ -731,8 +736,10 @@ _ARTIFACT_CODES: dict[str, tuple[str, str]] = {
     "artifact_unsafe": ("artifact_invalid", "Orbit refused an unsafe result file; reject this attempt."),
     "artifact_malformed": ("artifact_invalid", "The worker result is malformed; reject this attempt."),
     "artifact_oversized": ("response_too_large", "The patch is over Orbit's artifact limit; split the brief."),
-    "not_owner": ("forbidden", "Only the coordinator that dispatched this attempt can read its patch."),
+    "revision_missing": ("artifact_invalid", "Orbit has no source revision for this attempt; reject it and re-dispatch."),
+    "not_owner": ("forbidden", "Only the coordinator holding this attempt's capability can read its patch."),
     "coordinator_required": ("forbidden", "Set the coordinator name in the bundlebees settings."),
+    "capability_required": ("forbidden", "Orbit needs the capability from dispatch; re-dispatch from this coordinator."),
 }
 
 
@@ -829,26 +836,95 @@ def validate_artifact(data: Any, attempt_id: str) -> dict[str, Any]:
 class OrbitAdapterClient(_BaseClient):
     """Loopback adapter using ``POST /api/local-workers`` with an ``op`` field."""
 
-    def __init__(self, base_url: str, *, coordinator: str | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        coordinator: str | None = None,
+        capability_dir: Path | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(base_url, **kwargs)
-        name = str(coordinator or DEFAULT_COORDINATOR).strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+        name = str(coordinator or "").strip()
+        if name and not _COORDINATOR_RE.fullmatch(name):
             raise ClientError(
                 "coordinator name is not allowed",
                 "invalid_argument",
                 "Use letters, digits, dot, dash or underscore (max 64) for the coordinator setting.",
             )
-        self._coordinator = name
+        self._coordinator = name or None
+        self._capability_dir = Path(capability_dir) if capability_dir is not None else None
+        self._capabilities: dict[str, str] = {}
+
+    def _store_capability(self, attempt_id: str, capability: str) -> None:
+        """Store the per-attempt capability privately; never expose its value."""
+        if self._capability_dir is None:
+            self._capabilities[attempt_id] = capability
+            return
+        directory = self._capability_dir
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        try:
+            target = Path(contain_path(f"{attempt_id}.cap", str(directory)))
+            tmp = Path(
+                contain_path(
+                    f"{attempt_id}.cap.{os.getpid()}.{uuid.uuid4().hex}.tmp",
+                    str(directory),
+                )
+            )
+        except ValueError:
+            return
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(capability)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp, target)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
+
+    def _load_capability(self, attempt_id: str) -> str:
+        missing = ClientError(
+            "no artifact capability is stored for this attempt",
+            "capability_missing",
+            "Verify on the coordinator that dispatched it, or re-dispatch the brief.",
+            status=403,
+        )
+        if self._capability_dir is None:
+            capability = self._capabilities.get(str(attempt_id), "").strip()
+        else:
+            try:
+                path = Path(contain_path(f"{attempt_id}.cap", str(self._capability_dir)))
+                capability = path.read_text(encoding="utf-8").strip()
+            except (OSError, ValueError):
+                capability = ""
+        if not capability:
+            raise missing
+        return capability
 
     def artifact(self, attempt_id: str) -> dict[str, Any]:
-        """Fetch a finished attempt's patch through Orbit's coordinator-only artifact op.
+        """Fetch a finished attempt's patch through Orbit's capability-gated artifact op.
 
         Verifier-only: the result carries the raw patch and must never reach a tool response.
         """
+        capability = self._load_capability(attempt_id)
+        payload: dict[str, Any] = {"attempt_id": attempt_id, "capability": capability}
+        if self._coordinator:
+            payload["coordinator"] = self._coordinator
         saved = self._max_bytes
         self._max_bytes = max(saved, MAX_ARTIFACT_BYTES)
         try:
-            data = self._op("artifact", attempt_id=attempt_id, coordinator=self._coordinator)
+            data = self._op("artifact", **payload)
         except ClientError as exc:
             mapped = _ARTIFACT_CODES.get(exc.upstream_code or "")
             if mapped:
@@ -914,7 +990,9 @@ class OrbitAdapterClient(_BaseClient):
         model: str | None = None,
         kanban_task_id: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"brief": dict(brief), "coordinator": self._coordinator}
+        payload: dict[str, Any] = {"brief": dict(brief)}
+        if self._coordinator:
+            payload["coordinator"] = self._coordinator
         if model:
             payload["model"] = model
         if kanban_task_id:
@@ -930,7 +1008,17 @@ class OrbitAdapterClient(_BaseClient):
                     status=403,
                 ) from exc
             raise
-        return public_attempt(_unwrap_attempt(data))
+        attempt = _unwrap_attempt(data)
+        capability = data.get("artifact_capability") if isinstance(data, Mapping) else None
+        attempt_id = attempt.get("attempt_id") or attempt.get("id")
+        if (
+            isinstance(capability, str)
+            and _CAPABILITY_RE.fullmatch(capability)
+            and attempt_id is not None
+            and str(attempt_id)
+        ):
+            self._store_capability(str(attempt_id), capability)
+        return public_attempt(attempt)
 
     def cancel(self, attempt_id: str) -> dict[str, Any]:
         return public_attempt(_unwrap_attempt(self._op("cancel", attempt_id=attempt_id)))
@@ -993,6 +1081,7 @@ def client_from_config(
     config: Mapping[str, Any] | None = None,
     *,
     token_provider: Callable[[], str | None] | None = None,
+    state_dir: Path | None = None,
 ) -> _BaseClient:
     """Build the preferred client from non-secret settings plus the secret scope."""
     config = config or {}
@@ -1020,6 +1109,7 @@ def client_from_config(
     return OrbitAdapterClient(
         str(url),
         coordinator=config.get("coordinator") or None,
+        capability_dir=Path(state_dir) / "artifact-caps" if state_dir is not None else None,
         token_provider=provider,
         allow_loopback=True,
         allow_private=False,

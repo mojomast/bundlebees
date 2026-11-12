@@ -124,7 +124,7 @@ def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
         return injected
     from .adapters import adapter_from_config
 
-    return adapter_from_config(_ctx_config(ctx))
+    return adapter_from_config(_ctx_config(ctx), state_dir=_state_dir_for(ctx))
 
 
 def _project_key(project: Any) -> str | None:

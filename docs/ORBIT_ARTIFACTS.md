@@ -1,9 +1,16 @@
 # Retrieving worker patches through Orbit (orbit-loopback adapter)
 
-`hermes bundlebees verify` gets a finished worker's patch only through Orbit's coordinator-only artifact API
+`hermes bundlebees verify` gets a finished worker's patch only through Orbit's capability-gated artifact API
 (`POST /api/local-workers {op: "artifact"}`, `orbit.worker-artifact/1`). It never reads hyvv (formerly the
 PC launcher) or Orbit runtime files. The model-visible `bundlebees_attempt get` tool returns only the public result view, which
 never carries a patch, whatever the client returns.
+
+Orbit returns the per-attempt `artifact_capability` once, from `create`. The client stores it privately as
+`<state>/artifact-caps/<attempt_id>.cap` (directory `0700`, file `0600`) and sends it, with the attempt id,
+on every artifact read. The capability is never returned, logged or shown; a client without a stored
+capability fails locally with `capability_missing` before making any request. The `coordinator` setting is an
+optional label with no default: when set it is validated and sent on dispatch and artifact reads, when empty
+it is not sent at all.
 
 ## What verify checks
 
@@ -30,13 +37,14 @@ never printed or stored by verify.
 | `worker_disconnected`, `launcher_unreachable` | `launcher_unavailable` | yes |
 | `result_missing` | `result_missing` | re-dispatch |
 | `no_result_for_state` | `no_result_for_state` | re-dispatch |
-| `artifact_malformed`, `artifact_mismatch`, `artifact_changed`, `artifact_unsafe` | `artifact_invalid` | reject |
+| `artifact_malformed`, `artifact_mismatch`, `artifact_changed`, `artifact_unsafe`, `revision_missing` | `artifact_invalid` | reject |
 | `artifact_oversized` | `response_too_large` | split the brief |
-| `not_owner`, `coordinator_required` | `forbidden` | check the `coordinator` setting |
+| `not_owner`, `coordinator_required`, `capability_required` | `forbidden` | use the capability stored at dispatch and re-dispatch from this coordinator |
 | `unknown_attempt` | `not_found` | check the id |
 
-The `coordinator` setting (default `MR.INDIA`, Orbit's default) is sent at dispatch and with every artifact
-read. Orbit returns the patch only to the coordinator that dispatched the attempt.
+Ownership is the per-attempt capability Orbit returns from dispatch, not a coordinator name. Re-dispatch from
+this coordinator if the capability is missing (`capability_missing`) or Orbit refuses it (`capability_required`);
+the `coordinator` setting is only an optional label.
 
 ## hyvv
 
@@ -48,7 +56,7 @@ coordinator-facing artifact and codes stay the same, so this client needs no cha
 
 `tests/test_orbit_roundtrip.py` runs the real Orbit route from an orbitdesktop checkout under node, in front
 of a stand-in for hyvv's `/v1` API. It covers dispatch with a signed lease, Orbit dispatch, artifact retrieval, a signed
-GREEN in bubblewrap, refusal of a wrong key and of another coordinator, an Orbit restart with an identical
-hash, and refusal of a substituted result. Run it with `ORBIT_SRC=/path/to/orbitdesktop python -m pytest
+GREEN in bubblewrap, refusal of a wrong key and of a forged capability, an Orbit restart with an identical
+hash, and refusal of a substituted or oversized result while nothing is applied. Run it with `ORBIT_SRC=/path/to/orbitdesktop python -m pytest
 tests/test_orbit_roundtrip.py`. Without `ORBIT_SRC`, node or bwrap it is skipped with a reason, which means
 not run. It does not count as passed.
