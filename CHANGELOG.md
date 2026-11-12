@@ -11,6 +11,16 @@ Fixes for the independent engineering review of Nov 12, 2026 (on top of #5).
 
 ### Added
 
+- **Verified human reviews (HR1).** `tdd review --role human --token-file F`
+  records a human review only when its Ed25519 token verifies against the
+  new `review_public_key` setting. The token is minted locally by the
+  reviewer with `review-token mint`, and the private key never reaches
+  bundlebees. It binds the reviewer, the contract id and hash, `source_rev`,
+  the evidence chain head, the expiry and a single-use nonce. Anything else
+  records nothing (`human_review_unverified`). `tdd report` re-verifies the
+  token and prints `chain_head`, and an unverifiable human review isn't
+  accepted. The new optional extra `review` adds `cryptography`, which CI
+  requires.
 - **Collected test ids before freeze and dispatch (review C1).** `contract
   freeze --workdir` runs a bounded, sandboxed `pytest --collect-only` of the
   approved tests at `source_rev` and refuses unless every AC test reference

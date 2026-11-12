@@ -1,0 +1,4 @@
+HR1 GREEN at 4e314f9
+command: CI=1 python -m pytest -q tests/test_review_token.py tests/test_cli_review_token.py -> 28 passed (the same 28 approved tests that were RED at cfb7d83; unchanged since RED)
+full suite: CI=1 python -m pytest -> 520 passed (492 before HR1 + 28)
+approved test files: byte-identical to RED commit

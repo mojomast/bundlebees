@@ -198,6 +198,7 @@ Declared in `plugin.yaml`:
 | `verify_allow_weak_unshare` | boolean | `false` | **Unsafe.** Permit `verify_isolation: unshare` (network/PID isolation only; coordinator files stay readable). Env `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1` does the same. Disposable hosts only. |
 | `require_contract` | boolean | `false` | Opt the project in to ACDD: dispatch refuses briefs without a frozen contract (`contract_missing`). |
 | `verify_timeout_s` | integer | `900` | Wall-clock limit for one sandboxed test run (30–7200). |
+| `review_public_key` | string | `""` | Ed25519 **public** key that verifies human-review tokens: `ed25519:<base64>` or a PEM file path. Empty means no human review verifies (fail closed). See docs/ACDD.md, "Human-review tokens". |
 
 Secret (Hermes secrets, not config):
 

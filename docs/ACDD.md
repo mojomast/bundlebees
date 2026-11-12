@@ -116,7 +116,60 @@ A *missing declared interface* is `NotImplementedError`, or `ImportError` / `Mod
 
 **REFACTOR is valid** when it follows a valid GREEN, fingerprints still match, the classification is `passed`, and the contract hash is unchanged. "No refactor needed" is recorded as a refactor record on the GREEN revision with a note, not silently skipped, when `refactor` is in `evidence_required`.
 
-**A REVIEW is a coordinator-recorded review, not an authenticated human sign-off.** `tdd review --reviewer NAME [--role human]` writes `produced_by.role: reviewer` and an `attestation` of kind `coordinator_recorded_review` with `reviewer_label`, `claimed_reviewer_kind` and `identity_verified: false`. The HMAC proves the coordinator wrote the record, not who reviewed. A review record may only carry role `human` with a `human_authorization` receipt from an external identity provider. That kind is reserved: bundlebees can't verify one yet and never reports one as authenticated. `tdd report` shows `review_identity` (`coordinator_recorded`, or `coordinator_recorded (legacy human label)` for older records) and `human_authorization: not_recorded`. Merge, tag, release, deploy and publish stay human gates outside bundlebees.
+**A REVIEW is a coordinator-recorded review, not an authenticated human sign-off.** `tdd review --reviewer NAME [--role human]` writes `produced_by.role: reviewer` and an `attestation` of kind `coordinator_recorded_review` with `reviewer_label`, `claimed_reviewer_kind` and `identity_verified: false`. The HMAC proves the coordinator wrote the record, not who reviewed. A review record may only carry role `human` with a `human_authorization` attestation, and since HR1 that means a verified **human-review token** (below). `tdd report` shows `review_identity` (`human_verified`, `coordinator_recorded`, `coordinator_recorded (legacy human label)` or `unverified_human_authorization`) and `human_authorization` (`verified`, `unverified` with a reason, or `not_recorded`). Merge, tag, release, deploy and publish stay human gates outside bundlebees: a verified human review is review evidence, not permission to merge.
+
+### Human-review tokens (HR1)
+
+A human review counts only with a token the human signs on their own machine with an **Ed25519 private key that never leaves them**. bundlebees holds only the public key. It never generates, stores, receives or prints a private key, and the repository tracks none (a test enforces this).
+
+**The token** is `bbrt1.<claims>.<signature>`. It approves exactly one contract at one point in its evidence chain. Its claims (`bundlebees.review-token/v1`) are:
+
+- the reviewer label;
+- the contract id and `contract_sha256`;
+- the approved test revision (`source_rev`);
+- the **evidence chain head**, the digest of the newest record, which the review record's `prev_sha256` must equal;
+- `iat`/`exp`, at most 24 h apart (default 1 h, with 120 s of clock skew allowed);
+- a 128-bit nonce;
+- the key id and `verdict: approve`.
+
+**One-time setup (Kyle, locally).**
+
+1. Create the key on your own machine and keep it there, ideally on an encrypted disk:
+   ```bash
+   openssl genpkey -algorithm ed25519 -out ~/.config/bundlebees/review-ed25519.pem
+   chmod 600 ~/.config/bundlebees/review-ed25519.pem
+   ```
+   Mint refuses a key file that others can read. Encrypted PEM files aren't supported yet.
+2. Print the public key line with `python -m bundlebees_plugin.review_token pubkey --private-key ~/.config/bundlebees/review-ed25519.pem`. Install bundlebees with the `review` extra (`cryptography`) first. The output looks like `ed25519:…`.
+3. Set the plugin setting `review_public_key` to that line, or to a PEM public-key file path. It isn't a secret. If it's empty, no human review can verify (fail closed). Rotating the key makes earlier human reviews report as `unverified` until the old public key is configured again.
+
+**Each review.**
+
+1. The coordinator runs `hermes bundlebees tdd report <frozen.json> --json` and gives the reviewer the frozen contract and its `chain_head`.
+2. The reviewer reads the diff and evidence, then mints a token locally:
+   ```bash
+   python -m bundlebees_plugin.review_token mint --private-key ~/.config/bundlebees/review-ed25519.pem \
+     --contract frozen.json --chain-head <chain_head> --reviewer kyle --ttl 3600 > review.token
+   ```
+   `hermes bundlebees review-token mint` does the same. Mint checks that the contract is frozen and prints only the token.
+3. The coordinator records the review:
+   ```bash
+   hermes bundlebees tdd review frozen.json --role human --reviewer kyle \
+     --token-file review.token --approve --note "<why>"
+   ```
+
+**What's checked.** bundlebees verifies the signature against `review_public_key`. Then it checks:
+
+- the exact binding: contract id and hash, `source_rev`, and the *current* chain head;
+- the validity window;
+- that the reviewer matches `--reviewer`;
+- that the nonce hasn't been seen before. Nonces are consumed in an owner-only `review-tokens/` store, so a token works once.
+
+Only then does it write a review with `produced_by.role: human`. The record carries the attestation `human_authorization` with `identity_verified: true`, the key id, the nonce and the full token. If any check fails, **nothing is recorded** and the command fails with `human_review_unverified` plus the reason, for example `token_binding_mismatch`, `token_expired`, `token_replayed`, `token_bad_signature` or `review_key_missing`. If the chain moves between the check and the write, the write is refused too. The token is burned in that case, so mint a new one.
+
+**Re-verified in every report.** `tdd report` doesn't trust the stored flags. It re-verifies the stored token against the configured public key, bound to the record's own `prev_sha256`, at the record's time, and it checks that the nonce appears once in the chain. If that fails, `human_authorization.status` is `unverified` with a reason, the review phase is `human_review_unverified`, and the contract isn't accepted.
+
+**Limits.** The token proves that someone holding the private key approved this contract at this chain head. Protecting that key is the human's job. Without `--token-file`, `--role human` is still a coordinator-recorded review (C6).
 
 **REVIEW is valid** when a named reviewer (role `reviewer`, or `human` on older records; never `worker` or `verifier`) recorded it after a valid GREEN, and after a valid REFACTOR when the contract requires one, for that revision, with classification `passed` and a note. A rejection is recorded too, with classification `failed` (the only use of `failed`; test runs always use the §4 table), and makes the phase `review_failed`. Criteria with `verification: review` or `manual` count as passed only when REVIEW is valid. Integration requires REFACTOR as well as GREEN when `refactor` is in `evidence_required`.
 
