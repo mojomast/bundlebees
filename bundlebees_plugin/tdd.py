@@ -538,6 +538,9 @@ def _validate_record(record: Mapping[str, Any]) -> None:
             raise bad("attestation is only valid on review records")
         if attestation.get("kind") == "coordinator_recorded_review" and attestation.get("identity_verified") is not False:
             raise bad("a coordinator-recorded review must say identity_verified: false")
+        if attestation.get("kind") == "human_authorization":
+            if produced_by.get("role") != "human" or not isinstance(attestation.get("token"), str):
+                raise bad("a human_authorization attestation needs role human and the signed review token")
     if produced_by.get("role") == "human" and record.get("phase") == "review":
         if not isinstance(attestation, Mapping) or attestation.get("kind") != "human_authorization":
             raise bad("role human on a review needs a human_authorization receipt; "
@@ -640,7 +643,86 @@ def coordinator_review_attestation(reviewer: str, claimed_kind: str) -> dict[str
     }
 
 
-def review_identity(record: Mapping[str, Any]) -> str:
+def human_authorization_attestation(claims: Mapping[str, Any], token: str) -> dict[str, Any]:
+    """Attestation for a review whose human-review token verified (HR1).
+
+    The token itself is stored so any reader with the public key can
+    re-verify it; the report never trusts ``identity_verified`` alone.
+    """
+    from . import review_token
+
+    return {
+        "kind": "human_authorization",
+        "recorded_by": "coordinator",
+        "reviewer_label": str(claims["reviewer"]),
+        "claimed_reviewer_kind": "human",
+        "identity_verified": True,
+        "method": review_token.TOKEN_TYPE,
+        "key_id": str(claims["kid"]),
+        "nonce": str(claims["nonce"]),
+        "expires_at": int(claims["exp"]),
+        "chain_head": str(claims["chain_head"]),
+        "token_sha256": review_token.token_sha256(token),
+        "token": token.strip(),
+    }
+
+
+def chain_head(records: Sequence[Mapping[str, Any]]) -> str | None:
+    """Digest of the newest record: what the next record's ``prev_sha256`` will be."""
+    if not records:
+        return None
+    ordered = sorted(records, key=lambda r: int(r.get("sequence") or 0))
+    return record_digest(ordered[-1])
+
+
+def _record_epoch(record: Mapping[str, Any]) -> float | None:
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(record.get("at")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def verify_human_review(
+    contract: Mapping[str, Any],
+    contract_sha256: str,
+    record: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    public_key_value: Any,
+) -> dict[str, Any]:
+    """Re-verify a stored human review from its token. Never trusts stored flags."""
+    from . import review_token
+
+    att = record.get("attestation") if isinstance(record.get("attestation"), Mapping) else {}
+    try:
+        key = review_token.load_public_key(public_key_value)
+        when = _record_epoch(record)
+        if when is None:
+            raise review_token.ReviewTokenError("token_invalid_claims", "review record has no usable time")
+        claims = review_token.verify(
+            str(att.get("token") or ""), key, contract_id=str(contract.get("id") or ""),
+            contract_sha256=str(contract_sha256), test_rev=str(contract.get("source_rev") or ""),
+            chain_head=str(record.get("prev_sha256") or ""), now=when,
+        )
+        if (claims["reviewer"] != att.get("reviewer_label") or claims["nonce"] != att.get("nonce")
+                or (record.get("produced_by") or {}).get("role") != "human"):
+            raise review_token.ReviewTokenError("token_binding_mismatch", "review record does not match its token")
+        nonces = [
+            (r.get("attestation") or {}).get("nonce")
+            for r in records
+            if r.get("phase") == "review" and isinstance(r.get("attestation"), Mapping)
+        ]
+        if nonces.count(claims["nonce"]) != 1:
+            raise review_token.ReviewTokenError("token_replayed", "the same review token appears more than once")
+    except review_token.ReviewTokenError as exc:
+        return {"status": "unverified", "reason": exc.code, "reviewer": att.get("reviewer_label"),
+                "note": "a human review that cannot be verified is not accepted"}
+    return {"status": "verified", "reviewer": claims["reviewer"], "key_id": claims["kid"],
+            "method": review_token.TOKEN_TYPE}
+
+
+def review_identity(record: Mapping[str, Any], verified: bool | None = None) -> str:
     """How much a REVIEW record says about who reviewed (never more than it proves).
 
     Every record bundlebees writes today is ``coordinator_recorded``: the HMAC
@@ -652,7 +734,7 @@ def review_identity(record: Mapping[str, Any]) -> str:
     """
     attestation = record.get("attestation") if isinstance(record.get("attestation"), Mapping) else None
     if attestation is not None and attestation.get("kind") == "human_authorization":
-        return "unverified_human_authorization"
+        return "human_verified" if verified is True else "unverified_human_authorization"
     role = (record.get("produced_by") or {}).get("role")
     if attestation is None and role == "human":
         return "coordinator_recorded (legacy human label)"
@@ -731,7 +813,8 @@ def _private_dir(path: Path) -> Path:
     return path
 
 
-def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], key: bytes) -> Path:
+def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], key: bytes,
+                 expect_prev_sha256: str | None = None) -> Path:
     """Append one signed record under ``evidence/<contract_id>/NNNN-phase.json``."""
     contract_id = str(record.get("contract_id") or "")
     _check_id(contract_id)
@@ -764,6 +847,14 @@ def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], k
     record = dict(record)
     record["sequence"] = number
     record["prev_sha256"] = record_digest(previous) if previous is not None else None
+    if expect_prev_sha256 is not None and record["prev_sha256"] != expect_prev_sha256:
+        raise TddError("evidence_invalid", "the evidence chain moved since this record was prepared",
+                       "Re-read the chain head and try again.")
+    if (isinstance(record.get("attestation"), Mapping)
+            and record["attestation"].get("kind") == "human_authorization"
+            and record["attestation"].get("chain_head") != record["prev_sha256"]):
+        raise TddError("evidence_invalid", "a human review must be bound to the current chain head",
+                       "Mint a token for the current chain head.")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
@@ -1074,6 +1165,7 @@ def acceptance_report(
     contract: Mapping[str, Any],
     contract_sha256: str,
     records: Sequence[Mapping[str, Any]],
+    review_public_key: Any = None,
 ) -> dict:
     """Summarize each required phase and criterion without inflating unrun."""
     latest = _last_phase(records)
@@ -1082,6 +1174,17 @@ def acceptance_report(
         phase: _phase_status(phase, contract, contract_sha256, latest)
         for phase in required
     }
+    review = latest.get("review")
+    human = {
+        "status": "not_recorded",
+        "note": "no human-review token was recorded; the contract's human_gates stay with a human, outside bundlebees",
+    }
+    verified = None
+    if review is not None and (review.get("attestation") or {}).get("kind") == "human_authorization":
+        human = verify_human_review(contract, contract_sha256, review, records, review_public_key)
+        verified = human["status"] == "verified"
+        if not verified and "review" in phases:
+            phases["review"] = "human_review_unverified"
     criteria = _criteria_report(contract, latest)
     phases_ok = all(status == "valid" for status in phases.values())
     review_valid = phases.get("review") == "valid"
@@ -1090,7 +1193,6 @@ def acceptance_report(
         or (item["status"] == "review_required" and review_valid)
         for item in criteria.values()
     )
-    review = latest.get("review")
     return {
         "contract_id": str(contract.get("id") or ""),
         "contract_sha256": str(contract_sha256),
@@ -1098,11 +1200,8 @@ def acceptance_report(
         "test_first": _test_first(contract, contract_sha256, records),
         "phases": phases,
         "criteria": criteria,
-        "review_identity": review_identity(review) if review is not None else None,
-        "human_authorization": {
-            "status": "not_recorded",
-            "note": "bundlebees records reviews but does not authenticate human identity; "
-                    "the contract's human_gates stay with a human, outside bundlebees",
-        },
-        "accepted": bool(phases_ok and criteria_ok),
+        "review_identity": review_identity(review, verified) if review is not None else None,
+        "human_authorization": human,
+        "chain_head": chain_head(records),
+        "accepted": bool(phases_ok and criteria_ok and verified is not False),
     }

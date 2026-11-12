@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
-from . import acdd_cli, adapters, leases, metrics, revision, sandbox
+from . import acdd_cli, adapters, leases, metrics, review_token, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
@@ -235,6 +235,7 @@ def _build_parser(parser: Any) -> Any:
     doctor.set_defaults(command="doctor")
 
     acdd_cli.add_parsers(subparsers)
+    review_token.add_parsers(subparsers)
     return group
 
 
@@ -257,10 +258,15 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
             return acdd_cli.cmd_tdd(ctx, args)
+        if command == "review-token":
+            try:
+                return review_token.run(args)
+            except review_token.ReviewTokenError as exc:
+                raise CliError(exc.code, exc.message, exc.fix) from exc
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, review-token.",
         )
     except CliError as exc:
         _print_error(exc)

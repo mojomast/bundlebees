@@ -28,6 +28,7 @@ DEFAULTS: dict[str, Any] = {
     "verify_allow_weak_unshare": False,
     "require_contract": False,
     "verify_timeout_s": 900,
+    "review_public_key": "",
 }
 
 

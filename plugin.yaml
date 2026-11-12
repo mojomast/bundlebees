@@ -118,3 +118,10 @@ config_schema:
     type: int
     default: 900
     description: Wall-clock limit in seconds for one sandboxed test run.
+  review_public_key:
+    type: string
+    default: ""
+    description: >-
+      Public key that verifies human-review tokens: a PEM file path or
+      ed25519:<base64>. Not a secret. Empty means no human review can
+      verify (fail closed). Never put a private key here.

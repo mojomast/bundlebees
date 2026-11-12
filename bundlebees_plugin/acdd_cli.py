@@ -117,6 +117,44 @@ def _latest(records: list[dict], phase: str, sha: str) -> dict | None:
 # --------------------------------------------------------------------------- parser
 
 
+def _cmd_human_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str, state_dir: Path,
+                      key: bytes, records: list[dict], target: Mapping[str, Any], green: Mapping[str, Any],
+                      reviewer: str, note: str, token_file: str) -> int:
+    """HR1: record a human review only when its Ed25519 token verifies. Fail closed."""
+    from . import review_token
+
+    fix = ("Ask the reviewer to mint a fresh token for this contract and the current chain head "
+           "(`tdd report --json` shows chain_head); check review_public_key.")
+    head = tdd.chain_head(records)
+    try:
+        token = review_token.read_token_file(token_file)
+        public_key = review_token.load_public_key(_cli()._config(ctx).get("review_public_key"))
+        claims = review_token.verify(token, public_key, contract_id=str(contract["id"]), contract_sha256=sha,
+                                     test_rev=str(contract.get("source_rev") or ""), chain_head=str(head or ""))
+        if claims["reviewer"] != reviewer:
+            raise review_token.ReviewTokenError("token_binding_mismatch", "token reviewer does not match --reviewer")
+        review_token.consume(state_dir, claims, token)
+    except review_token.ReviewTokenError as exc:
+        raise _error("human_review_unverified", f"{exc.code}: {exc.message}; no review was recorded", fix) from exc
+    record = tdd.make_record(
+        contract, sha, phase="review", revision=str(target["revision"]),
+        test_fingerprints=target["test_fingerprints"], command=["review"],
+        result=None, produced_by={"role": "human", "name": scrub(reviewer)},
+        test_first=green["test_first"], notes=scrub(note), review_outcome="passed",
+        attestation=tdd.human_authorization_attestation(claims, token),
+    )
+    try:
+        tdd.write_record(state_dir, record, key, expect_prev_sha256=head)
+    except tdd.TddError as exc:
+        raise _error("human_review_unverified", f"{exc.error}; "
+                     "the token was used but no review was recorded", fix) from exc
+    print("bundlebees tdd review")
+    print(f"contract: {scrub(str(contract['id']))}")
+    _print_hex("revision", str(target["revision"]))
+    print(f"human review: verified ({scrub(reviewer)}, key {claims['kid']})")
+    return 0
+
+
 def add_parsers(subparsers: Any) -> None:
     contract_cmd = subparsers.add_parser("contract", help="Validate or freeze an acdd/1 contract.")
     contract_sub = contract_cmd.add_subparsers(dest="contract_command", required=True)
@@ -160,6 +198,9 @@ def add_parsers(subparsers: Any) -> None:
     verdict.add_argument("--approve", action="store_true", help="Accept the change.")
     verdict.add_argument("--reject", action="store_true", help="Reject the change.")
     review.add_argument("--note", required=True, help="Why the change was approved or rejected.")
+    review.add_argument("--token-file", default=None,
+                        help="Human-review token minted by the reviewer (`review-token mint`). With --role human, "
+                             "the review is recorded as a verified human review only if the token verifies.")
     tdd_cmd.set_defaults(command="tdd")
 
 
@@ -428,6 +469,10 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
                      "Pass --reviewer NAME and --note TEXT with real content.")
     role = str(getattr(args, "role", None) or "reviewer")
     approve = bool(getattr(args, "approve", False))
+    token_file = getattr(args, "token_file", None)
+    if token_file and (role != "human" or not approve):
+        raise _error("invalid_argument", "a review token only approves a human review",
+                     "Use --role human --approve with --token-file, or drop --token-file.")
 
     try:
         records = tdd.load_records(state_dir, str(contract["id"]), key)
@@ -459,6 +504,9 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
             raise _as_error(exc) from exc
 
     target = refactor or green
+    if token_file:
+        return _cmd_human_review(ctx, args, contract, sha, state_dir, key, records, target, green,
+                                 reviewer, note, str(token_file))
     # Review C6: this is a review the coordinator *recorded*. The HMAC proves
     # the coordinator wrote it, not who the reviewer is, so the record never
     # carries role "human"; the reviewer and their claimed kind are labels.
@@ -494,7 +542,8 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
     if sub == "report":
         try:
             records = tdd.load_records(state_dir, str(contract["id"]), key)
-            report = tdd.acceptance_report(contract, sha, records)
+            report = tdd.acceptance_report(contract, sha, records,
+                                           review_public_key=cli._config(ctx).get("review_public_key"))
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
         if getattr(args, "json", False):
@@ -510,7 +559,11 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
             print(f"test-first: {'yes' if report['test_first'] else 'no'}")
             if report.get("review_identity"):
                 print(f"review identity: {report['review_identity']}")
-            print(f"human authorization: {report['human_authorization']['status']}")
+            human = report["human_authorization"]
+            print(f"human authorization: {human['status']}"
+                  + (f" ({human.get('reason')})" if human.get("reason") else ""))
+            if report.get("chain_head"):
+                _print_hex("chain_head", report["chain_head"])
             print(f"accepted: {'yes' if report['accepted'] else 'no'}")
         return 0 if report["accepted"] else 1
     if sub == "refactor":

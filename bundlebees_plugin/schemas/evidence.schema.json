@@ -63,14 +63,21 @@
     "prev_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the canonical JSON of the previous signed record (signature included); null for sequence 1."},
     "attestation": {
       "type": "object",
-      "description": "Review records only. coordinator_recorded_review: the coordinator recorded a review by reviewer_label; identity_verified is always false. human_authorization is reserved for a receipt verified by an external identity provider; bundlebees has no such verifier yet and never reports one as authenticated.",
+      "description": "Review records only. coordinator_recorded_review: the coordinator recorded a review by reviewer_label; identity_verified is always false. human_authorization (HR1): the reviewer's Ed25519 review token verified against the configured review_public_key when recorded; the token is stored so any reader with the public key re-verifies it, and readers must not trust identity_verified alone.",
       "required": ["kind"],
       "properties": {
         "kind": {"enum": ["coordinator_recorded_review", "human_authorization"]},
         "recorded_by": {"type": "string"},
         "reviewer_label": {"type": "string"},
         "claimed_reviewer_kind": {"enum": ["reviewer", "human"]},
-        "identity_verified": {"type": "boolean"}
+        "identity_verified": {"type": "boolean"},
+        "method": {"const": "bundlebees.review-token/v1"},
+        "key_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+        "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "expires_at": {"type": "integer"},
+        "chain_head": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "token_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "token": {"type": "string", "maxLength": 4096}
       }
     },
     "log_path": {"type": "string"},
