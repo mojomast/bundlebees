@@ -23,6 +23,9 @@ DEFAULTS: dict[str, Any] = {
     "worktree": "",
     "branch": "",
     "deploy_host_alias": "",
+    "verify_isolation": "auto",
+    "verify_allow_unsafe_local": False,
+    "verify_timeout_s": 900,
 }
 
 

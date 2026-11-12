@@ -341,3 +341,15 @@ def test_concurrent_appends_keep_a_valid_chain(tmp_path: Path):
         range(1, workers * per_worker + 1)
     )
     assert len({event["attempt_id"] for event in events}) == workers * per_worker
+
+
+def test_integrate_event_with_an_attempts_list_counts_every_attempt(tmp_path):
+    from bundlebees_plugin import metrics as m
+
+    m.append_event(tmp_path, "r", "dispatch", attempt_id="a1", now="2026-11-12T10:00:00Z")
+    m.append_event(tmp_path, "r", "dispatch", attempt_id="a2", now="2026-11-12T10:00:10Z")
+    m.append_event(tmp_path, "r", "integrate", wave_id="w1", ok=True, attempts=["a1", "a2"], regressions=0,
+                   now="2026-11-12T10:01:00Z")
+    summary = m.summarize(m.read_events(tmp_path, "r"))
+    assert summary["accepted_changes"] == 2
+    assert summary["plan_to_accepted_s"] == {"median": 55.0, "max": 60.0}

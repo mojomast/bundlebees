@@ -1,6 +1,6 @@
 # Native Hermes plugin manifest (v2). Quote version. Keep provides_* in sync with register().
 name: bundlebees
-version: "0.1.1"
+version: "0.2.0"
 description: >-
   Orchestrate CUA bees from Hermes: check launcher health, dispatch leased
   briefs, watch attempts, and generate a paste-ready host setup prompt.
@@ -79,3 +79,21 @@ config_schema:
       Stored SSH host alias for the user-run hermes bundlebees deploy
       --execute command. Not a hostname field for tools, and never shown
       in the pane.
+  verify_isolation:
+    type: str
+    default: auto
+    description: >-
+      Sandbox for worker-produced code during verify and integrate: auto
+      (bwrap, then firejail, then unshare), or one of bwrap, firejail,
+      unshare. Verify fails closed when none is usable.
+  verify_allow_unsafe_local:
+    type: bool
+    default: false
+    description: >-
+      UNSAFE. Allow verify/integrate to run worker tests with no isolation
+      (temp copy and scrubbed env only, same user, network on) when no
+      sandbox backend is available. Leave false on shared or credentialed hosts.
+  verify_timeout_s:
+    type: int
+    default: 900
+    description: Wall-clock limit in seconds for one sandboxed test run.

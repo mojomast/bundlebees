@@ -448,23 +448,33 @@ def _tidy(value: float) -> int | float:
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
+def _event_attempts(event: Mapping[str, Any]) -> list[str]:
+    """Attempt ids an event refers to: ``attempt_id`` plus an ``attempts`` list."""
+    ids: list[str] = []
+    single = event.get("attempt_id")
+    if isinstance(single, str):
+        ids.append(single)
+    many = event.get("attempts")
+    if isinstance(many, (list, tuple)):
+        ids.extend(item for item in many if isinstance(item, str) and item not in ids)
+    return ids
+
+
 def _plan_to_accepted(
     events: list[Mapping[str, Any]], accepted_ids: set[str]
 ) -> dict[str, float | None]:
     dispatched: dict[str, _dt.datetime] = {}
     accepted_at: dict[str, _dt.datetime] = {}
     for event in events:
-        attempt_id = event.get("attempt_id")
-        if not isinstance(attempt_id, str):
-            continue
         at = _timestamp(event.get("at"))
         if at is None:
             continue
-        if event.get("event") == "dispatch" and attempt_id not in dispatched:
-            dispatched[attempt_id] = at
-        elif event.get("event") == "integrate" and bool(event.get("ok")):
-            if attempt_id in accepted_ids and attempt_id not in accepted_at:
-                accepted_at[attempt_id] = at
+        for attempt_id in _event_attempts(event):
+            if event.get("event") == "dispatch" and attempt_id not in dispatched:
+                dispatched[attempt_id] = at
+            elif event.get("event") == "integrate" and bool(event.get("ok")):
+                if attempt_id in accepted_ids and attempt_id not in accepted_at:
+                    accepted_at[attempt_id] = at
 
     durations: list[float] = []
     for attempt_id in accepted_ids:
@@ -524,8 +534,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
                 verify_ok.setdefault(attempt_key, []).append(bool(event.get("ok")))
         elif name == "integrate":
             if bool(event.get("ok")):
-                if attempt_key is not None:
-                    accepted_ids.add(attempt_key)
+                accepted_ids.update(_event_attempts(event))
                 wave = event.get("wave_id")
                 accepted_waves.add(str(wave) if isinstance(wave, str) else f"#{index}")
             else:

@@ -145,7 +145,7 @@ def test_security_allows_git_index_and_object_directory_extras():
 def test_base_keys_and_declared_base_locations(tmp_path: Path):
     _repo_path, base, later = _repo(tmp_path)
 
-    assert revision.BASE_KEYS == ("base_rev", "source_rev", "base_sha", "base")
+    assert revision.BASE_KEYS == ("base_rev", "source_rev", "base_sha", "base", "repo_rev")
     assert revision.declared_base({}) is None
     assert revision.declared_base({"base_rev": base}) == base
     assert revision.declared_base({"source_rev": later}) == later
@@ -452,3 +452,9 @@ def test_integrate_wave_validates_wave_and_attempt_ids(tmp_path: Path):
         )
     assert bad_attempt.value.code == "invalid_attempt_id"
     assert calls == []
+
+
+def test_declared_base_reads_orbit_launcher_source_repo_rev():
+    sha = "c" * 40
+    assert revision.declared_base({"source": {"project": "p", "repo_rev": sha}}) == sha
+    assert revision.check_declared_base({"source": {"repo_rev": sha}}, sha) == sha

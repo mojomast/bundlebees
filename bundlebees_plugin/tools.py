@@ -21,6 +21,9 @@ from .client import (
     client_from_config,
 )
 from .settings import settings_from_ctx
+from . import leases as _leases
+from . import metrics as _metrics
+from . import revision as _revision
 from .security import contains_address, is_public_git_url, looks_like_secret, scrub
 
 TOOL_NAMES = (
@@ -226,6 +229,7 @@ def _dispatched(
     brief: Mapping[str, Any],
     data: Mapping[str, Any],
     args: Mapping[str, Any],
+    state_dir: Path | None = None,
 ) -> str:
     """Build the dispatch success envelope.
 
@@ -239,10 +243,52 @@ def _dispatched(
     kanban_task_id = args.get("kanban_task_id")
     if "kanban_task_id" not in out and kanban_task_id:
         out["kanban_task_id"] = kanban_task_id
+    out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
     return _ok(**out)
 
 
-def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
+def _record_dispatch(state_dir: Path | None, attempt_id: Any, brief: Mapping[str, Any]) -> dict[str, Any]:
+    """Write the immutable coordinator lease and a metrics event for a new attempt.
+
+    The lease is the only file-scope authority ``hermes bundlebees verify``
+    accepts; worker-returned metadata never widens it. A failure here does not
+    hide the started attempt, but verify will refuse it (fail closed).
+    """
+    if state_dir is None or not isinstance(attempt_id, str) or not attempt_id:
+        return {
+            "lease_recorded": False,
+            "lease_fix": "Record the brief with `hermes bundlebees lease <attempt_id> --brief <file>` before verify.",
+        }
+    try:
+        _leases.record_lease(state_dir, attempt_id, brief)
+    except _leases.LeaseError as exc:
+        return {"lease_recorded": False, "lease_code": exc.code, "lease_fix": exc.fix}
+    try:
+        _metrics.append_event(
+            state_dir,
+            str(brief.get("run_id") or "default"),
+            "dispatch",
+            attempt_id=attempt_id,
+            **({"retry_of": brief["retry_of"]} if brief.get("retry_of") else {}),
+        )
+    except Exception:  # noqa: BLE001 - metrics are best-effort evidence
+        pass
+    return {"lease_recorded": True}
+
+
+def _state_dir_for(ctx: Any) -> Path | None:
+    """Plugin data dir for leases, waves and metrics (profile-aware)."""
+    injected = getattr(ctx, "bundlebees_state_dir", None)
+    if injected:
+        return Path(str(injected))
+    try:
+        from .cli import plugin_state_dir
+    except Exception:
+        return None
+    return plugin_state_dir()
+
+
+def _dispatch(client: Any, args: Mapping[str, Any], state_dir: Path | None = None) -> str:
     raw = args.get("brief")
     if isinstance(raw, str):
         try:
@@ -262,6 +308,12 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
         brief = validate_brief(parsed)
     except BriefError as exc:
         return _err("brief_invalid", exc.error, exc.fix)
+    if state_dir is None:
+        return _err(
+            "not_configured",
+            "the plugin data directory is unavailable, so the coordinator lease cannot be recorded",
+            "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
+        )
 
     project = brief.get("project")
     if isinstance(project, str) and project:
@@ -328,7 +380,7 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
         if exc.code == "project_unauthorized":
             return _err(exc.code, exc.error, _FIX_PROJECT)
         raise
-    return _dispatched(client, brief, _unwrap_attempt(data), args)
+    return _dispatched(client, brief, _unwrap_attempt(data), args, state_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +388,7 @@ def _dispatch(client: Any, args: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _attempt(client: Any, args: Mapping[str, Any]) -> str:
+def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None) -> str:
     op = args.get("op")
     if op not in _ATTEMPT_OPS:
         return _err(
@@ -402,6 +454,13 @@ def _attempt(client: Any, args: Mapping[str, Any]) -> str:
     note = args.get("note")
     if note is not None and not isinstance(note, str):
         return _err("invalid_argument", "note must be a string", "Pass a short text note or omit it.")
+    if accepted and (state_dir is None or not _revision.attempt_accepted(state_dir, attempt_id)):
+        return _err(
+            "integration_required",
+            "this attempt is not in an accepted wave yet",
+            "The user runs `hermes bundlebees integrate --wave <id> --attempts ...` so the full "
+            "suite passes on the combined branch; then retry the review.",
+        )
     data = client.review(
         attempt_id,
         accepted=accepted,
@@ -655,8 +714,8 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             if tool_name == "bundlebees_status":
                 return _status(client, data)
             if tool_name == "bundlebees_dispatch":
-                return _dispatch(client, data)
-            return _attempt(client, data)
+                return _dispatch(client, data, _state_dir_for(ctx))
+            return _attempt(client, data, _state_dir_for(ctx))
         except ClientError as exc:
             return json.dumps(exc.as_envelope())
         except Exception as exc:  # noqa: BLE001 - tool boundary must always answer

@@ -413,10 +413,20 @@ def test_attempt_review_requires_accepted_bool():
     assert payload["code"] == "review_invalid"
 
 
+def _accept_wave(ctx, *attempt_ids):
+    waves = ctx.bundlebees_state_dir / "waves"
+    waves.mkdir(parents=True, exist_ok=True)
+    (waves / "w1.json").write_text(
+        json.dumps({"wave_id": "w1", "accepted": True, "attempts": list(attempt_ids)}),
+        encoding="utf-8",
+    )
+    return ctx
+
+
 def test_attempt_review_with_confirm_scrubs_note():
     client = FakeClient()
     payload = _call(
-        _ctx(),
+        _accept_wave(_ctx(), "a1"),
         "bundlebees_attempt",
         {
             "op": "review",
@@ -436,7 +446,7 @@ def test_attempt_maps_no_result_yet():
     client = FakeClient()
     client.result_error = ClientError("no result yet", "no_result_yet")
     payload = _call(
-        _ctx(),
+        _accept_wave(_ctx(), "a1"),
         "bundlebees_attempt",
         {"op": "review", "attempt_id": "a1", "confirm": True, "accepted": True},
         client=client,
@@ -592,3 +602,77 @@ def test_host_prompt_needs_no_launcher_or_token():
     )
     assert payload["ok"] is True
     assert "macos" in payload["prompt"]
+
+
+def test_review_accept_requires_an_accepted_wave():
+    client = FakeClient()
+    ctx = _ctx()
+    blocked = _call(
+        ctx,
+        "bundlebees_attempt",
+        {"op": "review", "attempt_id": "a1", "confirm": True, "accepted": True},
+        client=client,
+    )
+    assert blocked["ok"] is False
+    assert blocked["code"] == "integration_required"
+    assert not any(call[0] == "review" for call in client.calls)
+
+    # A rejected (accepted=false) review never needs integration.
+    rejected = _call(
+        ctx,
+        "bundlebees_attempt",
+        {"op": "review", "attempt_id": "a1", "confirm": True, "accepted": False},
+        client=client,
+    )
+    assert rejected["ok"] is True
+
+    # A wave record that was NOT accepted does not unlock the review either.
+    waves = ctx.bundlebees_state_dir / "waves"
+    waves.mkdir(parents=True, exist_ok=True)
+    (waves / "w0.json").write_text(json.dumps({"accepted": False, "attempts": ["a1"]}), encoding="utf-8")
+    still = _call(
+        ctx,
+        "bundlebees_attempt",
+        {"op": "review", "attempt_id": "a1", "confirm": True, "accepted": True},
+        client=client,
+    )
+    assert still["code"] == "integration_required"
+
+
+def test_dispatch_records_an_immutable_lease_and_metrics_event():
+    from bundlebees_plugin import leases, metrics
+
+    client = FakeClient()
+    ctx = _ctx()
+    payload = _call(ctx, "bundlebees_dispatch", {"brief": _brief(run_id="r1")}, client=client)
+    assert payload["ok"] is True
+    assert payload["lease_recorded"] is True
+
+    state = ctx.bundlebees_state_dir
+    record = leases.load_lease(state, "a1")
+    assert record["assigned_files"] == ["src/a.py"]
+    assert record["source_rev"] == "a" * 40
+    lease_file = state / "leases" / "a1.json"
+    assert (lease_file.stat().st_mode & 0o777) == 0o400
+
+    events = metrics.read_events(state, "r1")
+    assert [e["event"] for e in events] == ["dispatch"]
+    assert events[0]["attempt_id"] == "a1"
+
+    # A second dispatch that reuses the attempt id cannot overwrite the lease.
+    again = _call(ctx, "bundlebees_dispatch", {"brief": _brief(assigned_files=["src/evil.py"])}, client=client)
+    assert again["lease_recorded"] is False
+    assert again["lease_code"] == "lease_exists"
+    assert leases.load_lease(state, "a1")["assigned_files"] == ["src/a.py"]
+
+
+def test_dispatch_refuses_without_a_state_dir(monkeypatch):
+    import bundlebees_plugin.tools as tools_mod
+
+    client = FakeClient()
+    ctx = _ctx()
+    monkeypatch.setattr(tools_mod, "_state_dir_for", lambda _ctx: None)
+    payload = _call(ctx, "bundlebees_dispatch", {"brief": _brief()}, client=client)
+    assert payload["ok"] is False
+    assert payload["code"] == "not_configured"
+    assert not any(call[0] == "create" for call in client.calls)

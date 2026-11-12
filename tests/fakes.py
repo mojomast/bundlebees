@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import tempfile
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +28,9 @@ class FakeCtx:
         self.skills: dict[str, Path] = {}
         self.hooks: dict[str, Callable[..., Any]] = {}
         self.cli_commands: dict[str, dict[str, Any]] = {}
+        # Stand-in for plugin_data_dir("bundlebees"): leases, waves, metrics.
+        # Real Hermes has no such attribute; tools fall back to plugin_data_dir.
+        self.bundlebees_state_dir = Path(tempfile.mkdtemp(prefix="bundlebees-test-state-"))
 
     def register_tool(self, name: str, toolset: str, schema: dict, handler, description: str = "", emoji: str = "", **_kwargs):
         self.tools[name] = {
