@@ -110,15 +110,8 @@ def _ctx_config(ctx: Any) -> dict[str, Any]:
 
 
 def _require_contract(ctx: Any) -> bool:
-    """Read the optional ``require_contract`` plugin setting (default false)."""
-    getter = getattr(ctx, "get_config", None)
-    if not callable(getter):
-        return False
-    try:
-        value = getter("require_contract", False)
-    except Exception:
-        return False
-    return config_flag(value, False)
+    """The optional ``require_contract`` setting (default false)."""
+    return config_flag(_ctx_config(ctx).get("require_contract"), False)
 
 
 def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
