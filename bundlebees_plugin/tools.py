@@ -19,6 +19,7 @@ from .client import (
     DEFAULT_MODEL,
     ClientError,
     client_from_config,
+    public_result,
 )
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
@@ -485,7 +486,8 @@ def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None
                 if exc.code != "no_result_yet":
                     raise
             else:
-                out["result"] = result
+                # Model-visible: always reduce to the public view so no client can leak a patch here.
+                out["result"] = public_result(result)
         return _ok(**out)
 
     if op == "events":

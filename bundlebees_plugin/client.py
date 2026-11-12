@@ -12,6 +12,7 @@ paths cannot reach a model-visible envelope.
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import re
 import socket
@@ -65,6 +66,7 @@ class ClientError(Exception):
         self.code = code
         self.fix = fix or _FIX_LAUNCHER
         self.status = status
+        self.upstream_code: str | None = None
 
     def as_envelope(self) -> dict[str, Any]:
         return {
@@ -509,7 +511,11 @@ class _BaseClient:
             code, fix = "launcher_unavailable", _FIX_LAUNCHER
         else:
             code, fix = "launcher_error", _FIX_LAUNCHER
-        return ClientError(message, code, fix, status=status)
+        err = ClientError(message, code, fix, status=status)
+        upstream = payload.get("code") if isinstance(payload, dict) else None
+        if isinstance(upstream, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", upstream):
+            err.upstream_code = upstream
+        return err
 
     def request_json(self, method: str, path: str, payload: Any = None) -> Any:
         url = self._absolute(path)
@@ -705,8 +711,152 @@ class LauncherClient(_BaseClient):
         return [public_container(item) for item in _as_list(data, "containers", "items")]
 
 
+ARTIFACT_VERSION = "orbit.worker-artifact/1"
+DEFAULT_COORDINATOR = "MR.INDIA"  # Orbit's default coordinator identity
+# Orbit's own artifact cap is 8 MiB of patch; allow JSON-escaping overhead.
+MAX_ARTIFACT_BYTES = 24 * 1_048_576
+_HEX40_64 = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+# Orbit artifact error codes -> stable bundlebees codes and fixes.
+_ARTIFACT_CODES: dict[str, tuple[str, str]] = {
+    "result_pending": ("no_result_yet", "Wait for the worker to finish, then retry."),
+    "worker_disconnected": ("launcher_unavailable", "The launcher is disconnected; retry when it is back."),
+    "launcher_unreachable": ("launcher_unavailable", "The launcher is unreachable; retry when it is back."),
+    "result_missing": ("result_missing", "The launcher no longer has this result; re-dispatch the brief."),
+    "unknown_attempt": ("not_found", "Check the attempt id."),
+    "no_result_for_state": ("no_result_for_state", "This attempt ended without a result; re-dispatch if needed."),
+    "artifact_changed": ("artifact_invalid", "The stored result changed after it was first read; reject this attempt."),
+    "artifact_mismatch": ("artifact_invalid", "The result does not match this attempt or source_rev; reject this attempt."),
+    "artifact_unsafe": ("artifact_invalid", "Orbit refused an unsafe result file; reject this attempt."),
+    "artifact_malformed": ("artifact_invalid", "The worker result is malformed; reject this attempt."),
+    "artifact_oversized": ("response_too_large", "The patch is over Orbit's artifact limit; split the brief."),
+    "not_owner": ("forbidden", "Only the coordinator that dispatched this attempt can read its patch."),
+    "coordinator_required": ("forbidden", "Set the coordinator name in the bundlebees settings."),
+}
+
+
+def _artifact_invalid(why: str) -> ClientError:
+    return ClientError(
+        f"Orbit returned an invalid worker artifact: {why}",
+        "artifact_invalid",
+        "Reject this worker result; nothing was applied.",
+        status=502,
+    )
+
+
+def _artifact_observed(observed: Mapping[str, Any]) -> dict[str, Any]:
+    """Launcher-observed facts, field by field (scrub() would redact hex revisions)."""
+    out: dict[str, Any] = {}
+    base = observed.get("local_base_rev")
+    if isinstance(base, str) and _HEX40_64.fullmatch(base):
+        out["local_base_rev"] = base
+    calls = observed.get("tool_calls")
+    if isinstance(calls, int) and not isinstance(calls, bool) and calls >= 0:
+        out["tool_calls"] = calls
+    for key in ("run_id", "sandbox_id", "status", "stop_reason"):
+        if isinstance(observed.get(key), str):
+            out[key] = str(scrub(observed[key]))[:200]
+    files = []
+    for item in observed.get("files") or []:
+        if not isinstance(item, Mapping):
+            continue
+        rel = _safe_rel_path(item.get("path"))
+        if not rel:
+            continue
+        sha = item.get("sha256")
+        files.append({
+            "path": rel,
+            "sha256": sha if isinstance(sha, str) and _HEX64.fullmatch(sha) else None,
+            "change": str(item.get("change") or "")[:20],
+            "in_assigned_scope": item.get("in_assigned_scope") is True,
+        })
+    if files:
+        out["files"] = files[:500]
+    return out
+
+
+def validate_artifact(data: Any, attempt_id: str) -> dict[str, Any]:
+    """Check an ``orbit.worker-artifact/1`` body and return only its evidence fields.
+
+    The returned dict carries the raw patch. It is for the verifier only and must
+    never be returned from a model-visible tool. Worker self-reports are dropped.
+    """
+    if not isinstance(data, dict):
+        raise _artifact_invalid("not an object")
+    if data.get("artifact_version") != ARTIFACT_VERSION:
+        raise _artifact_invalid("unsupported artifact_version")
+    if data.get("attempt_id") != attempt_id:
+        raise _artifact_invalid("attempt id does not match the request")
+    source_rev = data.get("source_rev")
+    if not isinstance(source_rev, str) or not _HEX40_64.fullmatch(source_rev):
+        raise _artifact_invalid("source_rev is not a full hex commit id")
+    patch = data.get("patch")
+    digest = data.get("patch_sha256")
+    if patch is None:
+        if digest is not None:
+            raise _artifact_invalid("patch_sha256 without a patch")
+    elif not isinstance(patch, str):
+        raise _artifact_invalid("patch is not text")
+    elif not isinstance(digest, str) or hashlib.sha256(patch.encode("utf-8")).hexdigest() != digest:
+        raise _artifact_invalid("patch_sha256 does not match the patch")
+    result_sha = data.get("result_sha256")
+    observed = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+    usage = None
+    if isinstance(data.get("usage"), dict):
+        # Numbers only: scrub() would redact "*Tokens" keys, and counts carry no secrets.
+        usage = {
+            str(k)[:40]: v for k, v in data["usage"].items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+        }
+        if isinstance(data["usage"].get("source"), str):
+            usage["source"] = data["usage"]["source"][:40]
+    return {
+        "artifact_version": ARTIFACT_VERSION,
+        "attempt_id": attempt_id,
+        "state": str(data.get("state") or ""),
+        "source_rev": source_rev,
+        "patch": patch,
+        "patch_sha256": digest,
+        "result_sha256": result_sha if isinstance(result_sha, str) and _HEX64.fullmatch(result_sha) else None,
+        "model": data.get("model") if isinstance(data.get("model"), str) else None,
+        "launcher": data.get("launcher") if isinstance(data.get("launcher"), str) else None,
+        "observed": _artifact_observed(observed),
+        "usage": usage,
+    }
+
+
 class OrbitAdapterClient(_BaseClient):
     """Loopback adapter using ``POST /api/local-workers`` with an ``op`` field."""
+
+    def __init__(self, base_url: str, *, coordinator: str | None = None, **kwargs: Any) -> None:
+        super().__init__(base_url, **kwargs)
+        name = str(coordinator or DEFAULT_COORDINATOR).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+            raise ClientError(
+                "coordinator name is not allowed",
+                "invalid_argument",
+                "Use letters, digits, dot, dash or underscore (max 64) for the coordinator setting.",
+            )
+        self._coordinator = name
+
+    def artifact(self, attempt_id: str) -> dict[str, Any]:
+        """Fetch a finished attempt's patch through Orbit's coordinator-only artifact op.
+
+        Verifier-only: the result carries the raw patch and must never reach a tool response.
+        """
+        saved = self._max_bytes
+        self._max_bytes = max(saved, MAX_ARTIFACT_BYTES)
+        try:
+            data = self._op("artifact", attempt_id=attempt_id, coordinator=self._coordinator)
+        except ClientError as exc:
+            mapped = _ARTIFACT_CODES.get(exc.upstream_code or "")
+            if mapped:
+                raise ClientError(exc.error, mapped[0], mapped[1], status=exc.status) from exc
+            raise
+        finally:
+            self._max_bytes = saved
+        return validate_artifact(data, attempt_id)
 
     def _op(self, op: str, **payload: Any) -> Any:
         body = {"op": op}
@@ -764,7 +914,7 @@ class OrbitAdapterClient(_BaseClient):
         model: str | None = None,
         kanban_task_id: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"brief": dict(brief)}
+        payload: dict[str, Any] = {"brief": dict(brief), "coordinator": self._coordinator}
         if model:
             payload["model"] = model
         if kanban_task_id:
@@ -869,6 +1019,7 @@ def client_from_config(
     )
     return OrbitAdapterClient(
         str(url),
+        coordinator=config.get("coordinator") or None,
         token_provider=provider,
         allow_loopback=True,
         allow_private=False,
