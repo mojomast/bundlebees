@@ -11,6 +11,7 @@ the same import path real Hermes provides.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import tempfile
 import types
@@ -65,14 +66,28 @@ class FakeCtx:
 
 
 def load_plugin():
-    """Load the plugin entry at repo-root __init__.py as ``bundlebees``."""
-    parent = str(ROOT.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    if ROOT.name != "bundlebees":
-        raise RuntimeError(f"plugin directory must be named bundlebees, got {ROOT.name}")
+    """Load the plugin entry at repo-root __init__.py as package ``bundlebees``.
+
+    Loaded from its file, so it works from any checkout directory name, including
+    the sandbox's ``/work`` copy (Hermes itself installs the plugin as ``bundlebees``).
+    """
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)  # bundlebees_plugin is importable from the repo root
     sys.modules.pop("bundlebees", None)
-    return importlib.import_module("bundlebees")
+    spec = importlib.util.spec_from_file_location(
+        "bundlebees", ROOT / "__init__.py", submodule_search_locations=[root]
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the plugin entry __init__.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["bundlebees"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("bundlebees", None)
+        raise
+    return module
 
 
 @contextmanager
