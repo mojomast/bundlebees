@@ -377,8 +377,21 @@ def public_result(payload: Any) -> dict[str, Any]:
         safe_files = [p for p in (_safe_rel_path(item) for item in files) if p]
         obs["changed_files"] = safe_files
     usage = observed.get("usage")
+    if isinstance(usage, str):
+        try:
+            usage = json.loads(usage)
+        except (TypeError, ValueError):
+            usage = None
     if isinstance(usage, dict):
-        obs["usage"] = scrub(usage)
+        # Usage is counts only. Keep numeric values verbatim (scrubbing a
+        # "token"-shaped key would redact its count) and sanitize key text,
+        # dropping every non-numeric value so no runtime string can leak.
+        numbers = {
+            str(scrub(str(key))): value
+            for key, value in usage.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        obs["usage"] = numbers
     stats = observed.get("stats")
     if isinstance(stats, dict):
         obs["stats"] = scrub(stats)

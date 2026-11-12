@@ -926,13 +926,24 @@ def _diffstat(workdir: Path, patch: str) -> dict[str, int]:
     return {"files": files, "added": added, "deleted": deleted}
 
 
+_USAGE_INT_KEYS = (
+    "tokens",
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
 def _usage(worker: Mapping[str, Any]) -> dict[str, Any]:
-    """Token/cost usage from the adapter-normalized result (untrusted, metrics only)."""
+    """Validated token/cost counts from the adapter-normalized result (untrusted)."""
     usage = worker.get("usage") if isinstance(worker.get("usage"), Mapping) else {}
     out: dict[str, Any] = {}
-    tokens = usage.get("tokens")
-    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
-        out["tokens"] = tokens
+    for key in _USAGE_INT_KEYS:
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
     cost = usage.get("cost_usd")
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
         out["cost_usd"] = float(cost)
@@ -1323,13 +1334,18 @@ def _record_verify(
     code: str,
     sha: str | None = None,
 ) -> None:
+    usage = _usage(worker)
     fields: dict[str, Any] = {
         "attempt_id": attempt_id,
         "ok": ok,
         "code": code,
         "first_pass": _first_verify(state_dir, run_id, attempt_id),
-        **_usage(worker),
     }
+    # The metrics log schema is unchanged in this slice; the extended usage
+    # counts stay available to _usage callers but are not persisted yet.
+    for key in ("tokens", "cost_usd"):
+        if key in usage:
+            fields[key] = usage[key]
     if sha:
         fields["sha"] = sha
     _metric(state_dir, run_id, "verify", **fields)

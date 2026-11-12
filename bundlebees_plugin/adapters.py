@@ -43,7 +43,11 @@ Every adapter result is reduced to exactly::
         "attempt_id": str | None,
         "patch": str | None,       # unified diff against source_rev, or None
         "base_rev": str | None,    # full hex base the worker *declares*, not proof
-        "usage": {"tokens": int | None, "cost_usd": float | None},
+        "usage": {"tokens": int | None, "cost_usd": float | None,
+                  # optional when the runtime reports them:
+                  "input_tokens", "cache_read_input_tokens",
+                  "cache_write_input_tokens", "output_tokens",
+                  "reasoning_output_tokens"},
         "evidence": {"checks": [{"name", "command", "passed"}]},  # worker claims
         "state": str | None,
         "untrusted": True,
@@ -61,6 +65,7 @@ Runtime-specific result shapes (for example the Orbit launcher's
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Callable, Mapping, Protocol
 
@@ -194,22 +199,111 @@ def _flatten(raw: Mapping[str, Any]) -> Mapping[str, Any]:
     return raw
 
 
+def _coerce_usage(value: Any) -> Mapping[str, Any] | None:
+    """Accept a usage mapping or its JSON string; ignore unparseable strings."""
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(parsed, Mapping):
+            return parsed
+    return None
+
+
+def _usage_int(usage: Mapping[str, Any], *keys: str) -> int | None:
+    """First non-negative integer among ``keys``; bools and negatives are rejected."""
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
 def _normalize_usage(raw: Mapping[str, Any]) -> dict[str, int | float | None]:
-    usage: Any = raw.get("usage")
-    if not isinstance(usage, Mapping):
+    """Reduce a runtime usage report to canonical, non-double-counted counts.
+
+    Accepts camelCase OpenCode, snake_case, and raw DeepSeek shapes, either as
+    a mapping or as a JSON string. Counts the runtime did not report stay None;
+    the extended keys are only added when at least one of them is known so the
+    original ``{"tokens", "cost_usd"}`` contract is unchanged for callers that
+    only report a total.
+    """
+    usage = _coerce_usage(raw.get("usage"))
+    if usage is None:
         observed = raw.get("observed")
-        usage = observed.get("usage") if isinstance(observed, Mapping) else None
-    if not isinstance(usage, Mapping):
+        usage = (
+            _coerce_usage(observed.get("usage"))
+            if isinstance(observed, Mapping)
+            else None
+        )
+    if usage is None:
         usage = {}
-    tokens = usage.get("tokens", usage.get("total_tokens"))
-    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+
+    total = _usage_int(usage, "totalTokens", "total_tokens", "tokens")
+    uncached_input = _usage_int(usage, "inputTokens", "input_tokens")
+    cache_read = _usage_int(
+        usage, "cachedReadTokens", "cache_read_tokens", "prompt_cache_hit_tokens"
+    )
+    cache_write = _usage_int(usage, "cacheWriteTokens", "cache_write_tokens")
+    reasoning = _usage_int(
+        usage, "thoughtTokens", "reasoningTokens", "reasoning_tokens"
+    )
+    if reasoning is None:
+        details = usage.get("completion_tokens_details")
+        reasoning = (
+            _usage_int(details, "reasoning_tokens")
+            if isinstance(details, Mapping)
+            else None
+        )
+    uncached_output = _usage_int(usage, "outputTokens", "output_tokens")
+    completion = _usage_int(usage, "completion_tokens")
+    prompt = _usage_int(usage, "prompt_tokens")
+
+    # Canonical input includes cached reads and writes. Raw DeepSeek
+    # ``prompt_tokens`` is already inclusive, so it is never added again.
+    if uncached_input is not None:
+        input_tokens = uncached_input + (cache_read or 0) + (cache_write or 0)
+    elif prompt is not None:
+        input_tokens = prompt
+    else:
+        input_tokens = None
+
+    # Canonical output includes reasoning. Raw DeepSeek ``completion_tokens``
+    # is already inclusive, so only the uncached-output shapes add reasoning.
+    if uncached_output is not None:
+        output_tokens = uncached_output + (reasoning or 0)
+    elif completion is not None:
+        output_tokens = completion
+    else:
+        output_tokens = None
+
+    if total is not None:
+        tokens = total
+    elif input_tokens is not None and output_tokens is not None:
+        tokens = input_tokens + output_tokens
+    else:
         tokens = None
+
     cost = usage.get("cost_usd")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
         cost = None
     else:
         cost = float(cost)
-    return {"tokens": tokens, "cost_usd": cost}
+
+    result: dict[str, int | float | None] = {"tokens": tokens, "cost_usd": cost}
+    extended = {
+        "input_tokens": input_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_write_input_tokens": cache_write,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning,
+    }
+    if any(value is not None for value in extended.values()):
+        result.update(extended)
+    return result
 
 
 def _patch_text(value: Any) -> str | None:
