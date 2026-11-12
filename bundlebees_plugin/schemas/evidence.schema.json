@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/schemas/tdd-evidence.schema.json",
+  "title": "TDD and verification evidence record (tdd-evidence/1)",
+  "description": "One recorded check against one revision for one ACDD contract. Produced by an independent verifier, never accepted from a worker as authority. Classification rules are in docs/16-acdd-tdd.md.",
+  "type": "object",
+  "required": ["evidence_version", "contract_id", "contract_sha256", "phase", "revision", "base_rev", "test_fingerprints", "command", "result", "classification", "criteria", "produced_by", "test_first", "at"],
+  "properties": {
+    "evidence_version": {"const": "tdd-evidence/1"},
+    "contract_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "phase": {"enum": ["red", "green", "refactor", "integration", "review"]},
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "base_rev": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "test_fingerprints": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "command": {"type": "array", "items": {"type": "string"}},
+    "environment": {"type": "object"},
+    "result": {
+      "type": "object",
+      "required": ["exit_code", "tests", "failures", "errors", "skipped", "timed_out"],
+      "properties": {
+        "exit_code": {"type": ["integer", "null"]},
+        "tests": {"type": "integer", "minimum": 0},
+        "failures": {"type": "integer", "minimum": 0},
+        "errors": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0},
+        "timed_out": {"type": "boolean"},
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "outcome"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "outcome": {"enum": ["passed", "failed", "error", "skipped"]},
+              "error_type": {"type": "string"},
+              "message": {"type": "string", "maxLength": 500}
+            }
+          }
+        }
+      }
+    },
+    "classification": {"enum": ["behavioral_failure", "passed", "syntax_error", "collection_error", "environment_error", "unrelated_failure", "timeout", "not_run"]},
+    "criteria": {
+      "type": "object",
+      "propertyNames": {"pattern": "^AC-[0-9]{3,}$"},
+      "additionalProperties": {"enum": ["passed", "failed", "not_run", "review_required"]}
+    },
+    "produced_by": {
+      "type": "object",
+      "required": ["role"],
+      "properties": {
+        "role": {"enum": ["verifier", "worker", "reviewer", "human"]},
+        "name": {"type": "string"}
+      }
+    },
+    "test_first": {"type": "boolean"},
+    "at": {"type": "string", "minLength": 1},
+    "log_path": {"type": "string"},
+    "notes": {"type": "string"},
+    "signature": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional coordinator HMAC-SHA256 over the canonical record without this field. The reference demo leaves it out (teaching only)."}
+  },
+  "additionalProperties": true
+}
