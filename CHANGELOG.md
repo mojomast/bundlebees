@@ -5,6 +5,75 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+Verifier and contract hardening from an external review of the workflow. The
+unit of progress is an accepted artifact with evidence, and every guarantee
+below lives in the coordinator, independent of which agent produced the work.
+Built as six file-leased DeepSeek bee slices (two waves) and integrated in
+one pull request.
+
+### Security
+
+- **Sandboxed verification.** `hermes bundlebees verify` no longer runs pytest
+  in the coordinator worktree. Tests run on a disposable copy (no `.git`) under
+  bubblewrap (unprivileged uid, all namespaces unshared, no network, only
+  `/usr` and the Python install mounted), firejail (`--net=none --private`) or
+  unshare (`--user --net --pid`, weakest), with an environment rebuilt from
+  scratch (no coordinator credentials, no SSH agent, empty `HOME`). Only
+  evidence returns: backend, exit code, junit counts, output tail, diff stats.
+  With no backend, verify and integrate fail closed with `sandbox_unavailable`
+  unless the new, clearly labelled `verify_allow_unsafe_local` setting is on.
+- **Immutable lease authority.** `bundlebees_dispatch` writes
+  `leases/<attempt_id>.json` under plugin data at dispatch: `O_EXCL`, mode
+  `0400`, HMAC-SHA256 signed with a `0600` key. Verify trusts only this record
+  (`lease_missing`, `lease_tampered`) and ignores, then reports, scope claimed
+  in the worker result.
+- **Revision guarantees.** Verify requires the worker's declared base to equal
+  the brief's `source_rev`, the patch to apply to that exact commit (checked in
+  a temporary index), and the feature branch to descend from it
+  (`base_undeclared`, `base_mismatch`, `source_rev_missing`,
+  `patch_not_at_source_rev`, `branch_diverged`).
+
+### Added
+
+- **Strict brief contract.** `brief.schema.json` requires `objective`, a full
+  40/64-hex `source_rev`, non-empty repository-relative `assigned_files`, and
+  `acceptance` (criteria list, or `{criteria, commands, tests}`). Validated in
+  `bundlebees_plugin/brief.py` before any launcher call. Optional `run_id`,
+  `wave`, `retry_of`, `tests`.
+- **Wave integration gate.** `hermes bundlebees integrate --wave <id>
+  --attempts ...` checks every slice's verify record against the combined
+  branch, then runs the full suite there in the sandbox and writes
+  `waves/<id>.json`. `bundlebees_attempt op=review accepted=true` returns
+  `integration_required` until the attempt is in an accepted wave.
+- **Outcome metrics.** Append-only, hash-chained `metrics/<run_id>.jsonl`
+  (dispatch, verify, integrate, intervention, recovery events) and
+  `hermes bundlebees metrics [--run] [--json] [--note]`: first-pass rate,
+  accepted changes, tokens and cost per accepted change, human interventions,
+  plan-to-accepted time, regressions found, failed-worker recoveries.
+- **`hermes bundlebees lease <attempt_id> --brief <file>`** records a lease for
+  a brief dispatched outside the tool.
+- **Agent-agnostic worker backends.** `bundlebees_plugin/adapters.py`:
+  `WorkerBackend` (required: `create`, `result`), `WorkerAdapter` (optional
+  capabilities), `normalize_result` (patch, declared base, usage,
+  worker-claimed checks; everything else dropped), `orbit-loopback` default,
+  `launcher`, and documented `opencode` / `codex` stubs. See
+  `docs/ADAPTERS.md`. Core modules never name an agent or launcher (tested).
+- Settings `verify_isolation`, `verify_allow_unsafe_local`, `verify_timeout_s`;
+  `doctor` reports the sandbox backend.
+
+### Changed
+
+- Verify records now include `evidence` (`source_rev`, `backend`,
+  `exit_code`, `junit`, `diffstat`, `duration_s`).
+- Branch and tests for verify come from the user or the lease, never from
+  worker metadata.
+- A missing optional backend capability returns `unsupported_operation`.
+
+Tool count unchanged (4). Schemas: 571 -> 573 o200k (+2, dispatch
+description).
+
 ## [0.1.1] - 2026-11-12
 
 Fixes from the Hermes catalog review of 0.1.0 (NousResearch/hermes-agent#153888). Tested against real Hermes 0.23.0.
