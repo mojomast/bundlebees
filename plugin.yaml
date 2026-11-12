@@ -66,6 +66,12 @@ config_schema:
     description: >-
       Loopback Orbit adapter URL. Private non-loopback addresses are
       rejected. The pane never displays the URL.
+  coordinator:
+    type: str
+    default: "MR.INDIA"
+    description: >-
+      Coordinator name sent to Orbit at dispatch. Orbit returns a worker's
+      patch through its artifact API only to this coordinator.
   worktree:
     type: str
     default: ""
