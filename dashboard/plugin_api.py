@@ -1,7 +1,12 @@
 """Dashboard backend for the bundlebees Desktop pane.
 
 Every route is namespace-relative (the host mounts this router under
-``/api/plugins/bundlebees``) and returns a JSON envelope. The backend never
+``/api/plugins/bundlebees`` because ``dashboard/manifest.json`` declares
+``"api": "plugin_api.py"``) and returns a JSON envelope. The launcher client
+is built lazily on each request from ``plugins.entries.bundlebees.settings``
+(``hermes_cli.config.load_config_readonly``) plus
+``agent.secret_scope.get_secret``, which Hermes scopes to the requesting
+profile for plugin routes. The backend never
 accepts a launcher URL, token, or host from a request; it reuses the plugin's
 preconfigured client and the shared scrubbers so production payloads cannot
 carry secrets, bind addresses, private URLs, or local filesystem paths.
@@ -9,19 +14,25 @@ carry secrets, bind addresses, private URLs, or local filesystem paths.
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse
 
-from bundlebees_plugin.client import (
+# Hermes imports this file by path (``spec_from_file_location``), so the plugin
+# root is not guaranteed to be on sys.path in the dashboard process.
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
+from bundlebees_plugin.client import (  # noqa: E402
     ClientError,
-    client_from_agent,
+    client_from_config,
     public_attempt,
     public_container,
     public_events,
@@ -29,7 +40,8 @@ from bundlebees_plugin.client import (
     public_project,
     public_result,
 )
-from bundlebees_plugin.security import contain_path, scrub
+from bundlebees_plugin.security import contain_path, scrub  # noqa: E402
+from bundlebees_plugin.settings import settings_from_hermes_config  # noqa: E402
 
 router = APIRouter()
 
@@ -115,9 +127,18 @@ def set_backend_factory(factory: Callable[[], Any]) -> None:
     _backend_factory = factory
 
 
-def configure_backend(agent: Any = None, config: Mapping[str, Any] | None = None) -> None:
-    """Build the production client from non-secret config plus get_secret."""
-    set_backend(client_from_agent(agent, config or {}))
+def configure_backend(config: Mapping[str, Any] | None = None) -> None:
+    """Pin a client built from explicit settings (tests and harnesses only).
+
+    Production does not call this: ``_get_backend`` builds a client lazily on
+    each request from the Hermes config, so a settings change applies at once.
+    """
+    set_backend(client_from_config(config or {}))
+
+
+def _default_backend() -> Any:
+    """The production client: Hermes settings plus the secret scope."""
+    return client_from_config(settings_from_hermes_config())
 
 
 def set_data_dir(path: str | os.PathLike[str]) -> None:
@@ -141,6 +162,21 @@ def _get_backend() -> Any:
     global _backend
     if _backend is not None:
         return _backend
+    if _backend_factory is None:
+        try:
+            return _default_backend()
+        except DashboardError:
+            raise
+        except ClientError as exc:
+            raise _client_error(exc) from exc
+        except Exception as exc:  # pragma: no cover - defensive
+            raise DashboardError(
+                f"the bundlebees backend could not start: {exc}",
+                "not_configured",
+                "Enable the bundlebees plugin and configure the launcher in "
+                "Hermes settings, then reload the pane.",
+                503,
+            ) from exc
     if _backend_factory is not None:
         try:
             _backend = _backend_factory()
@@ -571,68 +607,16 @@ def attempt_review(attempt_id: str, payload: Any = Body(default=None)) -> JSONRe
 # ---------------------------------------------------------------------------
 
 
-def _hermes_plugin_data_dir() -> Path | None:
-    """Ask the host for a profile-aware plugin data dir when the API exists.
+def _default_data_dir() -> Path | None:
+    """``plugins.plugin_storage.plugin_data_dir("bundlebees")`` (profile-aware)."""
+    from bundlebees_plugin.cli import plugin_state_dir
 
-    Prefers ``plugins.plugin_storage.plugin_data_dir`` and
-    ``hermes_constants.get_hermes_home()``. Does not read ``HERMES_HOME``
-    from the process environment.
-    """
-    try:
-        from plugins.plugin_storage import plugin_data_dir as storage_dir  # type: ignore
-    except Exception:
-        storage_dir = None
-    if callable(storage_dir):
-        try:
-            path = storage_dir("bundlebees")
-        except Exception:
-            path = None
-        if path:
-            return Path(path).expanduser().resolve()
-    for module_name in ("hermes.plugins", "hermes.plugin", "hermes", "hermes_cli"):
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
-        helper = getattr(module, "plugin_data_dir", None)
-        if callable(helper):
-            try:
-                path = helper("bundlebees")
-            except Exception:
-                path = None
-            if path:
-                return Path(path).expanduser().resolve()
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-    except Exception:
-        return None
-    try:
-        home = get_hermes_home()
-    except Exception:
-        return None
-    if home:
-        return (Path(home) / "plugin-data" / "bundlebees").expanduser().resolve()
-    return None
+    return plugin_state_dir()
 
 
-def _data_home_fallback() -> Path:
-    """Profile-neutral fallback when Hermes APIs are unavailable.
-
-    Does not read ``HERMES_HOME`` and does not hardcode ``~/.hermes``.
-    """
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg and str(xdg).strip():
-        return (Path(xdg).expanduser() / "hermes-plugins" / "bundlebees").resolve()
-    return (Path.home() / ".local" / "share" / "hermes-plugins" / "bundlebees").resolve()
-
-
-def _default_data_dir() -> Path:
-    found = _hermes_plugin_data_dir()
-    return (found or _data_home_fallback()).resolve()
-
-
-def _data_root() -> Path:
-    return (_data_dir or _default_data_dir()).resolve()
+def _data_root() -> Path | None:
+    root = _data_dir or _default_data_dir()
+    return root.resolve() if root is not None else None
 
 
 def _sanitize_verify_record(data: Any, fallback_id: str) -> dict[str, Any] | None:
@@ -672,6 +656,8 @@ def _sanitize_verify_record(data: Any, fallback_id: str) -> dict[str, Any] | Non
 def _load_verify_results(attempt_id: str | None = None) -> list[dict[str, Any]]:
     wanted = _require_attempt_id(attempt_id) if attempt_id else None
     root = _data_root()
+    if root is None:
+        return []
     directory = root / "verify-results"
     if not directory.is_dir():
         return []

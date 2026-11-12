@@ -7,16 +7,7 @@ import json
 import pytest
 
 from bundlebees_plugin.client import ClientError
-from tests.fakes import FakeCtx, ROOT, load_plugin
-
-
-class FakeAgent:
-    def __init__(self, token: str | None = None) -> None:
-        self.secret_scope = self
-        self._token = token
-
-    def get_secret(self, _name: str) -> str | None:
-        return self._token
+from tests.fakes import FakeCtx, ROOT, load_plugin, secret_scope
 
 
 class FakeClient:
@@ -110,11 +101,9 @@ def _ctx():
     return ctx
 
 
-def _call(ctx, name, args, client=None, agent=None):
+def _call(ctx, name, args, client=None):
     if client is not None:
         ctx.bundlebees_client = client
-    if agent is not None:
-        ctx.agent = agent
     result = ctx.tools[name]["handler"](args)
     assert isinstance(result, str)
     return json.loads(result)
@@ -457,10 +446,46 @@ def test_host_prompt_rejects_secrets_and_addresses(overrides):
 
 def test_missing_secret_fails_closed_without_client():
     ctx = _ctx()
-    ctx.agent = FakeAgent(None)
+    with secret_scope({}) as calls:
+        payload = json.loads(ctx.tools["bundlebees_status"]["handler"]({"op": "health"}))
+    assert payload["ok"] is False
+    assert payload["code"] == "not_configured"
+    assert calls.get("BUNDLEBEES_LAUNCHER_TOKEN") == 1
+
+
+def test_no_secret_scope_outside_hermes_fails_closed():
+    ctx = _ctx()
     payload = json.loads(ctx.tools["bundlebees_status"]["handler"]({"op": "health"}))
     assert payload["ok"] is False
     assert payload["code"] == "not_configured"
+
+
+def test_unscoped_secret_error_fails_closed():
+    ctx = _ctx()
+    with secret_scope({}, raises=True):
+        payload = json.loads(ctx.tools["bundlebees_status"]["handler"]({"op": "health"}))
+    assert payload["code"] == "not_configured"
+
+
+def test_settings_are_read_per_key_with_get_config():
+    from bundlebees_plugin.tools import _ctx_config
+
+    ctx = FakeCtx(settings={"adapter": "launcher", "launcher_url": "https://launcher.example.test"})
+    config = _ctx_config(ctx)
+    assert config["adapter"] == "launcher"
+    assert config["launcher_url"] == "https://launcher.example.test"
+    assert config["orbit_url"] == "http://127.0.0.1:4318"
+    assert config["allow_private"] is False
+    assert not hasattr(ctx, "config")
+
+
+def test_token_reaches_the_client_through_get_secret():
+    from bundlebees_plugin.tools import _client_for
+
+    ctx = FakeCtx(settings={"adapter": "launcher", "launcher_url": "http://127.0.0.1:9"})
+    with secret_scope({"BUNDLEBEES_LAUNCHER_TOKEN": "tok-test-value"}):
+        client = _client_for(ctx, {})
+        assert client._token() == "tok-test-value"
 
 
 def test_handler_exception_becomes_envelope():
@@ -494,7 +519,6 @@ def test_dispatch_allows_objective_only_brief():
 
 def test_host_prompt_needs_no_launcher_or_token():
     ctx = _ctx()
-    ctx.agent = FakeAgent(None)
     payload = json.loads(
         ctx.tools["bundlebees_host_prompt"]["handler"](
             {

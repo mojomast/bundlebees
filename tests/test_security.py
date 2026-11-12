@@ -229,3 +229,15 @@ def test_resolve_pinned_endpoint_rejects_if_any_address_is_metadata(monkeypatch)
             allow_loopback=False,
             allow_private=False,
         )
+
+
+def test_child_env_keeps_home_and_user_path_but_no_secret(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/someone")
+    monkeypatch.setenv("PATH", "/opt/custom/bin:/usr/bin")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel-should-not-pass")
+    monkeypatch.setenv("BUNDLEBEES_LAUNCHER_TOKEN", "sentinel-token")
+    env = security.child_env()
+    assert env["HOME"] == "/home/someone"
+    assert env["PATH"] == "/opt/custom/bin:/usr/bin"
+    assert "sentinel" not in " ".join(env.values())
+    assert set(env) <= {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"}

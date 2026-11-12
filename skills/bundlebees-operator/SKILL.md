@@ -165,7 +165,7 @@ user's behalf without their explicit decision.
   environment.
 - Board tracking is Hermes kanban only. Do not import `hermes_cli.kanban_db`
   and do not assign a dispatchable Hermes profile.
-- Keep the plugin version at `0.1.0`; this skill never changes the manifest.
+- Do not change the plugin version; this skill never changes the manifest.
 - Feature branch and PR only. No merge to `main`, tag, release, catalog PR,
   force-push, or deploy.
 - The final answer names `attempt_id`, `kanban_task_id` when present, the
