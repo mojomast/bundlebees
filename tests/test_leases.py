@@ -251,3 +251,47 @@ def test_key_never_appears_in_record_or_error_text(tmp_path: Path):
     text = "\n".join(messages).lower()
     assert key_hex.lower() not in text
     assert key.hex() not in text
+
+
+def test_parallel_first_leases_share_one_complete_key(tmp_path: Path, monkeypatch):
+    """Regression: concurrent first dispatches must never read a half-written key.
+
+    Seen in the workflow cold-start acceptance on CI: three parallel
+    dispatches on a fresh state dir, one failed with "the lease key is not 32
+    bytes" because it opened the key file after another thread created it but
+    before that thread wrote the bytes.
+    """
+    import os
+    import threading
+    import time
+
+    from bundlebees_plugin import leases
+
+    real_urandom = os.urandom
+
+    def slow_urandom(n):
+        time.sleep(0.2)
+        return real_urandom(n)
+
+    monkeypatch.setattr(leases.os, "urandom", slow_urandom)
+    barrier = threading.Barrier(6)
+    errors: list[BaseException] = []
+
+    def worker(i: int) -> None:
+        barrier.wait()
+        try:
+            _record(tmp_path, f"att-{i}")
+        except BaseException as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert [str(e) for e in errors] == []
+    assert len(list((tmp_path / "leases").glob("*.json"))) == 6
+    key = (tmp_path / "lease.key").read_bytes()
+    assert len(key) == 32
+    for i in range(6):
+        load_lease(tmp_path, f"att-{i}")

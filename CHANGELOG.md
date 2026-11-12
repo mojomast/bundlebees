@@ -13,6 +13,49 @@ below lives in the coordinator, independent of which agent produced the work.
 Built as six file-leased DeepSeek bee slices (two waves) and integrated in
 one pull request.
 
+### Added
+
+- **ACDD contracts and TDD evidence** ([docs/ACDD.md](docs/ACDD.md), the
+  protocol from workflow chapter 16). `bundlebees_plugin/contract.py` validates
+  `acdd/1` contracts (the bundled schema plus the eight code checks), hashes
+  them canonically and freezes them. `bundlebees_plugin/tdd.py` classifies test
+  runs per case, writes HMAC-signed, append-only `tdd-evidence/1` records and
+  checks RED, GREEN and REFACTOR. `bundlebees_dispatch` enforces a contract
+  in `brief.contract` and returns an `acdd` block. Briefs without one run in
+  legacy mode ("no ACDD contract; TDD evidence not required"). The new
+  `require_contract` setting makes a contract mandatory.
+- **CLI:** `contract validate|freeze`, `tdd red|refactor|review|report`. With a contract,
+  `verify` refuses edits to approved tests, requires a valid RED and records a
+  signed GREEN. `integrate` requires GREEN and records an `integration` record.
+  Sandboxed runs now return per-case results (`cases`).
+- The combined tool schema grows from 573 to 585 o200k (dispatch description).
+- Built test-first: the approved tests were committed before any
+  implementation, and DeepSeek bees implemented `contract.py`/`tools.py` and
+  `tdd.py`/`sandbox.py` against them. The coordinator implemented the CLI
+  wiring (also test-first) while bee dispatch was paused.
+- `tdd refactor --rev <sha>` reruns the read-only approved tests on a
+  descendant of GREEN in the sandbox and records signed REFACTOR evidence
+  (`refactor_failed`, `tests_tampered`, `scope_violation`, `stale_revision`);
+  `tdd refactor --none --note <text>` records "no refactor needed". Built
+  test-first by a DeepSeek bee against coordinator-approved tests.
+- `tdd review --reviewer <name> [--role reviewer|human] (--approve|--reject)
+  --note <text>` records a signed REVIEW for the GREEN (or required
+  REFACTOR) revision; review and manual criteria take its outcome, and a
+  rejection exits with `review_failed`. Workers can never record a review.
+- `integrate` now also requires a valid REFACTOR record (a real one or an
+  explicit `--none` skip) when the contract lists `refactor`.
+- The shared evidence schema allows `classification: "failed"`, for review
+  records only (a rejected review).
+
+### Fixed
+
+- Concurrent first dispatches on a fresh state directory could fail with
+  `lease_invalid: the lease key is not 32 bytes`: one thread opened the key
+  file after another created it but before the bytes were written (seen in
+  the workflow cold-start acceptance on CI). The key is now written to a
+  private temporary file and published with `os.link`, so readers only ever
+  see a complete key. Regression test written first and seen failing.
+
 ### Security
 
 - **No automatic weak sandbox.** `verify_isolation=auto` now picks only a

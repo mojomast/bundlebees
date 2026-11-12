@@ -107,6 +107,13 @@ config_schema:
       UNSAFE. Permit verify_isolation=unshare, which isolates network and
       PIDs but leaves the coordinator's filesystem readable. Never picked
       by auto. Env BUNDLEBEES_ALLOW_WEAK_UNSHARE=1 does the same.
+  require_contract:
+    type: bool
+    default: false
+    description: >-
+      Opt this project in to ACDD: dispatch refuses briefs without a frozen
+      acdd/1 contract (contract_missing). Off by default; briefs without a
+      contract then run in legacy mode with no TDD evidence required.
   verify_timeout_s:
     type: int
     default: 900

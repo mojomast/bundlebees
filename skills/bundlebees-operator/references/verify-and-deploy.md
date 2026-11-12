@@ -66,6 +66,18 @@ Verify writes `verify-results/<attempt_id>.json` with `attempt_id`, `ok`,
 `verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside
 the repo.
 
+## Contract-first (ACDD) work
+
+When the user wants test-first work, they freeze an `acdd/1` contract and commit the approved tests on their own first (see the plugin's `docs/ACDD.md`). Then:
+
+```text
+hermes bundlebees contract validate contract.json
+hermes bundlebees contract freeze contract.json --approved-by <name>
+hermes bundlebees tdd red contract.json --workdir <repo>
+```
+
+Put the frozen contract in `brief.contract`, with `source_rev` = the tests-only commit. Approved test files are never in `assigned_files`. Verify then refuses edits to approved tests (`tests_tampered`), needs that RED (`red_missing`), and records GREEN. `hermes bundlebees tdd refactor contract.json --workdir <repo> --rev <sha>` (or `--none --note <why>`) records REFACTOR. `hermes bundlebees tdd review contract.json --reviewer <name> --approve --note <why>` records REVIEW (only a reviewer or human, never a worker). Integrate needs REFACTOR when the contract lists it, and records the integration evidence. `hermes bundlebees tdd report contract.json` shows each phase as valid, a failure code or not run. Never edit evidence files, and never call a check passed when it did not run.
+
 ## Integrate (wave acceptance)
 
 ```text
@@ -97,6 +109,7 @@ If verify or integrate is red:
 | `lease_missing` / `lease_tampered` | No valid coordinator lease. Never edit lease files; record one from the dispatched brief or re-dispatch. |
 | `base_undeclared` / `base_mismatch` / `source_rev_missing` / `patch_not_at_source_rev` / `branch_diverged` | Not built on the brief's exact revision. Re-dispatch with the right `source_rev` and `retry_of`. |
 | `scope_violation` | The bee exceeded its lease. Stop; no repair dispatch until the user decides. |
+| `tests_tampered` / `red_missing` / `red_incomplete` / `contract_*` | ACDD stop. Report the code; the fix is the user's (restore tests, record RED, re-freeze). Never weaken an approved test. |
 | `sandbox_unavailable` | Install bubblewrap (or firejail). Do not suggest the unsafe local or weak unshare overrides on a shared or credentialed host. |
 | `tests_failed` | Report the test names and output tail; ask whether to dispatch a fresh narrow brief. |
 | `secret_detected` | Stop immediately. Do not echo the matched value. |

@@ -26,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "verify_isolation": "auto",
     "verify_allow_unsafe_local": False,
     "verify_allow_weak_unshare": False,
+    "require_contract": False,
     "verify_timeout_s": 900,
 }
 

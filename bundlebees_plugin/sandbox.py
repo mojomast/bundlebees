@@ -562,6 +562,16 @@ def run_in_sandbox(
             stdout, stderr = "", str(exc)
         duration = time.monotonic() - started
 
+        cases: list[dict] = []
+        try:
+            from . import tdd as _tdd
+
+            junit_path = evidence_host / "junit.xml"
+            if junit_path.is_file() and not junit_path.is_symlink():
+                cases = _tdd.parse_junit_cases(junit_path)
+        except Exception:
+            cases = []
+
         return {
             "backend": label,
             "exit_code": int(exit_code),
@@ -569,6 +579,7 @@ def run_in_sandbox(
             "duration_s": float(duration),
             "output_tail": _output_tail(stdout, stderr),
             "junit": _junit_summary(evidence_host),
+            "cases": cases,
         }
     finally:
         shutil.rmtree(root, ignore_errors=True)

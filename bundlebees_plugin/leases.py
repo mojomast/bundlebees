@@ -35,6 +35,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
@@ -250,20 +251,26 @@ def _read_existing_key(path: Path) -> bytes:
 
 
 def _ensure_key(state_dir: Path) -> bytes:
+    """Return the lease key, creating it atomically on first use.
+
+    The key is written in full to a private temporary file and then published
+    with ``os.link``, which fails if the key already exists. Concurrent first
+    dispatches therefore either publish the key or read a complete one; none
+    can observe a half-written key file.
+    """
     path = state_dir / _KEY_NAME
     try:
         return _read_existing_key(path)
     except FileNotFoundError:
         pass
 
+    tmp = state_dir / f".{_KEY_NAME}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     try:
         fd = os.open(
-            path,
+            tmp,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
             0o600,
         )
-    except FileExistsError:
-        return _read_existing_key(path)
     except OSError as exc:
         raise LeaseError(
             "lease_invalid",
@@ -271,19 +278,35 @@ def _ensure_key(state_dir: Path) -> bytes:
             _FIX_KEY,
         ) from exc
 
-    keep_fd = True
     try:
-        key = os.urandom(_KEY_BYTES)
-        with os.fdopen(fd, "wb") as handle:
-            keep_fd = False
-            handle.write(key)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(path, 0o600)
+        keep_fd = True
+        try:
+            key = os.urandom(_KEY_BYTES)
+            with os.fdopen(fd, "wb") as handle:
+                keep_fd = False
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+        finally:
+            if keep_fd:
+                os.close(fd)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return _read_existing_key(path)
+        except OSError as exc:
+            raise LeaseError(
+                "lease_invalid",
+                "the lease key could not be created safely",
+                _FIX_KEY,
+            ) from exc
+        return key
     finally:
-        if keep_fd:
-            os.close(fd)
-    return key
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def _load_key(state_dir: Path) -> bytes:
@@ -557,3 +580,25 @@ def ignored_worker_claims(
         claims.append("lease")
 
     return claims
+
+
+_EVIDENCE_KEY_LABEL = b"bundlebees/tdd-evidence/1"
+
+
+def evidence_key(state_dir: Path | str) -> bytes:
+    """32-byte HMAC key for signing ``tdd-evidence/1`` records.
+
+    Derived from the coordinator's private lease key with a fixed label, so
+    evidence and leases share one ``0600`` secret but never the same key.
+    Workers never see either: both live only in the coordinator state dir.
+    """
+    path = Path(state_dir)
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise LeaseError(
+            "lease_invalid",
+            "the plugin state directory could not be created safely",
+            "Use a writable plugin state directory and retry.",
+        ) from exc
+    return hmac.new(_ensure_key(path), _EVIDENCE_KEY_LABEL, hashlib.sha256).digest()

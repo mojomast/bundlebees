@@ -22,10 +22,17 @@ from .client import (
 )
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
+from . import contract as _contract
 from . import leases as _leases
 from . import metrics as _metrics
 from . import revision as _revision
-from .security import contains_address, is_public_git_url, looks_like_secret, scrub
+from .security import (
+    config_flag,
+    contains_address,
+    is_public_git_url,
+    looks_like_secret,
+    scrub,
+)
 
 TOOL_NAMES = (
     "bundlebees_status",
@@ -100,6 +107,11 @@ def _coerce_args(args: Any) -> dict[str, Any]:
 def _ctx_config(ctx: Any) -> dict[str, Any]:
     """Settings via ``ctx.get_config(key, default)`` for each declared key."""
     return settings_from_ctx(ctx)
+
+
+def _require_contract(ctx: Any) -> bool:
+    """The optional ``require_contract`` setting (default false)."""
+    return config_flag(_ctx_config(ctx).get("require_contract"), False)
 
 
 def _client_for(ctx: Any, kwargs: Mapping[str, Any]) -> Any:
@@ -233,6 +245,8 @@ def _dispatched(
     data: Mapping[str, Any],
     args: Mapping[str, Any],
     state_dir: Path | None = None,
+    *,
+    acdd: Mapping[str, Any] | None = None,
 ) -> str:
     """Build the dispatch success envelope.
 
@@ -246,6 +260,8 @@ def _dispatched(
     kanban_task_id = args.get("kanban_task_id")
     if "kanban_task_id" not in out and kanban_task_id:
         out["kanban_task_id"] = kanban_task_id
+    if acdd is not None:
+        out["acdd"] = dict(acdd)
     out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
     return _ok(**out)
 
@@ -279,6 +295,41 @@ def _record_dispatch(state_dir: Path | None, attempt_id: Any, brief: Mapping[str
     return {"lease_recorded": True}
 
 
+def _dispatch_acdd(
+    brief: Mapping[str, Any], require_contract: bool
+) -> dict[str, Any] | str:
+    """Enforce the optional ACDD contract before any launcher call.
+
+    Returns the ``acdd`` envelope block, or an error envelope string when the
+    contract is missing, invalid, unfrozen, changed, stale or widened.
+    """
+    contract = _contract.contract_from_brief(brief)
+    if contract is None:
+        if require_contract:
+            return _err(
+                "contract_missing",
+                "brief has no ACDD contract but this project requires one",
+                "Attach a frozen acdd/1 contract under brief.contract before dispatch.",
+            )
+        return {
+            "mode": "legacy",
+            "note": "no ACDD contract; TDD evidence not required",
+        }
+    try:
+        validated = _contract.validate_contract(contract)
+        digest = _contract.check_frozen(contract)
+        _contract.check_brief_against_contract(brief, validated)
+    except _contract.ContractError as exc:
+        return _err(exc.code, exc.error, exc.fix)
+    tdd = validated.get("tdd")
+    return {
+        "mode": "contract",
+        "contract_id": validated.get("id"),
+        "contract_sha256": digest,
+        "tdd_applicable": bool(tdd.get("applicable")) if isinstance(tdd, Mapping) else False,
+    }
+
+
 def _state_dir_for(ctx: Any) -> Path | None:
     """Plugin data dir for leases, waves and metrics (profile-aware)."""
     injected = getattr(ctx, "bundlebees_state_dir", None)
@@ -291,7 +342,13 @@ def _state_dir_for(ctx: Any) -> Path | None:
     return plugin_state_dir()
 
 
-def _dispatch(client: Any, args: Mapping[str, Any], state_dir: Path | None = None) -> str:
+def _dispatch(
+    client: Any,
+    args: Mapping[str, Any],
+    state_dir: Path | None = None,
+    *,
+    require_contract: bool = False,
+) -> str:
     raw = args.get("brief")
     if isinstance(raw, str):
         try:
@@ -311,6 +368,11 @@ def _dispatch(client: Any, args: Mapping[str, Any], state_dir: Path | None = Non
         brief = validate_brief(parsed)
     except BriefError as exc:
         return _err("brief_invalid", exc.error, exc.fix)
+
+    acdd = _dispatch_acdd(brief, require_contract)
+    if isinstance(acdd, str):
+        return acdd
+
     if state_dir is None:
         return _err(
             "not_configured",
@@ -383,7 +445,9 @@ def _dispatch(client: Any, args: Mapping[str, Any], state_dir: Path | None = Non
         if exc.code == "project_unauthorized":
             return _err(exc.code, exc.error, _FIX_PROJECT)
         raise
-    return _dispatched(client, brief, _unwrap_attempt(data), args, state_dir)
+    return _dispatched(
+        client, brief, _unwrap_attempt(data), args, state_dir, acdd=acdd
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +683,7 @@ _STATUS_SCHEMA = _schema(
 
 _DISPATCH_SCHEMA = _schema(
     "bundlebees_dispatch",
-    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. Does not apply patches, run tests, or deploy.",
+    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. An optional acdd/1 contract is validated and enforced. Does not apply patches, run tests, or deploy.",
     {
         "type": "object",
         "properties": {
@@ -718,7 +782,12 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             if tool_name == "bundlebees_status":
                 return _status(client, data)
             if tool_name == "bundlebees_dispatch":
-                return _dispatch(client, data, _state_dir_for(ctx))
+                return _dispatch(
+                    client,
+                    data,
+                    _state_dir_for(ctx),
+                    require_contract=_require_contract(ctx),
+                )
             return _attempt(client, data, _state_dir_for(ctx))
         except ClientError as exc:
             return json.dumps(exc.as_envelope())
