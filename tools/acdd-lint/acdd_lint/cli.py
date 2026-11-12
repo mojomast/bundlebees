@@ -132,16 +132,13 @@ def _read_object(path: Path) -> tuple[Mapping[str, Any] | None, str | None]:
     return None, None
 
 
-def _validate(
-    obj: Mapping[str, Any],
-    contract_schema: Mapping[str, Any],
-    evidence_schema: Mapping[str, Any],
-) -> tuple[str, Mapping[str, Any], list[tuple[str, str]]]:
+def _kind(obj: Mapping[str, Any]) -> str:
+    """Classify a parsed object as "contract", "evidence" or "other"."""
     if "contract_version" in obj:
-        return "contract", obj, schema.validate(obj, contract_schema)
+        return "contract"
     if "evidence_version" in obj:
-        return "evidence", obj, schema.validate(obj, evidence_schema)
-    return "other", obj, []
+        return "evidence"
+    return "other"
 
 
 def _scan(
@@ -171,17 +168,13 @@ def _scan(
                 continue
             if obj is None:
                 continue
-            kind, body, errors = _validate(obj, contract_schema, evidence_schema)
-            if kind == "contract":
-                found_contracts.append((relative, body))
-                code = "contract_invalid"
-            elif kind == "evidence":
-                found_records.append((relative, body))
-                code = "evidence_invalid"
-            else:
+            kind = _kind(obj)
+            if kind == "other":
                 continue
-            for where, message in errors:
-                problems.append(_problem(code, relative, where, message))
+            (found_contracts if kind == "contract" else found_records).append((relative, obj))
+            kind_schema = contract_schema if kind == "contract" else evidence_schema
+            for where, message in schema.validate(obj, kind_schema):
+                problems.append(_problem(f"{kind}_invalid", relative, where, message))
 
     return found_contracts, found_records, problems
 
