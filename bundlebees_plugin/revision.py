@@ -430,13 +430,22 @@ def _clean_record(record: Mapping[str, Any], head: str) -> dict:
         str(attempt_id): str(scrub(reason))
         for attempt_id, reason in dict(problems).items()
     }
+    suite = scrub(record.get("suite"))
+    raw_suites = (record.get("suite") or {}).get("suites") if isinstance(record.get("suite"), Mapping) else None
+    if isinstance(suite, dict) and isinstance(raw_suites, Mapping):
+        # Category names are fixed labels ("security" would match scrub()'s "uri" key rule).
+        suite["suites"] = {
+            name: scrub(dict(raw_suites[name]))
+            for name in ("regression", "contract", "security")
+            if isinstance(raw_suites.get(name), Mapping)
+        }
     return {
         "wave_id": record["wave_id"],
         "accepted": bool(record["accepted"]),
         "head_sha": head,
         "attempts": list(record["attempts"]),
         "problems": clean_problems,
-        "suite": scrub(record.get("suite")),
+        "suite": suite,
         "regressions": int(record["regressions"]),
         "at": record["at"],
     }
@@ -534,7 +543,12 @@ def integrate_wave(
     if not problems:
         evidence = run_suite(repo)
         suite = dict(evidence) if isinstance(evidence, Mapping) else {}
-        accepted = suite.get("exit_code") == 0 and not bool(suite.get("timed_out"))
+        # A runner may name test categories that failed or did not run (fail closed).
+        accepted = (
+            suite.get("exit_code") == 0
+            and not bool(suite.get("timed_out"))
+            and not suite.get("blocking")
+        )
 
     regressions = 0
     if not accepted and suite is not None:
