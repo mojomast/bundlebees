@@ -1,9 +1,8 @@
 # ACDD and TDD in bundlebees
 
-> This is bundlebees' copy of the protocol in [workflow chapter 16](https://github.com/mojomast/workflow/blob/main/docs/16-acdd-tdd.md). `bundlebees_plugin/schemas/contract.schema.json` and `evidence.schema.json` are byte-identical copies of the workflow repository's `schemas/` files.
+> This is bundlebees' copy of the protocol in [workflow chapter 16](https://github.com/mojomast/workflow/blob/main/docs/16-acdd-tdd.md), regenerated from it. `bundlebees_plugin/schemas/contract.schema.json` and `evidence.schema.json` are byte-identical copies of the workflow repository's `schemas/` files.
 
-
-**Status:** protocol defined here, enforced in the [reference demo](https://github.com/mojomast/workflow/blob/main/reference/README.md) (workflow repository) and, on a feature branch under review, in [bundlebees](https://github.com/mojomast/bundlebees) (`feat/acdd-tdd`, not merged, not released). Orbit display of contracts and evidence is planned; see [§9](#9-orbit). Nothing in this chapter changes who may merge, tag, release, deploy or publish.
+**Status (Nov 12, 2026):** the protocol is defined here and enforced in the [reference demo](https://github.com/mojomast/workflow/blob/main/reference/README.md) (workflow repository). In [bundlebees](https://github.com/mojomast/bundlebees) it is enforced at dispatch, verify and integrate on the `feat/acdd-tdd` branch, which is under review and not merged or released. Orbit's read-only evidence view is built on an orbitdesktop branch, also under review, but it is not yet wired into the board; see [§9](#9-orbit). Nothing in this chapter changes who may merge, tag, release, deploy or publish.
 
 The unit of progress is still an accepted artifact with evidence ([12](https://github.com/mojomast/workflow/blob/main/docs/12-three-layer-architecture.md)). This chapter makes two parts of that sentence machine-checkable:
 
@@ -33,7 +32,7 @@ Each arrow either produces an evidence record or stops with a named failure stat
 
 ## 2. The contract (`acdd/1`)
 
-Machine-readable form: [`schemas/acdd-contract.schema.json`](../bundlebees_plugin/schemas/contract.schema.json). Human-readable form: [`templates/CONTRACT.md`](https://github.com/mojomast/workflow/blob/main/templates/CONTRACT.md). A worked example: [`templates/contract.example.json`](https://github.com/mojomast/workflow/blob/main/templates/contract.example.json).
+Machine-readable form: [`schemas/acdd-contract.schema.json`](https://github.com/mojomast/workflow/blob/main/bundlebees_plugin/schemas/contract.schema.json). Human-readable form: [`templates/CONTRACT.md`](https://github.com/mojomast/workflow/blob/main/templates/CONTRACT.md). A worked example: [`templates/contract.example.json`](https://github.com/mojomast/workflow/blob/main/templates/contract.example.json).
 
 | Field | Meaning |
 |---|---|
@@ -69,7 +68,7 @@ A validator rejects a contract, with the failing field and a fix, when:
 
 ## 3. Evidence records (`tdd-evidence/1`)
 
-Schema: [`schemas/tdd-evidence.schema.json`](../bundlebees_plugin/schemas/evidence.schema.json). One record is one check on one revision:
+Schema: [`schemas/tdd-evidence.schema.json`](https://github.com/mojomast/workflow/blob/main/bundlebees_plugin/schemas/evidence.schema.json). One record is one check on one revision:
 
 - `contract_id`, `contract_sha256`, `phase` (`red`, `green`, `refactor`, `integration`, `review`);
 - `base_rev` (the contract's `source_rev`) and `revision` (the commit actually tested);
@@ -112,7 +111,7 @@ A *missing declared interface* is `NotImplementedError`, or `ImportError` / `Mod
 
 ## 6. Parallel dispatch and integration
 
-Parallel contracts must have disjoint `scope.assigned_files`. Test files may be shared read-only. Integration applies only patches with a valid GREEN (and REFACTOR when required), then runs the full suite on the combined branch, producing an `integration` record. A contract is *accepted* only when every phase in `evidence_required` has a valid verifier record, every criterion is `passed` or explicitly `review_required` with a review record, and integration passed. A human acceptance (merge and later gates) is still Kyle's.
+Parallel contracts must have disjoint `scope.assigned_files`. Test files may be shared read-only. Integration applies only patches with a valid GREEN (and REFACTOR when required; bundlebees' `integrate` currently checks GREEN only, see [§10](#10-where-this-is-enforced)), then runs the full suite on the combined branch, producing an `integration` record. A contract is *accepted* only when every phase in `evidence_required` has a valid verifier record, every criterion is `passed` or explicitly `review_required` with a review record, and integration passed. A human acceptance (merge and later gates) is still Kyle's.
 
 ## 7. Failure states
 
@@ -136,18 +135,18 @@ Every stop has a name, so reports and Orbit can show it without interpretation:
 
 - Briefs without a `contract` keep working exactly as before (`legacy` mode). Tools report "no ACDD contract; TDD evidence not required" so nobody mistakes legacy work for test-first work.
 - A brief with a `contract` is enforced: invalid or unfrozen contracts are rejected before dispatch.
-- Projects can opt every brief into enforcement with a `require_contract` setting (bundlebees) or by passing `--require-contract` (reference demo). The default stays off for `acdd/1`; a later version can flip it after a migration window.
+- Projects can opt every brief into enforcement with the `require_contract` setting (bundlebees): dispatch then refuses a brief without a contract (`contract_missing`). The default stays off for `acdd/1`; a later version can flip it after a migration window. The reference demo runs contract-first by default; `--legacy` runs the old flow.
 - New schema versions get a new `contract_version` / `evidence_version` string. Validators refuse versions they do not know rather than guessing.
 
 ## 9. Orbit
 
-Planned: Orbit shows each contract's criteria with their latest verifier status, the RED → GREEN → REFACTOR timeline, failure codes from [§7](#7-failure-states), and unrun checks in their own colour. Orbit only displays; the decision stays with bundlebees' verifier and Kyle's gates. The integration contract for that view is a separate Orbit plan, tracked in [17](https://github.com/mojomast/workflow/blob/main/docs/17-orbit-plans.md).
+In progress: a read-only model and panel renderer are built (orbitdesktop `server/acdd-evidence.mjs`, `src/acdd-evidence-panel.ts`, on a branch under review), but they are not wired into the board yet. When they are, Orbit shows each contract's criteria with their latest verifier status, the RED → GREEN → REFACTOR timeline, failure codes from [§7](#7-failure-states), and unrun checks in their own colour. Orbit only displays; the decision stays with bundlebees' verifier and Kyle's gates. The integration contract for that view is a separate Orbit plan, tracked in [17](https://github.com/mojomast/workflow/blob/main/docs/17-orbit-plans.md).
 
 ## 10. Where this is enforced
 
 | Layer | What enforces it | Status |
 |---|---|---|
 | Workflow (protocol) | This chapter, the two schemas, [`templates/CONTRACT.md`](https://github.com/mojomast/workflow/blob/main/templates/CONTRACT.md) | Defined |
-| Reference demo | `reference/workflow/acdd.py`, `reference/workflow/tdd.py`, and the contract-first run in `run_demo.py` | Implemented, tested in CI |
-| bundlebees | `contract.py`, `tdd.py`, the `contract` and `tdd` CLI commands, and contract-aware verify and integrate | On `feat/acdd-tdd`, under review; not on `main` |
-| Orbit | Contract and evidence view | Planned |
+| Reference demo | `reference/workflow/acdd.py`, `reference/workflow/tdd.py`, `reference/workflow/lifecycle.py` (the default run of `run_demo.py`), `reference/check_schemas.py` | Implemented, tested in CI. Evidence is unsigned and unsandboxed (teaching only) |
+| bundlebees | `contract.py` (validation, hash, freezing, the dispatch gate and `require_contract`), `tdd.py` (classification, signed append-only records, RED/GREEN/REFACTOR checks, acceptance report), and the CLI: `contract validate\|freeze`, `tdd red\|report`, a contract-aware `verify` (approved tests read-only, RED required, signed GREEN) and `integrate` (GREEN required, signed integration record) | On `feat/acdd-tdd`, under review; not on `main`, not released. Not wired yet: recording REFACTOR from the CLI, and REVIEW records (`tdd.check_refactor` exists; there is no command for it) |
+| Orbit | Read-only contract and evidence view | Model and panel built on a branch under review; wiring into the board, routes and activity feed is planned |

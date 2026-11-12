@@ -63,7 +63,7 @@ Helper files:
 
 - `${HERMES_SKILL_DIR}/references/kanban.md` - Hermes board only.
 - `${HERMES_SKILL_DIR}/references/briefs-and-leases.md` - brief fields, leases, budgets.
-- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - exact commands the user types.
+- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - exact commands the user types, including ACDD.
 - `${HERMES_SKILL_DIR}/references/security.md` - secrets, hosts, untrusted text.
 - `${HERMES_SKILL_DIR}/templates/host-setup-prompt.md` - template used by `bundlebees_host_prompt`.
 

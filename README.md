@@ -98,15 +98,15 @@ A Cua sandbox is not a sandbox for the Hermes process itself.
 
 ## Tools
 
-Every handler returns a JSON string: `{ok: true, ...}` or `{ok: false, error, code, fix}`. Combined schema size, measured by `scripts/measure_schemas.py` as a single JSON array, is **573 o200k** (cl100k 563, 2621 characters). The per-tool counts below are each schema measured on its own.
+Every handler returns a JSON string: `{ok: true, ...}` or `{ok: false, error, code, fix}`. Combined schema size, measured by `scripts/measure_schemas.py` as a single JSON array, is **585 o200k** (cl100k 575, 2676 characters; 573 before ACDD). The per-tool counts below are each schema measured on its own.
 
 | Tool | What it does | o200k |
 |---|---|---:|
 | `bundlebees_status` | Health, capacity, live attempts, events, containers, or authorized projects. `op` is required. Never returns tokens or hosts. | 108 |
-| `bundlebees_dispatch` | Validate a strict brief (object or JSON string), start a worker, and record its signed lease. Optional `model` (default `deepseek-v4.1-flash`) and `kanban_task_id`. | 132 |
+| `bundlebees_dispatch` | Validate a strict brief (object or JSON string), start a worker, and record its signed lease. An optional `acdd/1` contract under `brief.contract` must be valid and frozen and must match the brief's `source_rev` and files; the reply carries an `acdd` block (`mode: contract` or `legacy`). Optional `model` (default `deepseek-v4.1-flash`) and `kanban_task_id`. | 144 |
 | `bundlebees_attempt` | `get`, `events`, `cancel`, or `review` one attempt. `cancel` and `review` require `confirm=true` and a Hermes approval prompt (`pre_tool_call`). Notes are scrubbed. | 146 |
 | `bundlebees_host_prompt` | Paste-ready setup prompt for a remote-host agent. Inputs are `os`, a reach **method** (`same-machine`, `lan`, `vpn`, `ssh`), `provider`, `repos`, and `max_concurrent` (1–10). No secrets or host addresses in or out. | 185 |
-| **Combined (budget 900)** | Registered together, which is the budget that matters. | **573** |
+| **Combined (budget 900)** | Registered together, which is the budget that matters. | **585** |
 
 If the tools are not visible, call `tool_search(["bundlebees"])` or `skill_view("bundlebees:bundlebees-operator")`. Do not shell out to the launcher.
 
@@ -116,11 +116,15 @@ These commands are registered as `hermes bundlebees …`. They are **not** model
 
 | Command | What it does |
 |---|---|
-| `hermes bundlebees verify <attempt_id>` | Load the signed lease, check the declared base and exact-commit apply against `source_rev`, apply the in-lease patch on a clean feature-branch worktree, secret-scan, run the named tests in the sandbox, then commit and push that feature branch. `main` and `master` are refused. |
+| `hermes bundlebees verify <attempt_id>` | Load the signed lease, check the declared base and exact-commit apply against `source_rev`, apply the in-lease patch on a clean feature-branch worktree, secret-scan, run the named tests in the sandbox, then commit and push that feature branch. `main` and `master` are refused. With a contract in the lease, the patch may not touch approved test files (`tests_tampered`) or prohibited paths, a valid RED must exist (`red_missing`), the approved tests are what runs, and a signed GREEN is recorded. Without one it prints `no ACDD contract; TDD evidence not required`. |
 | `hermes bundlebees verify <attempt_id> --dry-run` | Apply and test without committing or pushing. |
 | `hermes bundlebees verify <attempt_id> --workdir <path> --branch <feat> --tests …` | Override worktree, branch, or test targets. Defaults come from plugin settings and the brief. |
 | `hermes bundlebees verify <attempt_id> --kanban-comment` | Also post a comment through the public `hermes` kanban CLI. |
-| `hermes bundlebees integrate --wave <id> --attempts <id> …` | Require an `ok` verify record (ancestor of HEAD) for every attempt, then run the full suite on the combined branch in the sandbox. Writes `waves/<id>.json`; only `accepted: true` counts. |
+| `hermes bundlebees integrate --wave <id> --attempts <id> …` | Require an `ok` verify record (ancestor of HEAD) for every attempt, and a valid signed GREEN for every attempt whose lease has a contract, then run the full suite on the combined branch in the sandbox and record a signed `integration` record per contract. Writes `waves/<id>.json`; only `accepted: true` counts. |
+| `hermes bundlebees contract validate <file>` | Check an `acdd/1` contract (schema plus the ACDD checks) and print its `contract_sha256` and whether it is frozen. |
+| `hermes bundlebees contract freeze <file> --approved-by <name> [--out <file>]` | Approve a valid contract and bind it to its hash. Refuses invalid contracts. |
+| `hermes bundlebees tdd red <contract> --workdir <repo>` | Run the approved tests at the contract's `source_rev` in the sandbox and record a signed RED. Only a `behavioral_failure` of every RED-set test is valid (`red_incomplete`, `red_invalid` otherwise). |
+| `hermes bundlebees tdd report <contract> [--json]` | Print the acceptance report: each required phase is `valid`, a failure code, or `not run`; never passed by default. Exit 0 only when accepted. |
 | `hermes bundlebees lease <attempt_id> --brief <file>` | Record the signed lease for a brief that was dispatched outside `bundlebees_dispatch`. Refuses to overwrite. |
 | `hermes bundlebees metrics [--run <id>] [--json] [--note <text>]` | Summarize the append-only, hash-chained outcome log, or record one human intervention. |
 | `hermes bundlebees deploy` | Print setup steps and the host setup prompt. **No SSH is attempted.** |
@@ -190,6 +194,7 @@ Declared in `plugin.yaml`:
 | `verify_isolation` | string | `auto` | Sandbox for verify/integrate: `auto` (bwrap, then firejail; never unshare) or one of `bwrap`, `firejail`, `unshare`. `unshare` also needs `verify_allow_weak_unshare`. |
 | `verify_allow_unsafe_local` | boolean | `false` | **Unsafe.** Run worker tests without isolation when no backend exists. See the security model. |
 | `verify_allow_weak_unshare` | boolean | `false` | **Unsafe.** Permit `verify_isolation: unshare` (network/PID isolation only; coordinator files stay readable). Env `BUNDLEBEES_ALLOW_WEAK_UNSHARE=1` does the same. Disposable hosts only. |
+| `require_contract` | boolean | `false` | Opt the project in to ACDD: dispatch refuses briefs without a frozen contract (`contract_missing`). |
 | `verify_timeout_s` | integer | `900` | Wall-clock limit for one sandboxed test run (30–7200). |
 
 Secret (Hermes secrets, not config):
@@ -215,12 +220,16 @@ Secret (Hermes secrets, not config):
 | `launcher_unavailable` | The configured adapter is down. Report configured state and ask the user to check the host. |
 | `no_result_yet` | The worker has not collected a result. Poll later; do not synthesize one. |
 | `scope_violation` | The worker changed files outside its lease. Stop and ask the user before any repair dispatch. |
+| `contract_invalid` / `contract_not_frozen` / `contract_changed` / `contract_missing` | Fix the named contract field, freeze it with `hermes bundlebees contract freeze`, or re-freeze after a change. `contract_missing` means `require_contract` is on. |
+| `red_missing` / `red_incomplete` / `red_invalid` | Run `hermes bundlebees tdd red` on the tests-only commit; every RED-set test must fail because the behaviour is missing, not because of a syntax, import or environment error. |
+| `tests_tampered` | The patch edits approved tests, or the test fingerprints changed since RED. Restore the approved tests; never weaken them. |
+| `green_failed` / `integration_failed` / `evidence_tampered` | The approved tests or the combined suite failed, or a signed evidence record does not verify. Never edit evidence files. |
 
 `hermes bundlebees doctor` is the first thing to run locally when the adapter looks wrong. `hermes plugins doctor <path-or-name>` validates the plugin itself.
 
 ## Roadmap
 
-- **v0.2.0** (in review): sandboxed verification, strict brief contract, signed coordinator leases, `source_rev` checks, wave integration gate, outcome metrics, and an agent-agnostic worker-backend interface.
+- **v0.2.0** (in review): ACDD contracts and signed TDD evidence ([docs/ACDD.md](docs/ACDD.md)), sandboxed verification, strict brief contract, signed coordinator leases, `source_rev` checks, wave integration gate, outcome metrics, and an agent-agnostic worker-backend interface.
 - **v0.1.1** is the latest release: catalog review fixes (secret scope, per-key settings, Desktop default export, dashboard `api` mount, `plugin_data_dir`, cross-origin redirect refusal, approval for attempt cancel/review).
 - **v0.1.0**: tools, user-run CLI, Desktop pane, and the operator skill.
 - A Hermes catalog listing is **not** opened from this repository yet. That takes a separate, explicit approval and a YAML-only catalog PR pinned to this release SHA.
