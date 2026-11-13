@@ -81,13 +81,22 @@ class DescendantPolicyTests(unittest.TestCase):
                                          dependencies=("job_a",))
         self.state = self.tmp / "state"
         self.state.mkdir()
+        from bundlebees_plugin import verify_local
+        path = verify_local.record_path(self.state, "att_1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"attempt_id": "att_1", "ok": True, "sha": self.root,
+                                    "base_rev": self.root, "suite": {"exit_code": 0},
+                                    "gitleaks": {"exit_code": 0}}))
+        self.accepted_job = {"tasks": [{"state": "accepted", "attempts": ["att_1"]}],
+                             "integration": {"last_commit": self.candidate,
+                                             "accepted_waves": [{"wave": 1, "commit": self.candidate,
+                                                                 "attempts": ["att_1"]}]}}
 
     def derive(self, **overrides):
         kwargs = dict(candidate_rev=self.candidate, repo="mojomast/smoke-real", worktree=self.repo,
                       assigned_files=["smoke/double.py"], state_dir=self.state, bees=1, wall_clock_s=900)
         kwargs.update(overrides)
-        accepted = {"integration": {"last_commit": self.candidate, "accepted_waves": []}}
-        with mock.patch.object(D.jobs, "load_job", lambda state_dir, job_id: accepted):
+        with mock.patch.object(D.jobs, "load_job", lambda state_dir, job_id: self.accepted_job):
             return D.derive(self.policy, **kwargs)
 
     def test_a_verified_descendant_is_accepted_with_provenance(self):
@@ -102,7 +111,9 @@ class DescendantPolicyTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "not_a_descendant")
 
     def test_the_dependency_must_name_the_same_commit(self):
-        accepted = {"integration": {"last_commit": self.root, "accepted_waves": []}}
+        accepted = {"tasks": [{"state": "accepted", "attempts": ["att_1"]}],
+                    "integration": {"last_commit": self.root,
+                                    "accepted_waves": [{"wave": 1, "commit": self.root, "attempts": ["att_1"]}]}}
         with mock.patch.object(D.jobs, "load_job", lambda state_dir, job_id: accepted):
             with self.assertRaises(D.DescendantError) as caught:
                 D.derive(self.policy, candidate_rev=self.candidate, repo="mojomast/smoke-real",
