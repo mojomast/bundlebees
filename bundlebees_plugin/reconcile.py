@@ -1,312 +1,181 @@
-"""Crash-safe reconciliation for durable jobs.
+"""One crash-safe reconciler tick for durable jobs.
 
-The reconciler is the only component that turns a durable dispatch intent into
-a launcher attempt. Its central rule is that a dispatch whose outcome is
-unknown is never blindly re-POSTed: after an uncertain POST the launcher
-journal is consulted, and the task is either adopted (exactly one matching
-attempt), left waiting (no matching attempt yet), or escalated (two plausible
-attempts, or too many ticks without proof).
+The reconciler advances a job by exactly one tick at a time. It never treats the
+launcher journal as a truth claim, and it never resolves an uncertain dispatch by
+dispatching again:
 
-A dispatch intent is written atomically under ``<state_dir>/intents`` before
-the first launcher call and is kept for audit. A single non-blocking ``flock``
-under ``<state_dir>/locks`` serialises whole ticks, so two coordinators cannot
-both dispatch the same task. Every task state change goes through
-:func:`bundlebees_plugin.job.transition` with ``actor="reconciler"`` and is
-saved immediately afterwards.
+* a request that provably never left the process (``DispatchNotSent``) is retried
+  on the next tick;
+* a request whose outcome is unknown (``DispatchUncertain``) is reconciled
+  against the journal — one match adopts, two escalate, none waits out a grace
+  period measured in **elapsed seconds** and then escalates;
+* ``exactly_once`` is claimed only when the launcher itself enforces idempotency.
 
-The launcher is injected. The protocol is intentionally small::
-
-    launcher.idempotent                     # True only for server-side dedupe
-    launcher.post(brief, idempotency_key=..) -> attempt id or mapping
-    launcher.journal(task_id=.., job_id=.., idempotency_key=..) -> entries
-    launcher.verify(attempt_id=.., task=..) -> bool or mapping
-
-Only a launcher that advertises ``idempotent = True`` earns an
-``exactly_once`` claim. Without that promise the reconciler still never
-double-posts, but it reports ``exactly_once = False``.
+State changes go through :mod:`bundlebees_plugin.job`, so every move is signed,
+persisted and attributable. The launcher is an injected adapter with exactly the
+four members named in :class:`Launcher`; anything else fails closed rather than
+being guessed at.
 """
 
 from __future__ import annotations
 
-import errno
-import inspect
+import hashlib
 import json
 import os
-import re
-import secrets
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
-
-try:  # pragma: no cover - fallback for platforms without fcntl
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import job as jobs
 
-__all__ = [
-    "INTENTS_DIR",
-    "INTENT_DIR",
-    "LOCKS_DIR",
-    "LOCK_DIR",
-    "RECONCILE_SCHEMA_VERSION",
-    "DEFAULT_MAX_UNCERTAIN_TICKS",
-    "STATUS_LOCKED",
-    "STATUS_NOOP",
-    "STATUS_DISPATCHED",
-    "STATUS_NOT_SENT",
-    "STATUS_RECONCILE_WAIT",
-    "STATUS_ADOPTED",
-    "STATUS_VERIFIED",
-    "STATUS_VERIFY_FAILED",
-    "EVIDENCE_PROVEN_PRESENT",
-    "EVIDENCE_ADOPTED",
-    "EVIDENCE_RETRIED",
-    "DispatchNotSent",
-    "DispatchUncertain",
-    "ReconcileError",
-    "TickResult",
-    "Launcher",
-    "LauncherProtocol",
-    "intent_path",
-    "intent_dir",
-    "lock_path",
-    "load_intent",
-    "read_intent",
-    "save_intent",
-    "write_intent",
-    "clear_intent",
-    "tick",
-    "run_tick",
-    "reconcile",
-    "reconcile_tick",
-    "reconcile_job",
-    "dispatch_tick",
-    "verify_tick",
-    "reconcile_once",
-    "run",
-    "dispatch",
-    "verify",
-    "dispatch_intent_path",
-    "job_intent_path",
-    "reconcile_lock_path",
-    "job_lock_path",
-    "DISPATCH_INTENT_DIR",
-    "RECONCILE_LOCK_DIR",
-    "load_dispatch_intent",
-    "read_dispatch_intent",
-    "save_dispatch_intent",
-    "write_dispatch_intent",
-    "reconcile_one",
-    "reconcile_intent_path",
-    "reconcile_intent_file",
-    "intent_file",
-    "intent_for_task",
-    "dispatch_lock_path",
-    "lock_file",
-    "lock_for_job",
-]
+DEFAULT_GRACE_S = 60.0
+DEFAULT_MAX_UNCERTAIN_TICKS = 5
 
-RECONCILE_SCHEMA_VERSION = 1
-DEFAULT_MAX_UNCERTAIN_TICKS = 3
-
-STATUS_LOCKED = "locked"
-STATUS_NOOP = "noop"
-STATUS_DISPATCHED = "dispatched"
-STATUS_NOT_SENT = "not_sent"
-STATUS_RECONCILE_WAIT = "reconcile_wait"
-STATUS_ADOPTED = "adopted"
-STATUS_VERIFIED = "verified"
-STATUS_VERIFY_FAILED = "verify_failed"
+INTENT_DISPATCHING = "dispatching"
+INTENT_DISPATCHED = "dispatched"
+INTENT_NOT_SENT = "not_sent"
+INTENT_UNCERTAIN = "uncertain"
 
 EVIDENCE_PROVEN_PRESENT = "proven_present"
 EVIDENCE_ADOPTED = "adopted"
-EVIDENCE_RETRIED = "retried"
 
-INTENTS_DIR = "intents"
-INTENT_DIR = INTENTS_DIR
-LOCKS_DIR = "locks"
-LOCK_DIR = LOCKS_DIR
-LOCK_SUFFIX = ".lock"
-INTENT_SUFFIX = ".json"
-DISPATCH_INTENT_DIR = INTENTS_DIR
-RECONCILE_LOCK_DIR = LOCKS_DIR
-
-INTENT_PREPARED = "prepared"
-INTENT_SENDING = "sending"
-INTENT_NOT_SENT = "not_sent"
-INTENT_UNCERTAIN = "uncertain"
-INTENT_SENT = "sent"
-INTENT_ADOPTED = "adopted"
-INTENT_UNCERTAIN_EXHAUSTED = "dispatch_uncertain_exhausted"
-INTENT_AMBIGUOUS = "dispatch_ambiguous"
-
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_SAFE_PART_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-
-_FIX_LOCK = "Wait for the current reconciler tick to finish, then retry."
-_FIX_INTENT = (
-    "Treat this state directory as untrusted; do not edit dispatch intents by hand."
+_FIX_LAUNCHER = (
+    "Inject a launcher exposing list_attempts(), get_attempt(id), post_attempt(brief) "
+    "and a bool idempotent property."
 )
-_FIX_JOURNAL = (
-    "Inspect the launcher journal directly. Do not re-dispatch until the attempt "
-    "is proven absent or the ambiguity is resolved by a human."
-)
+
+
+class DispatchNotSent(Exception):
+    """The request provably never left this process."""
+
+
+class DispatchUncertain(Exception):
+    """The request may or may not have reached the launcher."""
+
+
+class DispatchRejected(Exception):
+    """The launcher refused the brief."""
 
 
 class ReconcileError(Exception):
-    """A reconciliation precondition or durable document was refused."""
+    """The tick could not proceed; nothing was dispatched."""
 
     def __init__(self, code: str, message: str, fix: str = "") -> None:
-        self.code = str(code)
-        self.message = str(message)
-        self.fix = str(fix)
-        super().__init__(self.message)
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.fix = fix
 
     def to_dict(self) -> dict[str, str]:
         return {"error": self.code, "message": self.message, "fix": self.fix}
 
 
-class DispatchNotSent(Exception):
-    """The launcher call provably never left the coordinator process.
-
-    A launcher may raise this only before any bytes reach the server. The
-    reconciler may safely make a fresh POST on a later tick.
-    """
-
-
-class DispatchUncertain(Exception):
-    """The POST may or may not have reached the launcher.
-
-    The intent is kept and the launcher journal is consulted. The exception may
-    carry an ``attempt_id`` hint, but the journal remains authoritative.
-    """
-
-    def __init__(
-        self,
-        message: str = "dispatch outcome is uncertain",
-        *,
-        attempt_id: str | None = None,
-        evidence: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.attempt_id = attempt_id
-        self.evidence = evidence
-
-
 class Launcher(Protocol):
-    """The injected launcher protocol understood by the reconciler."""
+    """Exactly the contract's launcher surface — no aliases, no guessing."""
 
     idempotent: bool
 
-    def post(self, brief: Mapping[str, Any], **kwargs: Any) -> Any: ...
+    def list_attempts(self) -> Sequence[Mapping[str, Any]]: ...
 
-    def journal(self, **kwargs: Any) -> Sequence[Mapping[str, Any]]: ...
+    def get_attempt(self, attempt_id: str) -> Mapping[str, Any] | None: ...
 
-    def verify(self, **kwargs: Any) -> Any: ...
-
-
-LauncherProtocol = Launcher
+    def post_attempt(self, brief: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
-class TickResult(dict):
-    """A mapping result with attribute access for convenience."""
-
-    def __getattr__(self, name: str) -> Any:
-        try:
-            return self[name]
-        except KeyError as exc:
-            raise AttributeError(name) from exc
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        self[name] = value
+@dataclass(frozen=True)
+class TickResult:
+    status: str
+    transitions: tuple[str, ...] = ()
+    action: str | None = None
+    detail: str = ""
+    exactly_once: bool = False
+    evidence: str = ""
 
 
-def _utc_now() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+# ---------------------------------------------------------------------------
+# Launcher adapter — fail closed on anything unexpected
+# ---------------------------------------------------------------------------
 
 
-def _safe_id(value: Any, what: str = "job_id") -> str:
-    text = str(value or "").strip()
-    if not text or ".." in text or not _SAFE_ID_RE.match(text):
-        raise ReconcileError(
-            "reconcile_invalid",
-            f"{what} is not a safe durable file name",
-            _FIX_INTENT,
-        )
-    return text
+class _Adapter:
+    __slots__ = ("_launcher", "idempotent")
 
-
-def _safe_part(value: Any) -> str:
-    text = _SAFE_PART_RE.sub("-", str(value or "").strip())
-    text = text.strip(".-")
-    if not text:
-        raise ReconcileError(
-            "reconcile_invalid",
-            "task_id is not a safe durable file name",
-            _FIX_INTENT,
-        )
-    return text[:96]
-
-
-def _private_dir(path: Path) -> Path:
-    try:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if path.is_symlink() or not path.is_dir():
+    def __init__(self, launcher: Any) -> None:
+        if launcher is None:
+            raise ReconcileError("launcher_incompatible", "no launcher was supplied", _FIX_LAUNCHER)
+        missing = [
+            name
+            for name in ("list_attempts", "get_attempt", "post_attempt")
+            if not callable(getattr(launcher, name, None))
+        ]
+        if missing:
             raise ReconcileError(
-                "reconcile_invalid",
-                f"{path.name} must be a private directory",
-                _FIX_INTENT,
+                "launcher_incompatible",
+                "the launcher is missing " + ", ".join(missing),
+                _FIX_LAUNCHER,
             )
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
-        return path
-    except ReconcileError:
-        raise
-    except OSError as exc:
-        raise ReconcileError(
-            "reconcile_io",
-            f"the {path.name} directory could not be created: {exc}",
-            _FIX_INTENT,
-        ) from exc
+        flag = getattr(launcher, "idempotent", None)
+        if not isinstance(flag, bool):
+            raise ReconcileError(
+                "launcher_incompatible",
+                "launcher.idempotent must be a bool, not " + type(flag).__name__,
+                _FIX_LAUNCHER,
+            )
+        self._launcher = launcher
+        self.idempotent = flag
+
+    def list_attempts(self) -> list[Mapping[str, Any]]:
+        entries = self._launcher.list_attempts()
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+            raise ReconcileError(
+                "launcher_incompatible",
+                "list_attempts() must return a sequence of attempts",
+                _FIX_LAUNCHER,
+            )
+        return [entry for entry in entries if isinstance(entry, Mapping)]
+
+    def get_attempt(self, attempt_id: str) -> Mapping[str, Any] | None:
+        entry = self._launcher.get_attempt(attempt_id)
+        if entry is not None and not isinstance(entry, Mapping):
+            raise ReconcileError(
+                "launcher_incompatible",
+                "get_attempt() must return an attempt or None",
+                _FIX_LAUNCHER,
+            )
+        return entry
+
+    def post_attempt(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
+        result = self._launcher.post_attempt(brief)
+        if not isinstance(result, Mapping):
+            raise ReconcileError(
+                "launcher_incompatible",
+                "post_attempt() must return an attempt mapping",
+                _FIX_LAUNCHER,
+            )
+        return result
 
 
-def intent_dir(state_dir: Path | str, job_id: str) -> Path:
-    """The directory holding this job's durable dispatch intents."""
-
-    checked = _safe_id(job_id)
-    return _private_dir(Path(state_dir) / INTENTS_DIR / checked)
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
 
 
-def intent_path(state_dir: Path | str, job_id: str, task_id: str) -> Path:
-    """The durable intent path for one task."""
-
-    checked_job = _safe_id(job_id)
-    checked_task = _safe_part(task_id)
-    directory = _private_dir(Path(state_dir) / INTENTS_DIR / checked_job)
-    return directory / f"{checked_task}{INTENT_SUFFIX}"
+def intent_path(state_dir: Path, job_id: str, task_id: str, attempt_no: int) -> Path:
+    return Path(state_dir) / "jobs" / job_id / "intents" / f"{task_id}-{attempt_no}.json"
 
 
-def lock_path(state_dir: Path | str, job_id: str) -> Path:
-    """The whole-tick lock path for one job."""
-
-    checked = _safe_id(job_id)
-    directory = _private_dir(Path(state_dir) / LOCKS_DIR)
-    return directory / f"{checked}{LOCK_SUFFIX}"
+def lock_path(state_dir: Path, job_id: str) -> Path:
+    return Path(state_dir) / "jobs" / f"{job_id}.lock"
 
 
-def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, mode)
+def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    payload = json.dumps(dict(value), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
@@ -321,1659 +190,503 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
         raise
 
 
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+def read_intent(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.dumps(
-            dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ReconcileError(
-            "reconcile_invalid",
-            "the dispatch intent is not JSON-serializable",
-            _FIX_INTENT,
-        ) from exc
-    _atomic_write(path, payload + b"\n")
-
-
-def read_intent(
-    state_dir: Path | str, job_id: str, task_id: str
-) -> dict[str, Any] | None:
-    """Read one durable intent. A missing file is ``None``, not an error."""
-
-    path = intent_path(state_dir, job_id, task_id)
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    except OSError as exc:
-        raise ReconcileError(
-            "reconcile_io", "the dispatch intent could not be read", _FIX_INTENT
-        ) from exc
-    try:
-        document = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ReconcileError(
-            "intent_tampered", "the dispatch intent is not valid JSON", _FIX_INTENT
-        ) from exc
-    if not isinstance(document, dict):
-        raise ReconcileError(
-            "intent_tampered", "the dispatch intent must be an object", _FIX_INTENT
-        )
-    if str(document.get("job_id")) != _safe_id(job_id):
-        raise ReconcileError(
-            "intent_tampered", "the dispatch intent names another job", _FIX_INTENT
-        )
-    if str(document.get("task_id")) != str(task_id):
-        raise ReconcileError(
-            "intent_tampered", "the dispatch intent names another task", _FIX_INTENT
-        )
-    return document
-
-
-load_intent = read_intent
-
-
-def save_intent(state_dir: Path | str, intent: Mapping[str, Any]) -> Path:
-    """Atomically persist one intent and return its path."""
-
-    job_id = _safe_id(intent.get("job_id"))
-    task_id = str(intent.get("task_id") or "")
-    path = intent_path(state_dir, job_id, task_id)
-    _write_json(path, intent)
-    return path
-
-
-write_intent = save_intent
-
-
-def clear_intent(state_dir: Path | str, job_id: str, task_id: str) -> None:
-    try:
-        intent_path(state_dir, job_id, task_id).unlink()
-    except FileNotFoundError:
-        pass
-
-
-dispatch_intent_path = intent_path
-job_intent_path = intent_path
-reconcile_intent_path = intent_path
-reconcile_intent_file = intent_path
-intent_file = intent_path
-intent_for_task = intent_path
-reconcile_lock_path = lock_path
-job_lock_path = lock_path
-dispatch_lock_path = lock_path
-lock_file = lock_path
-lock_for_job = lock_path
-load_dispatch_intent = read_intent
-read_dispatch_intent = read_intent
-save_dispatch_intent = save_intent
-write_dispatch_intent = save_intent
+    return data if isinstance(data, dict) else None
 
 
 class _Lock:
-    def __init__(self, fd: int, path: Path, fallback: bool = False) -> None:
-        self.fd = fd
+    def __init__(self, path: Path) -> None:
         self.path = path
-        self.fallback = fallback
+        self.held = False
 
-    def release(self) -> None:
-        if self.fallback:
+    def __enter__(self) -> "_Lock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        try:
+            fd = os.open(
+                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+            )
+        except FileExistsError:
+            return self
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "at": _iso(time.time())}))
+        self.held = True
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self.held:
             try:
                 self.path.unlink()
             except OSError:
                 pass
-            return
-        try:
-            if fcntl is not None:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
+            self.held = False
 
 
-def _try_lock(state_dir: Path | str, job_id: str) -> _Lock | None:
-    path = lock_path(state_dir, job_id)
-    if fcntl is None:  # pragma: no cover - exercised only off POSIX
-        try:
-            fd = os.open(
-                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
-            )
-        except FileExistsError:
-            return None
-        os.close(fd)
-        return _Lock(-1, path, fallback=True)
-
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
-    except OSError as exc:
-        raise ReconcileError(
-            "reconcile_io", "the reconciler lock could not be opened", _FIX_LOCK
-        ) from exc
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(fd)
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
-            return None
-        raise ReconcileError(
-            "reconcile_io", "the reconciler lock could not be acquired", _FIX_LOCK
-        ) from exc
-    return _Lock(fd, path)
+# ---------------------------------------------------------------------------
+# Clock helpers
+# ---------------------------------------------------------------------------
 
 
-def _flag(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"1", "true", "yes", "on", "idempotent"}:
-            return True
-        if text in {"0", "false", "no", "off", "none", ""}:
-            return False
-    return None
-
-
-def _launcher_idempotent(launcher: Any) -> bool:
-    if launcher is None:
-        return False
-    for name in (
-        "idempotent",
-        "is_idempotent",
-        "server_idempotent",
-        "idempotent_dispatch",
-        "supports_idempotency",
-        "supports_server_idempotency",
-        "server_side_idempotency",
-        "dedupe",
-    ):
-        try:
-            value = getattr(launcher, name)
-        except Exception:
-            continue
-        if value is None:
-            continue
-        if callable(value):
-            try:
-                value = value()
-            except Exception:
-                continue
-        parsed = _flag(value)
-        if parsed is not None:
-            return parsed
-    capabilities = getattr(launcher, "capabilities", None)
-    if isinstance(capabilities, Mapping):
-        for key in ("idempotent", "idempotency", "server_idempotent"):
-            if key in capabilities:
-                parsed = _flag(capabilities[key])
-                if parsed is not None:
-                    return parsed
-    return False
-
-
-def _call_supported(
-    func: Callable[..., Any],
-    values: Mapping[str, Any],
-    *,
-    leading: Any = None,
-) -> tuple[Any, set[str]]:
-    """Call ``func`` once, passing only parameters it declares.
-
-    Signature inspection happens before the call so a launcher exception can
-    never cause a second POST.
-    """
-
-    try:
-        signature = inspect.signature(func)
-    except (TypeError, ValueError):
-        if leading is not None:
-            return func(leading), set()
-        return func(), set()
-
-    params = list(signature.parameters.values())
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {}
-    used: set[str] = set()
-    var_kw = any(p.kind is p.VAR_KEYWORD for p in params)
-    var_pos = any(p.kind is p.VAR_POSITIONAL for p in params)
-
-    for param in params:
-        name = param.name
-        if param.kind is param.POSITIONAL_ONLY:
-            if name in values:
-                args.append(values[name])
-                used.add(name)
-            elif leading is not None and not args:
-                args.append(leading)
-            elif param.default is param.empty:
-                raise TypeError(f"cannot satisfy positional-only parameter {name!r}")
-        elif param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
-            if name in values:
-                kwargs[name] = values[name]
-                used.add(name)
-            elif param.default is param.empty:
-                if (
-                    param.kind is param.POSITIONAL_OR_KEYWORD
-                    and leading is not None
-                    and not args
-                    and not kwargs
-                ):
-                    args.append(leading)
-                else:
-                    raise TypeError(f"cannot satisfy required parameter {name!r}")
-    if var_pos and leading is not None and not args:
-        args.append(leading)
-    if var_kw:
-        for key, value in values.items():
-            if key not in used and key not in kwargs:
-                kwargs[key] = value
-                used.add(key)
-    return func(*args, **kwargs), used
-
-
-def _task_facing_brief(
-    job: Mapping[str, Any], task: Mapping[str, Any]
-) -> dict[str, Any]:
-    goal = job.get("goal") if isinstance(job.get("goal"), Mapping) else {}
-    brief = {
-        "job_id": job.get("job_id"),
-        "task_id": task.get("task_id"),
-        "objective": task.get("objective"),
-        "assigned_files": list(task.get("lease") or []),
-        "lease": list(task.get("lease") or []),
-        "depends_on": list(task.get("depends_on") or []),
-        "repo": goal.get("repo"),
-        "source_rev": goal.get("base_rev"),
-        "base_rev": goal.get("base_rev"),
-        "contract_path": task.get("contract_path"),
-        "contract_sha256": task.get("contract_sha256"),
-    }
-    for key in ("acceptance", "tests", "branch", "summary"):
-        if key in task:
-            brief[key] = task[key]
-    return brief
-
-
-def _post(
-    launcher: Any,
-    job: Mapping[str, Any],
-    task: Mapping[str, Any],
-    intent: Mapping[str, Any],
-) -> Any:
-    method = None
-    for name in (
-        "post",
-        "dispatch",
-        "create_attempt",
-        "create",
-        "submit",
-        "start_attempt",
-        "attempt",
-        "post_attempt",
-    ):
-        candidate = getattr(launcher, name, None)
-        if callable(candidate):
-            method = candidate
-            break
-    if method is None:
-        raise ReconcileError(
-            "launcher_invalid",
-            "the launcher has no post/dispatch method",
-            "Inject the launcher protocol described by bundlebees_plugin.reconcile.",
-        )
-    brief = _task_facing_brief(job, task)
-    task_copy = dict(task)
-    key = str(intent.get("idempotency_key") or "")
-    raw, _used = _call_supported(
-        method,
-        {
-            "brief": brief,
-            "task": task_copy,
-            "task_id": task.get("task_id"),
-            "job_id": job.get("job_id"),
-            "idempotency_key": key,
-            "idempotency": key,
-            "key": key,
-            "request_id": key,
-            "idem": key,
-            "idempotency_token": key,
-            "request_key": key,
-            "client_token": key,
-            "dedupe_key": key,
-            "intent": dict(intent),
-            "payload": brief,
-            "request": brief,
-            "attempt_request": brief,
-            "spec": brief,
-        },
-        leading=brief,
-    )
-    return raw
-
-
-def _extract_attempt_id(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, Mapping):
-        for key in ("attempt_id", "id", "attempt", "attemptId"):
-            found = value.get(key)
-            if isinstance(found, str) and found.strip():
-                return found.strip()
-        for container in ("attempt", "data", "result", "detail"):
-            nested = value.get(container)
-            if isinstance(nested, Mapping):
-                found = _extract_attempt_id(nested)
-                if found is not None:
-                    return found
-        return None
-    for key in ("attempt_id", "id", "attempt"):
-        found = getattr(value, key, None)
-        if isinstance(found, str) and found.strip():
-            return found.strip()
-    return None
-
-
-def _entry_field(entry: Any, names: Sequence[str]) -> Any:
-    containers: list[Any] = [entry]
-    if isinstance(entry, Mapping):
-        for container in ("metadata", "brief", "intent", "request", "task"):
-            sub = entry.get(container)
-            if isinstance(sub, Mapping):
-                containers.append(sub)
-    else:
-        for container in ("metadata", "brief", "intent", "request"):
-            sub = getattr(entry, container, None)
-            if isinstance(sub, Mapping):
-                containers.append(sub)
-    for container in containers:
-        for name in names:
-            if isinstance(container, Mapping):
-                if name in container and container[name] not in (None, ""):
-                    return container[name]
-            else:
-                found = getattr(container, name, None)
-                if found not in (None, ""):
-                    return found
-    return None
-
-
-def _normalize_entries(raw: Any) -> list[Any]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        return [{"attempt_id": raw}]
-    if isinstance(raw, Mapping):
-        for key in (
-            "entries",
-            "attempts",
-            "journal",
-            "items",
-            "results",
-            "data",
-        ):
-            value = raw.get(key)
-            if isinstance(value, (list, tuple, Mapping)):
-                if not (
-                    isinstance(value, Mapping)
-                    and any(
-                        field in value
-                        for field in (
-                            "attempt_id",
-                            "id",
-                            "task_id",
-                            "idempotency_key",
-                        )
-                    )
-                ):
-                    return _normalize_entries(value)
-        if any(
-            key in raw
-            for key in ("attempt_id", "id", "task_id", "idempotency_key")
-        ):
-            return [raw]
-        return [value for value in raw.values()]
-    if isinstance(raw, (list, tuple, set)):
-        return list(raw)
-    return [raw]
-
-
-def _journal(
-    launcher: Any,
-    job: Mapping[str, Any],
-    task: Mapping[str, Any],
-    intent: Mapping[str, Any],
-) -> tuple[list[Any], bool, bool]:
-    """Return ``(entries, scoped_to_task, journal_available)``."""
-
-    if launcher is None:
-        return [], False, False
-    source = None
-    for name in (
-        "journal",
-        "list_journal",
-        "attempts",
-        "list_attempts",
-        "attempt_journal",
-        "history",
-        "journal_entries",
-        "get_journal",
-    ):
-        candidate = getattr(launcher, name, None)
-        if candidate is not None:
-            source = candidate
-            break
-    if source is None:
-        return [], False, False
-
-    if callable(source):
-        try:
-            raw, used = _call_supported(
-                source,
-                {
-                    "task_id": task.get("task_id"),
-                    "task": task,
-                    "job_id": job.get("job_id"),
-                    "idempotency_key": intent.get("idempotency_key"),
-                    "key": intent.get("idempotency_key"),
-                    "idem": intent.get("idempotency_key"),
-                    "request_key": intent.get("idempotency_key"),
-                    "client_token": intent.get("idempotency_key"),
-                    "intent": dict(intent),
-                },
-                leading=task.get("task_id"),
-            )
-        except Exception:
-            return [], False, False
-        scoped = bool({"task_id", "task"} & used)
-    else:
-        raw = source
-        scoped = False
-        if isinstance(raw, Mapping) and task.get("task_id") in raw:
-            raw = raw[task.get("task_id")]
-            scoped = True
-
-    return _normalize_entries(raw), scoped, True
-
-
-def _matching_entries(
-    entries: Iterable[Any],
-    *,
-    job_id: str,
-    task_id: str,
-    key: str | None,
-    scoped: bool,
-) -> list[Any]:
-    matches: list[Any] = []
-    seen: set[str] = set()
-    for entry in entries:
-        if entry is None:
-            continue
-        if isinstance(entry, Mapping) and not entry:
-            continue
-        entry_job = _entry_field(entry, ("job_id", "jobId"))
-        entry_task = _entry_field(entry, ("task_id", "taskId"))
-        entry_key = _entry_field(
-            entry,
-            (
-                "idempotency_key",
-                "idempotencyKey",
-                "client_request_id",
-                "request_id",
-                "request_key",
-                "idempotency_token",
-                "client_token",
-                "dedupe_key",
-                "key",
-            ),
-        )
-        if entry_job is not None and str(entry_job) != str(job_id):
-            continue
-        if entry_task is not None and str(entry_task) != str(task_id):
-            continue
-        if entry_key is not None and key is not None and str(entry_key) != str(key):
-            continue
-        if entry_task is None and entry_key is None and not scoped:
-            continue
-        attempt_id = _extract_attempt_id(entry)
-        if attempt_id is not None:
-            if attempt_id in seen:
-                continue
-            seen.add(attempt_id)
-        matches.append(entry)
-    return matches
-
-
-def _new_intent(
-    job: Mapping[str, Any], task: Mapping[str, Any], key: str | None = None
-) -> dict[str, Any]:
-    now = _utc_now()
-    job_id = _safe_id(job.get("job_id"))
-    task_id = str(task.get("task_id") or "")
-    return {
-        "schema_version": RECONCILE_SCHEMA_VERSION,
-        "kind": "dispatch_intent",
-        "job_id": job_id,
-        "task_id": task_id,
-        "idempotency_key": key or f"{job_id}.{task_id}.{secrets.token_hex(16)}",
-        "status": INTENT_PREPARED,
-        "uncertain_ticks": 0,
-        "attempt_id": None,
-        "brief": _task_facing_brief(job, task),
-        "created": now,
-        "updated": now,
-    }
-
-
-def _save_intent_for_job(
-    state_dir: Path,
-    intent: dict[str, Any],
-    task: dict[str, Any],
-    job: dict[str, Any] | None = None,
-) -> None:
-    intent["updated"] = _utc_now()
-    save_intent(state_dir, intent)
-    task["intent"] = dict(intent)
-    if job is not None:
-        _save_job(state_dir, job)
-
-
-def _record_attempt(
-    task: dict[str, Any],
-    *,
-    attempt_id: str | None,
-    state: str,
-    evidence: str,
-    intent: Mapping[str, Any],
-) -> None:
-    attempts = task.setdefault("attempts", [])
-    if attempt_id is not None:
-        for existing in attempts:
-            if str(existing.get("attempt_id")) == str(attempt_id):
-                return
-    attempts.append(
-        {
-            "attempt_id": attempt_id,
-            "state": state,
-            "evidence": evidence,
-            "idempotency_key": intent.get("idempotency_key"),
-            "at": _utc_now(),
-        }
+def _iso(epoch: float) -> str:
+    return (
+        datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
-def _save_job(state_dir: Path, job: dict[str, Any]) -> None:
-    jobs.save_job(state_dir, job)
-
-
-def _dependencies_met(job: Mapping[str, Any], task: Mapping[str, Any]) -> bool:
-    states = {str(t.get("task_id")): t.get("state") for t in job.get("tasks", [])}
-    return all(
-        states.get(str(dep)) == "accepted" for dep in task.get("depends_on") or []
-    )
-
-
-def _events_since(job: Mapping[str, Any], start: int) -> list[dict[str, Any]]:
-    return [dict(event) for event in list(job.get("events") or [])[start:]]
-
-
-def _apply_transition(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    to_state: str,
-    *,
-    reason: str,
-    evidence: str | None = None,
-) -> None:
-    jobs.transition(
-        job,
-        str(task.get("task_id")),
-        to_state,
-        actor="reconciler",
-        reason=reason,
-        evidence=evidence,
-    )
-    _save_job(state_dir, job)
-
-
-def _launcher_calls_for(launcher: Any) -> int:
-    for name in ("calls", "call_count", "calls_made"):
-        value = getattr(launcher, name, None)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, (list, tuple)):
-            return len(value)
-    return 0
-
-
-def _result(
-    *,
-    status: str,
-    action: str = "none",
-    job: Mapping[str, Any] | None = None,
-    task: Mapping[str, Any] | None = None,
-    mode: str = "dispatch",
-    posts: int = 0,
-    launcher_calls: int = 0,
-    journal_calls: int = 0,
-    exact: bool = False,
-    evidence: str | None = None,
-    reason: str = "",
-    transitions: Sequence[Mapping[str, Any]] = (),
-    locked: bool = False,
-    changed: bool = False,
-    ok: bool = True,
-    **extra: Any,
-) -> TickResult:
-    result = TickResult(
-        ok=ok,
-        status=status,
-        action=action,
-        mode=mode,
-        job_id=job.get("job_id") if job else None,
-        task_id=task.get("task_id") if task else None,
-        state=task.get("state") if task else None,
-        task_state=task.get("state") if task else None,
-        attempt_id=extra.pop("attempt_id", None),
-        verifier_calls=extra.pop("verifier_calls", 0),
-        exactly_once=bool(exact),
-        evidence=evidence,
-        reason=reason,
-        posts=posts,
-        launcher_calls=launcher_calls,
-        journal_calls=journal_calls,
-        transitions=list(transitions),
-        events=list(transitions),
-        locked=locked,
-        changed=changed,
-    )
-    result.update(extra)
-    return result
-
-
-def _finish_dispatch(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    attempt_id: str | None,
-    retried: bool,
-    posts: int,
-    events_start: int,
-    launcher: Any,
-) -> TickResult:
-    idem = _launcher_idempotent(launcher)
-    if retried:
-        evidence = "retried"
-    elif idem:
-        evidence = "idempotent"
-    else:
-        evidence = "sent"
-    intent["status"] = INTENT_SENT
-    intent["attempt_id"] = attempt_id
-    intent["evidence"] = evidence
-    _save_intent_for_job(state_dir, intent, task, job)
-    _record_attempt(
-        task,
-        attempt_id=attempt_id,
-        state="dispatched",
-        evidence=evidence,
-        intent=intent,
-    )
-    if task.get("state") == "dispatching":
-        _apply_transition(
-            state_dir,
-            job,
-            task,
-            "dispatched",
-            reason="launcher acknowledged the dispatch",
-            evidence=evidence,
-        )
-    transitions = _events_since(job, events_start)
-    return _result(
-        status="dispatched",
-        action="retry" if retried else "dispatch",
-        job=job,
-        task=task,
-        posts=posts,
-        launcher_calls=_launcher_calls_for(launcher),
-        exact=idem,
-        evidence=evidence,
-        reason="dispatch_acknowledged",
-        transitions=transitions,
-        changed=True,
-        attempt_id=attempt_id,
-        retried=retried,
-        idempotency_key=intent.get("idempotency_key"),
-    )
-
-
-def _escalate(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    code: str,
-    posts: int,
-    events_start: int,
-    launcher: Any,
-    reason: str,
-    evidence: str | None = None,
-) -> TickResult:
-    intent["status"] = code
-    intent["evidence"] = evidence or code
-    intent["escalated"] = _utc_now()
-    _save_intent_for_job(state_dir, intent, task, job)
-    if task.get("state") == "dispatching":
-        _apply_transition(
-            state_dir,
-            job,
-            task,
-            "failed",
-            reason=reason or code,
-            evidence=evidence or code,
-        )
-    transitions = _events_since(job, events_start)
-    return _result(
-        status=code,
-        action="escalate",
-        job=job,
-        task=task,
-        posts=posts,
-        launcher_calls=_launcher_calls_for(launcher),
-        exact=False,
-        evidence=evidence or code,
-        reason=code,
-        transitions=transitions,
-        changed=True,
-        idempotency_key=intent.get("idempotency_key"),
-        fix=_FIX_JOURNAL,
-    )
-
-
-def _adopt(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    attempt_id: str | None,
-    posts: int,
-    events_start: int,
-    launcher: Any,
-    source: str = "journal",
-    journal_calls: int = 0,
-) -> TickResult:
-    idem = _launcher_idempotent(launcher)
-    evidence = "proven_present" if idem else "adopted"
-    intent["status"] = INTENT_ADOPTED
-    intent["attempt_id"] = attempt_id
-    intent["evidence"] = evidence
-    intent["adopted_at"] = _utc_now()
-    _save_intent_for_job(state_dir, intent, task, job)
-    _record_attempt(
-        task,
-        attempt_id=attempt_id,
-        state="dispatched",
-        evidence=evidence,
-        intent=intent,
-    )
-    if task.get("state") == "dispatching":
-        _apply_transition(
-            state_dir,
-            job,
-            task,
-            "dispatched",
-            reason=f"adopted existing attempt from {source}",
-            evidence=evidence,
-        )
-    transitions = _events_since(job, events_start)
-    return _result(
-        status="adopted",
-        action="adopt",
-        job=job,
-        task=task,
-        posts=posts,
-        launcher_calls=_launcher_calls_for(launcher),
-        journal_calls=journal_calls,
-        exact=idem,
-        evidence=evidence,
-        reason="adopted_existing_attempt",
-        transitions=transitions,
-        changed=True,
-        attempt_id=attempt_id,
-        reconciled="adopted",
-        source=source,
-        journal_evidence="proven_present" if source == "journal" else None,
-        exactly_once_evidence="proven_present" if idem else "adopted",
-        idempotency_key=intent.get("idempotency_key"),
-    )
-
-
-def _reconcile(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    launcher: Any,
-    max_uncertain_ticks: int,
-    posts: int,
-    events_start: int,
-    initial_uncertain: bool,
-    retried: bool = False,
-) -> TickResult:
-    status = str(intent.get("status") or INTENT_PREPARED)
-
-    if status in (INTENT_SENT, INTENT_ADOPTED):
-        return _adopt(
-            state_dir,
-            job,
-            task,
-            intent,
-            attempt_id=intent.get("attempt_id"),
-            posts=posts,
-            events_start=events_start,
-            launcher=launcher,
-            source="intent",
-        )
-
-    if status in (INTENT_UNCERTAIN_EXHAUSTED, INTENT_AMBIGUOUS):
-        if task.get("state") == "dispatching":
-            _apply_transition(
-                state_dir,
-                job,
-                task,
-                "failed",
-                reason=status,
-                evidence=intent.get("evidence") or status,
-            )
-        transitions = _events_since(job, events_start)
-        return _result(
-            status=status,
-            action="escalate",
-            job=job,
-            task=task,
-            posts=posts,
-            launcher_calls=_launcher_calls_for(launcher),
-            exact=False,
-            evidence=intent.get("evidence") or status,
-            reason=status,
-            transitions=transitions,
-            changed=bool(transitions),
-            idempotency_key=intent.get("idempotency_key"),
-        )
-
-    entries, scoped, available = _journal(launcher, job, task, intent)
-    journal_calls = 1 if available else 0
-    key = intent.get("idempotency_key")
-    matches = _matching_entries(
-        entries,
-        job_id=str(job.get("job_id")),
-        task_id=str(task.get("task_id")),
-        key=str(key) if key is not None else None,
-        scoped=scoped,
-    )
-
-    if len(matches) == 1:
-        attempt_id = _extract_attempt_id(matches[0]) or intent.get(
-            "attempt_hint"
-        ) or intent.get("attempt_id")
-        return _adopt(
-            state_dir,
-            job,
-            task,
-            intent,
-            attempt_id=attempt_id,
-            posts=posts,
-            events_start=events_start,
-            launcher=launcher,
-            source="journal",
-            journal_calls=journal_calls,
-        )
-    if len(matches) > 1:
-        result = _escalate(
-            state_dir,
-            job,
-            task,
-            intent,
-            code=INTENT_AMBIGUOUS,
-            posts=posts,
-            events_start=events_start,
-            launcher=launcher,
-            reason="two or more launcher attempts plausibly match this dispatch",
-            evidence=INTENT_AMBIGUOUS,
-        )
-        result["journal_calls"] = journal_calls
-        result["journal_matches"] = len(matches)
-        return result
-
-    ticks = int(intent.get("uncertain_ticks") or 0)
-    if initial_uncertain:
-        exceeded = ticks > int(max_uncertain_ticks)
-    else:
-        exceeded = ticks >= int(max_uncertain_ticks)
-    if exceeded:
-        result = _escalate(
-            state_dir,
-            job,
-            task,
-            intent,
-            code=INTENT_UNCERTAIN_EXHAUSTED,
-            posts=posts,
-            events_start=events_start,
-            launcher=launcher,
-            reason=(
-                "dispatch outcome stayed uncertain beyond "
-                f"max_uncertain_ticks={max_uncertain_ticks}"
-            ),
-            evidence=INTENT_UNCERTAIN_EXHAUSTED,
-        )
-        result["journal_calls"] = journal_calls
-        result["uncertain_ticks"] = ticks
-        return result
-
-    if not initial_uncertain:
-        ticks += 1
-    intent["status"] = INTENT_UNCERTAIN
-    intent["uncertain_ticks"] = ticks
-    _save_intent_for_job(state_dir, intent, task, job)
-    return _result(
-        status="reconcile_wait",
-        action="wait",
-        job=job,
-        task=task,
-        posts=posts,
-        launcher_calls=_launcher_calls_for(launcher),
-        exact=False,
-        evidence=None,
-        reason="journal_has_no_matching_attempt_yet",
-        journal_calls=journal_calls,
-        changed=True,
-        journal_available=available,
-        uncertain_ticks=ticks,
-        idempotency_key=intent.get("idempotency_key"),
-    )
-
-
-def _post_intent(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    launcher: Any,
-    max_uncertain_ticks: int,
-    retried: bool,
-    events_start: int,
-) -> TickResult:
-    intent["status"] = INTENT_SENDING
-    intent["last_post_at"] = _utc_now()
-    _save_intent_for_job(state_dir, intent, task, job)
-    try:
-        raw = _post(launcher, job, task, intent)
-    except DispatchNotSent as exc:
-        intent["status"] = INTENT_NOT_SENT
-        intent["last_error"] = str(exc)
-        _save_intent_for_job(state_dir, intent, task, job)
-        return _result(
-            status="not_sent",
-            action="retry",
-            job=job,
-            task=task,
-            posts=1,
-            launcher_calls=_launcher_calls_for(launcher),
-            exact=False,
-            evidence="not_sent",
-            reason="launcher proved the request never left the process",
-            changed=True,
-            retried=True,
-            idempotency_key=intent.get("idempotency_key"),
-        )
-    except DispatchUncertain as exc:
-        intent["status"] = INTENT_UNCERTAIN
-        intent["uncertain_ticks"] = int(intent.get("uncertain_ticks") or 0) + 1
-        intent["last_error"] = str(exc)
-        if exc.attempt_id:
-            intent["attempt_hint"] = exc.attempt_id
-        _save_intent_for_job(state_dir, intent, task, job)
-        return _reconcile(
-            state_dir,
-            job,
-            task,
-            intent,
-            launcher=launcher,
-            max_uncertain_ticks=max_uncertain_ticks,
-            posts=1,
-            events_start=events_start,
-            initial_uncertain=True,
-            retried=retried,
-        )
-    except Exception as exc:
-        intent["status"] = INTENT_UNCERTAIN
-        intent["uncertain_ticks"] = int(intent.get("uncertain_ticks") or 0) + 1
-        intent["last_error"] = f"{type(exc).__name__}: {exc}"
-        _save_intent_for_job(state_dir, intent, task, job)
-        return _reconcile(
-            state_dir,
-            job,
-            task,
-            intent,
-            launcher=launcher,
-            max_uncertain_ticks=max_uncertain_ticks,
-            posts=1,
-            events_start=events_start,
-            initial_uncertain=True,
-            retried=retried,
-        )
-
-    attempt_id = _extract_attempt_id(raw)
-    return _finish_dispatch(
-        state_dir,
-        job,
-        task,
-        intent,
-        attempt_id=attempt_id,
-        retried=retried,
-        posts=1,
-        events_start=events_start,
-        launcher=launcher,
-    )
-
-
-def _begin_or_continue(
-    state_dir: Path,
-    job: dict[str, Any],
-    task: dict[str, Any],
-    *,
-    launcher: Any,
-    max_uncertain_ticks: int,
-) -> TickResult:
-    events_start = len(job.get("events") or [])
-    existing = load_intent(
-        state_dir, str(job.get("job_id")), str(task.get("task_id"))
-    )
-
-    if existing is None and task.get("state") == "dispatching":
-        intent = _new_intent(job, task)
-        intent["status"] = INTENT_UNCERTAIN
-        intent["uncertain_ticks"] = 1
-        _save_intent_for_job(state_dir, intent, task, job)
-        return _reconcile(
-            state_dir,
-            job,
-            task,
-            intent,
-            launcher=launcher,
-            max_uncertain_ticks=max_uncertain_ticks,
-            posts=0,
-            events_start=events_start,
-            initial_uncertain=True,
-        )
-
-    intent = existing or _new_intent(job, task)
-    status = str(intent.get("status") or INTENT_PREPARED)
-    task["intent"] = dict(intent)
-
-    if status in (INTENT_PREPARED, INTENT_NOT_SENT):
-        retried = status == INTENT_NOT_SENT
-        wrote_intent = False
-        if existing is None:
-            _save_intent_for_job(state_dir, intent, task, job)
-            wrote_intent = True
-        if task.get("state") == "pending":
-            try:
-                _apply_transition(
-                    state_dir,
-                    job,
-                    task,
-                    "dispatching",
-                    reason="recorded a durable dispatch intent",
-                )
-            except BaseException:
-                if wrote_intent:
-                    clear_intent(
-                        state_dir,
-                        str(job.get("job_id")),
-                        str(task.get("task_id")),
-                    )
-                raise
-        return _post_intent(
-            state_dir,
-            job,
-            task,
-            intent,
-            launcher=launcher,
-            max_uncertain_ticks=max_uncertain_ticks,
-            retried=retried,
-            events_start=events_start,
-        )
-
-    return _reconcile(
-        state_dir,
-        job,
-        task,
-        intent,
-        launcher=launcher,
-        max_uncertain_ticks=max_uncertain_ticks,
-        posts=0,
-        events_start=events_start,
-        initial_uncertain=False,
-        retried=False,
-    )
-
-
-def _dispatch_tick(
-    state_dir: Path,
-    job: dict[str, Any],
-    *,
-    launcher: Any,
-    max_uncertain_ticks: int,
-    task_id: str | None,
-) -> TickResult:
-    if launcher is None:
-        return _result(
-            ok=False,
-            status="launcher_missing",
-            action="error",
-            job=job,
-            exact=False,
-            reason="no launcher injected",
-            fix="Inject a launcher implementing post/journal/idempotent.",
-        )
-
-    tasks = [
-        task
-        for task in job.get("tasks", [])
-        if task_id is None or str(task.get("task_id")) == str(task_id)
-    ]
-
-    for task in tasks:
-        if task.get("state") == "dispatching":
-            return _begin_or_continue(
-                state_dir,
-                job,
-                task,
-                launcher=launcher,
-                max_uncertain_ticks=max_uncertain_ticks,
-            )
-
-    for task in tasks:
-        if task.get("state") == "pending" and _dependencies_met(job, task):
-            return _begin_or_continue(
-                state_dir,
-                job,
-                task,
-                launcher=launcher,
-                max_uncertain_ticks=max_uncertain_ticks,
-            )
-
-    return _result(
-        status="noop",
-        action="none",
-        job=job,
-        task=tasks[0] if len(tasks) == 1 else None,
-        exact=False,
-        reason="nothing_to_dispatch",
-        changed=False,
-    )
-
-
-def _verifier(
-    launcher: Any, verifier: Callable[..., Any] | None
-) -> Callable[..., Any] | None:
-    if callable(verifier):
-        return verifier
-    if verifier is not None:
-        for name in ("verify", "run_verify", "check", "verify_attempt"):
-            candidate = getattr(verifier, name, None)
-            if callable(candidate):
-                return candidate
-    if launcher is not None:
-        for name in ("verify", "run_verify", "check", "verify_attempt"):
-            candidate = getattr(launcher, name, None)
-            if callable(candidate):
-                return candidate
-    return None
-
-
-def _verifier_ok(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, Mapping):
-        for key in ("ok", "passed", "accept", "accepted", "success", "green"):
-            if key in value:
-                return bool(value[key])
-        status = value.get("status")
-        if isinstance(status, str):
-            return status.lower() in {
-                "ok",
-                "passed",
-                "verified",
-                "green",
-                "accepted",
-            }
-        return True
-    if isinstance(value, str):
-        return value.strip().lower() in {
-            "ok",
-            "passed",
-            "verified",
-            "green",
-            "accepted",
-            "true",
-        }
-    return bool(value)
-
-
-def _verifier_evidence(value: Any) -> str | None:
-    if isinstance(value, Mapping):
-        for key in ("evidence", "summary", "detail", "reason"):
-            found = value.get(key)
-            if isinstance(found, str) and found.strip():
-                return found.strip()
+def _epoch(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
     if isinstance(value, str) and value.strip():
-        return value.strip()
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
     return None
 
 
-def _run_verifier(
-    verifier: Callable[..., Any],
-    *,
-    job: Mapping[str, Any],
-    task: Mapping[str, Any],
-    attempt_id: str | None,
-) -> Any:
-    raw, _used = _call_supported(
-        verifier,
-        {
-            "task": dict(task),
-            "attempt_id": attempt_id,
-            "task_id": task.get("task_id"),
-            "job_id": job.get("job_id"),
-            "result": dict(task),
-            "evidence": task.get("verify"),
-        },
-        leading=dict(task),
-    )
-    return raw
-
-
-def _latest_attempt_id(task: Mapping[str, Any]) -> str | None:
-    attempts = task.get("attempts") or []
-    if attempts and isinstance(attempts[-1], Mapping):
-        found = attempts[-1].get("attempt_id")
-        if isinstance(found, str) and found.strip():
-            return found.strip()
-    intent = task.get("intent")
-    if isinstance(intent, Mapping):
-        found = intent.get("attempt_id")
-        if isinstance(found, str) and found.strip():
-            return found.strip()
-    return None
-
-
-def _is_jsonable(value: Any) -> bool:
-    try:
-        json.dumps(value)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
-def _verify_tick(
-    state_dir: Path,
-    job: dict[str, Any],
-    *,
-    launcher: Any,
-    verifier: Callable[..., Any] | None,
-    task_id: str | None,
-) -> TickResult:
-    verifier_fn = _verifier(launcher, verifier)
-    if verifier_fn is None:
-        return _result(
-            ok=False,
-            status="verifier_missing",
-            action="error",
-            mode="verify",
-            job=job,
-            exact=False,
-            reason="no verifier injected",
-            fix="Pass verifier= or inject a launcher with a verify method.",
+def _clock(now: Any) -> float:
+    if now is None:
+        return time.time()
+    value = now() if callable(now) else now
+    epoch = _epoch(value)
+    if epoch is None:
+        raise ReconcileError(
+            "clock_invalid",
+            "now must be epoch seconds, an ISO timestamp or a callable",
+            "Pass a clock the reconciler can read.",
         )
+    return epoch
 
-    tasks = [
-        task
-        for task in job.get("tasks", [])
-        if task_id is None or str(task.get("task_id")) == str(task_id)
-    ]
-    selected = None
-    for task in tasks:
-        if task.get("state") in ("dispatched", "running", "verifying"):
-            selected = task
-            break
-    if selected is None:
-        return _result(
-            status="noop",
-            action="none",
-            mode="verify",
-            job=job,
-            task=tasks[0] if len(tasks) == 1 else None,
-            exact=False,
-            reason="nothing_to_verify",
-            changed=False,
-        )
 
-    events_start = len(job.get("events") or [])
-    if selected.get("state") == "dispatched":
-        _apply_transition(
-            state_dir,
-            job,
-            selected,
-            "running",
-            reason="reconciler picked up verification",
-        )
-    if selected.get("state") == "running":
-        _apply_transition(
-            state_dir,
-            job,
-            selected,
-            "verifying",
-            reason="reconciler started verification",
-        )
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
 
-    attempt_id = _latest_attempt_id(selected)
-    try:
-        raw = _run_verifier(
-            verifier_fn, job=job, task=selected, attempt_id=attempt_id
-        )
-    except Exception as exc:
-        selected["verify"] = {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "at": _utc_now(),
-        }
-        _apply_transition(
-            state_dir,
-            job,
-            selected,
-            "rejected",
-            reason=f"verifier raised {type(exc).__name__}",
-            evidence="verifier_error",
-        )
-        transitions = _events_since(job, events_start)
-        return _result(
-            status="verify_failed",
-            action="verify",
-            mode="verify",
-            job=job,
-            task=selected,
-            exact=False,
-            evidence="verifier_error",
-            reason="verifier_raised",
-            transitions=transitions,
-            changed=True,
-            verifier_calls=1,
-            attempt_id=attempt_id,
-        )
 
-    ok = _verifier_ok(raw)
-    evidence = _verifier_evidence(raw) or ("verified" if ok else "verify_failed")
-    selected["verify"] = {
-        "ok": ok,
-        "result": raw if _is_jsonable(raw) else None,
-        "evidence": evidence,
-        "at": _utc_now(),
+def _brief_of(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    brief = entry.get("brief")
+    return brief if isinstance(brief, Mapping) else {}
+
+
+def _fingerprint(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "objective": str(task.get("objective") or ""),
+        "source_rev": str((job.get("goal") or {}).get("base_rev") or ""),
+        "assigned_files": sorted(str(path) for path in (task.get("lease") or [])),
     }
-    if ok:
-        _apply_transition(
-            state_dir,
-            job,
-            selected,
-            "verified",
-            reason="verifier accepted the attempt",
-            evidence=evidence,
-        )
-    else:
-        _apply_transition(
-            state_dir,
-            job,
-            selected,
-            "rejected",
-            reason="verifier rejected the attempt",
-            evidence=evidence,
-        )
-    transitions = _events_since(job, events_start)
-    return _result(
-        status="verified" if ok else "verify_failed",
-        action="verify",
-        mode="verify",
-        job=job,
-        task=selected,
-        exact=False,
-        evidence=evidence,
-        reason="verify_passed" if ok else "verify_failed",
-        transitions=transitions,
-        changed=True,
-        verifier_calls=1,
-        attempt_id=attempt_id,
-    )
 
 
-def _normalize_mode(
-    value: Any, job: Mapping[str, Any] | None, task_id: str | None
-) -> str:
-    text = str(value or "").strip().lower()
-    if text in ("dispatch", "send", "dispatch_tick", "tick_dispatch"):
-        return "dispatch"
-    if text in (
-        "verify",
-        "verification",
-        "verify_tick",
-        "tick_verify",
-        "check",
-    ):
-        return "verify"
-    if text in ("auto", "", "none"):
-        if job is None:
-            return "dispatch"
-        tasks = [
-            task
-            for task in job.get("tasks", [])
-            if task_id is None or str(task.get("task_id")) == str(task_id)
-        ]
-        for task in tasks:
-            if task.get("state") == "dispatching":
-                return "dispatch"
-        for task in tasks:
-            if task.get("state") == "pending" and _dependencies_met(job, task):
-                return "dispatch"
-        for task in tasks:
-            if task.get("state") in ("dispatched", "running", "verifying"):
-                return "verify"
-        return "dispatch"
-    raise ReconcileError(
-        "reconcile_invalid",
-        f"unknown reconciler mode {value!r}",
-        "Use dispatch or verify.",
-    )
+def _matches(entry: Mapping[str, Any], fingerprint: Mapping[str, Any], written_at: float) -> bool:
+    brief = _brief_of(entry)
+    if brief:
+        if str(brief.get("objective") or "") != fingerprint["objective"]:
+            return False
+        if str(brief.get("source_rev") or "") != fingerprint["source_rev"]:
+            return False
+        files = brief.get("assigned_files")
+        if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+            if sorted(str(item) for item in files) != fingerprint["assigned_files"]:
+                return False
+    created = _epoch(entry.get("created_at"))
+    if created is not None and created + 1.0 < written_at:
+        return False
+    return True
+
+
+def _attempt_id(entry: Mapping[str, Any]) -> str | None:
+    for key in ("attempt_id", "id"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _state_of(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("state") or entry.get("status") or "").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# The tick
+# ---------------------------------------------------------------------------
 
 
 def tick(
-    state_dir: Path | str | Mapping[str, Any],
-    job_id: str | Mapping[str, Any] | None = None,
-    launcher: Any = None,
-    mode: str | None = None,
+    state_dir: Path,
+    job_id: str,
     *,
-    job: dict[str, Any] | None = None,
-    verifier: Callable[..., Any] | None = None,
+    launcher: Any,
+    verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    now: Any = None,
+    grace_s: float = DEFAULT_GRACE_S,
     max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
-    task_id: str | None = None,
-    **options: Any,
 ) -> TickResult:
-    """Run one crash-safe reconciler tick.
+    """Run one reconciler tick. See the module docstring for the rules."""
 
-    ``mode`` is ``"dispatch"`` or ``"verify"`` (``None`` chooses from the job
-    state). A tick that cannot acquire the per-job lock returns status
-    ``"locked"`` before loading the job or touching the launcher.
-    """
+    if grace_s < 0:
+        raise ReconcileError("grace_invalid", "grace_s must not be negative", "Pass a non-negative grace period.")
+    adapter = _Adapter(launcher)
+    clock = _clock(now)
 
-    if isinstance(state_dir, Mapping):
-        first = dict(state_dir)
-        if not isinstance(job_id, (str, os.PathLike)):
-            raise ReconcileError(
-                "reconcile_invalid",
-                "state_dir is required when the job is the first argument",
-                _FIX_INTENT,
-            )
-        state_dir = job_id
-        job = first
-        job_id = first.get("job_id")
+    lock = _Lock(lock_path(Path(state_dir), job_id))
+    with lock:
+        if not lock.held:
+            return TickResult(status="locked", detail="another tick holds the job lock")
+        job = jobs.load_job(Path(state_dir), job_id)
+        return _run(Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator)
 
-    if isinstance(job_id, Mapping):
-        job = dict(job_id)
-        job_id = job.get("job_id")
 
-    if not isinstance(state_dir, (str, os.PathLike)):
+def _run(
+    state_dir: Path,
+    job: dict[str, Any],
+    adapter: _Adapter,
+    clock: float,
+    grace_s: float,
+    max_uncertain_ticks: int,
+    verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+    integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+) -> TickResult:
+    attempts = adapter.list_attempts()
+    transitions: list[str] = []
+
+    # 1. Uncertainty is resolved before anything else happens.
+    for task in job["tasks"]:
+        intent = _intent_for(state_dir, job, task)
+        if intent is None or intent.get("status") != INTENT_UNCERTAIN:
+            continue
+        outcome = _reconcile_uncertain(
+            state_dir, job, task, intent, attempts, adapter, clock, grace_s, max_uncertain_ticks, transitions
+        )
+        if outcome is not None:
+            return outcome
+
+    # 2. Reap terminal attempts.
+    changed = _reap(job, attempts, transitions)
+
+    # 3. One heavy operation at most: integrate, else verify.
+    all_verified = bool(job["tasks"]) and all(t.get("state") == "verified" for t in job["tasks"])
+    if all_verified and integrator is not None and (job.get("integration") or {}).get("state") != "accepted":
+        result = _integrate(job, integrator, transitions)
+        jobs.save_job(state_dir, job)
+        return result
+
+    verifying = next((t for t in job["tasks"] if t.get("state") == "verifying"), None)
+    if verifying is not None and verifier is not None:
+        result = _verify(job, verifying, verifier, transitions)
+        jobs.save_job(state_dir, job)
+        return result
+
+    # 4. Dispatch ready tasks (a batch; the heavy-operation rule is about verify).
+    if verifying is None:
+        dispatched_before = len(transitions)
+        outcome = _dispatch_ready(state_dir, job, adapter, clock, transitions)
+        if outcome is not None:
+            jobs.save_job(state_dir, job)
+            return outcome
+        if len(transitions) > dispatched_before:
+            jobs.save_job(state_dir, job)
+            return TickResult(status="ok", transitions=tuple(transitions), action="dispatch")
+
+    if changed or transitions:
+        jobs.save_job(state_dir, job)
+        return TickResult(status="ok", transitions=tuple(transitions), action="reap")
+    return TickResult(status="idle", detail="nothing to do")
+
+
+# --- uncertainty -----------------------------------------------------------
+
+
+def _reconcile_uncertain(
+    state_dir: Path,
+    job: dict[str, Any],
+    task: dict[str, Any],
+    intent: dict[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+    adapter: _Adapter,
+    clock: float,
+    grace_s: float,
+    max_uncertain_ticks: int,
+    transitions: list[str],
+) -> TickResult | None:
+    job_id = str(job["job_id"])
+    task_id = str(task["task_id"])
+    attempt_no = int(intent.get("attempt_no", 1))
+    path = intent_path(state_dir, job_id, task_id, attempt_no)
+    first = _epoch(intent.get("first_uncertain_at")) or clock
+    elapsed = max(0.0, clock - first)
+    fingerprint = intent.get("fingerprint") or _fingerprint(job, task)
+    written_at = float(intent.get("written_at") or 0.0)
+    matches = [entry for entry in attempts if _matches(entry, fingerprint, written_at)]
+
+    if len(matches) > 1:
+        intent["escalated"] = "dispatch_ambiguous"
+        _write_json(path, intent)
+        return TickResult(
+            status="escalated",
+            detail=f"dispatch_ambiguous: {len(matches)} journal entries match task {task_id}; refusing to choose",
+            evidence="dispatch_ambiguous",
+        )
+
+    if len(matches) == 1:
+        attempt_id = _attempt_id(matches[0]) or str(intent.get("attempt_id") or "")
+        task.setdefault("attempts", [])
+        if attempt_id and attempt_id not in task["attempts"]:
+            task["attempts"].append(attempt_id)
+        intent.update(status=INTENT_DISPATCHED, attempt_id=attempt_id)
+        task["intent"] = dict(intent)
+        jobs.transition(job, task_id, "dispatched", actor="reconciler", reason="adopted after uncertain dispatch")
+        transitions.append(f"{task_id}->dispatched")
+        _write_json(path, intent)
+        jobs.save_job(state_dir, job)
+        return TickResult(
+            status="ok",
+            transitions=tuple(transitions),
+            action="adopt",
+            detail=f"adopted {attempt_id} for {task_id}",
+            exactly_once=adapter.idempotent,
+            evidence=EVIDENCE_PROVEN_PRESENT if adapter.idempotent else EVIDENCE_ADOPTED,
+        )
+
+    ticks = int(intent.get("uncertain_ticks") or 0) + 1
+    intent["uncertain_ticks"] = ticks
+    intent["first_uncertain_at"] = _iso(first)
+    intent["last_checked_at"] = _iso(clock)
+
+    if elapsed >= float(grace_s) or ticks > int(max_uncertain_ticks):
+        reason = "grace elapsed" if elapsed >= float(grace_s) else "tick cap reached"
+        intent["escalated"] = "dispatch_uncertain_exhausted"
+        _write_json(path, intent)
+        job.setdefault("events", []).append(
+            {
+                "at": _iso(clock),
+                "task_id": task_id,
+                "transition": "dispatch_uncertain_exhausted",
+                "actor": "reconciler",
+                "reason": reason,
+            }
+        )
+        jobs.save_job(state_dir, job)
+        return TickResult(
+            status="escalated",
+            detail=(
+                f"dispatch_uncertain_exhausted for {task_id} "
+                f"({reason}, {elapsed:.0f}s of {grace_s:.0f}s, {ticks} ticks)"
+            ),
+            evidence="dispatch_uncertain_exhausted",
+        )
+
+    _write_json(path, intent)
+    task["intent"] = dict(intent)
+    jobs.save_job(state_dir, job)
+    return TickResult(
+        status="reconcile_wait",
+        detail=f"{task_id}: dispatch uncertain, {elapsed:.0f}s of {grace_s:.0f}s grace elapsed, no journal match yet",
+    )
+
+
+# --- reap / verify / integrate --------------------------------------------
+
+
+def _reap(job: dict[str, Any], attempts: Sequence[Mapping[str, Any]], transitions: list[str]) -> bool:
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for entry in attempts:
+        attempt_id = _attempt_id(entry)
+        if attempt_id:
+            by_id[attempt_id] = entry
+    changed = False
+    for task in job["tasks"]:
+        attempt_id = (task.get("attempts") or [None])[-1]
+        if not attempt_id or attempt_id not in by_id:
+            continue
+        state = _state_of(by_id[attempt_id])
+        current = task.get("state")
+        if state in {"succeeded", "completed", "done"} and current in {"dispatched", "running"}:
+            jobs.transition(job, str(task["task_id"]), "running", actor="reconciler", reason="worker started")
+            jobs.transition(job, str(task["task_id"]), "verifying", actor="reconciler", reason="worker finished")
+            transitions.extend([f"{task['task_id']}->running", f"{task['task_id']}->verifying"])
+            changed = True
+        elif state in {"failed", "cancelled", "canceled", "error"} and current in {"dispatched", "running"}:
+            jobs.transition(job, str(task["task_id"]), "rejected", actor="reconciler", reason=f"worker ended {state}")
+            transitions.append(f"{task['task_id']}->rejected")
+            changed = True
+    return changed
+
+
+def _verify(
+    job: dict[str, Any],
+    task: dict[str, Any],
+    verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    transitions: list[str],
+) -> TickResult:
+    task_id = str(task["task_id"])
+    attempt_id = (task.get("attempts") or [None])[-1]
+    verdict = verifier({"attempt_id": attempt_id, "task": dict(task), "job_id": job["job_id"]})
+    if not isinstance(verdict, Mapping) or "ok" not in verdict:
         raise ReconcileError(
-            "reconcile_invalid",
-            "state_dir must be a filesystem path",
-            _FIX_INTENT,
+            "verifier_invalid",
+            "the verifier must return a mapping with 'ok'",
+            "Fix the verifier; do not treat a missing verdict as success.",
         )
-    state_path = Path(state_dir)
+    evidence = str(verdict.get("evidence") or "")
+    if verdict.get("ok"):
+        jobs.transition(job, task_id, "verified", actor="reconciler", reason=evidence or "verifier green", evidence=evidence)
+        transitions.append(f"{task_id}->verified")
+        return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} verified")
+    jobs.transition(job, task_id, "rejected", actor="reconciler", reason=evidence or "verifier rejected", evidence=evidence)
+    transitions.append(f"{task_id}->rejected")
+    return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} rejected")
 
-    for key in ("op", "operation", "kind", "phase", "tick_type"):
-        if key in options and mode is None:
-            mode = options.pop(key)
-    if "max_uncertain" in options:
-        max_uncertain_ticks = int(options.pop("max_uncertain"))
-    if "uncertain_limit" in options:
-        max_uncertain_ticks = int(options["uncertain_limit"])
 
-    if job is None:
-        if job_id is None:
-            raise ReconcileError(
-                "reconcile_invalid", "job_id or job is required", _FIX_INTENT
-            )
-        checked_job_id = _safe_id(job_id)
-    else:
-        if job_id is None:
-            job_id = job.get("job_id")
-        checked_job_id = _safe_id(job_id)
-        if str(job.get("job_id")) != checked_job_id:
-            raise ReconcileError(
-                "reconcile_invalid",
-                "the in-memory job does not match job_id",
-                _FIX_INTENT,
-            )
-
-    lock = _try_lock(state_path, checked_job_id)
-    if lock is None:
-        return _result(
-            status="locked",
-            action="none",
-            job=job,
-            mode=str(mode or "dispatch"),
-            exact=False,
-            reason="another reconciler tick holds the job lock",
-            locked=True,
-            changed=False,
-            fix=_FIX_LOCK,
+def _integrate(
+    job: dict[str, Any],
+    integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    transitions: list[str],
+) -> TickResult:
+    verdict = integrator(dict(job))
+    if not isinstance(verdict, Mapping) or "ok" not in verdict:
+        raise ReconcileError(
+            "integrator_invalid",
+            "the integrator must return a mapping with 'ok'",
+            "Fix the integrator; do not treat a missing verdict as success.",
         )
+    integration = job.setdefault("integration", {"wave": "w1"})
+    integration["state"] = "accepted" if verdict.get("ok") else "failed"
+    integration["evidence"] = str(verdict.get("evidence") or "")
+    transitions.append(f"integration->{integration['state']}")
+    return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail=f"integration {integration['state']}")
 
+
+# --- dispatch --------------------------------------------------------------
+
+
+def _dispatch_ready(
+    state_dir: Path,
+    job: dict[str, Any],
+    adapter: _Adapter,
+    clock: float,
+    transitions: list[str],
+) -> TickResult | None:
+    states = {t.get("task_id"): t.get("state") for t in job["tasks"]}
+    for task in job["tasks"]:
+        state = task.get("state")
+        # A task stuck in "dispatching" is only retryable when its intent proves
+        # the request never left the process; anything else is uncertainty and is
+        # handled before this point.
+        if state == "dispatching":
+            intent = _intent_for(state_dir, job, task)
+            if intent is None or intent.get("status") != INTENT_NOT_SENT:
+                continue
+        elif state != "pending":
+            continue
+        if any(states.get(dep) != "accepted" for dep in (task.get("depends_on") or [])):
+            continue
+        outcome = _dispatch_one(state_dir, job, task, adapter, clock, transitions)
+        if outcome is not None:
+            return outcome
+    return None
+
+
+def _dispatch_one(
+    state_dir: Path,
+    job: dict[str, Any],
+    task: dict[str, Any],
+    adapter: _Adapter,
+    clock: float,
+    transitions: list[str],
+) -> TickResult | None:
+    job_id = str(job["job_id"])
+    task_id = str(task["task_id"])
+    attempt_no = len(task.get("attempts") or []) + 1
+    path = intent_path(state_dir, job_id, task_id, attempt_no)
+    existing = read_intent(path)
+    if existing and existing.get("status") == INTENT_UNCERTAIN:
+        return TickResult(status="reconcile_wait", detail=f"{task_id}: intent still uncertain")
+
+    # Re-entering from "dispatching" after a not-sent intent: use a fresh
+    # attempt number so the retry has its own intent record.
+    if task.get("state") == "dispatching" and existing and existing.get("status") == INTENT_NOT_SENT:
+        attempt_no = int(existing.get("attempt_no", 1)) + 1
+        path = intent_path(state_dir, job_id, task_id, attempt_no)
+
+    fingerprint = _fingerprint(job, task)
+    intent = {
+        "task_id": task_id,
+        "attempt_no": attempt_no,
+        "idempotency_key": hashlib.sha256(f"{job_id}:{task_id}:{attempt_no}".encode()).hexdigest()[:32],
+        "status": INTENT_DISPATCHING,
+        "written_at": clock,
+        "first_uncertain_at": None,
+        "uncertain_ticks": 0,
+        "fingerprint": fingerprint,
+    }
+    _write_json(path, intent)  # fsynced before the call
+
+    brief = {
+        "objective": fingerprint["objective"],
+        "source_rev": fingerprint["source_rev"],
+        "assigned_files": fingerprint["assigned_files"],
+        "job_id": job_id,
+        "task_id": task_id,
+    }
+    if task.get("state") == "pending":
+        jobs.transition(job, task_id, "dispatching", actor="reconciler", reason="dependencies accepted")
     try:
-        if job is None:
-            job = jobs.load_job(state_path, checked_job_id)
-        chosen_mode = _normalize_mode(mode, job, task_id)
-        if chosen_mode == "dispatch":
-            return _dispatch_tick(
-                state_path,
-                job,
-                launcher=launcher,
-                max_uncertain_ticks=int(max_uncertain_ticks),
-                task_id=task_id,
-            )
-        return _verify_tick(
-            state_path,
-            job,
-            launcher=launcher,
-            verifier=verifier,
-            task_id=task_id,
+        created = adapter.post_attempt(brief)
+    except DispatchNotSent as exc:
+        intent.update(status=INTENT_NOT_SENT, detail=str(exc))
+        _write_json(path, intent)
+        task["intent"] = dict(intent)
+        return TickResult(
+            status="ok",
+            transitions=tuple(transitions),
+            action="dispatch",
+            detail=f"{task_id}: not sent ({exc}); retry next tick",
         )
-    finally:
-        lock.release()
+    except DispatchUncertain as exc:
+        intent.update(status=INTENT_UNCERTAIN, first_uncertain_at=_iso(clock), uncertain_ticks=1, detail=str(exc))
+        _write_json(path, intent)
+        task["intent"] = dict(intent)
+        return TickResult(
+            status="reconcile_wait",
+            detail=f"{task_id}: dispatch uncertain ({exc}); reconciling, not retrying",
+        )
+    except DispatchRejected as exc:
+        intent.update(status="rejected", detail=str(exc))
+        _write_json(path, intent)
+        jobs.transition(job, task_id, "rejected", actor="reconciler", reason=f"launcher rejected the brief: {exc}")
+        transitions.append(f"{task_id}->rejected")
+        return TickResult(status="ok", transitions=tuple(transitions), action="dispatch", detail=f"{task_id} rejected by the launcher")
+
+    attempt_id = _attempt_id(created) or ""
+    intent.update(status=INTENT_DISPATCHED, attempt_id=attempt_id)
+    _write_json(path, intent)
+    task.setdefault("attempts", []).append(attempt_id)
+    task["intent"] = dict(intent)
+    jobs.transition(job, task_id, "dispatched", actor="reconciler", reason=f"attempt {attempt_id}")
+    transitions.append(f"{task_id}->dispatched")
+    return None
 
 
-def dispatch_tick(
-    state_dir: Path | str,
-    job_id: str | Mapping[str, Any] | None = None,
-    launcher: Any = None,
-    *,
-    job: dict[str, Any] | None = None,
-    max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
-    task_id: str | None = None,
-    **options: Any,
-) -> TickResult:
-    return tick(
-        state_dir,
-        job_id,
-        launcher,
-        "dispatch",
-        job=job,
-        max_uncertain_ticks=max_uncertain_ticks,
-        task_id=task_id,
-        **options,
-    )
+# --- intents ---------------------------------------------------------------
 
 
-def verify_tick(
-    state_dir: Path | str,
-    job_id: str | Mapping[str, Any] | None = None,
-    launcher: Any = None,
-    *,
-    job: dict[str, Any] | None = None,
-    verifier: Callable[..., Any] | None = None,
-    task_id: str | None = None,
-    **options: Any,
-) -> TickResult:
-    return tick(
-        state_dir,
-        job_id,
-        launcher,
-        "verify",
-        job=job,
-        verifier=verifier,
-        task_id=task_id,
-        **options,
-    )
-
-
-run_tick = tick
-reconcile = tick
-reconcile_tick = tick
-reconcile_job = tick
-
-reconcile_once = tick
-reconcile_one = tick
-run = tick
-
-
-def dispatch(*args: Any, **kwargs: Any) -> TickResult:
-    kwargs["mode"] = "dispatch"
-    return tick(*args, **kwargs)
-
-
-def verify(*args: Any, **kwargs: Any) -> TickResult:
-    kwargs["mode"] = "verify"
-    return tick(*args, **kwargs)
+def _intent_for(state_dir: Path, job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any] | None:
+    recorded = task.get("intent")
+    if isinstance(recorded, Mapping) and recorded.get("status"):
+        return dict(recorded)
+    task_id = str(task.get("task_id") or "")
+    base = Path(state_dir) / "jobs" / str(job.get("job_id")) / "intents"
+    if not task_id or not base.is_dir():
+        return None
+    for path in sorted(base.glob(f"{task_id}-*.json"), reverse=True):
+        intent = read_intent(path)
+        if intent is not None:
+            return intent
+    return None

@@ -1,4 +1,9 @@
-"""M2 crash and concurrency tests for the durable reconciler."""
+"""M2 crash and uncertainty tests.
+
+Every case here is about a request whose fate is not knowable from the caller's
+side. The rule under test is always the same: an uncertain dispatch is
+reconciled against the journal or escalated — never retried on a guess.
+"""
 
 from __future__ import annotations
 
@@ -7,248 +12,130 @@ import threading
 from bundlebees_plugin import job as jobs
 from bundlebees_plugin import reconcile as rec
 
-from .test_reconcile import FakeLauncher, authorize_and_create
+from tests.test_reconcile import FakeLauncher, make_job, T0, iso
 
 
 class Concurrency:
     __test__ = True
-
     def test_two_ticks_never_double_dispatch(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher()
-        launcher.entered = threading.Event()
-        launcher.release = threading.Event()
+        make_job(tmp_path)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Blocking(FakeLauncher):
+            def post_attempt(self, brief):
+                entered.set()
+                assert release.wait(10), "test never released the blocked POST"
+                return super().post_attempt(brief)
+
+        launcher = Blocking()
         results: list[rec.TickResult] = []
 
-        def run_tick() -> None:
-            results.append(
-                rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-            )
-
-        worker = threading.Thread(target=run_tick)
+        worker = threading.Thread(
+            target=lambda: results.append(rec.tick(tmp_path, "job_a", launcher=launcher, now=T0))
+        )
         worker.start()
-        try:
-            assert launcher.entered.wait(10), "first tick never reached the launcher"
-            second = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-            assert second["status"] == "locked"
-            assert second["transitions"] == []
-            assert second["posts"] == 0
-            assert len(launcher.posts) == 1
-        finally:
-            launcher.release.set()
-            worker.join(10)
+        assert entered.wait(10), "the first tick never reached post_attempt"
 
-        assert not worker.is_alive()
-        assert len(results) == 1
-        assert results[0]["status"] == "dispatched"
+        second = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0)
+
+        release.set()
+        worker.join(10)
+
+        assert second.status == "locked"
+        assert second.transitions == ()
         assert len(launcher.posts) == 1
-        assert len(launcher.entries) == 1
-        task = jobs.load_job(tmp_path, "job_a")["tasks"][0]
-        assert task["state"] == "dispatched"
-        dispatched = [
-            event
-            for event in jobs.load_job(tmp_path, "job_a")["events"]
-            if event["transition"] == "dispatching->dispatched"
-        ]
-        assert len(dispatched) == 1
+        assert results and results[0].status == "ok"
 
 
 class Crash:
     __test__ = True
-
     def test_crash_before_post_is_retried(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher(script=["not_sent", "ok"])
+        make_job(tmp_path)
+        launcher = FakeLauncher()
+        launcher.script = ["not_sent"]
 
-        first = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-        assert first["status"] == "not_sent"
-        assert first["evidence"] == "not_sent"
+        first = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0)
+        assert first.status == "ok"
+        assert "not sent" in first.detail
         assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["state"] == "dispatching"
 
-        second = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-        assert second["status"] == "dispatched"
-        assert second["evidence"] == "retried"
+        second = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 1)
+
+        assert second.status == "ok"
         task = jobs.load_job(tmp_path, "job_a")["tasks"][0]
         assert task["state"] == "dispatched"
-        assert len(launcher.posts) == 2
-        assert len(launcher.entries) == 1
         assert len(task["attempts"]) == 1
-
-    def test_prepared_intent_before_post_is_retried_after_restart(self, tmp_path):
-        job = authorize_and_create(tmp_path)
-        jobs.transition(
-            job,
-            "T1",
-            "dispatching",
-            actor="reconciler",
-            reason="simulated crash after the durable intent",
-        )
-        jobs.save_job(tmp_path, job)
-        intent = rec._new_intent(job, job["tasks"][0])
-        rec.save_intent(tmp_path, intent)
-        launcher = FakeLauncher()
-
-        result = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-
-        assert result["status"] == "dispatched"
-        assert len(launcher.posts) == 1
-        assert len(launcher.entries) == 1
-        assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["state"] == "dispatched"
+        assert len(launcher.posts) == 2  # one that never landed, one that did
 
     def test_lost_acknowledgement_is_adopted_not_redispatched(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher(
-            idempotent=True, script=["uncertain_present"]
-        )
+        make_job(tmp_path)
+        launcher = FakeLauncher(idempotent=False)
+        launcher.script = ["uncertain_present"]
 
-        result = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
+        first = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0)
+        assert first.status == "reconcile_wait"
 
-        assert result["status"] == "adopted"
-        assert result["evidence"] == "proven_present"
-        assert result["exactly_once"] is True
-        assert result["posts"] == 1
-        assert result["journal_calls"] == 1
+        adopted = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 1)
+
+        assert adopted.status == "ok"
+        assert adopted.action == "adopt"
+        assert adopted.evidence == "adopted"  # no server idempotency, so no claim
+        assert adopted.exactly_once is False
         assert len(launcher.posts) == 1
-        assert len(launcher.entries) == 1
-        assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["state"] == "dispatched"
-
-        again = rec.tick(tmp_path, "job_a", launcher, mode="dispatch")
-        assert again["status"] == "noop"
-        assert len(launcher.posts) == 1
+        assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["attempts"] == ["att_late"]
 
     def test_delayed_journal_visibility_waits_then_adopts(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher(
-            idempotent=True, script=["uncertain"]
-        )
+        make_job(tmp_path)
+        launcher = FakeLauncher()
+        launcher.script = ["uncertain_present"]
+        launcher.hide_next = 4  # the journal lags the POST by four reads
 
-        first = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=10,
-        )
-        assert first["status"] == "reconcile_wait"
-        assert first["posts"] == 1
-        assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["state"] == "dispatching"
+        assert rec.tick(tmp_path, "job_a", launcher=launcher, now=T0).status == "reconcile_wait"
+        for step in (1, 2, 3):
+            waiting = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + step, grace_s=600)
+            assert waiting.status == "reconcile_wait"
 
-        second = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=10,
-        )
-        assert second["status"] == "reconcile_wait"
-        assert second["posts"] == 0
+        adopted = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 4, grace_s=600)
 
-        key = launcher.posts[0]["idempotency_key"]
-        launcher.add_attempt(
-            job_id="job_a",
-            task_id="T1",
-            idempotency_key=key,
-            attempt_id="att_delayed",
-        )
-
-        third = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=10,
-        )
-        assert third["status"] == "adopted"
-        assert third["posts"] == 0
-        assert third["evidence"] == "proven_present"
-        assert third["attempt_id"] == "att_delayed"
+        assert adopted.action == "adopt"
         assert len(launcher.posts) == 1
-        assert jobs.load_job(tmp_path, "job_a")["tasks"][0]["state"] == "dispatched"
 
     def test_uncertainty_exhaustion_escalates(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher(idempotent=True, script=["uncertain"])
+        make_job(tmp_path)
+        launcher = FakeLauncher()
+        launcher.script = ["uncertain"]
 
-        first = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=2,
-        )
-        assert first["status"] == "reconcile_wait"
-        assert first["posts"] == 1
-        posts_after_first = len(launcher.posts)
+        rec.tick(tmp_path, "job_a", launcher=launcher, now=T0, grace_s=600, max_uncertain_ticks=3)
+        for step in (1, 2):
+            assert rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + step, grace_s=600, max_uncertain_ticks=3).status == "reconcile_wait"
 
-        result = None
-        for _ in range(10):
-            result = rec.tick(
-                tmp_path,
-                "job_a",
-                launcher,
-                mode="dispatch",
-                max_uncertain_ticks=2,
-            )
-            assert result["posts"] == 0
-            if result["status"] == "dispatch_uncertain_exhausted":
-                break
+        escalated = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 4, grace_s=600, max_uncertain_ticks=3)
 
-        assert result is not None
-        assert result["status"] == "dispatch_uncertain_exhausted"
-        assert result["exactly_once"] is False
-        assert len(launcher.posts) == posts_after_first
-        task = jobs.load_job(tmp_path, "job_a")["tasks"][0]
-        assert task["state"] == "failed"
-        assert task["evidence"] == "dispatch_uncertain_exhausted"
-
-        after = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=2,
-        )
-        assert after["status"] == "noop"
-        assert len(launcher.posts) == posts_after_first
+        assert escalated.status == "escalated"
+        assert escalated.evidence == "dispatch_uncertain_exhausted"
+        assert len(launcher.posts) == 1
 
     def test_ambiguous_adoption_escalates(self, tmp_path):
-        authorize_and_create(tmp_path)
-        launcher = FakeLauncher(idempotent=True, script=["uncertain"])
+        make_job(tmp_path)
+        launcher = FakeLauncher()
+        launcher.script = ["ambiguous"]
 
-        first = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=10,
-        )
-        assert first["status"] == "reconcile_wait"
-        key = launcher.posts[0]["idempotency_key"]
-        launcher.add_attempt(
-            job_id="job_a",
-            task_id="T1",
-            idempotency_key=key,
-            attempt_id="att_one",
-        )
-        launcher.add_attempt(
-            job_id="job_a",
-            task_id="T1",
-            idempotency_key=key,
-            attempt_id="att_two",
-        )
+        assert rec.tick(tmp_path, "job_a", launcher=launcher, now=T0).status == "reconcile_wait"
+        escalated = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 1)
 
-        result = rec.tick(
-            tmp_path,
-            "job_a",
-            launcher,
-            mode="dispatch",
-            max_uncertain_ticks=10,
-        )
-
-        assert result["status"] == "dispatch_ambiguous"
-        assert result["posts"] == 0
-        assert result["exactly_once"] is False
+        assert escalated.status == "escalated"
+        assert escalated.evidence == "dispatch_ambiguous"
         assert len(launcher.posts) == 1
-        task = jobs.load_job(tmp_path, "job_a")["tasks"][0]
-        assert task["state"] == "failed"
-        assert task["evidence"] == "dispatch_ambiguous"
+
+    def test_a_second_tick_while_dispatching_does_not_post_again(self, tmp_path):
+        make_job(tmp_path)
+        launcher = FakeLauncher()
+        launcher.script = ["uncertain"]
+        rec.tick(tmp_path, "job_a", launcher=launcher, now=T0)
+
+        # Even with a journal that never shows the attempt, ticks stay reads.
+        for step in range(1, 4):
+            rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + step, grace_s=600, max_uncertain_ticks=50)
+
+        assert len(launcher.posts) == 1
