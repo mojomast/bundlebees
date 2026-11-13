@@ -498,6 +498,7 @@ def tick(
     grace_s: float = DEFAULT_GRACE_S,
     max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
     stale_lock_s: float = DEFAULT_STALE_LOCK_S,
+    binder: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> TickResult:
     """Run one reconciler tick. See the module docstring for the rules."""
 
@@ -512,7 +513,9 @@ def tick(
         return TickResult(status="locked", detail="another live tick holds the job lock")
     try:
         job = jobs.load_job(Path(state_dir), job_id)
-        result = _run(Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator)
+        result = _run(
+            Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder
+        )
         if lock.stolen:
             result = TickResult(
                 status=result.status,
@@ -536,6 +539,7 @@ def _run(
     max_uncertain_ticks: int,
     verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+    binder: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> TickResult:
     attempts = adapter.list_attempts()
     transitions: list[str] = []
@@ -553,7 +557,7 @@ def _run(
         if status not in {INTENT_UNCERTAIN, INTENT_DISPATCHING} and not adoptable:
             continue
         outcome = _reconcile_uncertain(
-            state_dir, job, task, intent, attempts, adapter, clock, grace_s, max_uncertain_ticks, transitions
+            state_dir, job, task, intent, attempts, adapter, clock, grace_s, max_uncertain_ticks, transitions, binder
         )
         if outcome is not None:
             return outcome
@@ -593,7 +597,7 @@ def _run(
     # 4. Dispatch ready tasks (a batch; the heavy-operation rule is about verify).
     if verifying is None:
         dispatched_before = len(transitions)
-        outcome = _dispatch_ready(state_dir, job, adapter, clock, transitions)
+        outcome = _dispatch_ready(state_dir, job, adapter, clock, transitions, binder)
         if outcome is not None:
             jobs.save_job(state_dir, job)
             return outcome
@@ -621,6 +625,7 @@ def _reconcile_uncertain(
     grace_s: float,
     max_uncertain_ticks: int,
     transitions: list[str],
+    binder: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> TickResult | None:
     job_id = str(job["job_id"])
     task_id = str(task["task_id"])
@@ -648,6 +653,7 @@ def _reconcile_uncertain(
             if attempt_id not in task["attempts"]:
                 task["attempts"].append(attempt_id)
             task["intent"] = dict(intent)
+            _bind(binder, attempt_id, _brief_for(job, task))
             _to_dispatched(job, task, "adopted confirmed intent after a crash")
             transitions.append(f"{task_id}->dispatched")
             jobs.save_job(state_dir, job)
@@ -688,6 +694,7 @@ def _reconcile_uncertain(
             task["attempts"].append(attempt_id)
         intent.update(status=INTENT_DISPATCHED, attempt_id=attempt_id)
         task["intent"] = dict(intent)
+        _bind(binder, attempt_id, _brief_for(job, task))
         _to_dispatched(job, task, "adopted after uncertain dispatch")
         transitions.append(f"{task_id}->dispatched")
         _write_json(path, intent)
@@ -750,6 +757,25 @@ def _escalate(
     jobs.save_job(state_dir, job)
     return TickResult(status="escalated", transitions=tuple(transitions), detail=detail, evidence=code)
 
+
+
+def _bind(
+    binder: Callable[[str, Mapping[str, Any]], None] | None,
+    attempt_id: str,
+    brief: Mapping[str, Any],
+) -> None:
+    """Persist the coordinator-signed lease. Failure aborts the tick."""
+
+    if binder is None or not attempt_id:
+        return
+    try:
+        binder(attempt_id, brief)
+    except Exception as exc:  # noqa: BLE001 - any binding failure must stop the tick
+        raise ReconcileError(
+            "lease_binding_failed",
+            f"the lease for {attempt_id} could not be recorded: {exc}",
+            "Fix the lease state; an attempt without a lease must never be verified.",
+        ) from exc
 
 
 def _to_dispatched(job: dict[str, Any], task: dict[str, Any], reason: str) -> None:
@@ -934,6 +960,7 @@ def _dispatch_ready(
     adapter: _Adapter,
     clock: float,
     transitions: list[str],
+    binder: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> TickResult | None:
     states = {t.get("task_id"): t.get("state") for t in job["tasks"]}
     for task in job["tasks"]:
@@ -948,7 +975,7 @@ def _dispatch_ready(
             continue
         if any(states.get(dep) != "accepted" for dep in (task.get("depends_on") or [])):
             continue
-        outcome = _dispatch_one(state_dir, job, task, adapter, clock, transitions)
+        outcome = _dispatch_one(state_dir, job, task, adapter, clock, transitions, binder)
         if outcome is not None:
             return outcome
     return None
@@ -988,6 +1015,7 @@ def _dispatch_one(
     adapter: _Adapter,
     clock: float,
     transitions: list[str],
+    binder: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> TickResult | None:
     job_id = str(job["job_id"])
     task_id = str(task["task_id"])
@@ -1052,6 +1080,7 @@ def _dispatch_one(
         return TickResult(status="ok", transitions=tuple(transitions), action="dispatch", detail=f"{task_id} rejected by the launcher")
 
     attempt_id = _attempt_id(created) or ""
+    _bind(binder, attempt_id, brief)
     intent.update(status=INTENT_DISPATCHED, attempt_id=attempt_id)
     _write_json(path, intent)
     task.setdefault("attempts", []).append(attempt_id)
