@@ -18,6 +18,8 @@ import json
 import os
 import secrets
 import sys
+
+from . import packets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -424,10 +426,19 @@ def create_job(
     tasks: Sequence[Mapping[str, Any]],
     summary: str = "",
     workflow_ref: str | None = None,
+    packet: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a job that narrows an existing authorization."""
 
     authorization = load_authorization(state_dir, job_id)
+    packet_digest = ""
+    if packet is not None:
+        packet_digest = packets.validate(packet)
+        if str(packet.get("job_id")) != str(job_id):
+            raise JobError("packet_job_mismatch", "the packet names another job", "Refuse: packet and job identity must match.")
+        if str((packet.get("repository") or {}).get("identity")) != str(authorization.get("repo")):
+            raise JobError("packet_repo_mismatch", "the packet names another repository", "Refuse.")
+        workflow_ref = workflow_ref or str(packet.get("workflow_ref") or "") or None
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "job",
@@ -443,6 +454,7 @@ def create_job(
             # The protocol commit the feature is executed under. Pinned at creation;
             # a resumed job never reinterprets itself under a different workflow.
             "workflow_ref": str(workflow_ref or ""),
+            "packet_digest": packet_digest,
         },
         "tasks": [_normalize_task(task, for_create=True) for task in tasks],
         "integration": {"wave": "w1", "state": "pending", "evidence": None},
@@ -480,6 +492,17 @@ def load_job(state_dir: Path, job_id: str) -> dict[str, Any]:
 
 
 def save_job(state_dir: Path, job: Mapping[str, Any]) -> None:
+    previous = None
+    try:
+        previous = _unseal(job_path(Path(state_dir), str(job.get("job_id"))), _load_key(Path(state_dir)), "job")
+    except Exception:  # noqa: BLE001 - first save
+        previous = None
+    if previous is not None:
+        before = (previous.get("goal") or {}).get("packet_digest")
+        after = (job.get("goal") or {}).get("packet_digest")
+        if before and after and before != after:
+            raise JobError("packet_identity_changed", "the job would resume under a different packet identity",
+                           "Refuse: a sealed job keeps the protocol and packet it started with.")
     key = _ensure_key(state_dir)
     _atomic_write(job_path(state_dir, job["job_id"]), _canonical(_seal(job, key)) + b"\n")
 
