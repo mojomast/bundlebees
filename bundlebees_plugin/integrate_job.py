@@ -22,6 +22,22 @@ from typing import Any, Mapping, Sequence
 from . import revision, verify_local
 
 
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault checkpoint for the crash harness, if one is armed.
+
+    Imported lazily and tolerated when absent, exactly like the other lanes'
+    checkpoints: the shipped path has no hooks and this is a no-op.
+    """
+
+    try:  # noqa: SIM105 - a missing optional module is the normal no-op case
+        from . import faults  # noqa: PLC0415
+    except ImportError:
+        return
+    fire = getattr(faults, "checkpoint", None)
+    if callable(fire):
+        fire(name, **payload)
+
+
 class IntegrateError(Exception):
     def __init__(self, code: str, message: str, fix: str = "") -> None:
         super().__init__(message)
@@ -247,6 +263,12 @@ def integrate(
             head = str(record.get("head_sha") or "")
             if len(head) != 40:
                 raise IntegrateError("bad_wave_record", "the accepted wave has no head sha", "Inspect the wave record.")
+            # Fault boundary: the accepted wave record is durable, but neither the
+            # integration ref nor the job document names it yet. A crash here must
+            # be recovered from the record, never by integrating the wave again.
+            _checkpoint("wave.after_persist", job_id=str(job.get("job_id") or ""),
+                        wave_id=str(record.get("wave_id") or wave), head_sha=head,
+                        attempts=list(attempts))
             # Durable ref: the next wave starts here, not at the original base.
             _git(["update-ref", ref, head], repo)
     finally:
