@@ -2,6 +2,9 @@
 
 Nothing here reads ambient environment variables for credentials. ``child_env``
 builds a fresh exact-name environment instead of copying ``os.environ``.
+
+URL guards treat RFC 6598 carrier-grade NAT space (100.64.0.0/10) as a private
+bind class: it is allowed only when private binds are explicitly enabled.
 """
 
 from __future__ import annotations
@@ -230,6 +233,7 @@ _METADATA_IPS = frozenset(
         ipaddress.ip_address("fd00:ec2::254"),
     }
 )
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
@@ -249,6 +253,10 @@ def _check_ip(
         return
     if address.is_link_local or address.is_multicast or address.is_unspecified:
         raise UnsafeURLError("link-local, multicast, and unspecified addresses are not allowed")
+    if address.version == 4 and address in _CGNAT_NETWORK:
+        if not allow_private:
+            raise UnsafeURLError("carrier-grade NAT addresses require explicit configuration")
+        return
     if address.is_global:
         return
     if address.is_private or address.is_reserved:
@@ -268,9 +276,10 @@ def validate_url(
     """Validate a launcher/fetch URL against the address policy.
 
     Loopback is allowed by default (the Orbit adapter is loopback-only). Private
-    binds must be opted into from explicit user configuration, never from tool
-    arguments. Metadata, link-local, multicast, credentials, and non-HTTP
-    schemes are always rejected.
+    binds, including RFC 6598 carrier-grade NAT space (100.64.0.0/10), must be
+    opted into from explicit user configuration, never from tool arguments.
+    Metadata, link-local, multicast, credentials, and non-HTTP schemes are
+    always rejected.
     """
     if not isinstance(url, str) or not url:
         raise UnsafeURLError("URL must be a non-empty string")

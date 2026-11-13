@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 import pytest
 
 from bundlebees_plugin import security
+
+
+def _url_for_address(address: ipaddress._BaseAddress) -> str:
+    host = f"[{address}]" if address.version == 6 else str(address)
+    return f"http://{host}/"
 
 
 def test_scrub_redacts_tokens_urls_ips_and_ssh_hosts():
@@ -124,6 +130,66 @@ def test_validate_url_rejects_private_metadata_and_link_local(url: str):
 
 def test_validate_url_allows_explicit_private_bind_from_config():
     assert security.validate_url("http://10.0.0.5:8080", allow_private=True)
+
+
+def test_cgnat_allowed_with_private():
+    cgnat = ipaddress.ip_network("100.64.0.1/10", strict=False)
+    url = "http://100.64.0.1:4318/health"
+    assert security.validate_url(url, allow_private=True) == url
+    assert security.resolve_pinned_endpoint(url, allow_private=True) == (
+        "100.64.0.1",
+        4318,
+        "100.64.0.1",
+        "http",
+    )
+    for address in (cgnat.network_address, cgnat.broadcast_address):
+        assert security.validate_url(_url_for_address(address), allow_private=True)
+    for neighbour in (cgnat.network_address - 1, cgnat.broadcast_address + 1):
+        assert security.validate_url(_url_for_address(neighbour))
+
+
+def test_cgnat_rejected_by_default():
+    cgnat = ipaddress.ip_network("100.64.0.1/10", strict=False)
+    for address in (
+        cgnat.network_address,
+        ipaddress.ip_address("100.64.0.1"),
+        cgnat.broadcast_address,
+    ):
+        with pytest.raises(security.UnsafeURLError):
+            security.validate_url(_url_for_address(address))
+        with pytest.raises(security.UnsafeURLError):
+            security.validate_url(_url_for_address(address), allow_private=False)
+    with pytest.raises(security.UnsafeURLError):
+        security.resolve_pinned_endpoint("http://100.64.0.1:4318/health")
+
+
+def test_still_rejects_metadata_and_link_local():
+    metadata = tuple(security._METADATA_IPS)
+    link_local = (
+        ipaddress.ip_network(
+            f"{next(addr for addr in metadata if addr.version == 4)}/16",
+            strict=False,
+        ).network_address
+        + 1
+    )
+    rejected = [
+        *metadata,
+        link_local,
+        ipaddress.IPv6Address((0xFE80 << 112) | 1),
+        ipaddress.IPv4Address(0xE0000001),
+        ipaddress.IPv4Address(0),
+        ipaddress.IPv4Address(0x7F000001),
+    ]
+    for address in rejected:
+        with pytest.raises(security.UnsafeURLError):
+            security.validate_url(
+                _url_for_address(address),
+                allow_loopback=False,
+                allow_private=True,
+            )
+    for url in ("ftp://example.invalid/", "file:///etc/passwd"):
+        with pytest.raises(security.UnsafeURLError):
+            security.validate_url(url, allow_private=True)
 
 
 def test_metadata_is_rejected_even_with_private_opt_in():
