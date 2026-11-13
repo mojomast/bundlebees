@@ -198,8 +198,12 @@ def eligible(items: list[Item], done: set[str]) -> Item | None:
 
 
 def _handoff_dependents(state_dir: Path, items: Mapping[str, "Item"], done: set[str], context: Mapping[str, Any]) -> list[str]:
-    """Materialize queued dependents whose dependency is accepted. Production path."""
-    from . import handoff
+    """Materialize queued dependents from their intent packets. Production path.
+
+    Selection is by the packet's policy_id; a dependent without a stored packet
+    is left queued (no authority is inferred from a card or a dependency).
+    """
+    from . import handoff, packets
 
     created = []
     for item in items.values():
@@ -209,13 +213,17 @@ def _handoff_dependents(state_dir: Path, items: Mapping[str, "Item"], done: set[
             continue
         if _load_job_or_none(state_dir, item.job_id) is not None:
             continue
-        dependency = items[item.depends_on[0]]
-        policy = handoff.find_policy_for_dependency(state_dir, dependency.job_id)
-        if policy is None:
+        raw = packets.read_packet(state_dir, item.job_id)
+        if raw is None:
+            continue
+        try:
+            packet = json.loads(raw)
+        except ValueError:
             continue
         result = handoff.materialize(state_dir, feature_id=item.feature_id, job_id=item.job_id,
-                                     policy=policy, worktree=Path(context["worktree"]),
-                                     mirror=Path(context["mirror"]), repo_identity=str(context.get("repo_identity") or ""))
+                                     packet=packet, worktree=Path(context["worktree"]),
+                                     mirror=Path(context["mirror"]),
+                                     repo_identity=str(context.get("repo_identity") or ""))
         if result.get("created"):
             created.append(item.feature_id)
     return created
