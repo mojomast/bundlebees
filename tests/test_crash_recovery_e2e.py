@@ -634,9 +634,12 @@ class CrashRecoveryTwoFeatures(unittest.TestCase):
         # either way the restart must not integrate again.
         self.assertEqual(git(["cat-file", "-e", f"{commit_a}^{{commit}}"], self.work,
                              check=False).returncode, 0, "the accepted wave names a commit that is absent")
-        # The job has not accepted the wave yet: that is what the restart must
-        # recover from the record alone.
-        self.assertTrue(any(json.loads(path.read_text()).get("accepted") for path in waves.values()))
+        # The job document has not accepted the wave yet: that is the window the
+        # restart must close from the record alone.
+        on_disk = jobs.load_job(self.state, fx.JOB_A, recover=False)
+        self.assertNotEqual((on_disk.get("integration") or {}).get("last_commit"), commit_a,
+                            "the job already recorded the wave before the crash; the checkpoint is too "
+                            "late to prove recovery")
 
         self.drive()
         self.assert_final_proof(mirror_before=margin, wave_hashes=wave_hashes)
