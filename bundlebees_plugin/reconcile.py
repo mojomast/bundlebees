@@ -1006,6 +1006,11 @@ def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any
     }
     if isinstance(contract, Mapping):
         brief["contract"] = dict(contract)
+    binding = task.get("binding")
+    if isinstance(binding, Mapping) and binding.get("project"):
+        # The launcher dispatches into this project; without it the worker falls
+        # back to a default, which is exactly the failure this binding prevents.
+        brief["project"] = str(binding["project"])
     try:
         validate_brief(brief)
     except BriefError as exc:

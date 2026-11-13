@@ -186,13 +186,31 @@ def tick(
     require_gitleaks: bool = True,
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     now: Any = None,
+    provisioner: Any = None,
+    expect_host: str | None = None,
 ) -> dict[str, Any]:
-    """One mechanical tick, wired to the production adapter, verifier and integrator."""
+    """One mechanical tick: provisioning phase, then ordinary reconcile."""
 
-    adapter = LauncherAdapter(client)
     binder = LeaseBinder(state_dir)
     job = jobs.load_job(state_dir, job_id)
     job = _hydrate_contracts(state_dir, job, repo)
+
+    if provisioner is not None:
+        from . import provision_bind
+
+        outcome = provision_bind.advance(state_dir, job, provisioner=provisioner, expect_host=expect_host)
+        job = jobs.load_job(state_dir, job_id)
+        if outcome.get("blocked"):
+            return {"status": "uncertain", "action": "provision", "transitions": [],
+                    "detail": "provisioning outcome is uncertain; reconciled by receipt lookup, not re-POSTed",
+                    "evidence": outcome, "exactly_once": False, "handoff": None}
+
+    adapter = LauncherAdapter(client)
+    from . import provision_bind
+
+    bindings = provision_bind.bindings_for(job)
+    if bindings:
+        adapter = provision_bind.BoundLauncher(adapter, bindings)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
         from . import acdd_cli

@@ -467,8 +467,11 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "contract_sha256": task.get("contract_sha256"),
         "acceptance": task.get("acceptance"),
         "contract": task.get("contract"),
-        "state": "pending",
-        "attempts": [],
+        "provision": task.get("provision"),
+        "binding": task.get("binding"),
+        "provisioning": task.get("provisioning"),
+        "state": str(task.get("state") or "pending"),
+        "attempts": list(task.get("attempts") or []),
         "verify": None,
         "intent": None,
     }
