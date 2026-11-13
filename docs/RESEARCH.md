@@ -268,12 +268,29 @@ sha256, in-scope flags, usage); `worker_claims` is not.
 
 On the Orbit box, the same token-gated API is proxied as
 `POST http://127.0.0.1:4318/api/local-workers` with
-`op=create|list|get|cancel|review|tick|archive`. That loopback adapter is
+`op=create|list|get|cancel|review|artifact|tick|archive`. That loopback adapter is
 the preferred client target when Hermes is running on the same host as
 Orbit. The plugin must not print the launcher URL or the token. Direct
 launcher access, if configured, uses a URL the *user* set in the pane or
 config — never a model-supplied URL — and is subject to the SSRF /
 loopback-or-explicit-private-bind guard.
+
+### 6.1 Typed artifact consumer
+
+`OrbitAdapterClient.artifact(attempt_id, *, capability, coordinator=None)`
+posts `{op: "artifact", attempt_id, capability, coordinator}` where an
+omitted coordinator becomes `"Hermes"`. It returns exactly
+`artifact_version`, `attempt_id`, `source_rev`, `patch`, `patch_sha256`,
+`result_sha256`, `usage` and `worker_claims_untrusted`. Every value is
+shape-checked first, then sha256 is recomputed over the UTF-8 bytes of the
+received patch string with no normalisation. Shape or hash failures raise
+the existing `ClientError` as `artifact_invalid` and name the offending
+field. HTTP 400/403/409/413/503 are mapped once to
+`invalid_attempt_id`/`not_owner`/`artifact_mismatch`/`too_large`/
+`launcher_unreachable`; the client never retries and never returns a partial
+dict. Error text is fixed so neither the capability nor the patch can appear
+in a message, repr, envelope or log line. The stored-capability form
+`artifact(attempt_id)` remains the verifier path used by `bundlebees verify`.
 
 Worker model keys stay on the worker machine (env name
 `ORBIT_WORKER_GO_KEY` or a user-only key file). Hermes only holds the

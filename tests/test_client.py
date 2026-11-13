@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-import threading
 import socket
+import threading
+import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -23,6 +25,23 @@ from bundlebees_plugin.client import (
 
 TOKEN = "test-token-value"
 REQUESTS: list[tuple[str, str, dict]] = []
+
+FIXTURE_CAPABILITY = "fixture-capability-not-real"
+FIXTURE_PATCH = (
+    "--- a/fixture.py\n"
+    "+++ b/fixture.py\n"
+    "@@ -1 +1 @@\n"
+)
+ARTIFACT_FIELDS = {
+    "artifact_version",
+    "attempt_id",
+    "source_rev",
+    "patch",
+    "patch_sha256",
+    "result_sha256",
+    "usage",
+    "worker_claims_untrusted",
+}
 
 
 class FakeHandler(BaseHTTPRequestHandler):
@@ -220,8 +239,67 @@ class FakeHandler(BaseHTTPRequestHandler):
                         "accepted": bool(body.get("accepted")),
                     },
                 )
+            if op == "artifact":
+                attempt_id = str(body.get("attempt_id") or "")
+                if attempt_id.startswith("att_missing_"):
+                    payload = self._artifact(attempt_id)
+                    payload.pop(attempt_id[len("att_missing_"):], None)
+                    return self._json(200, payload)
+                if attempt_id.startswith("att_type_"):
+                    field = attempt_id[len("att_type_"):]
+                    bad = {
+                        "artifact_version": 1,
+                        "attempt_id": 1,
+                        "source_rev": 1,
+                        "patch": 1,
+                        "patch_sha256": 1,
+                        "result_sha256": 1,
+                        "usage": [],
+                        "worker_claims_untrusted": [],
+                    }
+                    payload = self._artifact(attempt_id)
+                    payload[field] = bad[field]
+                    return self._json(200, payload)
+                if attempt_id == "att_bad_hash":
+                    return self._json(
+                        200, self._artifact(attempt_id, patch_sha256="0" * 64)
+                    )
+                errors = {
+                    "att_error_403": (403, "not_owner"),
+                    "att_error_409": (409, "artifact_mismatch"),
+                    "att_error_400": (400, "invalid_attempt_id"),
+                    "att_error_413": (413, "too_large"),
+                    "att_error_503": (503, "launcher_unreachable"),
+                }
+                if attempt_id in errors:
+                    status, code = errors[attempt_id]
+                    return self._json(
+                        status,
+                        {
+                            "error": f"{body.get('capability')} {FIXTURE_PATCH}",
+                            "code": code,
+                        },
+                    )
+                return self._json(200, self._artifact(attempt_id))
             return self._json(400, {"error": "unknown op"})
         return self._json(404, {"error": "not found"})
+
+    @staticmethod
+    def _artifact(attempt_id: str, **over) -> dict:
+        payload = {
+            "artifact_version": "orbit.worker-artifact/1",
+            "attempt_id": attempt_id,
+            "source_rev": "a" * 40,
+            "patch": FIXTURE_PATCH,
+            "patch_sha256": hashlib.sha256(
+                FIXTURE_PATCH.encode("utf-8")
+            ).hexdigest(),
+            "result_sha256": "b" * 64,
+            "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5},
+            "worker_claims_untrusted": {"summary": "untrusted fixture claim"},
+        }
+        payload.update(over)
+        return payload
 
     @staticmethod
     def _attempt(attempt_id: str) -> dict:
@@ -530,3 +608,139 @@ def test_cross_origin_redirect_is_refused_before_auth_leaves(base_url: str):
         other.shutdown()
         other.server_close()
     assert seen == []
+
+
+class ArtifactClientTests(unittest.TestCase):
+    """Typed artifact consumer, exercised over real HTTP against FakeHandler."""
+
+    def setUp(self):
+        REQUESTS.clear()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeHandler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+        REQUESTS.clear()
+
+    def _client(self, **kwargs) -> OrbitAdapterClient:
+        return OrbitAdapterClient(
+            self.base_url, token_provider=lambda: TOKEN, **kwargs
+        )
+
+    @staticmethod
+    def _leak_texts(exc: ClientError) -> list[str]:
+        texts = [
+            str(exc),
+            repr(exc),
+            exc.error,
+            exc.fix,
+            json.dumps(exc.as_envelope()),
+        ]
+        for chained in (exc.__cause__, exc.__context__):
+            if chained is not None:
+                texts.extend([str(chained), repr(chained)])
+        return texts
+
+    def test_artifact_posts_the_op_and_returns_documented_fields(self):
+        client = self._client()
+        art = client.artifact("att_fixture", capability=FIXTURE_CAPABILITY)
+
+        assert set(art) == ARTIFACT_FIELDS
+        assert art["artifact_version"] == "orbit.worker-artifact/1"
+        assert art["attempt_id"] == "att_fixture"
+        assert art["source_rev"] == "a" * 40
+        assert art["patch"] == FIXTURE_PATCH
+        assert art["patch_sha256"] == hashlib.sha256(
+            FIXTURE_PATCH.encode("utf-8")
+        ).hexdigest()
+        assert art["result_sha256"] == "b" * 64
+        assert art["usage"] == {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}
+        assert art["worker_claims_untrusted"] == {
+            "summary": "untrusted fixture claim"
+        }
+
+        method, path, body = REQUESTS[-1]
+        assert (method, path) == ("POST", "/api/local-workers")
+        assert body == {
+            "op": "artifact",
+            "attempt_id": "att_fixture",
+            "capability": FIXTURE_CAPABILITY,
+            "coordinator": "Hermes",
+        }
+
+    def test_artifact_refuses_a_patch_that_does_not_match_its_hash(self):
+        client = self._client()
+        before = len(REQUESTS)
+        with pytest.raises(ClientError) as excinfo:
+            client.artifact("att_bad_hash", capability=FIXTURE_CAPABILITY)
+
+        assert excinfo.value.code == "artifact_invalid"
+        assert "patch_sha256" in str(excinfo.value)
+        assert len(REQUESTS) == before + 1
+        for text in self._leak_texts(excinfo.value):
+            assert FIXTURE_CAPABILITY not in text
+            assert FIXTURE_PATCH not in text
+
+    def test_artifact_maps_server_errors_without_retrying(self):
+        client = self._client()
+        cases = [
+            ("att_error_403", 403, "not_owner"),
+            ("att_error_409", 409, "artifact_mismatch"),
+            ("att_error_400", 400, "invalid_attempt_id"),
+            ("att_error_413", 413, "too_large"),
+            ("att_error_503", 503, "launcher_unreachable"),
+        ]
+        for attempt_id, status, code in cases:
+            before = len(REQUESTS)
+            with pytest.raises(ClientError) as excinfo:
+                client.artifact(attempt_id, capability=FIXTURE_CAPABILITY)
+            assert excinfo.value.status == status
+            assert excinfo.value.code == code
+            assert excinfo.value.upstream_code == code
+            assert len(REQUESTS) == before + 1
+            for text in self._leak_texts(excinfo.value):
+                assert FIXTURE_CAPABILITY not in text
+                assert FIXTURE_PATCH not in text
+
+    def test_artifact_refuses_a_response_missing_required_fields(self):
+        client = self._client()
+        for field in sorted(ARTIFACT_FIELDS):
+            with pytest.raises(ClientError) as excinfo:
+                client.artifact(
+                    f"att_missing_{field}", capability=FIXTURE_CAPABILITY
+                )
+            assert excinfo.value.code == "artifact_invalid"
+            assert field in str(excinfo.value)
+
+        for field in sorted(ARTIFACT_FIELDS):
+            with pytest.raises(ClientError) as excinfo:
+                client.artifact(
+                    f"att_type_{field}", capability=FIXTURE_CAPABILITY
+                )
+            assert excinfo.value.code == "artifact_invalid"
+            assert field in str(excinfo.value)
+
+    def test_artifact_never_leaks_the_capability_or_the_patch(self):
+        client = self._client()
+        attempts = [
+            "att_bad_hash",
+            "att_error_403",
+            "att_error_409",
+            "att_error_400",
+            "att_error_413",
+            "att_error_503",
+            "att_missing_patch_sha256",
+            "att_type_patch",
+        ]
+        for attempt_id in attempts:
+            with pytest.raises(ClientError) as excinfo:
+                client.artifact(attempt_id, capability=FIXTURE_CAPABILITY)
+            for text in self._leak_texts(excinfo.value):
+                assert FIXTURE_CAPABILITY not in text
+                assert FIXTURE_PATCH not in text
+                for line in FIXTURE_PATCH.splitlines():
+                    assert line not in text

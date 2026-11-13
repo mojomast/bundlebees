@@ -34,11 +34,11 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-      - name: Install test dependencies
+      - name: Install test dependencies (declared in pyproject.toml)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "pytest>=8,<9" "pyyaml>=6,<7" "ruamel.yaml>=0.18,<0.19" \
-            "tiktoken>=0.7,<1" "fastapi>=0.110,<1" "httpx>=0.27,<1"
+          python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies'] + d['project']['optional-dependencies']['dev']))" > "$RUNNER_TEMP/requirements-dev.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-dev.txt"
       - name: Report sandbox backend
         run: |
           python -c "from bundlebees_plugin import sandbox; print('auto backend:', sandbox.detect_backend())"
@@ -84,8 +84,11 @@ jobs:
           sudo apt-get install -y -qq bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-      - name: Install test dependencies
-        run: python -m pip install "pytest>=8,<9" "pyyaml>=6,<7"
+      - name: Install test dependencies (declared in pyproject.toml)
+        run: |
+          python -m pip install --upgrade pip
+          python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies'] + d['project']['optional-dependencies']['dev']))" > "$RUNNER_TEMP/requirements-dev.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-dev.txt"
       - name: Real Orbit round trip
         env:
           BUNDLEBEES_REQUIRE_ROUNDTRIP: "1"
@@ -111,12 +114,40 @@ jobs:
           git clone -q --depth 1 --branch v0.23.0 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
           cd "$RUNNER_TEMP/hermes-agent"
           uv sync --frozen --no-dev --python 3.14
-      - name: Plugin doctor
+      - name: Install bundlebees runtime dependencies into the Hermes environment
+        run: |
+          python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies']))" > "$RUNNER_TEMP/runtime-requirements.txt"
+          cat "$RUNNER_TEMP/runtime-requirements.txt"
+          python -m uv pip install --python "$RUNNER_TEMP/hermes-agent/.venv/bin/python" -r "$RUNNER_TEMP/runtime-requirements.txt"
+      - name: Plugin doctor (fails closed on registration errors)
+        # The doctor prints a registration error and exits 0, so its exit status
+        # is not a gate. Assert the output instead: no ERROR line, and exactly
+        # EXPECTED_TOOLS tools registered.
         env:
           HERMES_HOME: ${{ runner.temp }}/hermes-home
+          EXPECTED_TOOLS: "4"
         run: |
           mkdir -p "$HERMES_HOME"
-          "$RUNNER_TEMP/hermes-agent/.venv/bin/hermes" plugins doctor .
+          HERMES_BIN="$RUNNER_TEMP/hermes-agent/.venv/bin/hermes"
+          set +e
+          output=$("$HERMES_BIN" plugins doctor . 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$output" | tee "$RUNNER_TEMP/plugin-doctor.log"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::hermes plugins doctor exited $rc"
+            exit 1
+          fi
+          if printf '%s\n' "$output" | grep -q "ERROR"; then
+            echo "::error::plugin doctor reported a registration error"
+            exit 1
+          fi
+          tools=$(printf '%s\n' "$output" | sed -nE 's/.*registrations: ([0-9]+) tool\(s\), ([0-9]+) hook\(s\).*/\1/p' | tail -1)
+          if [ "${tools:-}" != "$EXPECTED_TOOLS" ]; then
+            echo "::error::expected $EXPECTED_TOOLS registered tool(s), got '${tools:-none}'"
+            exit 1
+          fi
+          echo "plugin doctor registered $tools tool(s)"
 
   secret-scan:
     name: gitleaks
