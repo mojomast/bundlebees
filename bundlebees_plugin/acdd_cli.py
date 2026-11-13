@@ -600,13 +600,20 @@ def record_integration(state_dir: Path, items: list[dict[str, Any]], workdir: Pa
             fingerprints = tdd.fingerprint_files(workdir, item["tests"])
         except tdd.TddError:
             fingerprints = {}
+        targets = [str(t) for t in (suite or {}).get("targets") or []]
         record = tdd.make_record(
             contract, sha, phase="integration", revision=revision, test_fingerprints=fingerprints,
-            command=["pytest", "(full suite on the combined branch)"],
+            command=["pytest", *targets] if targets else ["pytest", "(default suite on the combined branch)"],
             result=_result(suite) if suite else None,
             produced_by={"role": "verifier", "name": "bundlebees integrate"}, test_first=_test_first(contract),
             environment=_environment(suite or {}),
         )
+        suites = (suite or {}).get("suites")
+        if isinstance(suites, Mapping):
+            # Per-category status (regression / contract / security), signed with the record.
+            record["suites"] = {str(k): dict(v) for k, v in suites.items() if isinstance(v, Mapping)}
+            if (suite or {}).get("blocking") and record.get("classification") == "passed":
+                record["classification"] = "failed"
         try:
             tdd.write_record(state_dir, record, item["key"])
         except tdd.TddError as exc:

@@ -98,6 +98,20 @@ config_schema:
       (bwrap, then firejail; never unshare), or one of bwrap, firejail,
       unshare. unshare also needs verify_allow_weak_unshare. Verify fails
       closed when none is usable.
+  integrate_suite:
+    type: str
+    default: ""
+    description: >-
+      Regression suite integrate runs on the combined branch (space- or
+      comma-separated test paths). Empty uses the repository's pytest
+      testpaths, or the whole repository.
+  integrate_security_tests:
+    type: str
+    default: ""
+    description: >-
+      Security and negative test paths integrate must also pass. Empty is
+      recorded as not run. A configured path that is missing or collects
+      no tests fails integration.
   verify_allow_unsafe_local:
     type: bool
     default: false
@@ -123,3 +137,9 @@ config_schema:
     type: int
     default: 900
     description: Wall-clock limit in seconds for one sandboxed test run.
+  sandbox_tiktoken_cache:
+    type: str
+    default: ''
+    description: >-
+      Optional read-only tiktoken encoding cache for offline tests in the
+      verifier sandbox; must be outside your home directory.

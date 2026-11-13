@@ -25,10 +25,13 @@ DEFAULTS: dict[str, Any] = {
     "branch": "",
     "deploy_host_alias": "",
     "verify_isolation": "auto",
+    "sandbox_tiktoken_cache": "",
     "verify_allow_unsafe_local": False,
     "verify_allow_weak_unshare": False,
     "require_contract": False,
     "verify_timeout_s": 900,
+    "integrate_suite": "",
+    "integrate_security_tests": "",
 }
 
 

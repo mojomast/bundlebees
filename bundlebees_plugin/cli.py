@@ -960,17 +960,47 @@ def _apply_patch(workdir: Path, patch: str, assigned: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _secret_scan(workdir: Path, files: Iterable[str]) -> list[str]:
+def _added_lines(patch: str) -> dict[str, str]:
+    """Lines each file gains in a unified diff, keyed by its new path."""
+    added: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip().split("\t", 1)[0]
+            current = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
+            if current is not None:
+                added.setdefault(current, [])
+        elif line.startswith("diff --git "):
+            current = None
+        elif current is not None and line.startswith("+"):
+            added[current].append(line[1:])
+    return {path: "\n".join(lines) for path, lines in added.items()}
+
+
+def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) -> list[str]:
+    """Flag files whose patch-added lines look secret-like.
+
+    With a patch, only the lines it adds are scanned: content already on source_rev is
+    not the worker's output (and bundlebees' own sources mention tokens by design). A
+    file the diff does not describe line by line is scanned whole (fail closed).
+    """
     flagged: list[str] = []
+    added = _added_lines(patch) if patch else {}
     for rel in files:
-        path = Path(contain_path(rel, str(workdir)))
-        try:
-            if path.stat().st_size > _MAX_SCAN_BYTES:
+        if rel in added:
+            text = added[rel]
+            if len(text.encode("utf-8", errors="replace")) > _MAX_SCAN_BYTES:
                 flagged.append(rel)
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        else:
+            path = Path(contain_path(rel, str(workdir)))
+            try:
+                if path.stat().st_size > _MAX_SCAN_BYTES:
+                    flagged.append(rel)
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
         if _PRIVATE_KEY_RE.search(text):
             flagged.append(rel)
             continue
@@ -987,6 +1017,7 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
         timeout = int(config.get("verify_timeout_s") or 900)
     except (TypeError, ValueError):
         timeout = 900
+    tiktoken_cache = str(config.get("sandbox_tiktoken_cache") or "").strip() or None
     return {
         "backend": backend,
         "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
@@ -994,13 +1025,42 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
             config_flag(config.get("verify_allow_weak_unshare"), False)
         ),
         "timeout": max(30, min(timeout, 7200)),
+        "tiktoken_cache": tiktoken_cache,
     }
+
+
+def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
+    """Keep only the approved targets pytest can collect; drop non-Python fixtures."""
+    kept: list[str] = []
+    for target in targets:
+        if not isinstance(target, str):
+            continue
+        text = target.strip()
+        if not text:
+            continue
+        if "::" in text or text.endswith(".py") or text == ".":
+            kept.append(text)
+            continue
+        try:
+            candidate = Path(contain_path(text.split("::", 1)[0] or ".", str(workdir)))
+        except ValueError:
+            continue
+        if candidate.is_dir():
+            kept.append(text)
+    return kept
 
 
 def _run_sandboxed(workdir: Path, targets: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
     """Run pytest on a disposable copy of *workdir*; return evidence only."""
+    pytest_targets = _pytest_targets(list(targets), Path(workdir))
+    if not pytest_targets:
+        raise CliError(
+            "no_test_targets",
+            "none of the approved test files can be collected by pytest",
+            "Reference at least one Python test file in scope.test_files.",
+        )
     try:
-        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(list(targets)), **_sandbox_options(config))
+        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(pytest_targets), **_sandbox_options(config))
     except sandbox.SandboxUnavailable as exc:
         raise CliError(exc.code, exc.error, exc.fix) from exc
     except ValueError as exc:
@@ -1347,7 +1407,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         changed = _apply_patch(workdir, patch, files)
         files = changed
 
-        flagged = _secret_scan(workdir, files)
+        flagged = _secret_scan(workdir, files, patch)
         if flagged:
             _reset_patch(workdir)
             raise CliError(
@@ -1518,6 +1578,102 @@ def _cmd_lease(ctx: Any, args: Any) -> int:
     return 0
 
 
+_CATEGORIES = ("regression", "contract", "security")
+
+
+def _split_targets(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [item for item in re.split(r"[\s,]+", value) if item]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _repo_testpaths(workdir: Path) -> list[str]:
+    """``testpaths`` from pytest.ini, pyproject.toml, tox.ini or setup.cfg (first found)."""
+    import configparser
+
+    for name, section in (("pytest.ini", "pytest"), ("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")):
+        path = workdir / name
+        if path.is_file():
+            parser = configparser.ConfigParser()
+            try:
+                parser.read(path, encoding="utf-8")
+            except configparser.Error:
+                continue
+            if parser.has_option(section, "testpaths"):
+                return _split_targets(parser.get(section, "testpaths"))
+    pyproject = workdir / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            import tomllib
+
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - unreadable config: fall back to defaults
+            data = {}
+        paths = ((data.get("tool") or {}).get("pytest") or {}).get("ini_options", {}).get("testpaths")
+        if paths:
+            return _split_targets(paths)
+    return []
+
+
+def _integration_plan(workdir: Path, config: Mapping[str, Any], items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Targets per category: configured regression suite, approved contract tests, security tests."""
+    regression = _split_targets(config.get("integrate_suite")) or _repo_testpaths(workdir) or ["."]
+    contract = sorted({str(t) for item in items for t in item.get("tests") or []})
+    security = _split_targets(config.get("integrate_security_tests"))
+    plan: dict[str, dict[str, Any]] = {}
+    for name, targets, configured in (
+        ("regression", regression, True),
+        ("contract", contract, bool(items)),
+        ("security", security, bool(security)),
+    ):
+        clean = _test_targets(targets, workdir) if targets else []
+        missing = [t for t in clean if not (workdir / t.split("::", 1)[0]).exists()]
+        plan[name] = {"targets": clean, "configured": configured, "missing": missing}
+    return plan
+
+
+def _case_in(case_id: str, target: str) -> bool:
+    if target in (".", ""):
+        return True
+    path = case_id.split("::", 1)[0]
+    if "::" in target:
+        return case_id == target or case_id.startswith(target + "::") or case_id.startswith(target + "[")
+    return path == target or path.startswith(target.rstrip("/") + "/")
+
+
+def _categorize(plan: Mapping[str, Mapping[str, Any]], suite: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Per-category passed / failed / not_run from the suite's JUnit cases."""
+    cases = [c for c in suite.get("cases") or [] if isinstance(c, Mapping) and isinstance(c.get("id"), str)]
+    out: dict[str, dict[str, Any]] = {}
+    blocking: list[str] = []
+    for name in _CATEGORIES:
+        entry = plan.get(name) or {}
+        targets = list(entry.get("targets") or [])
+        if not entry.get("configured"):
+            reason = "no contract attempts" if name == "contract" else "not configured"
+            out[name] = {"status": "not_run", "reason": reason, "targets": [], "tests": 0}
+            continue
+        mine = [c for c in cases if any(_case_in(c["id"], t) for t in targets)]
+        failed = sorted({c["id"] for c in mine if c.get("outcome") in ("failed", "error")})
+        info: dict[str, Any] = {"targets": targets, "tests": len(mine), "failed": failed[:50]}
+        if entry.get("missing"):
+            info.update(status="failed", reason="missing: " + ", ".join(entry["missing"]))
+        elif suite.get("timed_out"):
+            info.update(status="failed", reason="timed out")
+        elif failed:
+            info.update(status="failed", reason=f"{len(failed)} failing")
+        elif not mine:
+            info.update(status="failed", reason="no tests collected")
+        else:
+            info.update(status="passed")
+        out[name] = info
+        if info["status"] == "failed":
+            blocking.append(name)
+    return out, blocking
+
+
 def _cmd_integrate(ctx: Any, args: Any) -> int:
     state_dir = _state_dir(ctx, args)
     config = _config(ctx)
@@ -1532,13 +1688,31 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
         except (leases.LeaseError, IndexError):
             run_id = "default"
     contract_items = acdd_cli.integrate_preflight(state_dir, attempt_ids)
+    plan = _integration_plan(workdir, config, contract_items)
+    run_targets: list[str] = []
+    for name in _CATEGORIES:
+        for target in plan[name]["targets"]:
+            if target in plan[name]["missing"]:
+                continue
+            # pytest collects a file passed alongside a directory that holds it only once, and
+            # not always both; pass each test exactly once and attribute cases by path afterwards.
+            if any(_case_in(target, earlier) for earlier in run_targets if "::" not in earlier):
+                continue
+            run_targets = [t for t in run_targets if not _case_in(t, target)] + [target]
+
+    def run_suite(wd: Path) -> dict[str, Any]:
+        evidence = dict(_run_sandboxed(wd, run_targets, config))
+        evidence["targets"] = list(run_targets)
+        evidence["suites"], evidence["blocking"] = _categorize(plan, evidence)
+        return evidence
+
     try:
         record = revision.integrate_wave(
             state_dir,
             str(getattr(args, "wave", "")),
             workdir,
             attempt_ids,
-            lambda wd: _run_sandboxed(wd, [], config),
+            run_suite,
         )
     except revision.RevisionError as exc:
         raise _as_cli_error(exc) from exc
@@ -1559,6 +1733,9 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
         _print(f"problem: {attempt}: {problem}")
     if suite:
         _print(f"suite: exit {suite.get('exit_code')} via {suite.get('backend')} junit={json.dumps(suite.get('junit'))}")
+    for name, info in (suite.get("suites") or {}).items():
+        reason = f" ({info.get('reason')})" if info.get("reason") and info.get("status") != "passed" else ""
+        _print(f"suite {name}: {info.get('status')}{reason}, {info.get('tests', 0)} tests")
     for contract_id, status in integration:
         _print(f"contract: {contract_id}")
         _print(f"integration: {'not run' if status == 'unrun' else status}")
