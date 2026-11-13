@@ -32,6 +32,7 @@ DEFAULTS: dict[str, Any] = {
     "verify_timeout_s": 900,
     "integrate_suite": "",
     "integrate_security_tests": "",
+    "integrate_base": "",
 }
 
 

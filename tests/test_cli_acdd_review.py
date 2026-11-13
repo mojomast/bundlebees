@@ -76,7 +76,16 @@ def test_approved_review_is_recorded_and_accepts_review_criteria(tmp_path, capsy
     assert review["criteria"]["AC-002"] == "passed"
     report = _report(state, path, capsys)
     assert report["phases"] == {"red": "valid", "green": "valid", "review": "valid"}
+    # X2: a reviewer-role review makes the phase valid but does not satisfy a review criterion
+    assert report["accepted"] is False
+    assert "review_required" in [item["status"] for item in report["criteria"].values()]
+    # human review (Kyle's chat approval, recorded with --role human) satisfies it
+    rc = _review(state, path, "--reviewer", "kyle", "--role", "human", "--approve", "--note", "approved in chat")
+    capsys.readouterr()
+    assert rc == 0
+    report = _report(state, path, capsys)
     assert report["accepted"] is True
+    assert all(item["status"] == "passed" for item in report["criteria"].values())
 
 
 def test_review_criteria_are_not_accepted_without_a_review(tmp_path, capsys):

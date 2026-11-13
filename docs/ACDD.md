@@ -79,6 +79,23 @@ Schema: [`schemas/tdd-evidence.schema.json`](https://github.com/mojomast/workflo
 
 Only records produced by the verifier count for acceptance. A worker may attach its own RED output, but it is labelled `produced_by.role: worker` and never authorizes anything (AC-006). In bundlebees the coordinator signs records with its existing lease key; the reference demo does not sign (teaching only).
 
+### The signed acceptance report (`acceptance_report/1`)
+
+`hermes bundlebees tdd report` writes `<state>/reports/<contract_id>.json`, whether or not the contract is accepted, and prints the relative path as `report: reports/<contract_id>.json` (never the absolute state path). The file is created atomically: a temporary file is opened exclusively as `0600` inside a `0700` `reports/` directory, written, and `os.replace`d into place. The contract id is confined under `reports/` before use. `--json` prints the same signed object that was written, and the exit code is unchanged (`0` accepted, `1` not accepted).
+
+The artifact is the acceptance report (§6) plus these fields:
+
+| Field | Meaning |
+|---|---|
+| `report_version` | Always `acceptance_report/1` |
+| `generated_at` | UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ` |
+| `signature` | Lowercase hex HMAC-SHA256 over the canonical report |
+
+It also carries the fields Orbit's ACDD evidence view reads: `contract_id`, `contract_sha256`, `accepted`, `phases`, `criteria`, `test_first` and `mode`.
+
+The signature uses the `tdd-evidence/1` scheme: HMAC-SHA256, lowercase hex, over Python canonical JSON (`sort_keys=True`, compact separators `,` and `:`, ASCII escapes) of the report **without** the `signature` key and **without** any `_`-prefixed keys. The HMAC key is the bundlebees evidence key, derived with a fixed label from the coordinator's private `<state>/lease.key`; it is never written into the report. Orbit verifies the same scheme (`verifyRecordSignature` / `bundlebeesEvidenceKey`, Orbit #26), so editing any signed field after the fact makes the signature fail.
+
+
 ## 4. Classifying a run
 
 The **RED set** is every test named by a `test` criterion that is not `regression: true`. A case *matches* a test id when the ids are equal or one is a `::` / `[` prefix of the other (a file-level collection error covers every test in that file). Classification, first match wins:

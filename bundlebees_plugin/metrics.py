@@ -56,6 +56,9 @@ _ALLOWED_FIELDS = frozenset(
         "retry_of",
         "sha",
         "duration_s",
+        "failed_tests",
+        "environmental_tests",
+        "pre_existing_tests",
     }
 )
 _VERBATIM_FIELDS = frozenset({"attempt_id", "wave_id", "retry_of", "sha"})
@@ -490,23 +493,64 @@ def _plan_to_accepted(
     return {"median": float(statistics.median(durations)), "max": float(max(durations))}
 
 
+# Verify outcomes that are not a verdict on the worker's patch: excluded from first-pass.
+NON_VERDICT_CODES = frozenset({
+    "no_result_yet", "launcher_unavailable", "launcher_error", "result_missing", "no_result_for_state",
+    "not_found", "unauthorized", "forbidden", "worktree_dirty", "internal_error", "not_configured",
+    "lease_missing", "lease_tampered", "lease_invalid", "unsafe_url", "response_too_large",
+})
+FIRST_PASS_RULE = (
+    "first verify with a verdict per attempt passed; attempts whose verifies were all non-verdicts "
+    "(waiting, launcher or lease problems) are excluded and listed"
+)
+_LEGACY_NOTE = "pre-BM1 counts; may double-count; not regressions"
+
+
+def _ids(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
 def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate a run's verified events into outcome metrics."""
+    """Aggregate a run's verified events into outcome metrics.
+
+    Failures are de-duplicated by test id across waves and retries. Environmental and pre-existing
+    failures are counted apart from regressions. Missing usage is ``None``, never 0. Per-attempt
+    usage is cumulative (the last report per attempt counts). First-pass rates carry their
+    denominator and exclusions. Historical events without test ids are reported as legacy.
+
+    Dispatch counting publishes three numbers: ``attempts_dispatched`` is the number of unique
+    attempts dispatched, counting each distinct string ``attempt_id`` once plus one for every
+    dispatch event without such an id (a legacy event cannot be de-duplicated); ``dispatch_events``
+    is the raw number of dispatch events; and ``dispatch_events_without_attempt_id`` is how many of
+    those events carried no string ``attempt_id``.
+    """
     ordered = _ordered(events)
     run_id = next((item.get("run_id") for item in ordered), None)
     if not isinstance(run_id, str):
         run_id = None
 
-    dispatched = 0
+    dispatched_ids: set[str] = set()
+    dispatch_events = 0
+    dispatch_events_without_attempt_id = 0
     verified_attempts: set[str] = set()
-    first_verify: dict[str, bool] = {}
+    first_verdict: dict[str, bool] = {}
+    non_verdict: dict[str, str] = {}
     accepted_ids: set[str] = set()
-    tokens_total = 0
-    cost_total = 0.0
-    tokens_known = False
-    cost_known = False
+    tokens_by_attempt: dict[str, float] = {}
+    cost_by_attempt: dict[str, float] = {}
+    loose_tokens = 0.0
+    loose_cost = 0.0
+    loose_tokens_known = False
+    loose_cost_known = False
+    usage_attempts: set[str] = set()
     interventions = 0
-    regressions = 0
+    regression_ids: set[str] = set()
+    environmental_ids: set[str] = set()
+    pre_existing_ids: set[str] = set()
+    legacy_events = 0
+    legacy_total = 0.0
     accepted_waves: set[str] = set()
     rejected_waves: set[str] = set()
     verify_ok: dict[str, list[bool]] = {}
@@ -518,31 +562,53 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         attempt_key = attempt_id if isinstance(attempt_id, str) else None
         tokens = _number(event.get("tokens"))
         cost = _number(event.get("cost_usd"))
-        if tokens is not None:
-            tokens_total += tokens
-            tokens_known = True
-        if cost is not None:
-            cost_total += cost
-            cost_known = True
+        if attempt_key is not None:
+            if name in ("dispatch", "verify"):
+                usage_attempts.add(attempt_key)
+            if tokens is not None:
+                tokens_by_attempt[attempt_key] = tokens  # cumulative per attempt: last report wins
+            if cost is not None:
+                cost_by_attempt[attempt_key] = cost
+        else:
+            if tokens is not None:
+                loose_tokens += tokens
+                loose_tokens_known = True
+            if cost is not None:
+                loose_cost += cost
+                loose_cost_known = True
 
         if name == "dispatch":
-            dispatched += 1
+            dispatch_events += 1
+            if isinstance(attempt_id, str):
+                dispatched_ids.add(attempt_id)
+            else:
+                dispatch_events_without_attempt_id += 1
         elif name == "verify":
             if attempt_key is not None:
                 verified_attempts.add(attempt_key)
-                first_verify.setdefault(attempt_key, bool(event.get("ok")))
                 verify_ok.setdefault(attempt_key, []).append(bool(event.get("ok")))
+                code = event.get("code")
+                ok = bool(event.get("ok"))
+                if ok or code not in NON_VERDICT_CODES:
+                    first_verdict.setdefault(attempt_key, ok)
+                elif attempt_key not in first_verdict:
+                    non_verdict[attempt_key] = str(code)
         elif name == "integrate":
+            wave = event.get("wave_id")
             if bool(event.get("ok")):
                 accepted_ids.update(_event_attempts(event))
-                wave = event.get("wave_id")
                 accepted_waves.add(str(wave) if isinstance(wave, str) else f"#{index}")
             else:
-                wave = event.get("wave_id")
                 rejected_waves.add(str(wave) if isinstance(wave, str) else f"#{index}")
-            count = _number(event.get("regressions"))
-            if count is not None:
-                regressions += count
+            if "failed_tests" in event:
+                regression_ids.update(_ids(event.get("failed_tests")))
+                environmental_ids.update(_ids(event.get("environmental_tests")))
+                pre_existing_ids.update(_ids(event.get("pre_existing_tests")))
+            else:
+                count = _number(event.get("regressions"))
+                if count:
+                    legacy_events += 1
+                    legacy_total += count
         elif name == "intervention":
             interventions += 1
         elif name == "recovery":
@@ -553,30 +619,48 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     failed_recoveries = 0
     for attempt_id in recoveries:
         results = verify_ok.get(attempt_id)
-        if not results:
-            failed_recoveries += 1
-        elif not all(results):
+        if not results or not all(results):
             failed_recoveries += 1
 
-    attempted = len(first_verify)
-    first_pass = sum(1 for ok in first_verify.values() if ok)
+    excluded = {a: c for a, c in sorted(non_verdict.items()) if a not in first_verdict}
+    denominator = len(first_verdict)
+    first_pass = sum(1 for ok in first_verdict.values() if ok)
     accepted = len(accepted_ids)
-    tokens_per_accepted = _rate(tokens_total, accepted) if tokens_known else None
-    cost_per_accepted = _rate(cost_total, accepted) if cost_known else None
+    tokens_known = bool(tokens_by_attempt) or loose_tokens_known
+    cost_known = bool(cost_by_attempt) or loose_cost_known
+    tokens_total = (sum(tokens_by_attempt.values()) + loose_tokens) if tokens_known else None
+    cost_total = (sum(cost_by_attempt.values()) + loose_cost) if cost_known else None
+    with_tokens = len([a for a in usage_attempts if a in tokens_by_attempt] + [a for a in tokens_by_attempt if a not in usage_attempts])
 
     return {
         "run_id": run_id,
-        "attempts_dispatched": dispatched,
+        "attempts_dispatched": len(dispatched_ids) + dispatch_events_without_attempt_id,
+        "dispatch_events": dispatch_events,
+        "dispatch_events_without_attempt_id": dispatch_events_without_attempt_id,
         "attempts_verified": len(verified_attempts),
-        "first_pass_rate": _rate(first_pass, attempted),
+        "first_pass_rate": _rate(first_pass, denominator),
+        "first_pass": {"passed": first_pass, "denominator": denominator, "excluded": excluded,
+                       "rule": FIRST_PASS_RULE},
         "accepted_changes": accepted,
-        "tokens_total": _tidy(tokens_total),
-        "tokens_per_accepted": tokens_per_accepted,
+        "tokens_total": _tidy(tokens_total) if tokens_total is not None else None,
+        "tokens_per_accepted": _rate(tokens_total, accepted) if tokens_total is not None else None,
         "cost_usd_total": cost_total,
-        "cost_per_accepted": cost_per_accepted,
+        "cost_per_accepted": _rate(cost_total, accepted) if cost_total is not None else None,
+        "usage": {
+            "attempts_with_tokens": with_tokens,
+            "attempts_without_tokens": len([a for a in usage_attempts if a not in tokens_by_attempt]),
+            "source": "reported" if tokens_known else "unavailable",
+        },
         "human_interventions": interventions,
         "plan_to_accepted_s": _plan_to_accepted(ordered, accepted_ids),
-        "regressions_found": _tidy(regressions),
+        "regressions_found": len(regression_ids),
+        "regression_tests": sorted(regression_ids)[:200],
+        "environmental_failures": len(environmental_ids),
+        "pre_existing_failures": len(pre_existing_ids),
+        "legacy_unclassified_failures": (
+            {"events": legacy_events, "reported_total": _tidy(legacy_total), "note": _LEGACY_NOTE}
+            if legacy_events else None
+        ),
         "failed_worker_recoveries": failed_recoveries,
         "waves_accepted": len(accepted_waves),
         "waves_rejected": len(rejected_waves),
@@ -594,6 +678,8 @@ def format_summary(summary: Mapping[str, Any]) -> str:
     lines = [
         f"run_id: {render(summary.get('run_id'))}",
         f"attempts_dispatched: {render(summary.get('attempts_dispatched'))}",
+        f"dispatch_events: {render(summary.get('dispatch_events'))}",
+        f"dispatch_events_without_attempt_id: {render(summary.get('dispatch_events_without_attempt_id'))}",
         f"attempts_verified: {render(summary.get('attempts_verified'))}",
         f"first_pass_rate: {render(summary.get('first_pass_rate'))}",
         f"accepted_changes: {render(summary.get('accepted_changes'))}",
@@ -604,7 +690,15 @@ def format_summary(summary: Mapping[str, Any]) -> str:
         f"human_interventions: {render(summary.get('human_interventions'))}",
         "plan_to_accepted_s: median="
         f"{render(plan_map.get('median'))} max={render(plan_map.get('max'))}",
+        f"first_pass: {render((summary.get('first_pass') or {}).get('passed'))}/"
+        f"{render((summary.get('first_pass') or {}).get('denominator'))} "
+        f"excluded={json.dumps((summary.get('first_pass') or {}).get('excluded') or {}, sort_keys=True)}",
+        f"usage: {json.dumps(summary.get('usage'), sort_keys=True)}",
         f"regressions_found: {render(summary.get('regressions_found'))}",
+        f"regression_tests: {json.dumps(summary.get('regression_tests') or [])}",
+        f"environmental_failures: {render(summary.get('environmental_failures'))}",
+        f"pre_existing_failures: {render(summary.get('pre_existing_failures'))}",
+        f"legacy_unclassified_failures: {json.dumps(summary.get('legacy_unclassified_failures'), sort_keys=True)}",
         f"failed_worker_recoveries: {render(summary.get('failed_worker_recoveries'))}",
         f"waves_accepted: {render(summary.get('waves_accepted'))}",
         f"waves_rejected: {render(summary.get('waves_rejected'))}",

@@ -355,7 +355,9 @@ def test_acceptance_report(tdd, tmp_path):
     review = _record(tdd, "review", GREEN_CASES, role="reviewer")
     rep2 = tdd.acceptance_report(c2, CSHA, records + [review])
     assert rep2["phases"]["review"] == "valid"
-    assert rep2["accepted"] is True
+    # X2: a reviewer-role record does not satisfy a review criterion; only a human review does
+    assert rep2["criteria"]["AC-004"]["status"] == "review_required"
+    assert rep2["accepted"] is False
 
 
 def test_tests_after_code_is_reported_honestly(tdd):

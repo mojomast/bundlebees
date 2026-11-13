@@ -137,7 +137,9 @@ def test_store_orders_records_and_keeps_them_private(tmp_path):
     assert stat.S_IMODE(first.stat().st_mode) == 0o600
     loaded = tdd.load_records(tmp_path, "W2-extra", KEY)
     assert [r["phase"] for r in loaded] == ["red", "green"]
-    assert loaded[0]["_path"] == str(first)
+    # RP1: evidence paths are state-relative, never absolute
+    assert loaded[0]["_path"] == "evidence/W2-extra/0001-red.json"
+    assert (tmp_path / loaded[0]["_path"]) == first
 
 
 def test_records_are_canonical_json_without_private_fields_in_signature(tmp_path):

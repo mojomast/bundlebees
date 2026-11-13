@@ -231,6 +231,16 @@ def test_summarize_has_exact_numbers_for_a_synthetic_run(tmp_path: Path):
         "failed_worker_recoveries",
         "waves_accepted",
         "waves_rejected",
+        # BM1 accounting keys
+        "first_pass",
+        "usage",
+        "regression_tests",
+        "environmental_failures",
+        "pre_existing_failures",
+        "legacy_unclassified_failures",
+        # BM2: unique attempts vs raw dispatch events
+        "dispatch_events",
+        "dispatch_events_without_attempt_id",
     }
     assert summary["run_id"] == "default"
     assert summary["attempts_dispatched"] == 3
@@ -244,7 +254,9 @@ def test_summarize_has_exact_numbers_for_a_synthetic_run(tmp_path: Path):
     assert summary["human_interventions"] == 1
     assert summary["plan_to_accepted_s"]["median"] == pytest.approx(210.0)
     assert summary["plan_to_accepted_s"]["max"] == pytest.approx(240.0)
-    assert summary["regressions_found"] == 3
+    # BM1: integrate events without failed_tests are legacy counts, not de-duplicated regressions.
+    assert summary["regressions_found"] == 0
+    assert summary["legacy_unclassified_failures"]["reported_total"] == 3
     assert summary["failed_worker_recoveries"] == 1
     assert summary["waves_accepted"] == 2
     assert summary["waves_rejected"] == 1
@@ -259,8 +271,9 @@ def test_summarize_reports_unknown_per_accepted_rates(tmp_path: Path):
     summary = metrics.summarize(metrics.read_events(state, "default"))
 
     assert summary["accepted_changes"] == 1
-    assert summary["tokens_total"] == 0
-    assert summary["cost_usd_total"] == 0
+    # BM1: no usage was reported, so totals are unavailable (None), not a genuine zero.
+    assert summary["tokens_total"] is None
+    assert summary["cost_usd_total"] is None
     assert summary["tokens_per_accepted"] is None
     assert summary["cost_per_accepted"] is None
 
@@ -273,9 +286,9 @@ def test_summarize_without_data_does_not_divide_by_zero():
     assert summary["attempts_verified"] == 0
     assert summary["first_pass_rate"] is None
     assert summary["accepted_changes"] == 0
-    assert summary["tokens_total"] == 0
+    assert summary["tokens_total"] is None  # BM1: unavailable, not zero
     assert summary["tokens_per_accepted"] is None
-    assert summary["cost_usd_total"] == 0
+    assert summary["cost_usd_total"] is None
     assert summary["cost_per_accepted"] is None
     assert summary["human_interventions"] == 0
     assert summary["plan_to_accepted_s"] == {"median": None, "max": None}

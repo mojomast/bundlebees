@@ -989,6 +989,7 @@ class OrbitAdapterClient(_BaseClient):
         *,
         model: str | None = None,
         kanban_task_id: str | None = None,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"brief": dict(brief)}
         if self._coordinator:
@@ -997,6 +998,15 @@ class OrbitAdapterClient(_BaseClient):
             payload["model"] = model
         if kanban_task_id:
             payload["kanban_task_id"] = kanban_task_id
+        if isinstance(task_id, str) and task_id:
+            payload["task_id"] = task_id
+        elif isinstance(kanban_task_id, str) and kanban_task_id:
+            payload["task_id"] = kanban_task_id
+        else:
+            canonical = json.dumps(
+                dict(brief), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            payload["task_id"] = "bb-" + hashlib.sha256(canonical).hexdigest()[:24]
         try:
             data = self._op("create", **payload)
         except ClientError as exc:

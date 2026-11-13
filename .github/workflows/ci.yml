@@ -57,6 +57,7 @@ jobs:
     timeout-minutes: 20
     env:
       ORBIT_REF: d7cf47afd8c0dec34aa42e2a40b408ad8128f3ca  # orbitdesktop feat/worker-artifact-api (OA2)
+      ORBIT_ACDD_REF: 60f0ca07f6529b7d7f235e14e1d244a3dd62f523  # orbitdesktop feat/acdd-evidence-view (#26, HMAC verifier)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,6 +65,12 @@ jobs:
           repository: mojomast/orbitdesktop
           ref: ${{ env.ORBIT_REF }}
           path: .orbit-src
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mojomast/orbitdesktop
+          ref: ${{ env.ORBIT_ACDD_REF }}
+          path: .orbit-acdd-src
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -83,8 +90,9 @@ jobs:
         env:
           BUNDLEBEES_REQUIRE_ROUNDTRIP: "1"
         run: |
-          ORBIT_SRC="$GITHUB_WORKSPACE/.orbit-src" python -m pytest -rA -p no:cacheprovider \
-            tests/test_orbit_roundtrip.py tests/test_orbit_artifact.py
+          ORBIT_SRC="$GITHUB_WORKSPACE/.orbit-src" ORBIT_ACDD_SRC="$GITHUB_WORKSPACE/.orbit-acdd-src" \
+            python -m pytest -rA -p no:cacheprovider \
+            tests/test_orbit_roundtrip.py tests/test_orbit_artifact.py tests/test_signed_report.py
 
   plugin-doctor:
     name: hermes plugins doctor (offline)

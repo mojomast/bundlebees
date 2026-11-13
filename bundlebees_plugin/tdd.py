@@ -29,12 +29,13 @@ import hmac
 import json
 import os
 import re
+import secrets
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .security import scrub
+from .security import contain_path, scrub
 
 EVIDENCE_VERSION = "tdd-evidence/1"
 
@@ -674,8 +675,19 @@ def _private_dir(path: Path) -> Path:
     except TddError:
         raise
     except OSError as exc:
-        raise TddError("evidence_invalid", f"could not create evidence directory: {exc}") from exc
+        detail = exc.strerror or type(exc).__name__
+        raise TddError(
+            "evidence_invalid", f"could not create evidence directory: {detail}"
+        ) from exc
     return path
+
+
+def _report_failure(contract_id: str, exc: BaseException) -> TddError:
+    detail = getattr(exc, "strerror", None) or type(exc).__name__
+    return TddError(
+        "evidence_invalid",
+        f"could not write reports/{contract_id}.json: {detail}",
+    )
 
 
 def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], key: bytes) -> Path:
@@ -732,9 +744,54 @@ def load_records(state_dir: os.PathLike[str] | str, contract_id: str, key: bytes
         if not isinstance(data, dict) or not verify_signature(data, key):
             raise TddError("evidence_tampered", f"evidence record signature is invalid: {path.name}")
         record = dict(data)
-        record["_path"] = str(path)
+        record["_path"] = f"evidence/{contract_id}/{path.name}"
         loaded.append(record)
     return loaded
+
+
+def write_report(state_dir: os.PathLike[str] | str, signed: Mapping[str, Any]) -> Path:
+    """Atomically write a signed report at ``<state>/reports/<contract_id>.json``.
+
+    The directory is private (``0700``) and the file is created exclusively as
+    ``0600`` through a temporary file that is replaced into place, so a reader
+    never sees a half-written report. The contract id is confined with
+    :func:`bundlebees_plugin.security.contain_path`.
+    """
+    contract_id = str(signed.get("contract_id") or "")
+    _check_id(contract_id)
+    root = Path(state_dir)
+    try:
+        reports = _private_dir(root / "reports")
+    except (TddError, OSError) as exc:
+        raise _report_failure(contract_id, exc) from exc
+    try:
+        target = Path(contain_path(f"{contract_id}.json", str(reports)))
+    except ValueError as exc:
+        raise TddError(
+            "evidence_invalid",
+            f"report path is unsafe for reports/{contract_id}.json: {exc}",
+        ) from exc
+    payload = json.dumps(signed, indent=2, sort_keys=True)
+    tmp = reports / f".{contract_id}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(tmp, flags, 0o600)
+    except OSError as exc:
+        raise _report_failure(contract_id, exc) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise _report_failure(contract_id, exc) from exc
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +1010,7 @@ def _criteria_report(
     latest: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     sources = [latest.get(phase) for phase in ("integration", "refactor", "green")]
+    review = latest.get("review")
     report: dict[str, dict[str, Any]] = {}
     for criterion in contract.get("acceptance_criteria") or []:
         if not isinstance(criterion, Mapping):
@@ -970,6 +1028,15 @@ def _criteria_report(
                 status = str(values[ac_id])
                 evidence = record.get("_path")
                 break
+        if (
+            criterion.get("verification") == "review"
+            and status == "review_required"
+            and review is not None
+            and (review.get("produced_by") or {}).get("role") == "human"
+            and review.get("classification") == "passed"
+        ):
+            status = "passed"
+            evidence = review.get("_path")
         report[ac_id] = {"status": status, "evidence": evidence}
     return report
 
@@ -1014,12 +1081,7 @@ def acceptance_report(
     }
     criteria = _criteria_report(contract, latest)
     phases_ok = all(status == "valid" for status in phases.values())
-    review_valid = phases.get("review") == "valid"
-    criteria_ok = all(
-        item["status"] == "passed"
-        or (item["status"] == "review_required" and review_valid)
-        for item in criteria.values()
-    )
+    criteria_ok = all(item["status"] == "passed" for item in criteria.values())
     return {
         "contract_id": str(contract.get("id") or ""),
         "contract_sha256": str(contract_sha256),
