@@ -50,7 +50,7 @@ TASK_SIDE_STATES: dict[str, tuple[str, ...]] = {
 }
 
 _LEGAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "pending": ("dispatching",),
+    "pending": ("dispatching", "failed"),
     "dispatching": ("dispatched", "rejected", "failed"),
     "dispatched": ("running", "rejected", "superseded", "failed"),
     "running": ("verifying", "rejected", "failed"),
@@ -465,6 +465,7 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "depends_on": [str(dep) for dep in depends_on],
         "contract_path": task.get("contract_path"),
         "contract_sha256": task.get("contract_sha256"),
+        "acceptance": task.get("acceptance"),
         "state": "pending",
         "attempts": [],
         "verify": None,

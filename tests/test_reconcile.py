@@ -93,7 +93,14 @@ def make_job(tmp_path: Path, tasks=None, *, bees: int = 3) -> dict:
         tmp_path,
         job_id="job_a",
         tasks=tasks
-        or [{"task_id": "T1", "objective": "reject malformed source_rev", "lease": ["tools/x.py"]}],
+        or [
+            {
+                "task_id": "T1",
+                "objective": "reject malformed source_rev",
+                "lease": ["tools/x.py"],
+                "acceptance": {"criteria": ["malformed source_rev is refused"], "tests": ["tests/x.py"]},
+            }
+        ],
     )
 
 

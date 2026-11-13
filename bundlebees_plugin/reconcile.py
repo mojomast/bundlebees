@@ -7,8 +7,10 @@ dispatching again:
 * a request that provably never left the process (``DispatchNotSent``) is retried
   on the next tick;
 * a request whose outcome is unknown (``DispatchUncertain``) is reconciled
-  against the journal — one match adopts, two escalate, none waits out a grace
-  period measured in **elapsed seconds** and then escalates;
+  against the journal — one *strict* match adopts, two escalate, none waits out a
+  grace period measured in **elapsed seconds** and then escalates;
+* an intent left on disk by a crashed tick is never overwritten: it is treated as
+  uncertainty until the journal proves otherwise;
 * ``exactly_once`` is claimed only when the launcher itself enforces idempotency.
 
 State changes go through :mod:`bundlebees_plugin.job`, so every move is signed,
@@ -29,17 +31,22 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import job as jobs
+from .brief import BriefError, validate_brief
 
 DEFAULT_GRACE_S = 60.0
 DEFAULT_MAX_UNCERTAIN_TICKS = 5
+DEFAULT_STALE_LOCK_S = 300.0
 
 INTENT_DISPATCHING = "dispatching"
 INTENT_DISPATCHED = "dispatched"
 INTENT_NOT_SENT = "not_sent"
 INTENT_UNCERTAIN = "uncertain"
+INTENT_ESCALATED = "escalated"
 
 EVIDENCE_PROVEN_PRESENT = "proven_present"
 EVIDENCE_ADOPTED = "adopted"
+
+_ALLOWED_ID = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
 
 _FIX_LAUNCHER = (
     "Inject a launcher exposing list_attempts(), get_attempt(id), post_attempt(brief) "
@@ -158,16 +165,38 @@ class _Adapter:
 
 
 # ---------------------------------------------------------------------------
-# Filesystem helpers
+# Identifiers and paths
 # ---------------------------------------------------------------------------
 
 
+def _safe_id(value: Any, what: str) -> str:
+    text = str(value if value is not None else "").strip()
+    if (
+        not text
+        or len(text) > 96
+        or text in {".", ".."}
+        or any(ch not in _ALLOWED_ID for ch in text)
+    ):
+        raise ReconcileError(
+            "identifier_invalid",
+            f"{what} {text!r} is not a safe path component",
+            "Use letters, digits, '-', '_' and '.' only, at most 96 characters.",
+        )
+    return text
+
+
 def intent_path(state_dir: Path, job_id: str, task_id: str, attempt_no: int) -> Path:
-    return Path(state_dir) / "jobs" / job_id / "intents" / f"{task_id}-{attempt_no}.json"
+    return (
+        Path(state_dir)
+        / "jobs"
+        / _safe_id(job_id, "job_id")
+        / "intents"
+        / f"{_safe_id(task_id, 'task_id')}-{int(attempt_no)}.json"
+    )
 
 
 def lock_path(state_dir: Path, job_id: str) -> Path:
-    return Path(state_dir) / "jobs" / f"{job_id}.lock"
+    return Path(state_dir) / "jobs" / f"{_safe_id(job_id, 'job_id')}.lock"
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -198,32 +227,93 @@ def read_intent(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Single-writer lock, with safe recovery from a killed holder
+# ---------------------------------------------------------------------------
+
+
 class _Lock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.held = False
+        self.stolen: str | None = None
 
-    def __enter__(self) -> "_Lock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.path.parent, 0o700)
-        try:
-            fd = os.open(
-                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
-            )
-        except FileExistsError:
-            return self
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"pid": os.getpid(), "at": _iso(time.time())}))
-        self.held = True
+    def __enter__(self) -> "_Lock":  # pragma: no cover - replaced by _acquire
         return self
 
     def __exit__(self, *_exc: Any) -> None:
+        self.release()
+
+    def release(self) -> None:
         if self.held:
             try:
                 self.path.unlink()
             except OSError:
                 pass
             self.held = False
+
+
+def _holder_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_lock(
+    state_dir: Path,
+    job_id: str,
+    clock: float,
+    stale_after_s: float = DEFAULT_STALE_LOCK_S,
+) -> _Lock | None:
+    """Take the job lock, or return None when a live holder owns it.
+
+    A lock left by a dead process (or older than ``stale_after_s``) is moved
+    aside and retried once, so a killed tick cannot wedge the job. The stale
+    file is kept for the audit trail rather than deleted.
+    """
+
+    path = lock_path(state_dir, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    stolen_note: str | None = None
+
+    for _attempt in range(2):
+        lock = _Lock(path)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            holder = read_intent(path) or {}
+            pid = holder.get("pid")
+            started = _epoch(holder.get("at"))
+            dead = not _holder_alive(pid)
+            too_old = started is not None and clock - started > float(stale_after_s)
+            if not dead and not too_old:
+                return None
+            stale = path.with_name(f"{path.name}.stale.{int(clock)}.{os.getpid()}")
+            try:
+                os.replace(path, stale)
+            except OSError:
+                return None
+            stolen_note = f"stale lock from pid {pid} moved to {stale.name}"
+            continue
+        except OSError:
+            return None
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "at": _iso(clock)}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        lock.held = True
+        lock.stolen = stolen_note
+        return lock
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +356,7 @@ def _clock(now: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Matching
+# Strict attempt identity
 # ---------------------------------------------------------------------------
 
 
@@ -284,18 +374,34 @@ def _fingerprint(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, A
 
 
 def _matches(entry: Mapping[str, Any], fingerprint: Mapping[str, Any], written_at: float) -> bool:
+    """Strict identity: an incomplete journal entry is never proof of anything."""
+
+    if not _attempt_id(entry):
+        return False
     brief = _brief_of(entry)
-    if brief:
-        if str(brief.get("objective") or "") != fingerprint["objective"]:
-            return False
-        if str(brief.get("source_rev") or "") != fingerprint["source_rev"]:
-            return False
-        files = brief.get("assigned_files")
-        if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
-            if sorted(str(item) for item in files) != fingerprint["assigned_files"]:
-                return False
+    if not brief:
+        return False
+
+    objective = brief.get("objective")
+    if not isinstance(objective, str) or not objective.strip():
+        return False
+    if objective != fingerprint["objective"]:
+        return False
+
+    source_rev = brief.get("source_rev")
+    if not isinstance(source_rev, str) or source_rev != fingerprint["source_rev"]:
+        return False
+
+    files = brief.get("assigned_files")
+    if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
+        return False
+    if sorted(str(item) for item in files) != fingerprint["assigned_files"]:
+        return False
+
     created = _epoch(entry.get("created_at"))
-    if created is not None and created + 1.0 < written_at:
+    if created is None:
+        return False  # no trustworthy timestamp, no adoption
+    if created + 1.0 < written_at:
         return False
     return True
 
@@ -327,20 +433,34 @@ def tick(
     now: Any = None,
     grace_s: float = DEFAULT_GRACE_S,
     max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
+    stale_lock_s: float = DEFAULT_STALE_LOCK_S,
 ) -> TickResult:
     """Run one reconciler tick. See the module docstring for the rules."""
 
     if grace_s < 0:
         raise ReconcileError("grace_invalid", "grace_s must not be negative", "Pass a non-negative grace period.")
+    job_id = _safe_id(job_id, "job_id")
     adapter = _Adapter(launcher)
     clock = _clock(now)
 
-    lock = _Lock(lock_path(Path(state_dir), job_id))
-    with lock:
-        if not lock.held:
-            return TickResult(status="locked", detail="another tick holds the job lock")
+    lock = _acquire_lock(Path(state_dir), job_id, clock, stale_lock_s)
+    if lock is None:
+        return TickResult(status="locked", detail="another live tick holds the job lock")
+    try:
         job = jobs.load_job(Path(state_dir), job_id)
-        return _run(Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator)
+        result = _run(Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator)
+        if lock.stolen:
+            result = TickResult(
+                status=result.status,
+                transitions=result.transitions,
+                action=result.action,
+                detail=(result.detail + f" [{lock.stolen}]").strip(),
+                exactly_once=result.exactly_once,
+                evidence=result.evidence,
+            )
+        return result
+    finally:
+        lock.release()
 
 
 def _run(
@@ -356,10 +476,17 @@ def _run(
     attempts = adapter.list_attempts()
     transitions: list[str] = []
 
-    # 1. Uncertainty is resolved before anything else happens.
+    # 1. Uncertainty — including an intent a crashed tick left behind — is
+    #    resolved before anything else can dispatch.
     for task in job["tasks"]:
         intent = _intent_for(state_dir, job, task)
-        if intent is None or intent.get("status") != INTENT_UNCERTAIN:
+        if intent is None:
+            continue
+        status = intent.get("status")
+        # A confirmed intent whose job state was never saved (crash between the
+        # confirmation write and the job save) is adoptable, not pending work.
+        adoptable = status == INTENT_DISPATCHED and task.get("state") in {"pending", "dispatching"}
+        if status not in {INTENT_UNCERTAIN, INTENT_DISPATCHING} and not adoptable:
             continue
         outcome = _reconcile_uncertain(
             state_dir, job, task, intent, attempts, adapter, clock, grace_s, max_uncertain_ticks, transitions
@@ -371,15 +498,19 @@ def _run(
     changed = _reap(job, attempts, transitions)
 
     # 3. One heavy operation at most: integrate, else verify.
-    all_verified = bool(job["tasks"]) and all(t.get("state") == "verified" for t in job["tasks"])
-    if all_verified and integrator is not None and (job.get("integration") or {}).get("state") != "accepted":
-        result = _integrate(job, integrator, transitions)
+    in_flight = {"dispatching", "dispatched", "running", "verifying"}
+    wave_ready = (
+        any(t.get("state") == "verified" for t in job["tasks"])
+        and not any(t.get("state") in in_flight for t in job["tasks"])
+    )
+    if wave_ready and integrator is not None and (job.get("integration") or {}).get("state") != "accepted":
+        result = _integrate(state_dir, job, integrator, transitions)
         jobs.save_job(state_dir, job)
         return result
 
     verifying = next((t for t in job["tasks"] if t.get("state") == "verifying"), None)
     if verifying is not None and verifier is not None:
-        result = _verify(job, verifying, verifier, transitions)
+        result = _verify(state_dir, job, verifying, verifier, transitions)
         jobs.save_job(state_dir, job)
         return result
 
@@ -419,6 +550,38 @@ def _reconcile_uncertain(
     task_id = str(task["task_id"])
     attempt_no = int(intent.get("attempt_no", 1))
     path = intent_path(state_dir, job_id, task_id, attempt_no)
+
+    if intent.get("status") == INTENT_ESCALATED:
+        return None
+
+    if intent.get("status") == INTENT_DISPATCHED and intent.get("attempt_id"):
+        entry = adapter.get_attempt(str(intent["attempt_id"]))
+        if entry is not None:
+            attempt_id = str(intent["attempt_id"])
+            task.setdefault("attempts", [])
+            if attempt_id not in task["attempts"]:
+                task["attempts"].append(attempt_id)
+            task["intent"] = dict(intent)
+            _to_dispatched(job, task, "adopted confirmed intent after a crash")
+            transitions.append(f"{task_id}->dispatched")
+            jobs.save_job(state_dir, job)
+            return TickResult(
+                status="ok",
+                transitions=tuple(transitions),
+                action="adopt",
+                detail=f"adopted {attempt_id} for {task_id} from the confirmed intent",
+                exactly_once=adapter.idempotent,
+                evidence=EVIDENCE_PROVEN_PRESENT if adapter.idempotent else EVIDENCE_ADOPTED,
+            )
+        intent["status"] = INTENT_UNCERTAIN
+        intent.setdefault("first_uncertain_at", _iso(float(intent.get("written_at") or clock)))
+
+    # An intent still marked "dispatching" is a crash window, not a retry
+    # licence: the POST may have landed. Treat it as uncertain.
+    if intent.get("status") == INTENT_DISPATCHING:
+        intent["status"] = INTENT_UNCERTAIN
+        intent.setdefault("first_uncertain_at", _iso(float(intent.get("written_at") or clock)))
+
     first = _epoch(intent.get("first_uncertain_at")) or clock
     elapsed = max(0.0, clock - first)
     fingerprint = intent.get("fingerprint") or _fingerprint(job, task)
@@ -426,22 +589,16 @@ def _reconcile_uncertain(
     matches = [entry for entry in attempts if _matches(entry, fingerprint, written_at)]
 
     if len(matches) > 1:
-        intent["escalated"] = "dispatch_ambiguous"
-        _write_json(path, intent)
-        return TickResult(
-            status="escalated",
-            detail=f"dispatch_ambiguous: {len(matches)} journal entries match task {task_id}; refusing to choose",
-            evidence="dispatch_ambiguous",
-        )
+        return _escalate(state_dir, job, task, intent, clock, "dispatch_ambiguous", f"{len(matches)} journal entries match task {task_id}; refusing to choose")
 
     if len(matches) == 1:
-        attempt_id = _attempt_id(matches[0]) or str(intent.get("attempt_id") or "")
+        attempt_id = _attempt_id(matches[0]) or ""
         task.setdefault("attempts", [])
         if attempt_id and attempt_id not in task["attempts"]:
             task["attempts"].append(attempt_id)
         intent.update(status=INTENT_DISPATCHED, attempt_id=attempt_id)
         task["intent"] = dict(intent)
-        jobs.transition(job, task_id, "dispatched", actor="reconciler", reason="adopted after uncertain dispatch")
+        _to_dispatched(job, task, "adopted after uncertain dispatch")
         transitions.append(f"{task_id}->dispatched")
         _write_json(path, intent)
         jobs.save_job(state_dir, job)
@@ -461,26 +618,8 @@ def _reconcile_uncertain(
 
     if elapsed >= float(grace_s) or ticks > int(max_uncertain_ticks):
         reason = "grace elapsed" if elapsed >= float(grace_s) else "tick cap reached"
-        intent["escalated"] = "dispatch_uncertain_exhausted"
-        _write_json(path, intent)
-        job.setdefault("events", []).append(
-            {
-                "at": _iso(clock),
-                "task_id": task_id,
-                "transition": "dispatch_uncertain_exhausted",
-                "actor": "reconciler",
-                "reason": reason,
-            }
-        )
-        jobs.save_job(state_dir, job)
-        return TickResult(
-            status="escalated",
-            detail=(
-                f"dispatch_uncertain_exhausted for {task_id} "
-                f"({reason}, {elapsed:.0f}s of {grace_s:.0f}s, {ticks} ticks)"
-            ),
-            evidence="dispatch_uncertain_exhausted",
-        )
+        detail = f"dispatch_uncertain_exhausted for {task_id} ({reason}, {elapsed:.0f}s of {grace_s:.0f}s, {ticks} ticks)"
+        return _escalate(state_dir, job, task, intent, clock, "dispatch_uncertain_exhausted", detail)
 
     _write_json(path, intent)
     task["intent"] = dict(intent)
@@ -489,6 +628,47 @@ def _reconcile_uncertain(
         status="reconcile_wait",
         detail=f"{task_id}: dispatch uncertain, {elapsed:.0f}s of {grace_s:.0f}s grace elapsed, no journal match yet",
     )
+
+
+def _escalate(
+    state_dir: Path,
+    job: dict[str, Any],
+    task: dict[str, Any],
+    intent: dict[str, Any],
+    clock: float,
+    code: str,
+    detail: str,
+) -> TickResult:
+    """Persist the escalation once, and put the task beyond further dispatch."""
+
+    job_id = str(job["job_id"])
+    task_id = str(task["task_id"])
+    path = intent_path(state_dir, job_id, task_id, int(intent.get("attempt_no", 1)))
+    intent.update(status=INTENT_ESCALATED, escalated=code, escalated_at=_iso(clock))
+    _write_json(path, intent)
+    task["intent"] = dict(intent)
+
+    if task.get("state") in {"pending", "dispatching", "dispatched", "running", "verifying"}:
+        jobs.transition(job, task_id, "failed", actor="reconciler", reason=f"{code}: {detail}")
+        transitions = [f"{task_id}->failed"]
+    else:
+        transitions = []
+
+    job.setdefault("escalations", []).append(
+        {"at": _iso(clock), "task_id": task_id, "code": code, "detail": detail}
+    )
+    jobs.save_job(state_dir, job)
+    return TickResult(status="escalated", transitions=tuple(transitions), detail=detail, evidence=code)
+
+
+
+def _to_dispatched(job: dict[str, Any], task: dict[str, Any], reason: str) -> None:
+    """Walk the legal transitions to ``dispatched`` from wherever the task is."""
+
+    if task.get("state") == "pending":
+        jobs.transition(job, str(task["task_id"]), "dispatching", actor="reconciler", reason=reason)
+    if task.get("state") == "dispatching":
+        jobs.transition(job, str(task["task_id"]), "dispatched", actor="reconciler", reason=reason)
 
 
 # --- reap / verify / integrate --------------------------------------------
@@ -519,7 +699,32 @@ def _reap(job: dict[str, Any], attempts: Sequence[Mapping[str, Any]], transition
     return changed
 
 
+def _verdict(verdict: Any, what: str) -> tuple[bool, str]:
+    """A passing verdict must say so literally, and must carry evidence."""
+
+    if not isinstance(verdict, Mapping):
+        raise ReconcileError(f"{what}_invalid", f"the {what} must return a mapping", f"Fix the {what}; a missing result is not success.")
+    if "ok" not in verdict:
+        raise ReconcileError(f"{what}_invalid", f"the {what} returned no 'ok' field", f"Fix the {what}; a missing verdict is not success.")
+    ok = verdict.get("ok")
+    if not isinstance(ok, bool):
+        raise ReconcileError(
+            f"{what}_invalid",
+            f"the {what} returned a non-boolean ok ({type(ok).__name__})",
+            "Return True or False, not a truthy value.",
+        )
+    evidence = verdict.get("evidence")
+    if ok and (not isinstance(evidence, str) or not evidence.strip()):
+        raise ReconcileError(
+            f"{what}_invalid",
+            f"the {what} passed without evidence",
+            "A passing verdict must name what was checked.",
+        )
+    return ok, str(evidence or "").strip()
+
+
 def _verify(
+    state_dir: Path,
     job: dict[str, Any],
     task: dict[str, Any],
     verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]],
@@ -528,15 +733,9 @@ def _verify(
     task_id = str(task["task_id"])
     attempt_id = (task.get("attempts") or [None])[-1]
     verdict = verifier({"attempt_id": attempt_id, "task": dict(task), "job_id": job["job_id"]})
-    if not isinstance(verdict, Mapping) or "ok" not in verdict:
-        raise ReconcileError(
-            "verifier_invalid",
-            "the verifier must return a mapping with 'ok'",
-            "Fix the verifier; do not treat a missing verdict as success.",
-        )
-    evidence = str(verdict.get("evidence") or "")
-    if verdict.get("ok"):
-        jobs.transition(job, task_id, "verified", actor="reconciler", reason=evidence or "verifier green", evidence=evidence)
+    ok, evidence = _verdict(verdict, "verifier")
+    if ok:
+        jobs.transition(job, task_id, "verified", actor="reconciler", reason=evidence, evidence=evidence)
         transitions.append(f"{task_id}->verified")
         return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} verified")
     jobs.transition(job, task_id, "rejected", actor="reconciler", reason=evidence or "verifier rejected", evidence=evidence)
@@ -545,22 +744,41 @@ def _verify(
 
 
 def _integrate(
+    state_dir: Path,
     job: dict[str, Any],
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     transitions: list[str],
 ) -> TickResult:
     verdict = integrator(dict(job))
-    if not isinstance(verdict, Mapping) or "ok" not in verdict:
-        raise ReconcileError(
-            "integrator_invalid",
-            "the integrator must return a mapping with 'ok'",
-            "Fix the integrator; do not treat a missing verdict as success.",
-        )
+    ok, evidence = _verdict(verdict, "integrator")
     integration = job.setdefault("integration", {"wave": "w1"})
-    integration["state"] = "accepted" if verdict.get("ok") else "failed"
-    integration["evidence"] = str(verdict.get("evidence") or "")
-    transitions.append(f"integration->{integration['state']}")
-    return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail=f"integration {integration['state']}")
+    integration["attempts"] = int(integration.get("attempts") or 0) + 1
+    integration["evidence"] = evidence
+    integration["state"] = "accepted" if ok else "failed"
+
+    if ok:
+        # Accept the wave and unblock dependants: verified -> integrating -> accepted.
+        for task in job["tasks"]:
+            if task.get("state") == "verified":
+                task_id = str(task["task_id"])
+                jobs.transition(job, task_id, "integrating", actor="reconciler", reason="wave accepted")
+                jobs.transition(job, task_id, "accepted", actor="reconciler", reason="wave accepted", evidence=evidence)
+                transitions.append(f"{task_id}->accepted")
+        transitions.append("integration->accepted")
+        return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail="integration accepted")
+
+    transitions.append("integration->failed")
+    if integration["attempts"] >= 2:
+        job.setdefault("escalations", []).append(
+            {
+                "at": _iso(time.time()),
+                "task_id": "integration",
+                "code": "integration_failed",
+                "detail": f"two integration attempts failed; last: {evidence}",
+            }
+        )
+        return TickResult(status="escalated", transitions=tuple(transitions), action="integrate", detail="integration failed twice", evidence="integration_failed")
+    return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail="integration failed; one retry remains", evidence="integration_failed")
 
 
 # --- dispatch --------------------------------------------------------------
@@ -576,14 +794,13 @@ def _dispatch_ready(
     states = {t.get("task_id"): t.get("state") for t in job["tasks"]}
     for task in job["tasks"]:
         state = task.get("state")
-        # A task stuck in "dispatching" is only retryable when its intent proves
-        # the request never left the process; anything else is uncertainty and is
-        # handled before this point.
-        if state == "dispatching":
+        if state in {"pending", "dispatching"}:
             intent = _intent_for(state_dir, job, task)
-            if intent is None or intent.get("status") != INTENT_NOT_SENT:
+            if intent is not None and intent.get("status") == INTENT_ESCALATED:
                 continue
-        elif state != "pending":
+            if state == "dispatching" and (intent is None or intent.get("status") != INTENT_NOT_SENT):
+                continue
+        else:
             continue
         if any(states.get(dep) != "accepted" for dep in (task.get("depends_on") or [])):
             continue
@@ -591,6 +808,33 @@ def _dispatch_ready(
         if outcome is not None:
             return outcome
     return None
+
+
+def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the production brief shape and validate it with the real schema.
+
+    The signed lease is written by the dispatch path in ``tools.py`` once an
+    attempt id exists; that binding is the M3 adapter's job, not this module's.
+    """
+
+    fingerprint = _fingerprint(job, task)
+    brief: dict[str, Any] = {
+        "objective": fingerprint["objective"],
+        "source_rev": fingerprint["source_rev"],
+        "assigned_files": list(fingerprint["assigned_files"]),
+        "acceptance": task.get("acceptance"),
+        "job_id": str(job["job_id"]),
+        "task_id": str(task["task_id"]),
+    }
+    try:
+        validate_brief(brief)
+    except BriefError as exc:
+        raise ReconcileError(
+            "brief_invalid",
+            f"task {task['task_id']}: {exc}",
+            "Give the task an acceptance block (criteria/commands/tests); the launcher requires one.",
+        ) from exc
+    return brief
 
 
 def _dispatch_one(
@@ -606,14 +850,19 @@ def _dispatch_one(
     attempt_no = len(task.get("attempts") or []) + 1
     path = intent_path(state_dir, job_id, task_id, attempt_no)
     existing = read_intent(path)
-    if existing and existing.get("status") == INTENT_UNCERTAIN:
-        return TickResult(status="reconcile_wait", detail=f"{task_id}: intent still uncertain")
 
-    # Re-entering from "dispatching" after a not-sent intent: use a fresh
-    # attempt number so the retry has its own intent record.
-    if task.get("state") == "dispatching" and existing and existing.get("status") == INTENT_NOT_SENT:
-        attempt_no = int(existing.get("attempt_no", 1)) + 1
-        path = intent_path(state_dir, job_id, task_id, attempt_no)
+    if existing:
+        status = existing.get("status")
+        if status == INTENT_NOT_SENT:
+            attempt_no = int(existing.get("attempt_no", attempt_no)) + 1
+            path = intent_path(state_dir, job_id, task_id, attempt_no)
+        else:
+            # A persisted intent is never overwritten: the previous POST may
+            # have landed. Reconcile it; do not issue a second one.
+            return TickResult(
+                status="reconcile_wait",
+                detail=f"{task_id}: intent {status!r} already on disk; reconciling, not redispatching",
+            )
 
     fingerprint = _fingerprint(job, task)
     intent = {
@@ -626,15 +875,9 @@ def _dispatch_one(
         "uncertain_ticks": 0,
         "fingerprint": fingerprint,
     }
+    brief = _brief_for(job, task)
     _write_json(path, intent)  # fsynced before the call
 
-    brief = {
-        "objective": fingerprint["objective"],
-        "source_rev": fingerprint["source_rev"],
-        "assigned_files": fingerprint["assigned_files"],
-        "job_id": job_id,
-        "task_id": task_id,
-    }
     if task.get("state") == "pending":
         jobs.transition(job, task_id, "dispatching", actor="reconciler", reason="dependencies accepted")
     try:
