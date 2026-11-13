@@ -55,6 +55,41 @@ def _wave_number(job: Mapping[str, Any]) -> int:
         return 1
 
 
+def job_wave_id(job: Mapping[str, Any]) -> str:
+    """Wave records are per job: two jobs in one state dir both use "w1".
+
+    Returns ``<job_id>.w<N>`` so a record can never be recovered for another job.
+    """
+    job_id = str(job.get("job_id") or "").strip()
+    if not job_id:
+        raise IntegrateError("bad_job_id", "the job has no id", "Fix the job document.")
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in job_id)
+    return f"{safe}.w{_wave_number(job)}"
+
+
+def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> dict[str, Any] | None:
+    """Copy an old ``wN`` record to its per-job name, only on exact proof.
+
+    Existing evidence is preserved (the legacy file is left in place); adoption
+    happens only when the legacy record lists exactly this job's attempts.
+    """
+    if wave == legacy:
+        return None
+    target = Path(state_dir) / "waves" / f"{wave}.json"
+    source = Path(state_dir) / "waves" / f"{legacy}.json"
+    if target.exists() or not source.exists():
+        return None
+    try:
+        record = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    recorded = record.get("attempts") if isinstance(record, dict) else None
+    if not isinstance(recorded, list) or sorted(str(a) for a in recorded) != sorted(str(a) for a in attempts):
+        return None
+    target.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    return record
+
+
 def integration_ref(job_id: str) -> str:
     """The durable ref that carries the last accepted integration head."""
 
@@ -95,11 +130,13 @@ def integrate(
     if len(base_rev) != 40:
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
-    wave = wave_id or f"w{_wave_number(job)}"
+    wave = wave_id or job_wave_id(job)
+    legacy = f"w{_wave_number(job)}"
 
     # Crash recovery: an accepted wave record already on disk is the result.
     # Restore the durable ref if the crash happened before it was updated, and
     # report recovery so the caller does not count it as a new attempt.
+    adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
     existing = _accepted_wave_record(state_dir, wave)
     if existing is not None:
         head = str(existing.get("head_sha") or "")
