@@ -466,6 +466,7 @@ def add_parsers(subparsers: Any) -> None:
     run.add_argument("--once", action="store_true", help="One deterministic pass (required for now).")
     run.add_argument("--repo", required=True, help="Repository worktree used by verification/integration.")
     run.add_argument("--state-dir", default=None)
+    run.add_argument("--gitleaks", default=None, help="Scanner executable; defaults to PATH or queue.gitleaks in config.")
     run.add_argument("--backend", choices=["json", "kanban"], default="json",
                      help="Queue backend. json is the deterministic local/test store; kanban uses the configured CLI.")
     inspect = qsub.add_parser("inspect")
@@ -540,9 +541,20 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
             return 2
         client = client_factory()
         provisioner = provisioner_factory() if provisioner_factory is not None else None
+        scanner = getattr(args, "gitleaks", None) or (config.get("queue") or {}).get("gitleaks")
+        if not scanner:
+            import shutil
+
+            scanner = shutil.which("gitleaks")
+        if not scanner:
+            # Verification requires the scanner; refuse before claiming anything.
+            print(json.dumps({"error": "gitleaks_unavailable",
+                              "detail": "queue run requires gitleaks; install it or set --gitleaks"}, indent=2))
+            return 2
 
         def one_tick(job_id: str):
-            return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner)
+            return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner,
+                        gitleaks=scanner)
 
         result = queue_mod.run_once(state_dir, backend, tick=one_tick)
         print(json.dumps(result, indent=2, sort_keys=True))

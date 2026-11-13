@@ -275,13 +275,36 @@ def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
 
 
 def _job_accepted(state_dir: Path, job_id: str) -> bool:
-    """Evidence of acceptance, from the job document (never from the card)."""
+    """Completion requires the real evidence, not just a status string.
+
+    Every task must carry a verification record naming a verification commit and
+    the frozen contract hash; integration must name an accepted commit. A missing,
+    stale or mismatched record fails closed.
+    """
     try:
         job = jobs.load_job(state_dir, job_id)
     except Exception:  # noqa: BLE001
         return False
     tasks = job.get("tasks") or []
-    if not tasks or any(str(task.get("state")) not in ("accepted", "verified", "succeeded") for task in tasks):
+    if not tasks:
         return False
+    goal = job.get("goal") or {}
+    for task in tasks:
+        if str(task.get("state")) not in ("accepted", "verified", "succeeded"):
+            return False
+        record = task.get("verify")
+        if not isinstance(record, Mapping) or record.get("ok") is not True:
+            return False
+        if not str(record.get("commit") or record.get("sha") or ""):
+            return False
+        expected_contract = str(task.get("contract_sha256") or "")
+        if expected_contract and str(record.get("contract_sha256") or "") != expected_contract:
+            return False
     integration = job.get("integration") or {}
-    return str(integration.get("state") or "") in ("accepted", "integrated", "done")
+    if str(integration.get("state") or "") not in ("accepted", "integrated", "done"):
+        return False
+    if not str(integration.get("commit") or integration.get("head") or ""):
+        return False
+    if str(goal.get("workflow_ref") or "") and str(integration.get("workflow_ref") or "") not in ("", str(goal.get("workflow_ref"))):
+        return False
+    return True

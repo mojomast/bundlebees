@@ -8,6 +8,7 @@ from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from bundlebees_plugin import job_cli
 from bundlebees_plugin import queue as Q
 
 
@@ -143,6 +144,34 @@ class QueueTests(unittest.TestCase):
 
         self.assertNotIn("job_2", called, "f2 must not run while f1 has no accepted evidence")
         self.assertIn(result["action"], {"idle", "blocked"})
+
+    def test_completion_requires_real_verification_and_integration_evidence(self):
+        good_task = {"state": "accepted", "contract_sha256": "c" * 64,
+                     "verify": {"ok": True, "commit": "a" * 40, "contract_sha256": "c" * 64}}
+        good_job = {"goal": {"workflow_ref": "w" * 40}, "tasks": [dict(good_task)],
+                    "integration": {"state": "accepted", "commit": "b" * 40, "workflow_ref": "w" * 40}}
+
+        with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: good_job):
+            self.assertTrue(Q._job_accepted(self.tmp, "j"))
+
+        for broken in (
+            {**good_job, "integration": {"state": "accepted"}},
+            {**good_job, "integration": {"state": "pending", "commit": "b" * 40}},
+            {**good_job, "tasks": [{**good_task, "verify": None}]},
+            {**good_job, "tasks": [{**good_task, "verify": {"ok": True, "commit": "a" * 40, "contract_sha256": "d" * 64}}]},
+            {**good_job, "integration": {"state": "accepted", "commit": "b" * 40, "workflow_ref": "x" * 40}},
+        ):
+            with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id, b=broken: b):
+                self.assertFalse(Q._job_accepted(self.tmp, "j"), broken)
+
+    def test_queue_run_refuses_to_start_without_a_scanner(self):
+        with TemporaryDirectory() as tmp:
+            args = type("A", (), {"command": "queue", "queue_handler": "run", "once": True, "repo": tmp,
+                                  "state_dir": tmp, "backend": "json", "gitleaks": None})()
+            ctx = type("C", (), {"config": {}})()
+            with mock.patch("shutil.which", lambda name: None):
+                code = job_cli.cmd_queue(ctx, args, state_dir=Path(tmp), client_factory=lambda: None)
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
