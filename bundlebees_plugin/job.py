@@ -331,6 +331,7 @@ def create_job(
     job_id: str,
     tasks: Sequence[Mapping[str, Any]],
     summary: str = "",
+    workflow_ref: str | None = None,
 ) -> dict[str, Any]:
     """Create a job that narrows an existing authorization."""
 
@@ -347,6 +348,9 @@ def create_job(
             "summary": str(summary or authorization["statement"]),
             "repo": authorization["repo"],
             "base_rev": authorization["base_rev"],
+            # The protocol commit the feature is executed under. Pinned at creation;
+            # a resumed job never reinterprets itself under a different workflow.
+            "workflow_ref": str(workflow_ref or ""),
         },
         "tasks": [_normalize_task(task, for_create=True) for task in tasks],
         "integration": {"wave": "w1", "state": "pending", "evidence": None},

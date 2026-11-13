@@ -42,6 +42,15 @@ jobs:
       - name: Report sandbox backend
         run: |
           python -c "from bundlebees_plugin import sandbox; print('auto backend:', sandbox.detect_backend())"
+      - name: Install gitleaks (verification requires a real scanner)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          "$RUNNER_TEMP/bin/gitleaks" version
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "GITLEAKS=$RUNNER_TEMP/bin/gitleaks" >> "$GITHUB_ENV"
       - name: Check out hyvv provisioning contract (pinned)
         run: |
           set -euo pipefail

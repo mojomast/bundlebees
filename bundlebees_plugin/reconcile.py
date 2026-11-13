@@ -903,6 +903,8 @@ def _integrate(
     integration["attempts"] = int(integration.get("attempts") or 0) + 1
     integration["evidence"] = evidence
     integration["state"] = "accepted" if ok else "failed"
+    if ok and isinstance(verdict.get("commit"), str) and verdict["commit"]:
+        integration["last_commit"] = verdict["commit"]
 
     if ok:
         # Accept the wave, then open the next one so dependants can complete.
@@ -914,7 +916,8 @@ def _integrate(
                 transitions.append(f"{task_id}->accepted")
         wave = _wave_number(integration)
         accepted = list(integration.get("accepted_waves") or [])
-        accepted.append({"wave": wave, "at": _iso(clock), "evidence": evidence})
+        accepted.append({"wave": wave, "at": _iso(clock), "evidence": evidence,
+                         "commit": integration.get("last_commit") or ""})
         integration.update(
             accepted_waves=accepted,
             wave=wave + 1,

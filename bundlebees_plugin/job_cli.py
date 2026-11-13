@@ -322,7 +322,14 @@ def tick(
             )
         except (integrate_job.IntegrateError, Exception) as exc:  # noqa: BLE001 - reported as a failed wave
             return {"ok": False, "evidence": f"integration error: {exc}"}
-        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or "")}
+        commit = ""
+        ref = result.get("integration_ref")
+        if ref:
+            import subprocess as _sp
+
+            head = _sp.run(["git", "-C", str(repo), "rev-parse", str(ref)], capture_output=True, text=True)
+            commit = head.stdout.strip() if head.returncode == 0 else ""
+        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or ""), "commit": commit}
 
     result = reconcile.tick(
         state_dir,

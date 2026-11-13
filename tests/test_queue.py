@@ -146,23 +146,34 @@ class QueueTests(unittest.TestCase):
         self.assertIn(result["action"], {"idle", "blocked"})
 
     def test_completion_requires_real_verification_and_integration_evidence(self):
-        good_task = {"state": "accepted", "contract_sha256": "c" * 64,
-                     "verify": {"ok": True, "commit": "a" * 40, "contract_sha256": "c" * 64}}
-        good_job = {"goal": {"workflow_ref": "w" * 40}, "tasks": [dict(good_task)],
-                    "integration": {"state": "accepted", "commit": "b" * 40, "workflow_ref": "w" * 40}}
+        from bundlebees_plugin import verify_local
 
-        with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: good_job):
-            self.assertTrue(Q._job_accepted(self.tmp, "j"))
+        record = {"attempt_id": "att_1", "ok": True, "sha": "a" * 40, "base_rev": "b" * 40,
+                  "files": ["smoke/answer.py"], "tests": ["tests/test_smoke.py"],
+                  "suite": {"exit_code": 0}, "gitleaks": {"exit_code": 0}, "mode": "commit-local"}
+        path = verify_local.record_path(self.tmp / "state", "att_1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
 
-        for broken in (
-            {**good_job, "integration": {"state": "accepted"}},
-            {**good_job, "integration": {"state": "pending", "commit": "b" * 40}},
-            {**good_job, "tasks": [{**good_task, "verify": None}]},
-            {**good_job, "tasks": [{**good_task, "verify": {"ok": True, "commit": "a" * 40, "contract_sha256": "d" * 64}}]},
-            {**good_job, "integration": {"state": "accepted", "commit": "b" * 40, "workflow_ref": "x" * 40}},
-        ):
-            with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id, b=broken: b):
-                self.assertFalse(Q._job_accepted(self.tmp, "j"), broken)
+        task = {"task_id": "T1", "state": "accepted", "attempts": ["att_1"],
+                "contract_sha256": "c" * 64,
+                "binding": {"source_rev": "b" * 40, "contract_sha256": "c" * 64}}
+        job = {"tasks": [task], "integration": {"accepted_waves": [{"wave": 1, "commit": "d" * 40}],
+                                                "last_commit": "d" * 40}}
+
+        with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: job):
+            self.assertTrue(Q._job_accepted(self.tmp / "state", "j"))
+            for broken in (
+                {**job, "integration": {"accepted_waves": []}},
+                {**job, "tasks": [{**task, "state": "verified"}]},
+                {**job, "tasks": [{**task, "binding": {"source_rev": "e" * 40, "contract_sha256": "c" * 64}}]},
+            ):
+                with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id, b=broken: b):
+                    self.assertFalse(Q._job_accepted(self.tmp / "state", "j"), broken)
+
+        path.write_text(json.dumps({**record, "gitleaks": {"exit_code": 1}}))
+        with mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: job):
+            self.assertFalse(Q._job_accepted(self.tmp / "state", "j"), "a failed secret scan cannot complete")
 
     def test_queue_run_refuses_to_start_without_a_scanner(self):
         with TemporaryDirectory() as tmp:

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from . import job as jobs
+from . import verify_local
 
 
 class QueueError(Exception):
@@ -274,37 +275,54 @@ def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _job_accepted(state_dir: Path, job_id: str) -> bool:
-    """Completion requires the real evidence, not just a status string.
-
-    Every task must carry a verification record naming a verification commit and
-    the frozen contract hash; integration must name an accepted commit. A missing,
-    stale or mismatched record fails closed.
-    """
+def _job_accepted_reasons(state_dir: Path, job_id: str) -> list[str]:
+    """Why a job is not reviewable yet (empty list means accepted)."""
+    reasons: list[str] = []
     try:
         job = jobs.load_job(state_dir, job_id)
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception as exc:  # noqa: BLE001
+        return [f"job unreadable: {exc}"]
     tasks = job.get("tasks") or []
     if not tasks:
-        return False
-    goal = job.get("goal") or {}
+        return ["job has no tasks"]
     for task in tasks:
-        if str(task.get("state")) not in ("accepted", "verified", "succeeded"):
-            return False
-        record = task.get("verify")
-        if not isinstance(record, Mapping) or record.get("ok") is not True:
-            return False
-        if not str(record.get("commit") or record.get("sha") or ""):
-            return False
-        expected_contract = str(task.get("contract_sha256") or "")
-        if expected_contract and str(record.get("contract_sha256") or "") != expected_contract:
-            return False
+        task_id = task.get("task_id")
+        if str(task.get("state")) != "accepted":
+            reasons.append(f"{task_id}: state {task.get('state')}")
+            continue
+        attempts = task.get("attempts") or []
+        if not attempts:
+            reasons.append(f"{task_id}: no attempts")
+            continue
+        record = verify_local.read_record(Path(state_dir), str(attempts[-1]))
+        if not isinstance(record, Mapping) or record.get("ok") is not True or not record.get("sha"):
+            reasons.append(f"{task_id}: verification record missing or invalid")
+            continue
+        binding = task.get("binding") or {}
+        if binding.get("source_rev") and str(record.get("base_rev")) != str(binding.get("source_rev")):
+            reasons.append(f"{task_id}: verified base {record.get('base_rev')} != bound {binding.get('source_rev')}")
+        if binding.get("contract_sha256") and str(task.get("contract_sha256") or "") != str(binding.get("contract_sha256")):
+            reasons.append(f"{task_id}: contract hash mismatch")
+        if not isinstance(record.get("gitleaks"), Mapping) or record["gitleaks"].get("exit_code") != 0:
+            reasons.append(f"{task_id}: gitleaks did not pass")
+        if not isinstance(record.get("suite"), Mapping) or record["suite"].get("exit_code") != 0:
+            reasons.append(f"{task_id}: regression suite did not pass")
     integration = job.get("integration") or {}
-    if str(integration.get("state") or "") not in ("accepted", "integrated", "done"):
-        return False
-    if not str(integration.get("commit") or integration.get("head") or ""):
-        return False
-    if str(goal.get("workflow_ref") or "") and str(integration.get("workflow_ref") or "") not in ("", str(goal.get("workflow_ref"))):
-        return False
-    return True
+    waves = [w for w in integration.get("accepted_waves") or [] if isinstance(w, Mapping)]
+    if not waves:
+        reasons.append("no accepted integration wave")
+    if not str(integration.get("last_commit") or (waves[-1].get("commit") if waves else "") or ""):
+        reasons.append("accepted wave names no integrated commit")
+    return reasons
+
+
+def _job_accepted(state_dir: Path, job_id: str) -> bool:
+    """Completion requires real verification records, not status strings."""
+    return not _job_accepted_reasons(state_dir, job_id)
+
+
+def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
+    try:
+        return jobs.load_job(state_dir, job_id)
+    except Exception:  # noqa: BLE001 - missing job is a normal crash-recovery state
+        return None
