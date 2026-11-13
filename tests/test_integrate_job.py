@@ -70,6 +70,7 @@ def verified(state: Path, repo: Path, base: str, attempt: str, files: dict[str, 
         base_rev=base,
         tests=[test_file],
         suite_command=SUITE,
+        require_gitleaks=False,
     )
     return record["sha"]
 
@@ -143,7 +144,7 @@ class Siblings:
                     "acceptance": {"criteria": ["x"], "tests": ["tests/test_ok.py"]},
                 },
             )
-            verify_local.verify_and_commit(state, repo, attempt, patch=patch, declared_files=lease["assigned_files"], base_rev=base, tests=["tests/test_ok.py"], suite_command=SUITE)
+            verify_local.verify_and_commit(state, repo, attempt, patch=patch, declared_files=lease["assigned_files"], base_rev=base, tests=["tests/test_ok.py"], suite_command=SUITE, require_gitleaks=False)
 
         with pytest.raises(integrate_job.IntegrateError) as exc:
             integrate_job.integrate(state, job_for(base), repo, suite_command=SUITE)

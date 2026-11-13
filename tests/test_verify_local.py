@@ -94,6 +94,7 @@ class HappyPath:
             base_rev=base,
             tests=["tests/test_newmod.py"],
             suite_command=SUITE,
+            require_gitleaks=False,
         )
 
         assert record["ok"] is True
@@ -112,8 +113,8 @@ class HappyPath:
         lease(state, base)
         patch = make_patch(repo, base, NEW_FILES)
 
-        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
-        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
 
         assert second["sha"] == first["sha"]
         assert second.get("resumed") is False  # served from the record
@@ -134,7 +135,7 @@ class Refusals:
         patch = make_patch(repo, base, extra)
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=[], base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=[], base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
 
         assert exc.value.code in {"lease_scope_mismatch", "patch_scope_mismatch"}
         assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""
@@ -146,7 +147,7 @@ class Refusals:
         patch = make_patch(repo, base, {"pkg/unchanged.py": "X = 1\n", "tests/test_existing.py": "from pkg.existing import VALUE\n\ndef test_value():\n    assert VALUE == 1\n"})
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=["pkg/unchanged.py", "tests/test_existing.py"], base_rev=base, tests=["tests/test_existing.py"], suite_command=SUITE)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=["pkg/unchanged.py", "tests/test_existing.py"], base_rev=base, tests=["tests/test_existing.py"], suite_command=SUITE, require_gitleaks=False)
 
         assert exc.value.code == "red_missing"
 
@@ -161,7 +162,7 @@ class Refusals:
         lease(state, base, files=list(bad))
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(bad), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(bad), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
 
         assert exc.value.code == "tests_failed"
         assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""
@@ -172,7 +173,7 @@ class Refusals:
         patch = make_patch(repo, base, NEW_FILES)
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
 
         assert exc.value.code == "lease_missing"
 
@@ -180,16 +181,21 @@ class Refusals:
 class Recovery:
     __test__ = True
 
-    def test_a_commit_without_a_record_is_adopted_on_restart(self, tmp_path):
+    def test_a_commit_without_a_record_is_reverified_not_adopted(self, tmp_path):
         repo, base = make_repo(tmp_path)
         state = tmp_path / "state"
         lease(state, base)
         patch = make_patch(repo, base, NEW_FILES)
 
-        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
         verify_local.record_path(state, "att_1").unlink()
 
-        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE)
+        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
 
-        assert second["sha"] == first["sha"]
-        assert second["resumed"] is True
+        # A leftover branch is not evidence: every check ran again.
+        assert second["ok"] is True
+        assert second["resumed"] is False
+        assert second["red"] is not None and second["red"]["exit_code"] != 0
+        assert second["suite"] is not None and second["suite"]["exit_code"] == 0
+        assert second["patch_sha256"]
+        assert git(repo, "rev-parse", f"{second['sha']}^").stdout.strip() == base

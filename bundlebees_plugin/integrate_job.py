@@ -41,6 +41,25 @@ def _git(args: Sequence[str], cwd: Path, *, check: bool = True) -> subprocess.Co
     return proc
 
 
+def _wave_number(job: Mapping[str, Any]) -> int:
+    """M1 writes "w1"; later waves are integers. Accept both."""
+
+    value = (job.get("integration") or {}).get("wave", 1)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(1, value)
+    text = str(value or "").strip().lower().lstrip("w")
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return 1
+
+
+def integration_ref(job_id: str) -> str:
+    """The durable ref that carries the last accepted integration head."""
+
+    return f"refs/bb/integrated/{job_id}"
+
+
 def verified_attempts(job: Mapping[str, Any]) -> list[str]:
     """Attempt ids for tasks whose verification is recorded and ok."""
 
@@ -75,6 +94,11 @@ def integrate(
     if len(base_rev) != 40:
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
+    # Later waves build on the last accepted result, not on the original base.
+    ref = integration_ref(str(job.get("job_id") or ""))
+    ref_check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
+    start_rev = ref_check.stdout.strip() if ref_check.returncode == 0 else base_rev
+
     shas: list[tuple[str, str]] = []
     for attempt_id in attempts:
         record = verify_local.read_record(state_dir, attempt_id)
@@ -91,9 +115,12 @@ def integrate(
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
     root.mkdir(parents=True, exist_ok=True)
 
-    _git(["worktree", "add", "--detach", str(worktree), base_rev], repo)
+    _git(["worktree", "add", "--detach", str(worktree), start_rev], repo)
     try:
         for attempt_id, sha in shas:
+            already = _git(["merge-base", "--is-ancestor", sha, "HEAD"], worktree, check=False)
+            if already.returncode == 0:
+                continue  # this wave already contains it
             # Merge keeps the verified commit itself as an ancestor: no rewrite.
             merged = _git(
                 ["merge", "--no-ff", "--no-edit", "-m", f"integrate {attempt_id}", sha],
@@ -118,15 +145,22 @@ def integrate(
 
         record = revision.integrate_wave(
             state_dir,
-            wave_id or f"w{int((job.get('integration') or {}).get('wave') or 1)}",
+            wave_id or f"w{_wave_number(job)}",
             worktree,
             attempts,
             run_suite,
         )
+        if record.get("accepted"):
+            head = str(record.get("head_sha") or "")
+            if len(head) != 40:
+                raise IntegrateError("bad_wave_record", "the accepted wave has no head sha", "Inspect the wave record.")
+            # Durable ref: the next wave starts here, not at the original base.
+            _git(["update-ref", ref, head], repo)
     finally:
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
 
     accepted = bool(record.get("accepted"))
+    head_ref = ref if accepted else None
     return {
         "ok": accepted,
         "evidence": (
@@ -136,4 +170,6 @@ def integrate(
             else f"wave {record.get('wave_id')} rejected: {record.get('problems') or record.get('suite')}"
         ),
         "record": record,
+        "integration_ref": head_ref,
+        "start_rev": start_rev,
     }

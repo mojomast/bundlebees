@@ -97,6 +97,10 @@ def verify_and_commit(
     tests: Sequence[str] = (),
     suite_command: Sequence[str] | None = None,
     gitleaks: str | None = None,
+    require_gitleaks: bool = True,
+    tests_required: bool = True,
+    expected_patch_sha256: str | None = None,
+    acdd_preflight: Any = None,
     worktree_root: Path | None = None,
     identity: Sequence[str] = ("-c", "user.name=bundlebees", "-c", "user.email=bees@localhost"),
 ) -> dict[str, Any]:
@@ -104,6 +108,37 @@ def verify_and_commit(
 
     state_dir = Path(state_dir)
     repo = Path(repo)
+
+    # Fail closed on missing evidence rather than recording a hollow pass.
+    if tests_required and not list(tests):
+        raise VerifyError(
+            "tests_required",
+            "this contract needs named tests and none were given",
+            "Pass the contract's test targets; an empty list is not a pass.",
+        )
+    if require_gitleaks and not gitleaks:
+        raise VerifyError(
+            "security_tool_missing",
+            "gitleaks is required for verification but is not available",
+            "Install gitleaks, or record an explicit exemption in the contract.",
+        )
+    if expected_patch_sha256:
+        actual = hashlib.sha256(patch.encode()).hexdigest()
+        if actual != expected_patch_sha256:
+            raise VerifyError(
+                "artifact_mismatch",
+                f"patch sha256 {actual[:12]} does not match the declared {expected_patch_sha256[:12]}",
+                "Reject this artifact; its bytes changed after dispatch.",
+            )
+    if acdd_preflight is not None:
+        try:
+            acdd_preflight(list(declared_files))
+        except Exception as exc:  # noqa: BLE001 - any contract refusal is fatal
+            raise VerifyError(
+                "contract_violation",
+                f"the frozen contract refused this patch: {exc}",
+                "Do not verify a patch that changes its own acceptance criteria.",
+            ) from exc
 
     # 1. The lease is the authority; worker claims never widen it.
     try:
@@ -133,13 +168,22 @@ def verify_and_commit(
     existing = read_record(state_dir, attempt_id)
     if existing and existing.get("ok") is True:
         sha = str(existing.get("sha") or "")
-        if sha and _commit_exists(repo, sha):
+        if not sha or not _commit_exists(repo, sha):
+            raise VerifyError(
+                "verify_record_stale",
+                "a verify record exists but its commit does not",
+                "Re-run verification; the record cannot be trusted without its commit.",
+            )
+        if not _commit_matches(repo, sha, base_rev, declared):
+            raise VerifyError(
+                "verify_record_stale",
+                "the recorded commit no longer matches the pinned base or patch file set",
+                "Re-run verification; the record is not evidence for this artifact.",
+            )
+        if _evidence_complete(existing, require_gitleaks=require_gitleaks, tests_required=tests_required):
             return existing
-        raise VerifyError(
-            "verify_record_stale",
-            "a verify record exists but its commit does not",
-            "Re-run verification; the record cannot be trusted without its commit.",
-        )
+        # Incomplete evidence: fall through and re-run the checks on this commit.
+        existing = None
 
     branch = _branch(attempt_id)
     root = Path(worktree_root) if worktree_root else repo.parent / f".bb-verify-{attempt_id}"
@@ -147,13 +191,9 @@ def verify_and_commit(
     if worktree.exists():
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
 
-    # A previous run may have committed and died before writing the record.
+    # A commit left by a crashed run is not a verified result: it is rechecked
+    # from scratch below, and replaced if it does not survive the checks.
     if _branch_exists(repo, branch):
-        sha = _rev(repo, branch)
-        if _commit_matches(repo, sha, base_rev, declared):
-            record = _record(attempt_id, sha, base_rev, declared, tests, red=None, suite=None, gitleaks=None, resumed=True)
-            _write_record(state_dir, attempt_id, record)
-            return record
         _run(["git", "branch", "-D", branch], repo)
 
     _run(["git", "worktree", "add", "--detach", str(worktree), base_rev], repo)
@@ -221,12 +261,12 @@ def verify_and_commit(
     if diff_files != declared:
         raise VerifyError("commit_scope_mismatch", f"commit touches {diff_files}, expected {declared}", "Reject this verification.")
 
-    record = _record(attempt_id, sha, base_rev, declared, tests, red=red, suite=suite, gitleaks=scan)
+    record = _record(attempt_id, sha, base_rev, declared, tests, red=red, suite=suite, gitleaks=scan, patch_sha256=hashlib.sha256(patch.encode()).hexdigest())
     _write_record(state_dir, attempt_id, record)
     return record
 
 
-def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, resumed=False) -> dict[str, Any]:
+def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, patch_sha256=None, resumed=False) -> dict[str, Any]:
     return {
         "attempt_id": attempt_id,
         "ok": True,
@@ -239,9 +279,26 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, re
         "suite": None if suite is None else {"exit_code": suite.returncode},
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
+        "patch_sha256": patch_sha256,
         "resumed": resumed,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _evidence_complete(record: Mapping[str, Any], *, require_gitleaks: bool, tests_required: bool) -> bool:
+    """A reused record must carry the evidence this configuration requires."""
+
+    if tests_required and not record.get("tests"):
+        return False
+    if record.get("red") is None:
+        return False
+    if record.get("suite") is None:
+        return False
+    if require_gitleaks and record.get("gitleaks") is None:
+        return False
+    if not record.get("patch_sha256"):
+        return False
+    return True
 
 
 def _run_tests(worktree: Path, tests: Sequence[str], suite_command: Sequence[str] | None) -> dict[str, Any]:

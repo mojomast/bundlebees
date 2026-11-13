@@ -140,15 +140,21 @@ class LeaseBinder:
                 ) from write_exc
             return
 
-        # An existing lease is authoritative. If it disagrees with what we are
-        # about to claim, something is wrong and the tick must stop.
+        # An existing lease is authoritative. Rebinding must preserve the exact
+        # authorised brief: the objective, the acceptance block (contract
+        # identity) and the file scope all have to agree, not just the revision.
         recorded = existing.get("brief") if isinstance(existing, Mapping) else None
         if not isinstance(recorded, Mapping):
             raise ReconcileError("lease_invalid", f"lease for {attempt_id} has no brief", _FIX)
-        for field in ("source_rev", "assigned_files"):
-            if recorded.get(field) != brief.get(field):
-                raise ReconcileError(
-                    "lease_mismatch",
-                    f"lease for {attempt_id} disagrees on {field}",
-                    "Do not verify this attempt; investigate the lease record.",
-                )
+
+        mismatched = []
+        for field in ("objective", "source_rev", "assigned_files", "acceptance", "contract_path", "contract_sha256"):
+            if field in brief or field in recorded:
+                if recorded.get(field) != brief.get(field):
+                    mismatched.append(field)
+        if mismatched:
+            raise ReconcileError(
+                "lease_mismatch",
+                f"lease for {attempt_id} disagrees on {', '.join(mismatched)}",
+                "Do not verify this attempt; the authorised brief changed.",
+            )

@@ -73,7 +73,7 @@ class Mechanical:
         make_job(tmp_path)
         client = FakeClient()
 
-        result = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path)
+        result = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, require_gitleaks=False)
 
         assert result["status"] == "ok"
         assert result["action"] == "dispatch"
@@ -85,9 +85,9 @@ class Mechanical:
     def test_a_second_tick_is_a_noop(self, tmp_path):
         make_job(tmp_path)
         client = FakeClient()
-        job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path)
+        job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, require_gitleaks=False)
 
-        second = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path)
+        second = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, require_gitleaks=False)
 
         assert second["status"] == "idle"
         assert len(client.created) == 1
@@ -99,7 +99,7 @@ class Handoff:
     def _escalated(self, tmp_path):
         make_job(tmp_path)
         client = FakeClient(fail=True)
-        job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path)  # uncertain
+        job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, require_gitleaks=False)  # uncertain
 
         # Two plausible journal entries make adoption ambiguous on the next tick.
         brief = {
@@ -115,7 +115,7 @@ class Handoff:
             {"attempt_id": "att_a", "state": "succeeded", "created_at": _iso(1_800_000_000.0), "brief": brief},
             {"attempt_id": "att_b", "state": "succeeded", "created_at": _iso(1_800_000_000.0), "brief": brief},
         ]
-        result = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, now=1_800_000_001.0)
+        result = job_cli.tick(tmp_path, "job_a", client=client, repo=tmp_path, now=1_800_000_001.0, require_gitleaks=False)
         assert result["status"] == "escalated"
         return result
 

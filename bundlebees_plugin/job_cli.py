@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import integrate_job, job as jobs, reconcile, verify_local
+from . import integrate_job, job as jobs, leases, reconcile, verify_local
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -90,30 +90,83 @@ def record_handoff(state_dir: Path, job_id: str, result: reconcile.TickResult) -
     return payload_obj
 
 
-def pending_prompt(state_dir: Path, job_id: str) -> str | None:
-    """Claim the pending prompt without deleting it."""
+def _epoch(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def pending_prompt(
+    state_dir: Path,
+    job_id: str,
+    *,
+    now: Any = None,
+    claim_timeout_s: float = 300.0,
+) -> str | None:
+    """Claim the pending prompt without deleting it.
+
+    A claim is a lease, not a tombstone: if the agent turn that claimed it dies,
+    the prompt becomes available again once ``claim_timeout_s`` has elapsed.
+    """
 
     payload = read_handoff(state_dir, job_id)
-    if not payload or payload.get("status") != "pending":
+    if not payload:
         return None
-    payload.update(status="claimed", claimed_at=_now(), claimed_by=f"pid:{os.getpid()}")
+    clock = _epoch(now) if now is not None else time.time()
+    status = payload.get("status")
+    if status == "pending":
+        pass
+    elif status == "claimed":
+        claimed = _epoch(payload.get("claimed_at"))
+        if claimed is not None and clock - claimed <= float(claim_timeout_s):
+            return None
+        payload["reclaimed"] = int(payload.get("reclaimed") or 0) + 1
+    else:
+        return None
+    payload.update(status="claimed", claimed_at=_now_at(clock), claimed_by=f"pid:{os.getpid()}")
     _write_handoff(state_dir, job_id, payload)
     return str(payload.get("prompt") or "")
 
 
-def acknowledge(state_dir: Path, job_id: str, note: str) -> dict[str, Any]:
+def acknowledge(state_dir: Path, job_id: str, note: str, *, now: Any = None) -> dict[str, Any]:
+    """Record the decision. Idempotent: a crash mid-write replays cleanly."""
+
     payload = read_handoff(state_dir, job_id)
     if not payload:
         raise JobCliError("no_handoff", "this job has no pending handoff", "Nothing to acknowledge.")
-    if not str(note or "").strip():
+    text = str(note or "").strip()
+    if not text:
         raise JobCliError("empty_note", "a decision needs a note", "Say what you decided and why.")
-    payload.update(status="done", acknowledged_at=_now(), decision=str(note).strip())
-    _write_handoff(state_dir, job_id, payload)
+
+    clock = _epoch(now) if now is not None else time.time()
+    already = payload.get("status") == "done"
+    if not already:
+        payload.update(status="done", acknowledged_at=_now_at(clock), decision=text)
+        _write_handoff(state_dir, job_id, payload)
+
+    # The event is written after the handoff, and only once, so a crash between
+    # the two is repaired by replaying this call rather than duplicating it.
     job = jobs.load_job(state_dir, job_id)
-    job.setdefault("events", []).append(
-        {"at": _now(), "task_id": "job", "transition": "agent_ack", "actor": "agent", "reason": str(note).strip()}
-    )
-    jobs.save_job(state_dir, job)
+    events = job.setdefault("events", [])
+    marker = payload.get("acknowledged_at")
+    if not any(e.get("transition") == "agent_ack" and e.get("at") == marker for e in events):
+        events.append(
+            {
+                "at": marker or _now_at(clock),
+                "task_id": "job",
+                "transition": "agent_ack",
+                "actor": "agent",
+                "reason": str(payload.get("decision") or text),
+            }
+        )
+        jobs.save_job(state_dir, job)
     return payload
 
 
@@ -130,6 +183,7 @@ def tick(
     repo: Path,
     tests_for_task=None,
     gitleaks: str | None = None,
+    require_gitleaks: bool = True,
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     now: Any = None,
 ) -> dict[str, Any]:
@@ -140,16 +194,51 @@ def tick(
     job = jobs.load_job(state_dir, job_id)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
+        from . import acdd_cli
+
         task = ctx.get("task") or {}
         attempt_id = str(ctx.get("attempt_id") or "")
-        envelope = client.result_envelope(attempt_id)
-        patch = _patch_text(envelope)
-        if not patch:
-            return {"ok": False, "evidence": "no patch in the worker result"}
-        files = [str(item.get("path")) for item in ((envelope.get("patch") or {}).get("files") or []) if item.get("path")]
-        source = str(((envelope.get("source") or {}).get("repo_rev")) or "")
         acceptance = task.get("acceptance") or {}
         tests = list(acceptance.get("tests") or []) if isinstance(acceptance, Mapping) else []
+
+        # Preferred path: the capability-bound artifact API, which verifies the
+        # patch sha256 and the result sha256 client-side.
+        patch: str | None = None
+        files: list[str] = []
+        source = ""
+        expected_sha: str | None = None
+
+        artifact = getattr(client, "artifact", None)
+        if callable(artifact):
+            try:
+                art = artifact(attempt_id)
+            except Exception as exc:  # noqa: BLE001 - capability or integrity refusal
+                return {"ok": False, "evidence": f"artifact refused: {exc}"}
+            patch = art.get("patch") if isinstance(art, Mapping) else None
+            source = str((art or {}).get("source_rev") or "")
+            expected_sha = str((art or {}).get("patch_sha256") or "") or None
+            files = _files_from_patch(patch or "")
+        else:
+            # Documented trust boundary: the launcher result is read with the
+            # coordinator token, then every check below re-proves the artifact
+            # (lease, source rev, sha256 when declared, files, tests, gitleaks).
+            envelope = client.result_envelope(attempt_id)
+            patch = _patch_text(envelope)
+            source = str(((envelope.get("source") or {}).get("repo_rev")) or "")
+            expected_sha = str(envelope.get("patch_sha256") or "") or None
+            files = [
+                str(item.get("path"))
+                for item in ((envelope.get("patch") or {}).get("files") or [])
+                if item.get("path")
+            ]
+
+        if not patch:
+            return {"ok": False, "evidence": "no patch in the worker result"}
+
+        def preflight(patch_files: list[str]) -> None:
+            record = leases.load_lease(state_dir, attempt_id)
+            acdd_cli.verify_preflight(record, state_dir, patch_files)
+
         try:
             record = verify_local.verify_and_commit(
                 state_dir,
@@ -161,6 +250,9 @@ def tick(
                 tests=tests,
                 suite_command=list(suite_command),
                 gitleaks=gitleaks,
+                require_gitleaks=require_gitleaks,
+                expected_patch_sha256=expected_sha,
+                acdd_preflight=preflight,
             )
         except verify_local.VerifyError as exc:
             return {"ok": False, "evidence": f"{exc.code}: {exc.message}"}
@@ -213,6 +305,10 @@ def _patch_text(envelope: Mapping[str, Any]) -> str | None:
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _now_at(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 # ---------------------------------------------------------------------------
@@ -380,3 +476,15 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
     except (JobCliError, jobs.JobError, reconcile.ReconcileError, verify_local.VerifyError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
         return 1
+
+
+def _files_from_patch(patch: str) -> list[str]:
+    found: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                path = parts[3][2:] if parts[3].startswith("b/") else parts[3]
+                if path not in found:
+                    found.append(path)
+    return found
