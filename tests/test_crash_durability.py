@@ -410,6 +410,23 @@ class WaveEvidence:
         assert (tmp_path / "waves" / "wave-a.json").read_bytes() == before
         assert stat.S_IMODE((tmp_path / "waves" / "wave-a.json").stat().st_mode) == 0o600
 
+    def test_a_filesystem_without_hard_links_still_publishes_create_only(self, tmp_path, monkeypatch):
+        # The O_EXCL fallback is the only publish path on filesystems that refuse
+        # os.link; it must stay create-only there too, or an accepted record could
+        # be replaced by a later writer on exactly those filesystems.
+        def no_links(*_args, **_kwargs):
+            raise OSError("hard links are not supported here")
+
+        monkeypatch.setattr(revision.os, "link", no_links)
+        record = {"wave_id": "wave-x", "accepted": True, "head_sha": "c" * 40, "attempts": ["att_1"]}
+        revision._write_wave(tmp_path, "wave-x", record)
+        assert revision.read_wave(tmp_path, "wave-x")["head_sha"] == "c" * 40
+
+        with pytest.raises(revision.RevisionError) as caught:
+            revision._write_wave(tmp_path, "wave-x", dict(record, head_sha="d" * 40))
+        assert caught.value.code == "wave_already_accepted"
+        assert revision.read_wave(tmp_path, "wave-x")["head_sha"] == "c" * 40
+
     def test_two_concurrent_writers_cannot_both_publish_an_accepted_wave(self, tmp_path):
         barrier = threading.Barrier(2)
         results: list[tuple[str, str]] = []
