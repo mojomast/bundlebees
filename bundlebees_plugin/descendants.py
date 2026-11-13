@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import job as jobs
+from . import verify_local
 
 POLICY = "rizzstack.descendant-authorization/1"
 
@@ -54,10 +55,13 @@ class DescendantPolicy:
         dependencies = tuple(str(item) for item in block.get("dependencies") or ())
         if not dependencies:
             raise DescendantError("policy_incomplete", "a descendant policy must name its dependencies", "Name the jobs whose accepted integration may become the baseline.")
+        scopes = tuple(str(item) for item in authorization.get("scope") or ())
+        if not scopes:
+            raise DescendantError("policy_incomplete", "a descendant policy needs an explicit file scope", "Enroll the scope the descendant may touch.")
         return cls(
             root_rev=_safe_sha(authorization.get("base_rev")),
             repo=str(authorization.get("repo") or ""),
-            scopes=tuple(str(item) for item in authorization.get("scope") or ()),
+            scopes=scopes,
             max_bees=int((authorization.get("budget") or {}).get("bees") or 0),
             max_wall_clock_s=int((authorization.get("budget") or {}).get("wall_clock_s") or 0),
             dependencies=dependencies,
@@ -77,11 +81,27 @@ def accepted_commit(state_dir: Path, dependency_job: str) -> str:
         raise DescendantError("dependency_unknown", f"no job {dependency_job}: {exc}", "Integrate the dependency first.") from exc
     integration = job.get("integration") or {}
     waves = [w for w in integration.get("accepted_waves") or [] if isinstance(w, Mapping)]
-    commit = integration.get("last_commit") or (waves[-1].get("commit") if waves else "")
-    if not commit:
-        raise DescendantError("dependency_not_accepted", f"{dependency_job} has no accepted integration commit",
+    if not waves:
+        raise DescendantError("dependency_not_accepted", f"{dependency_job} has no accepted integration wave",
                               "Wait for its integration; a card status is not evidence.")
-    return _safe_sha(commit)
+    wave = waves[-1]
+    commit = _safe_sha(wave.get("commit"))
+    last = integration.get("last_commit")
+    if last and _safe_sha(last) != commit:
+        raise DescendantError("provenance_mismatch", f"{dependency_job}: last_commit and the accepted wave disagree",
+                              "Refuse: the artifact identity is ambiguous.")
+    attempts = [str(a) for a in wave.get("attempts") or []]
+    if not attempts:
+        attempts = [str((task.get("attempts") or [""])[-1]) for task in job.get("tasks") or [] if task.get("state") == "accepted"]
+    if not attempts:
+        raise DescendantError("no_verified_attempt", f"{dependency_job}'s accepted wave names no verified attempts",
+                              "Re-integrate from verified work.")
+    for attempt_id in attempts:
+        record = verify_local.read_record(Path(state_dir), attempt_id)
+        if not record or record.get("ok") is not True or not record.get("sha"):
+            raise DescendantError("attempt_unverified", f"{attempt_id} has no accepted verification record",
+                                  "Refuse: unverified work cannot become a baseline.")
+    return commit
 
 
 def derive(policy: DescendantPolicy, *, candidate_rev: str, repo: str, worktree: Path,

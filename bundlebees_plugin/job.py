@@ -273,6 +273,67 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
     return _unseal(authorization_path(state_dir, job_id), key, "authorization")
 
 
+def record_derived_authorization(
+    state_dir: Path,
+    *,
+    job_id: str,
+    parent_job_id: str,
+    statement: str,
+    repo: str,
+    candidate_rev: str,
+    scope: Sequence[str],
+    bees: int,
+    wall_clock_s: int,
+    dependencies: Sequence[str],
+    root_rev: str,
+    policy_scope: Sequence[str] | None = None,
+    gates: Sequence[str] = ("merge",),
+    by: str = "coordinator(derived)",
+) -> dict[str, Any]:
+    """Seal a narrow, derived authority for one dependent job.
+
+    This does not create authority: it records that an already-approved descendant
+    policy was resolved to a concrete commit by validated evidence. The parent
+    authorization's identity and its dependency's accepted commit are sealed in.
+    """
+
+    parent = load_authorization(state_dir, parent_job_id)
+    scope_globs = _normalize_scope(scope)
+    if not scope_globs:
+        raise JobError("derived_scope_missing", "a derived authorization needs a file scope", _FIX_SCOPE)
+    # The enclosing grant is the human-approved descendant policy's scope, which
+    # the parent job itself only partially used. Without one, the parent scope is
+    # the ceiling.
+    ceiling = _normalize_scope(policy_scope) if policy_scope else _normalize_scope(parent.get("scope") or [])
+    outside = [p for p in scope_globs if not _covered(p, ceiling)]
+    if outside:
+        raise JobError("derived_scope_widened", f"outside the approved scope: {', '.join(outside)}",
+                       "A derived authority may only narrow the original approval.")
+    body = {
+        "kind": "authorization",
+        "job_id": _job_id(job_id),
+        "auth_id": secrets.token_hex(8),
+        "statement": str(statement),
+        "repo": str(repo),
+        "base_rev": str(candidate_rev).strip().lower(),
+        "scope": scope_globs,
+        "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
+        "gates": sorted({_slug(gate) for gate in gates}) or ["merge"],
+        "by": by,
+        "at": _utc_now(),
+        "authority": "derived",
+        "derived_from": {"job_id": str(parent_job_id), "auth_id": parent.get("auth_id"),
+                         "base_rev": parent.get("base_rev")},
+        "descendant": {"policy": "rizzstack.descendant-authorization/1", "root_rev": str(root_rev),
+                       "dependencies": [str(item) for item in dependencies],
+                       "scope": ceiling},
+    }
+    key = _ensure_key(state_dir)
+    path = authorization_path(state_dir, job_id)
+    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
+    return body
+
+
 def record_approval(
     state_dir: Path,
     *,
