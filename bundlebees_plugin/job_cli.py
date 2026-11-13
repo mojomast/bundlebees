@@ -192,6 +192,7 @@ def tick(
     adapter = LauncherAdapter(client)
     binder = LeaseBinder(state_dir)
     job = jobs.load_job(state_dir, job_id)
+    job = _hydrate_contracts(state_dir, job, repo)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
         from . import acdd_cli
@@ -235,9 +236,11 @@ def tick(
         if not patch:
             return {"ok": False, "evidence": "no patch in the worker result"}
 
-        def preflight(patch_files: list[str]) -> None:
-            record = leases.load_lease(state_dir, attempt_id)
-            acdd_cli.verify_preflight(record, state_dir, patch_files)
+        lease_record = leases.load_lease(state_dir, attempt_id)
+        declared = bool((lease_record.get("brief") or {}).get("contract"))
+
+        def preflight(patch_files: list[str]) -> object:
+            return acdd_cli.verify_preflight(lease_record, state_dir, patch_files)
 
         try:
             record = verify_local.verify_and_commit(
@@ -253,6 +256,7 @@ def tick(
                 require_gitleaks=require_gitleaks,
                 expected_patch_sha256=expected_sha,
                 acdd_preflight=preflight,
+                contract_declared=declared,
             )
         except verify_local.VerifyError as exc:
             return {"ok": False, "evidence": f"{exc.code}: {exc.message}"}
@@ -488,3 +492,46 @@ def _files_from_patch(patch: str) -> list[str]:
                 if path not in found:
                     found.append(path)
     return found
+
+
+def _hydrate_contracts(state_dir: Path, job: dict[str, Any], repo: Path) -> dict[str, Any]:
+    """Load each task's frozen contract from its path and verify its sha256.
+
+    A task that declares a contract must never reach dispatch without it: that
+    would silently drop the contract checks and fall back to legacy mode.
+    """
+
+    changed = False
+    for task in job.get("tasks", []):
+        path = task.get("contract_path")
+        if not path:
+            continue
+        source = Path(repo) / str(path)
+        try:
+            raw_bytes = source.read_bytes()
+        except OSError as exc:
+            raise JobCliError(
+                "contract_unavailable",
+                f"task {task.get('task_id')} contract {path} cannot be read: {exc}",
+                "Provide the frozen contract at the recorded path before dispatching.",
+            ) from exc
+        digest = __import__("hashlib").sha256(raw_bytes).hexdigest()
+        expected = task.get("contract_sha256")
+        if expected and str(expected) != digest:
+            raise JobCliError(
+                "contract_mismatch",
+                f"task {task.get('task_id')} contract sha256 {digest[:12]} != declared {str(expected)[:12]}",
+                "Restore the frozen contract; do not dispatch against a changed one.",
+            )
+        try:
+            task["contract"] = json.loads(raw_bytes)
+        except ValueError as exc:
+            raise JobCliError(
+                "contract_invalid",
+                f"task {task.get('task_id')} contract is not valid JSON: {exc}",
+                "Fix the frozen contract file.",
+            ) from exc
+        changed = True
+    if changed:
+        jobs.save_job(state_dir, job)
+    return job

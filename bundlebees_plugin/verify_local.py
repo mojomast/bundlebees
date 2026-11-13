@@ -101,6 +101,7 @@ def verify_and_commit(
     tests_required: bool = True,
     expected_patch_sha256: str | None = None,
     acdd_preflight: Any = None,
+    contract_declared: bool = False,
     worktree_root: Path | None = None,
     identity: Sequence[str] = ("-c", "user.name=bundlebees", "-c", "user.email=bees@localhost"),
 ) -> dict[str, Any]:
@@ -130,15 +131,27 @@ def verify_and_commit(
                 f"patch sha256 {actual[:12]} does not match the declared {expected_patch_sha256[:12]}",
                 "Reject this artifact; its bytes changed after dispatch.",
             )
-    if acdd_preflight is not None:
+    if acdd_preflight is not None or contract_declared:
+        if acdd_preflight is None:
+            raise VerifyError(
+                "contract_missing",
+                "the lease declares a frozen contract but no preflight was supplied",
+                "Refusing to fall back to legacy mode for a contracted task.",
+            )
         try:
-            acdd_preflight(list(declared_files))
+            outcome = acdd_preflight(list(declared_files))
         except Exception as exc:  # noqa: BLE001 - any contract refusal is fatal
             raise VerifyError(
                 "contract_violation",
                 f"the frozen contract refused this patch: {exc}",
                 "Do not verify a patch that changes its own acceptance criteria.",
             ) from exc
+        if contract_declared and outcome is None:
+            raise VerifyError(
+                "contract_missing",
+                "the task declares a frozen contract but the preflight found none",
+                "Refusing to verify a contracted task in legacy mode.",
+            )
 
     # 1. The lease is the authority; worker claims never widen it.
     try:
@@ -167,22 +180,18 @@ def verify_and_commit(
     # 3. Idempotent restart: an accepted record with a real commit is reused.
     existing = read_record(state_dir, attempt_id)
     if existing and existing.get("ok") is True:
-        sha = str(existing.get("sha") or "")
-        if not sha or not _commit_exists(repo, sha):
-            raise VerifyError(
-                "verify_record_stale",
-                "a verify record exists but its commit does not",
-                "Re-run verification; the record cannot be trusted without its commit.",
-            )
-        if not _commit_matches(repo, sha, base_rev, declared):
-            raise VerifyError(
-                "verify_record_stale",
-                "the recorded commit no longer matches the pinned base or patch file set",
-                "Re-run verification; the record is not evidence for this artifact.",
-            )
-        if _evidence_complete(existing, require_gitleaks=require_gitleaks, tests_required=tests_required):
+        if _record_still_valid(
+            existing,
+            repo,
+            base_rev=base_rev,
+            files=declared,
+            tests=list(tests),
+            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch=patch,
+            require_gitleaks=require_gitleaks,
+        ):
             return existing
-        # Incomplete evidence: fall through and re-run the checks on this commit.
+        # Present-but-invalid evidence is not evidence: re-run every check.
         existing = None
 
     branch = _branch(attempt_id)
@@ -285,20 +294,74 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, pa
     }
 
 
-def _evidence_complete(record: Mapping[str, Any], *, require_gitleaks: bool, tests_required: bool) -> bool:
-    """A reused record must carry the evidence this configuration requires."""
+def _record_still_valid(
+    record: Mapping[str, Any],
+    repo: Path,
+    *,
+    base_rev: str,
+    files: Sequence[str],
+    tests: Sequence[str],
+    patch_sha256: str,
+    patch: str,
+    require_gitleaks: bool,
+) -> bool:
+    """Reuse only a record whose *results* still apply to this exact artifact.
 
-    if tests_required and not record.get("tests"):
+    Presence is not proof: a record claiming RED exit 0, a failed suite, a
+    mismatched patch hash, a different test list or a different base is stale and
+    must be re-earned.
+    """
+
+    sha = str(record.get("sha") or "")
+    if not sha or not _commit_exists(repo, sha):
         return False
-    if record.get("red") is None:
+    if record.get("base_rev") != base_rev:
         return False
-    if record.get("suite") is None:
+    if record.get("patch_sha256") != patch_sha256:
         return False
-    if require_gitleaks and record.get("gitleaks") is None:
+    if sorted(record.get("files") or []) != sorted(files):
         return False
-    if not record.get("patch_sha256"):
+    if sorted(record.get("tests") or []) != sorted(tests):
         return False
+    if not _commit_matches(repo, sha, base_rev, files):
+        return False
+    if not _commit_contains_patch(repo, sha, base_rev, patch):
+        return False
+
+    red = record.get("red")
+    if not isinstance(red, Mapping) or red.get("exit_code") in (None, 0):
+        return False
+    suite = record.get("suite")
+    if not isinstance(suite, Mapping) or suite.get("exit_code") != 0:
+        return False
+    if require_gitleaks:
+        scan = record.get("gitleaks")
+        if not isinstance(scan, Mapping) or scan.get("exit_code") != 0:
+            return False
     return True
+
+
+def _commit_contains_patch(repo: Path, sha: str, base_rev: str, patch: str) -> bool:
+    """The committed tree must equal the tree produced by applying this patch."""
+
+    try:
+        committed = _rev(repo, f"{sha}^{{tree}}")
+    except VerifyError:
+        return False
+    scratch = repo.parent / f".bb-tree-check-{os.getpid()}"
+    if scratch.exists():
+        _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
+    try:
+        if _run(["git", "worktree", "add", "--detach", str(scratch), base_rev], repo).returncode != 0:
+            return False
+        if _run(["git", "apply", "--whitespace=nowarn", "-"], scratch, input_text=patch).returncode != 0:
+            return False
+        if _run(["git", "add", "-A"], scratch).returncode != 0:
+            return False
+        tree = _run(["git", "write-tree"], scratch)
+        return tree.returncode == 0 and tree.stdout.strip() == committed
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
 
 
 def _run_tests(worktree: Path, tests: Sequence[str], suite_command: Sequence[str] | None) -> dict[str, Any]:

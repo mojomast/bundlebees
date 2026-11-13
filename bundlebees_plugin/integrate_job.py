@@ -13,6 +13,7 @@ has always enforced. Nothing here weakens it.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -94,6 +95,29 @@ def integrate(
     if len(base_rev) != 40:
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
+    wave = wave_id or f"w{_wave_number(job)}"
+
+    # Crash recovery: an accepted wave record already on disk is the result.
+    # Restore the durable ref if the crash happened before it was updated, and
+    # report recovery so the caller does not count it as a new attempt.
+    existing = _accepted_wave_record(state_dir, wave)
+    if existing is not None:
+        head = str(existing.get("head_sha") or "")
+        if len(head) != 40:
+            raise IntegrateError("bad_wave_record", f"accepted wave {wave} has no head sha", "Inspect the wave record.")
+        ref_name = integration_ref(str(job.get("job_id") or ""))
+        current = _git(["rev-parse", "--verify", "--quiet", ref_name], repo, check=False).stdout.strip()
+        if current != head:
+            _git(["update-ref", ref_name, head], repo)
+        return {
+            "ok": True,
+            "evidence": f"wave {wave} already accepted at {head[:8]}; recovered without re-integrating",
+            "record": existing,
+            "integration_ref": ref_name,
+            "start_rev": current or head,
+            "recovered": True,
+        }
+
     # Later waves build on the last accepted result, not on the original base.
     ref = integration_ref(str(job.get("job_id") or ""))
     ref_check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
@@ -145,7 +169,7 @@ def integrate(
 
         record = revision.integrate_wave(
             state_dir,
-            wave_id or f"w{_wave_number(job)}",
+            wave,
             worktree,
             attempts,
             run_suite,
@@ -172,4 +196,18 @@ def integrate(
         "record": record,
         "integration_ref": head_ref,
         "start_rev": start_rev,
+        "recovered": False,
     }
+
+
+def _accepted_wave_record(state_dir: Path, wave: str) -> dict[str, Any] | None:
+    """The accepted wave record, if one was already written for this wave."""
+
+    path = Path(state_dir) / "waves" / f"{wave}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get("accepted") is True:
+        return data
+    return None

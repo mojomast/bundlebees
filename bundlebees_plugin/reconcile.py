@@ -989,6 +989,13 @@ def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any
     """
 
     fingerprint = _fingerprint(job, task)
+    contract = task.get("contract")
+    if task.get("contract_sha256") and not isinstance(contract, Mapping):
+        raise ReconcileError(
+            "contract_missing",
+            f"task {task['task_id']} declares a frozen contract that is not loaded",
+            "Hydrate the contract from its path and verify its sha256 before dispatching.",
+        )
     brief: dict[str, Any] = {
         "objective": fingerprint["objective"],
         "source_rev": fingerprint["source_rev"],
@@ -997,6 +1004,8 @@ def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any
         "job_id": str(job["job_id"]),
         "task_id": str(task["task_id"]),
     }
+    if isinstance(contract, Mapping):
+        brief["contract"] = dict(contract)
     try:
         validate_brief(brief)
     except BriefError as exc:
