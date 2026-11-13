@@ -273,6 +273,9 @@ def _dispatch(ctx: Any, args: Any) -> int:
                 args,
                 state_dir=_state_dir(ctx, args),
                 client_factory=lambda: _client_for(ctx),
+                provisioner_factory=lambda: __import__("bundlebees_plugin.provisioning", fromlist=["from_client"]).from_client(
+                    _config(ctx), _client_for(ctx)
+                ),
             )
         raise CliError(
             "invalid_argument",

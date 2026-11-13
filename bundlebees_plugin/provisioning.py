@@ -173,6 +173,26 @@ class WorkerProvisioner(Protocol):
     def cleanup(self, project: str) -> dict[str, Any]: ...
 
 
+def from_client(config: Mapping[str, Any] | None, client: Any) -> "HyvvProvisioner | None":
+    """Build the provisioner over the existing authenticated launcher client.
+
+    Returns None unless provisioning is enabled, so the CLI keeps its previous
+    behaviour for jobs that never asked for it.
+    """
+    block = (config or {}).get("provisioning") or {}
+    if not block.get("enabled"):
+        return None
+
+    def transport(method: str, path: str, body: Mapping[str, Any] | None):
+        try:
+            return 200, client.request_json(method, path, body)
+        except Exception as exc:  # noqa: BLE001 - mapped to the contract's status space
+            status = getattr(exc, "status", None) or getattr(exc, "http_status", None)
+            return int(status or 502), {"error": getattr(exc, "code", "client_error"), "message": str(exc)}
+
+    return HyvvProvisioner(transport, expect_host=block.get("host") or None)
+
+
 class HyvvProvisioner:
     """HTTP implementation over the pinned phase-1 contract.
 

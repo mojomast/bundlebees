@@ -477,7 +477,7 @@ def add_parsers(subparsers: Any) -> None:
     rep.set_defaults(command="job", job_handler="report")
 
 
-def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
+def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     handler = getattr(args, "job_handler", None)
     job_id = getattr(args, "job_id", None)
     try:
@@ -507,7 +507,9 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
 
         if handler == "tick":
             client = client_factory()
-            result = tick(state_dir, job_id, client=client, repo=Path(args.repo), gitleaks=args.gitleaks)
+            provisioner = provisioner_factory() if provisioner_factory is not None else None
+            result = tick(state_dir, job_id, client=client, repo=Path(args.repo), gitleaks=args.gitleaks,
+                          provisioner=provisioner)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
