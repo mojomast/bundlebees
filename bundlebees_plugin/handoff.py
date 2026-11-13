@@ -19,12 +19,24 @@ revision, writes an immutable source-resolution record, records a create-only
 derived authorization rooted in the verified policy, and creates the dependent job
 with its intent packet bound. The intent packet is never edited: only the
 resolution record and the frozen contract carry the resolved revision.
+
+Publication is create-only at Git's own update boundary
+(``transport.create_only_push`` sends an absent-ref compare-and-set), so a
+restart can reconcile the existing ref but never move it or publish twice.
+Immediately after the publication receipt is validated — and before the
+resolution is persisted — ``materialize`` fires the ``transport.after_publish``
+fault checkpoint. A crash there restarts into the same accepted ref: the
+resolution is reused only when it still validates against the intent packet and
+accepted commit, a matching derived authorization and job are reused, a moved
+dependency source or any conflicting record is refused, and the derived source
+revision never changes across restarts.
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
 import os
 import secrets
@@ -463,8 +475,41 @@ def _existing_job(state_dir: Path, job_id: str) -> dict[str, Any] | None:
                            "Refuse: never materialize over a damaged job record.") from exc
 
 
+def _read_resolution(state_dir: Path, job_id: str) -> dict[str, Any] | None:
+    """Return the recorded source resolution, or None when it was never written."""
+
+    path = resolution_path(state_dir, job_id)
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HandoffError("resolution_unreadable", f"resolution for {job_id} cannot be read: {exc}",
+                           "Refuse: inspect it by hand.") from exc
+    if not isinstance(record, Mapping):
+        raise HandoffError("resolution_unreadable", f"resolution for {job_id} is not an object",
+                           "Refuse: inspect it by hand.")
+    return dict(record)
+
+
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault-injection checkpoint owned by another lane.
+
+    ``bundlebees_plugin.faults`` registers hooks for tests; the shipped path has
+    no hooks registered and this is a no-op. The module is optional so this lane
+    never depends on the fault lane landing first.
+    """
+
+    try:
+        faults = importlib.import_module(f"{__package__}.faults")
+    except ImportError:
+        return
+    faults.checkpoint(name, **payload)
+
+
 def _replay(existing: Mapping[str, Any], state_dir: Path, job_id: str, packet_digest: str,
-            policy: Mapping[str, Any], policy_digest_value: str) -> dict[str, Any]:
+            policy: Mapping[str, Any], policy_digest_value: str,
+            intent: Mapping[str, Any]) -> dict[str, Any]:
     """Return the already-materialized dependent job without rewriting anything."""
 
     sealed = str((existing.get("goal") or {}).get("packet_digest") or "")
@@ -489,6 +534,19 @@ def _replay(existing: Mapping[str, Any], state_dir: Path, job_id: str, packet_di
                                "Refuse: the enrolled policy no longer matches the record.")
         accepted = str(resolution.get("accepted_commit") or "")
         contract_sha = str(resolution.get("contract_sha256") or "")
+        # The recorded resolution is reusable only if it still proves exactly
+        # this intent at exactly this accepted commit.
+        try:
+            packets.validate_resolution(resolution, packet=intent, accepted_commit=accepted)
+        except packets.PacketError as exc:
+            raise HandoffError("resolution_conflict",
+                               f"the recorded resolution for {job_id} does not validate against "
+                               f"the intent packet and its accepted commit: {exc}",
+                               "Refuse: a resolution is immutable; inspect it by hand.") from exc
+        if source_rev and accepted and source_rev != accepted:
+            raise HandoffError("resolution_conflict",
+                               f"job {job_id} is bound to {source_rev} but its resolution derives {accepted}",
+                               "Refuse: the derived source revision may never change.")
     return {"job_id": job_id, "created": False, "packet_digest": packet_digest,
             "policy_id": str(policy["policy_id"]), "policy_digest": policy_digest_value,
             "dependency_job": str((policy.get("dependencies") or [""])[0]),
@@ -534,7 +592,7 @@ def materialize(state_dir: Path, *, feature_id: str, job_id: str, packet: Mappin
 
     existing = _existing_job(state_dir, job_id)
     if existing is not None:
-        return _replay(existing, state_dir, job_id, packet_digest, policy, policy_digest_value)
+        return _replay(existing, state_dir, job_id, packet_digest, policy, policy_digest_value, intent)
 
     dependency_job = str((policy.get("dependencies") or [""])[0])
     dependency_feature = str((policy.get("dependency_features") or [""])[0])
@@ -549,6 +607,25 @@ def materialize(state_dir: Path, *, feature_id: str, job_id: str, packet: Mappin
     except transport.TransportError as exc:
         raise HandoffError(exc.code, exc.message, exc.fix) from exc
 
+    # A resolution written before a crash pins the derived source. The dependency's
+    # accepted commit must not have moved since: recovering onto a different
+    # commit would publish a second artifact and change the dependent's baseline.
+    recorded = _read_resolution(state_dir, job_id)
+    if recorded is not None:
+        pinned = str(recorded.get("accepted_commit") or "")
+        try:
+            packets.validate_resolution(recorded, packet=intent, accepted_commit=pinned)
+        except packets.PacketError as exc:
+            raise HandoffError("resolution_conflict",
+                               f"the recorded resolution for {job_id} does not validate against the "
+                               f"intent packet and the accepted commit: {exc}",
+                               "Refuse: a resolution is immutable; inspect it by hand.") from exc
+        if pinned != accepted:
+            raise HandoffError("source_changed",
+                               f"job {job_id} was resolved to {pinned or '<none>'}, but dependency "
+                               f"{dependency_job} now accepts {accepted}",
+                               "Refuse: a resolved source never changes; investigate before re-running.")
+
     try:
         receipt = transport.publish(state_dir, dependency_job, repo=Path(worktree), mirror=Path(mirror),
                                     repo_identity=repo, root_rev=str(policy.get("root_rev") or ""))
@@ -556,6 +633,13 @@ def materialize(state_dir: Path, *, feature_id: str, job_id: str, packet: Mappin
         raise HandoffError(exc.code, exc.message, exc.fix) from exc
     if receipt["source_sha"] != accepted:
         raise HandoffError("publication_mismatch", "the published commit is not the accepted commit", "Refuse.")
+    mirror_ref = str(receipt.get("mirror_ref") or "")
+    if mirror_ref != transport.ref_for(dependency_job, accepted):
+        raise HandoffError("publication_mismatch",
+                           f"the receipt names {mirror_ref!r}, not the job's immutable accepted ref",
+                           "Refuse: publication is not proven.")
+    # Fault boundary: publication is validated and no resolution is persisted yet.
+    _checkpoint("transport.after_publish", job_id=job_id, mirror_ref=mirror_ref, source_sha=accepted)
 
     try:
         rule = descendants.DescendantPolicy.parse({
@@ -598,6 +682,19 @@ def materialize(state_dir: Path, *, feature_id: str, job_id: str, packet: Mappin
     except packets.PacketError as exc:
         raise HandoffError(exc.code, exc.message, "Refuse: the resolution must satisfy the pinned protocol.") from exc
     written = write_resolution(state_dir, job_id, resolution)
+    # Reused or freshly written, the record must still prove this intent at this
+    # accepted commit before anything is derived from it.
+    try:
+        packets.validate_resolution(written, packet=intent, accepted_commit=accepted)
+    except packets.PacketError as exc:
+        raise HandoffError("resolution_conflict",
+                           f"the recorded resolution for {job_id} does not validate against the "
+                           f"intent packet and the accepted commit: {exc}",
+                           "Refuse: a resolution is immutable; inspect it by hand.") from exc
+    if str(written.get("derived_source_rev") or "") != accepted:
+        raise HandoffError("source_changed",
+                           f"job {job_id} derives {written.get('derived_source_rev')!r}, not the accepted {accepted}",
+                           "Refuse: the derived source revision may never change.")
 
     evidence = {"job_id": dependency_job, "accepted_commit": accepted,
                 "attempts": [str(item) for item in attempts],
@@ -640,7 +737,7 @@ def materialize(state_dir: Path, *, feature_id: str, job_id: str, packet: Mappin
         concurrent = _existing_job(state_dir, job_id)
         if concurrent is None:
             raise HandoffError("job_exists", f"job {job_id} exists but cannot be read", "Refuse.") from exc
-        return _replay(concurrent, state_dir, job_id, packet_digest, policy, policy_digest_value)
+        return _replay(concurrent, state_dir, job_id, packet_digest, policy, policy_digest_value, intent)
     return {"job_id": job_id, "created": created, "packet_digest": packet_digest,
             "policy_id": policy_id, "policy_digest": policy_digest_value,
             "dependency_job": dependency_job, "dependency_feature": dependency_feature,

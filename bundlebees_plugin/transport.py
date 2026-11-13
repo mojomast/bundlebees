@@ -31,7 +31,8 @@ class TransportError(Exception):
 
 def _git(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
     done = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"})
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                               "LC_ALL": "C"})
     if check and done.returncode != 0:
         raise TransportError("git_error", f"git {' '.join(args)} failed: {done.stderr.strip()[:300]}", "Inspect the mirror and the accepted commit.")
     return done
@@ -101,6 +102,12 @@ def _ref_for(job_id: str, sha: str) -> str:
     return f"refs/bb/accepted/{safe}/{sha}"
 
 
+def ref_for(job_id: str, sha: str) -> str:
+    """The immutable, job-scoped ref an accepted commit is published at."""
+
+    return _ref_for(job_id, sha)
+
+
 def _remote_ref(mirror: Path, ref: str) -> str | None:
     done = _git(["ls-remote", str(mirror), ref], Path(mirror).parent, check=False)
     if done.returncode != 0:
@@ -112,9 +119,63 @@ def _remote_ref(mirror: Path, ref: str) -> str | None:
     return None
 
 
+def create_only_push(repo: Path, mirror: Path, *, sha: str, ref: str) -> bool:
+    """Create ``ref`` at ``sha``, refusing to move anything already there.
+
+    ``--force-with-lease=<ref>:`` makes Git send this update command with the
+    null object id as its *expected* old value, which receive-pack compares
+    against the ref at the moment it applies the update: an absent-ref
+    compare-and-set at Git's own update boundary, not a check-then-push window
+    in this process. The client additionally rejects the push when the
+    advertisement it just received disagrees, so both sides enforce it.
+
+    Returns ``True`` when this call created the ref and ``False`` when the
+    mirror already advertised exactly ``sha`` (Git reports the refspec as
+    ``[up to date]`` and performs no update). A ref holding any other commit is
+    a hard ``ref_conflict``.
+    """
+
+    done = _git(["push", "--porcelain", f"--force-with-lease={ref}:", str(mirror), f"{sha}:{ref}"],
+                Path(repo), check=False)
+    if done.returncode == 0:
+        # ``--porcelain`` prints one ``<flag>\t<from>:<to>\t<summary>`` line per
+        # refspec; ``=`` means Git found the ref already at this commit and
+        # performed no update, any other flag means this call created it.
+        for line in done.stdout.splitlines():
+            flag, _, rest = line.partition("\t")
+            if rest.split("\t")[0].endswith(f":{ref}"):
+                return flag.strip() != "="
+        return True
+    current = _remote_ref(Path(mirror), ref)
+    if current == sha:
+        return False
+    if current is not None:
+        raise TransportError("ref_conflict", f"{ref} already points at {current}, not {sha}",
+                             "Hard refusal: immutable refs are never moved.")
+    raise TransportError("publish_failed", f"the mirror refused the ref: {done.stderr.strip()[:200]}",
+                         "Check mirror permissions and ref ownership.")
+
+
+def _receipt(path: Path, job_id: str, repo_identity: str, sha: str, attempts: list[str],
+             ref: str, *, recovered: bool) -> dict[str, Any]:
+    receipt = {"schema": "rizzstack.transport/1", "job_id": job_id, "repo": repo_identity,
+               "source_sha": sha, "attempts": attempts, "mirror_ref": ref, "recovered": recovered,
+               "published_at": _now()}
+    _write_receipt(path, receipt)
+    return receipt
+
+
 def publish(state_dir: Path, job_id: str, *, repo: Path, mirror: Path, repo_identity: str,
             root_rev: str) -> dict[str, Any]:
-    """Create the immutable ref for an accepted commit; idempotent and recoverable."""
+    """Create the immutable ref for an accepted commit; idempotent and recoverable.
+
+    The create is enforced by Git's update transaction (see
+    :func:`create_only_push`), so two concurrent publishers of different commits
+    for one ref cannot both succeed and neither can move the other's ref. When
+    the ref already holds exactly the accepted commit — a restart after a crash,
+    or a concurrent publisher of the same commit — publication is recovered
+    without a second update.
+    """
 
     job = jobs.load_job(Path(state_dir), job_id)
     sha, attempts = accepted_commit(Path(state_dir), job)
@@ -141,32 +202,13 @@ def publish(state_dir: Path, job_id: str, *, repo: Path, mirror: Path, repo_iden
     if existing is not None:
         if existing != sha:
             raise TransportError("ref_conflict", f"{ref} already points at {existing}, not {sha}", "Hard refusal: immutable refs are never moved.")
-        receipt = {"schema": "rizzstack.transport/1", "job_id": job_id, "repo": repo_identity,
-                   "source_sha": sha, "attempts": attempts, "mirror_ref": ref, "recovered": True,
-                   "published_at": _now()}
-        _write_receipt(path, receipt)
-        return receipt
+        return _receipt(path, job_id, repo_identity, sha, attempts, ref, recovered=True)
 
-    push = _git(["push", "--porcelain", str(mirror), f"{sha}:{ref}"], Path(repo), check=False)
-    if push.returncode != 0:
-        # A concurrent publisher may have created it with the same commit.
-        raced = _remote_ref(Path(mirror), ref)
-        if raced == sha:
-            receipt = {"schema": "rizzstack.transport/1", "job_id": job_id, "repo": repo_identity,
-                       "source_sha": sha, "attempts": attempts, "mirror_ref": ref, "recovered": True,
-                       "published_at": _now()}
-            _write_receipt(path, receipt)
-            return receipt
-        raise TransportError("publish_failed", f"the mirror refused the ref: {push.stderr.strip()[:200]}", "Check mirror permissions and ref ownership.")
-
+    created = create_only_push(Path(repo), Path(mirror), sha=sha, ref=ref)
     advertised = _remote_ref(Path(mirror), ref)
     if advertised != sha:
         raise TransportError("publish_unverified", f"the mirror advertises {advertised}, expected {sha}", "Refuse: publication is not proven.")
-    receipt = {"schema": "rizzstack.transport/1", "job_id": job_id, "repo": repo_identity,
-               "source_sha": sha, "attempts": attempts, "mirror_ref": ref, "recovered": False,
-               "published_at": _now()}
-    _write_receipt(path, receipt)
-    return receipt
+    return _receipt(path, job_id, repo_identity, sha, attempts, ref, recovered=not created)
 
 
 def _now() -> str:
