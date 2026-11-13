@@ -20,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
     "launcher_url": "",
     "allow_private": False,
     "orbit_url": "http://127.0.0.1:4318",
+    "coordinator": "",
     "worktree": "",
     "branch": "",
     "deploy_host_alias": "",

@@ -303,11 +303,15 @@ def plugin_state_dir() -> Path | None:
         return None
 
 
-def _state_dir(ctx: Any, args: Any) -> Path:
-    explicit = getattr(args, "state_dir", None)
+def _state_dir_or_none(args: Any = None) -> Path | None:
+    explicit = getattr(args, "state_dir", None) if args is not None else None
     if explicit:
         return Path(str(explicit)).expanduser().resolve()
-    found = plugin_state_dir()
+    return plugin_state_dir()
+
+
+def _state_dir(ctx: Any, args: Any) -> Path:
+    found = _state_dir_or_none(args)
     if found is not None:
         return found
     raise CliError(
@@ -317,12 +321,14 @@ def _state_dir(ctx: Any, args: Any) -> Path:
     )
 
 
-def _client_for(ctx: Any) -> Any:
+def _client_for(ctx: Any, args: Any = None) -> Any:
     injected = getattr(ctx, "bundlebees_client", None)
     if injected is not None:
         return injected
     try:
-        return adapters.adapter_from_config(_config(ctx))
+        return adapters.adapter_from_config(
+            _config(ctx), state_dir=_state_dir_or_none(args)
+        )
     except Exception as exc:  # noqa: BLE001 - map client configuration errors
         code = getattr(exc, "code", "not_configured")
         fix = getattr(
@@ -610,6 +616,105 @@ def _fetch_result(client: Any, attempt_id: str) -> dict[str, Any]:
                     merged[key] = data[key]
             data = merged
     return data
+
+
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_HEX_REV_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+_USAGE_KEYS = (
+    "inputTokens", "outputTokens", "reasoningTokens", "cachedInputTokens", "totalTokens",
+    "input_tokens", "output_tokens", "total_tokens", "tokens", "cost_usd", "costUsd",
+)
+
+
+def _artifact_usage(usage: Any) -> dict[str, Any]:
+    """Launcher-reported usage, or an explicit ``unavailable`` marker (never a fake zero)."""
+    if not isinstance(usage, Mapping):
+        return {"source": "unavailable"}
+    out: dict[str, Any] = {}
+    for key in _USAGE_KEYS:
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+    if not out:
+        return {"source": "unavailable"}
+    out["source"] = str(usage.get("source") or "launcher_reported")[:40]
+    return out
+
+
+def _print_digest(label: str, digest: Any) -> None:
+    """Print a validated sha256 digest without passing it through scrub()."""
+    if isinstance(digest, str) and _HEX64_RE.fullmatch(digest):
+        print(f"{label}: {digest}")
+
+
+def _fetch_artifact(
+    client: Any, attempt_id: str, state_dir: Path, source_rev: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fetch the patch through Orbit's coordinator-only artifact API.
+
+    Checks that the artifact was produced for the lease's ``source_rev`` and that
+    its patch hash matches the one pinned on first read. Returns the result for
+    ``adapters.normalize_result`` and the non-secret evidence fields. Never prints
+    or stores the patch itself.
+    """
+    try:
+        art = client.artifact(attempt_id)
+    except Exception as exc:  # noqa: BLE001 - ClientError or fake error
+        code = getattr(exc, "code", "launcher_error")
+        fix = getattr(exc, "fix", "Check Orbit and retry when the worker finishes.")
+        raise CliError(str(code), str(exc), str(fix)) from exc
+    if not isinstance(art, Mapping):
+        raise CliError("artifact_invalid", "Orbit did not return an artifact object", "Reject this worker result.")
+    if art.get("source_rev") != source_rev:
+        raise CliError(
+            "stale_revision",
+            "the artifact was produced for a different source_rev than the lease",
+            "Reject this worker result and re-dispatch from the current source_rev; nothing was applied.",
+        )
+    digest = art.get("patch_sha256")
+    pin_path = Path(contain_path(f"artifact-pins/{attempt_id}.json", str(state_dir)))
+    if pin_path.exists():
+        try:
+            pinned = json.loads(pin_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pinned = {}
+        if pinned.get("patch_sha256") != digest:
+            raise CliError(
+                "artifact_changed",
+                "the worker patch differs from the one first retrieved for this attempt",
+                "Reject this attempt; a retry must return the identical artifact.",
+            )
+    elif digest is not None:
+        pin_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = pin_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "attempt_id": attempt_id, "patch_sha256": digest, "result_sha256": art.get("result_sha256"),
+            "source_rev": source_rev, "first_read_at": _now(),
+        }, sort_keys=True), encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(pin_path)
+    observed = art.get("observed") if isinstance(art.get("observed"), Mapping) else {}
+    base = observed.get("local_base_rev")
+    usage = _artifact_usage(art.get("usage"))
+    tokens = usage.get("totalTokens", usage.get("total_tokens", usage.get("tokens")))
+    result: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "state": art.get("state"),
+        "patch": art.get("patch"),
+        "usage": {"tokens": tokens if isinstance(tokens, int) else None, "cost_usd": usage.get("cost_usd")},
+    }
+    if isinstance(base, str) and _HEX_REV_RE.fullmatch(base):
+        result["base_rev"] = base
+    evidence: dict[str, Any] = {
+        "artifact": art.get("artifact_version"),
+        "patch_sha256": digest,
+        "result_sha256": art.get("result_sha256"),
+        "usage": usage,
+        "model": art.get("model"),
+        "launcher": art.get("launcher"),
+        "observed": {k: observed.get(k) for k in ("tool_calls", "stop_reason", "status") if k in observed},
+    }
+    return result, evidence
 
 
 def _brief_from(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1030,6 +1135,14 @@ def _write_verify_result(
     clean = scrub(payload)
     if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
         clean["evidence"]["source_rev"] = source_rev
+    for key in ("patch_sha256", "result_sha256"):
+        digest = (evidence or {}).get(key)
+        if isinstance(digest, str) and _HEX64_RE.fullmatch(digest):
+            clean["evidence"][key] = digest
+    usage = (evidence or {}).get("usage")
+    if isinstance(usage, Mapping):
+        # Validated numeric counts; scrub() would redact the *Tokens key names.
+        clean["evidence"]["usage"] = _artifact_usage(usage)
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
@@ -1145,8 +1258,13 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         source_rev = str(record.get("source_rev") or "")
         evidence["source_rev"] = source_rev
 
-        client = _client_for(ctx)
-        result = _fetch_result(client, attempt_id)
+        client = _client_for(ctx, args)
+        if callable(getattr(client, "artifact", None)):
+            # Supported path: Orbit's coordinator-only artifact API, never launcher files.
+            result, artifact_evidence = _fetch_artifact(client, attempt_id, state_dir, source_rev)
+            evidence.update(artifact_evidence)
+        else:
+            result = _fetch_result(client, attempt_id)
         warnings = leases.ignored_worker_claims(record, result)
         if warnings:
             evidence["ignored_worker_claims"] = warnings
@@ -1278,6 +1396,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _print(f"files: {', '.join(files)}")
             _print(f"tests: {', '.join(tests)}")
             _print(f"sandbox: {evidence.get('backend')}")
+            _print_digest("patch_sha256", evidence.get("patch_sha256"))
             acdd_cli.print_mode(acdd_state, green)
             _print("result: dry-run passed; nothing was committed or pushed")
             _print(f"verify result: {target}")
@@ -1311,6 +1430,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _print(f"files: {', '.join(files)}")
         _print(f"tests: {', '.join(tests)}")
         _print(f"sandbox: {evidence.get('backend')}")
+        _print_digest("patch_sha256", evidence.get("patch_sha256"))
         acdd_cli.print_mode(acdd_state, green)
         _print(f"pushed: feature branch only ({BRANCH_BUDGET_NOTE})")
         _print(f"verify result: {target}")
@@ -1554,7 +1674,7 @@ def _cmd_doctor(ctx: Any, args: Any) -> int:
     client = getattr(ctx, "bundlebees_client", None)
     if client is None:
         try:
-            client = _client_for(ctx)
+            client = _client_for(ctx, args)
         except CliError:
             client = None
     health = getattr(client, "health", None) if client is not None else None
