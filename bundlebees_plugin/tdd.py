@@ -32,12 +32,17 @@ import re
 import secrets
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+import jsonschema
 
 from .security import contain_path, scrub
 
 EVIDENCE_VERSION = "tdd-evidence/1"
+COLLECTION_VERSION = "test-collection/1"
+ATTESTATION_KINDS = ("coordinator_recorded_review", "human_authorization")
 
 CLASSIFICATIONS: tuple[str, ...] = (
     "behavioral_failure",
@@ -71,6 +76,8 @@ FAILURE_CODES: tuple[str, ...] = (
 )
 
 _PHASES = ("red", "green", "refactor", "integration", "review")
+_EVIDENCE_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "evidence.schema.json"
+_MAX_COLLECTION_BYTES = 4_000_000
 _ROLES = ("verifier", "worker", "reviewer", "human")
 _CRITERIA_STATUS = ("passed", "failed", "not_run", "review_required")
 _CONTRACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -478,6 +485,22 @@ def _criteria(
     return statuses
 
 
+@lru_cache(maxsize=1)
+def load_evidence_schema() -> dict[str, Any]:
+    """Load the bundled draft 2020-12 record schema once."""
+    return json.loads(_EVIDENCE_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _jsonschema_record_problem(record: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the first draft 2020-12 schema violation for *record*."""
+    errors = list(jsonschema.Draft202012Validator(load_evidence_schema()).iter_errors(dict(record)))
+    if not errors:
+        return None
+    error = min(errors, key=lambda item: (len(item.absolute_path), [str(part) for part in item.absolute_path]))
+    field = ".".join(str(part) for part in error.absolute_path) or "record"
+    return field, f"{field} {error.message}"
+
+
 def _validate_record(record: Mapping[str, Any]) -> None:
     def bad(error: str) -> TddError:
         return TddError("evidence_invalid", error, "Build the record with make_record().")
@@ -517,10 +540,11 @@ def _validate_record(record: Mapping[str, Any]) -> None:
         not isinstance(exit_code, int) or isinstance(exit_code, bool)
     ):
         raise bad("result.exit_code must be an integer or null")
-    review_failed = (
-        record.get("phase") == "review" and record.get("classification") == "failed"
+    failed_phase = (
+        record.get("classification") == "failed"
+        and record.get("phase") in ("review", "integration")
     )
-    if record.get("classification") not in CLASSIFICATIONS and not review_failed:
+    if record.get("classification") not in CLASSIFICATIONS and not failed_phase:
         raise bad("classification is not a tdd-evidence/1 value")
     criteria = record.get("criteria")
     if not isinstance(criteria, Mapping):
@@ -531,10 +555,26 @@ def _validate_record(record: Mapping[str, Any]) -> None:
     produced_by = record.get("produced_by")
     if not isinstance(produced_by, Mapping) or produced_by.get("role") not in _ROLES:
         raise bad("produced_by.role is not verifier, worker, reviewer, or human")
+    attestation = record.get("attestation")
+    if attestation is not None:
+        if not isinstance(attestation, Mapping) or attestation.get("kind") not in ATTESTATION_KINDS:
+            raise bad("attestation.kind is not coordinator_recorded_review or human_authorization")
+        if record.get("phase") != "review":
+            raise bad("attestation is only valid on review records")
+        if attestation.get("kind") == "coordinator_recorded_review" and attestation.get("identity_verified") is not False:
+            raise bad("a coordinator-recorded review must say identity_verified: false")
+    if record.get("phase") == "review":
+        name = produced_by.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise bad("a review record needs a non-empty reviewer name")
     if not isinstance(record.get("test_first"), bool):
         raise bad("test_first must be a boolean")
     if not isinstance(record.get("at"), str) or not record.get("at"):
         raise bad("at must be a non-empty timestamp")
+    problem = _jsonschema_record_problem(record)
+    if problem is not None:
+        _field, error = problem
+        raise bad(error)
 
 
 def make_record(
@@ -552,6 +592,7 @@ def make_record(
     notes: str | None = None,
     now: str | None = None,
     review_outcome: str | None = None,
+    attestation: Mapping[str, Any] | None = None,
 ) -> dict:
     """Build one signed-ready ``tdd-evidence/1`` record for a contract phase."""
     if review_outcome is not None:
@@ -608,8 +649,32 @@ def make_record(
         record["environment"] = dict(environment)
     if notes is not None:
         record["notes"] = str(notes)
+    if attestation is not None:
+        record["attestation"] = dict(attestation)
     _validate_record(record)
     return record
+
+
+def coordinator_review_attestation(reviewer: str, claimed_kind: str) -> dict[str, Any]:
+    """Labels for a coordinator-recorded review; identity is never verified here."""
+    return {
+        "kind": "coordinator_recorded_review",
+        "recorded_by": "coordinator",
+        "reviewer_label": str(reviewer),
+        "claimed_reviewer_kind": "human" if claimed_kind == "human" else "reviewer",
+        "identity_verified": False,
+    }
+
+
+def review_identity(record: Mapping[str, Any]) -> str:
+    """How much a REVIEW record says about who reviewed (never more than it proves)."""
+    attestation = record.get("attestation") if isinstance(record.get("attestation"), Mapping) else None
+    if attestation is not None and attestation.get("kind") == "human_authorization":
+        return "unverified_human_authorization"
+    role = (record.get("produced_by") or {}).get("role")
+    if attestation is None and role == "human":
+        return "coordinator_recorded (legacy human label)"
+    return "coordinator_recorded"
 
 
 # ---------------------------------------------------------------------------
@@ -690,8 +755,22 @@ def _report_failure(contract_id: str, exc: BaseException) -> TddError:
     )
 
 
+def _require_review_note(record: Mapping[str, Any]) -> None:
+    if record.get("phase") != "review":
+        return
+    notes = record.get("notes")
+    if not isinstance(notes, str) or not notes.strip():
+        raise TddError(
+            "evidence_invalid",
+            "a review record needs a non-empty note",
+            "Record the review with --note TEXT explaining the verdict.",
+        )
+
+
 def write_record(state_dir: os.PathLike[str] | str, record: Mapping[str, Any], key: bytes) -> Path:
     """Append one signed record under ``evidence/<contract_id>/NNNN-phase.json``."""
+    _validate_record(record)
+    _require_review_note(record)
     contract_id = str(record.get("contract_id") or "")
     _check_id(contract_id)
     phase = str(record.get("phase") or "")
@@ -743,6 +822,11 @@ def load_records(state_dir: os.PathLike[str] | str, contract_id: str, key: bytes
             raise TddError("evidence_tampered", f"evidence record is unreadable: {path.name}") from exc
         if not isinstance(data, dict) or not verify_signature(data, key):
             raise TddError("evidence_tampered", f"evidence record signature is invalid: {path.name}")
+        try:
+            _validate_record(data)
+            _require_review_note(data)
+        except TddError as exc:
+            raise TddError("evidence_tampered", f"evidence record is invalid: {path.name}: {exc.error}") from exc
         record = dict(data)
         record["_path"] = f"evidence/{contract_id}/{path.name}"
         loaded.append(record)
@@ -792,6 +876,103 @@ def write_report(state_dir: os.PathLike[str] | str, signed: Mapping[str, Any]) -
             pass
         raise _report_failure(contract_id, exc) from exc
     return target
+
+
+# ---------------------------------------------------------------------------
+# Collected-test manifests
+# ---------------------------------------------------------------------------
+
+
+def resolve_test_ref(ref: str, ids: Iterable[str]) -> list[str]:
+    """Collected ids a reference names: exact, parametrized, or class children.
+
+    A bare file reference never resolves because it is too broad to prove one
+    acceptance criterion.
+    """
+    text = str(ref)
+    if "::" not in text:
+        return []
+    return sorted(
+        item
+        for item in (str(value) for value in ids)
+        if item == text or item.startswith(text + "[") or item.startswith(text + "::")
+    )
+
+
+def collection_digest(manifest: Mapping[str, Any]) -> str:
+    """SHA-256 of the whole signed manifest (signature included)."""
+    return hashlib.sha256(
+        _canonical({key: value for key, value in manifest.items() if not str(key).startswith("_")})
+    ).hexdigest()
+
+
+def collection_path(state_dir: os.PathLike[str] | str, contract_id: str, contract_sha256: str) -> Path:
+    """Return the manifest path for exactly one contract hash."""
+    _check_id(contract_id)
+    if not _SHA256_RE.match(str(contract_sha256)):
+        raise TddError("tests_not_collected", "contract_sha256 must be 64 lower-case hex characters")
+    return Path(state_dir) / "collections" / str(contract_id) / f"{contract_sha256}.json"
+
+
+def write_collection(
+    state_dir: os.PathLike[str] | str,
+    manifest: Mapping[str, Any],
+    key: bytes,
+) -> tuple[Path, str]:
+    """Sign and store a collected-test manifest; return its path and digest."""
+    contract_id = str(manifest.get("contract_id") or "")
+    contract_sha256 = str(manifest.get("contract_sha256") or "")
+    path = collection_path(state_dir, contract_id, contract_sha256)
+    for directory in (path.parent.parent, path.parent):
+        _private_dir(directory)
+    signed = sign_record(manifest, key)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(tmp, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(signed, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise TddError("tests_not_collected", f"could not store the collected-test manifest: {exc.strerror or exc}") from exc
+    return path, collection_digest(signed)
+
+
+def load_collection(
+    state_dir: os.PathLike[str] | str,
+    contract_id: str,
+    contract_sha256: str,
+    key: bytes,
+) -> dict[str, Any]:
+    """Load and verify exactly one signed collected-test manifest."""
+    path = collection_path(state_dir, contract_id, contract_sha256)
+    if path.is_symlink() or not path.is_file():
+        raise TddError("tests_not_collected", "no collected-test manifest for this contract hash",
+                       "Run `contract freeze --workdir <repo>` so the approved tests are collected.")
+    try:
+        if path.stat().st_size > _MAX_COLLECTION_BYTES:
+            raise TddError("tests_not_collected", "collected-test manifest is too large")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except TddError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise TddError("tests_not_collected", "collected-test manifest is unreadable") from exc
+    if not isinstance(data, dict) or not verify_signature(data, key):
+        raise TddError("evidence_tampered", "collected-test manifest signature is invalid")
+    if (
+        data.get("collection_version") != COLLECTION_VERSION
+        or data.get("contract_id") != contract_id
+        or data.get("contract_sha256") != contract_sha256
+        or not _REV_RE.match(str(data.get("source_rev") or ""))
+    ):
+        raise TddError("tests_not_collected", "collected-test manifest is for a different contract or revision")
+    return dict(data)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1192,16 @@ def _criteria_report(
 ) -> dict[str, dict[str, Any]]:
     sources = [latest.get(phase) for phase in ("integration", "refactor", "green")]
     review = latest.get("review")
+    review_required = "review" in [str(phase) for phase in contract.get("evidence_required") or []]
+    attestation = review.get("attestation") if isinstance(review, Mapping) and isinstance(review.get("attestation"), Mapping) else {}
+    human_review = (
+        review is not None
+        and review.get("classification") == "passed"
+        and (
+            (review.get("produced_by") or {}).get("role") == "human"
+            or attestation.get("claimed_reviewer_kind") == "human"
+        )
+    )
     report: dict[str, dict[str, Any]] = {}
     for criterion in contract.get("acceptance_criteria") or []:
         if not isinstance(criterion, Mapping):
@@ -1031,9 +1222,8 @@ def _criteria_report(
         if (
             criterion.get("verification") == "review"
             and status == "review_required"
-            and review is not None
-            and (review.get("produced_by") or {}).get("role") == "human"
-            and review.get("classification") == "passed"
+            and review_required
+            and human_review
         ):
             status = "passed"
             evidence = review.get("_path")
@@ -1082,6 +1272,7 @@ def acceptance_report(
     criteria = _criteria_report(contract, latest)
     phases_ok = all(status == "valid" for status in phases.values())
     criteria_ok = all(item["status"] == "passed" for item in criteria.values())
+    review = latest.get("review")
     return {
         "contract_id": str(contract.get("id") or ""),
         "contract_sha256": str(contract_sha256),
@@ -1089,5 +1280,11 @@ def acceptance_report(
         "test_first": _test_first(contract, contract_sha256, records),
         "phases": phases,
         "criteria": criteria,
+        "review_identity": review_identity(review) if review is not None else None,
+        "human_authorization": {
+            "status": "not_recorded",
+            "note": "bundlebees records reviews but does not authenticate human identity; "
+                    "the contract's human_gates stay with a human, outside bundlebees",
+        },
         "accepted": bool(phases_ok and criteria_ok),
     }

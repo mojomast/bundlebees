@@ -32,6 +32,7 @@ def _review_record(contract, **overrides):
         "result": None,
         "produced_by": {"role": "reviewer", "name": "kyle"},
         "test_first": True,
+        "notes": "reviewed the diff",
         "review_outcome": "passed",
     }
     values.update(overrides)
@@ -96,3 +97,17 @@ def test_worker_produced_review_is_never_accepted(tmp_path, capsys):
     report = _report(state, path, capsys)
     assert report["phases"]["review"] == "review_failed"
     assert report["accepted"] is False
+
+
+def test_a_review_record_needs_a_reviewer_name_and_a_stored_note(tmp_path):
+    contract = _frozen(BASE)
+    values = dict(
+        phase="review", revision=IMPL, test_fingerprints=dict(FP), command=["review"],
+        result=None, produced_by={"role": "reviewer", "name": "kyle"},
+        test_first=True, review_outcome="passed",
+    )
+    with pytest.raises(tdd.TddError):
+        tdd.make_record(contract, SHA, notes="reviewed", **dict(values, produced_by={"role": "reviewer"}))
+    note_less = tdd.make_record(contract, SHA, **values)
+    with pytest.raises(tdd.TddError):
+        tdd.write_record(tmp_path, note_less, leases.evidence_key(tmp_path))

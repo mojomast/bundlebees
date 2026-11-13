@@ -87,6 +87,7 @@ def _record(tdd, phase, cases, *, revision=IMPL, exit_code=None, fp=None, role="
         test_fingerprints=dict(FP if fp is None else fp), command=["python", "-m", "pytest"],
         result=_result(cases, exit_code), produced_by={"role": role, "name": "test"},
         test_first=test_first, now="2026-11-12T18:00:00Z",
+        notes="reviewed" if phase == "review" else None,
     )
 
 
@@ -355,9 +356,11 @@ def test_acceptance_report(tdd, tmp_path):
     review = _record(tdd, "review", GREEN_CASES, role="reviewer")
     rep2 = tdd.acceptance_report(c2, CSHA, records + [review])
     assert rep2["phases"]["review"] == "valid"
-    # X2: a reviewer-role record does not satisfy a review criterion; only a human review does
+    # A reviewer-role record does not satisfy a review criterion by itself.
     assert rep2["criteria"]["AC-004"]["status"] == "review_required"
     assert rep2["accepted"] is False
+    assert rep2["review_identity"] == "coordinator_recorded"
+    assert rep2["human_authorization"]["status"] == "not_recorded"
 
 
 def test_tests_after_code_is_reported_honestly(tdd):

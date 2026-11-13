@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+import jsonschema
+
 from .security import scrub
 
 __all__ = [
@@ -129,6 +131,16 @@ def _invalid(error: str, field: str | None = None, fix: str = _FIX_CODE) -> Cont
 def load_schema() -> dict[str, Any]:
     """Load the bundled draft 2020-12 ``acdd/1`` contract schema."""
     return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _jsonschema_problem(document: Any, schema: Mapping[str, Any], name: str) -> tuple[str, str] | None:
+    """Return the first standard draft 2020-12 violation as ``(field, message)``."""
+    errors = list(jsonschema.Draft202012Validator(dict(schema)).iter_errors(document))
+    if not errors:
+        return None
+    error = min(errors, key=lambda item: (len(item.absolute_path), [str(part) for part in item.absolute_path]))
+    field = ".".join(str(part) for part in error.absolute_path) or name
+    return field, f"{field} {error.message}"
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +517,10 @@ def _schema_checked(contract: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(contract, Mapping)
         else copy.deepcopy(contract)
     )
-    problem = _schema_problem(candidate, load_schema(), "contract")
+    schema = load_schema()
+    problem = _jsonschema_problem(candidate, schema, "contract")
+    if problem is None:
+        problem = _schema_problem(candidate, schema, "contract")
     if problem:
         field, message = problem
         raise _invalid(message, field, _FIX_SCHEMA)
@@ -552,8 +567,14 @@ def freeze_contract(
     *,
     approved_by: str,
     approved_at: str | None = None,
+    test_collection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate *contract* and return a copy approved and bound to its hash."""
+    """Validate *contract* and return a copy approved and bound to its hash.
+
+    *test_collection* binds the frozen contract to the signed collected-test
+    manifest by digest. The review block is excluded from the contract hash, so
+    the manifest and the contract can name each other.
+    """
     if not isinstance(approved_by, str) or not approved_by.strip():
         raise _invalid(
             "approved_by must be a non-empty string",
@@ -574,6 +595,8 @@ def freeze_contract(
         "approved_at": timestamp,
         "contract_sha256": contract_sha256(frozen),
     }
+    if test_collection is not None:
+        frozen["review"]["test_collection"] = dict(test_collection)
     return frozen
 
 

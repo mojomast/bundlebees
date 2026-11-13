@@ -16,10 +16,12 @@ the coordinator's lease key and is never produced by the worker.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +33,30 @@ from .security import child_env, scrub
 
 LEGACY_NOTE = "no ACDD contract; TDD evidence not required"
 _MAX_CONTRACT_BYTES = 1024 * 1024
+_MAX_COLLECTED_IDS = 20_000
+_MAX_ID_CHARS = 1024
+_COLLECT_FILE = "collected.json"
 _HEX = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$|^[0-9a-f]{64}$")
+_COLLECTOR = r"""
+import json, re, sys
+import pytest
+out_path, targets = sys.argv[1], sys.argv[2:]
+ids, errors = [], []
+pat = re.compile(r"^E\s+([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b", re.M)
+class Collector:
+    def pytest_collectreport(self, report):
+        if report.failed:
+            text = str(report.longrepr or "")
+            match = pat.search(text)
+            errors.append({"nodeid": report.nodeid, "error_type": match.group(1).rsplit(".", 1)[-1] if match else None})
+    def pytest_collection_finish(self, session):
+        ids.extend(item.nodeid for item in session.items)
+code = pytest.main(["-p", "no:cacheprovider", "-q", "--collect-only",
+                    "--continue-on-collection-errors", *targets], plugins=[Collector()])
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump({"exit_code": int(code), "ids": ids, "errors": errors}, handle)
+sys.exit(0)
+"""
 
 
 def _cli():
@@ -114,6 +139,155 @@ def _latest(records: list[dict], phase: str, sha: str) -> dict | None:
     return found[-1] if found else None
 
 
+def _collection_requirements(contract: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Map test criteria to their references; empty when TDD does not apply."""
+    block = contract.get("tdd") if isinstance(contract.get("tdd"), Mapping) else {}
+    if block.get("applicable") is not True:
+        return {}
+    out: dict[str, list[str]] = {}
+    for index, criterion in enumerate(contract.get("acceptance_criteria") or []):
+        if not isinstance(criterion, Mapping) or criterion.get("verification") != "test":
+            continue
+        refs = [str(item) for item in criterion.get("tests") or [] if isinstance(item, str)]
+        if refs:
+            out[str(criterion.get("id") or f"#{index}")] = refs
+    return out
+
+
+def _needs_collection(contract: Mapping[str, Any]) -> bool:
+    return any(_collection_requirements(contract).values())
+
+
+def _bounded_ids(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        raise _error("tests_uncollectable", "the test collector returned no id list",
+                     "Check that pytest is installed in the sandbox and retry.")
+    if len(values) > _MAX_COLLECTED_IDS:
+        raise _error("tests_uncollectable", f"the test collector returned more than {_MAX_COLLECTED_IDS} ids",
+                     "Narrow scope.test_files to the approved tests for this contract.")
+    out: list[str] = []
+    for value in values:
+        if (not isinstance(value, str) or not value or len(value) > _MAX_ID_CHARS
+                or any(ord(char) < 32 for char in value)):
+            raise _error("tests_uncollectable", "the test collector returned a malformed test id",
+                         "Rename the test so its id is plain text, then freeze again.")
+        out.append(value)
+    return out
+
+
+def _static_ids(path: str, source: str) -> list[str]:
+    """Test ids read from a file's syntax tree, without importing it."""
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as exc:
+        raise _error("tests_uncollectable",
+                     f"approved test file {path} has a syntax error: {scrub(exc.msg)} (line {exc.lineno})",
+                     "Fix the approved test file and freeze again.") from exc
+    ids: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            ids.append(f"{path}::{node.name}")
+        elif isinstance(node, ast.ClassDef):
+            bases = [getattr(base, "attr", getattr(base, "id", "")) for base in node.bases]
+            if node.name.startswith("Test") or any(str(name).endswith("TestCase") for name in bases):
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
+                        ids.append(f"{path}::{node.name}::{item.name}")
+    return ids
+
+
+def _collect_argv(test_files: list[str]) -> list[str]:
+    return [sys.executable, "-B", "-c", _COLLECTOR, "{evidence}/" + _COLLECT_FILE, *test_files]
+
+
+def _collect_manifest(ctx: Any, contract: Mapping[str, Any], sha: str, workdir: Path) -> dict[str, Any]:
+    """Collect the approved tests at ``source_rev`` in the sandbox (bounded)."""
+    from . import sandbox
+
+    cli = _cli()
+    options = cli._sandbox_options(cli._config(ctx))
+    options["timeout"] = min(int(options.get("timeout") or 300), 300)
+    tests = _test_files(contract)
+    with tempfile.TemporaryDirectory(prefix="bundlebees-collect-") as tmp:
+        repo = _checkout(workdir, str(contract["source_rev"]), Path(tmp))
+        try:
+            fingerprints = tdd.fingerprint_files(repo, tests)
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        try:
+            evidence = sandbox.run_in_sandbox(
+                repo, _collect_argv(tests), collect_file=_COLLECT_FILE, **options
+            )
+        except sandbox.SandboxUnavailable as exc:
+            raise _error(exc.code, exc.error, exc.fix) from exc
+        except ValueError as exc:
+            raise _error("invalid_argument", f"unknown verify_isolation backend: {exc}",
+                         "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).") from exc
+
+        if evidence.get("timed_out"):
+            raise _error("tests_uncollectable", "test collection timed out in the sandbox",
+                         "Make the approved tests importable quickly, or raise verify_timeout_s.")
+        collected = evidence.get("collected")
+        if not isinstance(collected, Mapping):
+            raise _error(
+                "tests_uncollectable",
+                f"test collection produced no manifest (exit {evidence.get('exit_code')}): "
+                f"{str(evidence.get('output_tail') or '')[-300:]}",
+                "Run pytest --collect-only on the approved tests at source_rev and fix the error.",
+            )
+        ids = _bounded_ids(collected.get("ids"))
+        methods = {path: "pytest" for path in tests}
+        errors = collected.get("errors") if isinstance(collected.get("errors"), list) else []
+        importable_errors = ("ImportError", "ModuleNotFoundError", "AttributeError", "NameError")
+        for item in errors:
+            if not isinstance(item, Mapping):
+                continue
+            nodeid = str(item.get("nodeid") or "")
+            error_type = str(item.get("error_type") or "")
+            path = nodeid.split("::", 1)[0]
+            if path not in methods:
+                raise _error("tests_uncollectable",
+                             f"collection failed outside the approved tests: {nodeid or 'session'}",
+                             "Fix conftest or package imports so the approved tests can be collected.")
+            if error_type not in importable_errors:
+                raise _error("tests_uncollectable",
+                             f"approved test file {path} failed to collect ({error_type or 'unknown error'})",
+                             "Only a missing interface (an import-type error) is allowed at source_rev; fix the test file.")
+            try:
+                source = (repo / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise _error("tests_uncollectable", f"approved test file {path} is unreadable",
+                             "Commit the approved test file at source_rev.") from exc
+            ids.extend(_static_ids(path, source))
+            methods[path] = "static"
+        ids = sorted(set(_bounded_ids(ids)))
+
+    resolved: dict[str, dict[str, list[str]]] = {}
+    for criterion_id, refs in _collection_requirements(contract).items():
+        resolved[criterion_id] = {}
+        for ref in refs:
+            matches = tdd.resolve_test_ref(ref, ids)
+            if not matches:
+                why = ("names a whole file; name exact test ids (path::Class::test)" if "::" not in ref
+                       else "matches no collected test id")
+                raise _error("test_unresolved", f"{criterion_id} test {ref!r} {why}",
+                             "Fix the reference to an exact collected id, or commit the missing approved test, then freeze again.")
+            resolved[criterion_id][ref] = matches
+    return {
+        "collection_version": tdd.COLLECTION_VERSION,
+        "contract_id": str(contract.get("id") or ""),
+        "contract_sha256": str(sha),
+        "source_rev": str(contract.get("source_rev") or ""),
+        "test_fingerprints": {str(path): str(digest) for path, digest in fingerprints.items()},
+        "methods": methods,
+        "collected_ids": ids,
+        "resolved": resolved,
+        "environment": {"isolation": str(evidence.get("backend") or "unknown"),
+                        "runner": "pytest --collect-only (bundlebees sandbox)"},
+        "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -126,6 +300,9 @@ def add_parsers(subparsers: Any) -> None:
     freeze.add_argument("path", help="Contract JSON file.")
     freeze.add_argument("--approved-by", required=True, help="Who approved the contract.")
     freeze.add_argument("--out", default=None, help="Where to write the frozen contract (default: overwrite path).")
+    freeze.add_argument("--workdir", default=None,
+                        help="Git repository with source_rev; its approved tests are collected in the sandbox first.")
+    freeze.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     contract_cmd.set_defaults(command="contract")
 
     tdd_cmd = subparsers.add_parser("tdd", help="Record RED evidence or print the acceptance report.")
@@ -182,7 +359,34 @@ def cmd_contract(ctx: Any, args: Any) -> int:
     if sub == "freeze":
         approved_by = str(getattr(args, "approved_by", "") or "")
         try:
-            frozen = acdd.freeze_contract(data, approved_by=approved_by)
+            validated = acdd.validate_contract(data)
+        except acdd.ContractError as exc:
+            raise _as_error(exc) from exc
+        test_collection = None
+        manifest = None
+        if _needs_collection(validated):
+            workdir_value = getattr(args, "workdir", None) or _cli()._config(ctx).get("worktree")
+            if not workdir_value:
+                raise _error("collection_required",
+                             "this contract names tests; they must be collected at source_rev before freezing",
+                             "Pass --workdir with the repository that contains source_rev.")
+            sha = acdd.contract_sha256(validated)
+            state_dir = _cli()._state_dir(ctx, args)
+            manifest = _collect_manifest(ctx, validated, sha, Path(str(workdir_value)).expanduser().resolve())
+            try:
+                _path, digest = tdd.write_collection(state_dir, manifest, leases.evidence_key(state_dir))
+            except tdd.TddError as exc:
+                raise _as_error(exc) from exc
+            except OSError as exc:
+                raise _error("tests_not_collected", f"could not store the collected-test manifest: {exc}",
+                             "Check the plugin state directory.") from exc
+            test_collection = {
+                "manifest_sha256": digest,
+                "source_rev": str(validated["source_rev"]),
+                "collected": len(manifest["collected_ids"]),
+            }
+        try:
+            frozen = acdd.freeze_contract(data, approved_by=approved_by, test_collection=test_collection)
         except acdd.ContractError as exc:
             raise _as_error(exc) from exc
         target = Path(str(getattr(args, "out", None) or getattr(args, "path"))).expanduser()
@@ -203,6 +407,11 @@ def cmd_contract(ctx: Any, args: Any) -> int:
         print("bundlebees contract freeze")
         print(f"contract: {scrub(str(frozen.get('id')))} approved")
         _print_hex("contract_sha256", frozen["review"]["contract_sha256"])
+        if manifest is not None:
+            static = sorted(path for path, how in manifest["methods"].items() if how == "static")
+            print(f"tests collected: {len(manifest['collected_ids'])} ids at source_rev, every AC reference resolved")
+            if static:
+                print("read statically (import-type collection error at source_rev): " + scrub(", ".join(static)))
         print(f"written: {scrub(str(target))}")
         return 0
     raise _error("invalid_argument", "unknown contract command", "Use: contract validate|freeze.")
@@ -377,12 +586,16 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
             raise _as_error(exc) from exc
 
     target = refactor or green
+    # C6: this is a review the coordinator *recorded*. The HMAC proves the
+    # coordinator wrote it, not who the reviewer is, so the record never
+    # carries role "human"; the reviewer and claimed kind are unverified labels.
     record = tdd.make_record(
         contract, sha, phase="review", revision=str(target["revision"]),
         test_fingerprints=target["test_fingerprints"], command=["review"],
-        result=None, produced_by={"role": role, "name": scrub(reviewer)},
+        result=None, produced_by={"role": "reviewer", "name": "bundlebees tdd review (coordinator-recorded)"},
         test_first=green["test_first"], notes=scrub(note),
         review_outcome="passed" if approve else "failed",
+        attestation=tdd.coordinator_review_attestation(scrub(reviewer), role),
     )
     try:
         tdd.write_record(state_dir, record, key)
@@ -394,7 +607,7 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
     print("bundlebees tdd review")
     print(f"contract: {scrub(str(contract['id']))}")
     _print_hex("revision", str(target["revision"]))
-    print("review: valid")
+    print("review: valid (coordinator-recorded; reviewer identity not authenticated)")
     return 0
 
 
@@ -431,6 +644,9 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
             for cid, item in report["criteria"].items():
                 print(f"{cid}: {'not run' if item['status'] in ('unrun', 'not_run') else item['status']}")
             print(f"test-first: {'yes' if report['test_first'] else 'no'}")
+            if report.get("review_identity"):
+                print(f"review identity: {report['review_identity']}")
+            print(f"human authorization: {report['human_authorization']['status']}")
             print(f"accepted: {'yes' if report['accepted'] else 'no'}")
             print(f"report: reports/{contract['id']}.json")
         return 0 if report["accepted"] else 1
@@ -448,13 +664,24 @@ def cmd_tdd(ctx: Any, args: Any) -> int:
         raise _error("invalid_argument", "no workdir", "Pass --workdir with the repository that contains source_rev.")
     workdir = Path(str(workdir_value)).expanduser().resolve()
     tests = _test_files(contract)
-    with tempfile.TemporaryDirectory(prefix="bundlebees-red-") as tmp:
-        repo = _checkout(workdir, str(contract["source_rev"]), Path(tmp))
-        evidence = cli._run_sandboxed(repo, list(tests), cli._config(ctx))
+    manifest = None
+    review_block = contract.get("review") if isinstance(contract.get("review"), Mapping) else {}
+    if isinstance(review_block.get("test_collection"), Mapping):
         try:
-            fingerprints = tdd.fingerprint_files(repo, tests)
+            manifest = tdd.load_collection(state_dir, str(contract["id"]), sha, key)
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
+    with tempfile.TemporaryDirectory(prefix="bundlebees-red-") as tmp:
+        repo = _checkout(workdir, str(contract["source_rev"]), Path(tmp))
+        try:
+            fingerprints = tdd.fingerprint_files(repo, tests)
+            if manifest is not None and dict(manifest.get("test_fingerprints") or {}) != fingerprints:
+                raise _error("tests_tampered",
+                             "approved test files differ from the ones collected at freeze",
+                             "Re-freeze the contract so the new tests are collected and approved.")
+        except tdd.TddError as exc:
+            raise _as_error(exc) from exc
+        evidence = cli._run_sandboxed(repo, list(tests), cli._config(ctx))
     collected = {str(c.get("id")) for c in evidence.get("cases") or [] if isinstance(c, Mapping)}
     unknown = sorted({
         str(ref) for ac in contract.get("acceptance_criteria") or [] if isinstance(ac, Mapping)
