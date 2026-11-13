@@ -157,6 +157,47 @@ def _without_seal(body: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if k != "seal"}
 
 
+def _create_only(path: Path, payload: bytes, mode: int = 0o400) -> bool:
+    """Publish a document only if it does not exist yet.
+
+    The bytes are written in full to a private temporary file and then linked
+    into place, which fails atomically when the target exists. Two concurrent
+    writers therefore cannot both believe they created the document, and a
+    crash mid-write can never leave a half-written document where a reader
+    would take it for authority.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        except OSError:
+            # Filesystems without hard links: exclusive create is still atomic.
+            try:
+                direct = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            except FileExistsError:
+                return False
+            with os.fdopen(direct, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return True
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _seal(body: Mapping[str, Any], key: bytes) -> dict[str, Any]:
     document = dict(body)
     return {"body": document, "mac": _sign(document, key)}
@@ -259,13 +300,6 @@ def record_authorization(
         raise JobError("authorization_incomplete", "the wall-clock budget must be at least 60 s", _FIX_AUTH)
 
     path = authorization_path(state_dir, job_id)
-    if path.exists():
-        raise JobError(
-            "authorization_exists",
-            "an authorization already exists for this job id",
-            "Authorize a new job id; recorded authorizations are immutable.",
-        )
-
     key = _ensure_key(state_dir)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
@@ -281,7 +315,12 @@ def record_authorization(
         "by": by or _current_user(),
         "at": _utc_now(),
     }
-    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
+    if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        raise JobError(
+            "authorization_exists",
+            "an authorization already exists for this job id",
+            "Authorize a new job id; recorded authorizations are immutable.",
+        )
     return body
 
 
@@ -299,6 +338,30 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
     return _unseal(authorization_path(state_dir, job_id), key, "authorization")
 
 
+def _load_enrolled_policy(state_dir: Path, policy_id: str) -> tuple[dict[str, Any], str]:
+    """Load and verify the human-enrolled policy that is the root of this authority.
+
+    Imported lazily because the handoff module depends on this one at import time.
+    The policy is verified with the enrollment (approval) key, never with the
+    coordinator's job key, so a job-sealing key cannot mint authority here.
+    """
+
+    from . import handoff  # noqa: PLC0415 - breaks the import cycle by design
+
+    policy = handoff.load_policy(Path(state_dir), str(policy_id))
+    return policy, handoff.policy_digest(policy)
+
+
+_DERIVED_IDENTITY = (
+    "kind", "job_id", "statement", "repo", "base_rev", "scope", "budget", "gates",
+    "policy", "derived_from", "dependency_evidence", "descendant",
+)
+
+
+def _derived_identity(body: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: body.get(key) for key in _DERIVED_IDENTITY}
+
+
 def record_derived_authorization(
     state_dir: Path,
     *,
@@ -310,61 +373,129 @@ def record_derived_authorization(
     scope: Sequence[str],
     bees: int,
     wall_clock_s: int,
-    dependencies: Sequence[str],
-    root_rev: str,
-    policy_scope: Sequence[str] | None = None,
+    policy_id: str,
+    dependency_feature: str = "",
+    dependent_feature: str = "",
+    dependency_evidence: Mapping[str, Any] | None = None,
     gates: Sequence[str] = ("merge",),
     by: str = "coordinator(derived)",
 ) -> dict[str, Any]:
     """Seal a narrow, derived authority for one dependent job.
 
     This does not create authority: it records that an already-approved descendant
-    policy was resolved to a concrete commit by validated evidence. The parent
-    authorization's identity and its dependency's accepted commit are sealed in.
+    policy was resolved to a concrete commit by validated evidence. The ceiling is
+    the *sealed, enrolled* policy read back from disk — never a caller-supplied
+    scope — and every dimension (repository, dependency, scope, budget, gates,
+    dependency evidence, resolved revision) is compared against it.
     """
 
+    policy, policy_digest = _load_enrolled_policy(state_dir, policy_id)
     parent = load_authorization(state_dir, parent_job_id)
+
+    dependency_jobs = [str(item) for item in policy.get("dependencies") or []]
+    dependency_features = [str(item) for item in policy.get("dependency_features") or []]
+    if len(dependency_jobs) != 1 or len(dependency_features) != 1:
+        raise JobError("policy_ambiguous", f"policy {policy.get('policy_id')} does not name exactly one dependency",
+                       "Enroll one bounded policy per dependent job.")
+    if str(parent_job_id) != dependency_jobs[0]:
+        raise JobError("derived_dependency_mismatch",
+                       f"policy {policy.get('policy_id')} is not bound to dependency job {parent_job_id!r}",
+                       "Enroll the policy against this dependency.")
+    feature = str(dependency_feature or dependency_features[0])
+    if feature != dependency_features[0]:
+        raise JobError("derived_dependency_mismatch", f"{feature!r} is not the policy's dependency feature",
+                       "Name the feature the policy was enrolled for.")
+    if str(repo) != str(policy.get("repo") or ""):
+        raise JobError("derived_repo_mismatch", f"{repo!r} is not the policy's repository",
+                       "A derived authority may not change repository.")
+    dependent = str(dependent_feature or policy.get("dependent_feature") or "")
+    if dependent and dependent != str(policy.get("dependent_feature") or ""):
+        raise JobError("derived_feature_mismatch", f"{dependent!r} is not the policy's dependent feature",
+                       "Enroll a policy bound to this feature.")
+    if str(policy.get("dependent_job") or "") != _job_id(job_id):
+        raise JobError("derived_job_mismatch", f"policy is bound to dependent job {policy.get('dependent_job')!r}",
+                       "Enroll a policy bound to this job id.")
+
+    revision = str(candidate_rev or "").strip().lower()
+    if not _is_sha(revision):
+        raise JobError("derived_revision_invalid", "the derived source revision must be a full 40-hex commit",
+                       "Resolve the dependency's accepted commit first.")
+    from . import descendants  # noqa: PLC0415 - descendants imports this module at import time
+
+    try:
+        accepted = descendants.accepted_commit(Path(state_dir), str(parent_job_id))
+    except descendants.DescendantError as exc:
+        raise JobError(exc.code, exc.message, exc.fix) from exc
+    if accepted != revision:
+        raise JobError("derived_revision_mismatch",
+                       f"{revision} is not dependency {parent_job_id}'s accepted commit {accepted}",
+                       "Use the exact accepted integration commit, or ask the human for a new policy.")
+
     scope_globs = _normalize_scope(scope)
     if not scope_globs:
         raise JobError("derived_scope_missing", "a derived authorization needs a file scope", _FIX_SCOPE)
-    # The enclosing grant is the human-approved descendant policy's scope, which
-    # the parent job itself only partially used. Without one, the parent scope is
-    # the ceiling.
-    ceiling = _normalize_scope(policy_scope) if policy_scope else _normalize_scope(parent.get("scope") or [])
+    ceiling = _normalize_scope(policy.get("scope") or [])
     outside = [p for p in scope_globs if not _covered(p, ceiling)]
     if outside:
-        raise JobError("derived_scope_widened", f"outside the approved scope: {', '.join(outside)}",
-                       "A derived authority may only narrow the original approval.")
+        raise JobError("derived_scope_widened", f"outside the enrolled policy scope: {', '.join(outside)}",
+                       "A derived authority may only narrow the enrolled policy.")
+
+    budget = policy.get("budget") or {}
+    if int(bees) < 1 or int(bees) > int(budget.get("bees") or 0):
+        raise JobError("derived_budget_exceeded", f"bees={bees} exceeds the enrolled policy budget",
+                       "Stay inside the enrolled envelope.")
+    if int(wall_clock_s) < 1 or int(wall_clock_s) > int(budget.get("wall_clock_s") or 0):
+        raise JobError("derived_budget_exceeded", f"wall_clock_s={wall_clock_s} exceeds the enrolled policy budget",
+                       "Stay inside the enrolled envelope.")
+
+    policy_gates = sorted({_slug(gate) for gate in policy.get("gates") or []}) or ["merge"]
+    wanted_gates = sorted({_slug(gate) for gate in gates}) or ["merge"]
+    if not set(wanted_gates).issubset(policy_gates):
+        raise JobError("derived_gate_widened", f"gates {wanted_gates} are not all enrolled in the policy {policy_gates}",
+                       "A derived authority may not add a gate.")
+
+    evidence = dict(dependency_evidence or {})
+    if not evidence:
+        evidence = {"job_id": str(parent_job_id), "accepted_commit": revision, "attempts": []}
+    if str(evidence.get("job_id")) != str(parent_job_id) or str(evidence.get("accepted_commit")) != revision:
+        raise JobError("derived_evidence_mismatch",
+                       "the dependency evidence does not name this dependency and its accepted commit",
+                       "Re-read the dependency's accepted wave.")
+
     body = {
         "kind": "authorization",
         "job_id": _job_id(job_id),
         "auth_id": secrets.token_hex(8),
         "statement": str(statement),
         "repo": str(repo),
-        "base_rev": str(candidate_rev).strip().lower(),
+        "base_rev": revision,
         "scope": scope_globs,
         "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
-        "gates": sorted({_slug(gate) for gate in gates}) or ["merge"],
+        "gates": wanted_gates,
         "by": by,
         "at": _utc_now(),
         "authority": "derived",
+        "policy": {"policy_id": str(policy.get("policy_id")), "policy_digest": policy_digest},
         "derived_from": {"job_id": str(parent_job_id), "auth_id": parent.get("auth_id"),
                          "base_rev": parent.get("base_rev")},
-        "descendant": {"policy": "rizzstack.descendant-authorization/1", "root_rev": str(root_rev),
-                       "dependencies": [str(item) for item in dependencies],
+        "dependency_evidence": evidence,
+        "descendant": {"policy": "rizzstack.descendant-authorization/1",
+                       "root_rev": str(policy.get("root_rev")),
+                       "dependencies": dependency_jobs,
+                       "dependency_features": dependency_features,
+                       "dependent_feature": str(policy.get("dependent_feature") or ""),
+                       "dependent_job": str(policy.get("dependent_job") or ""),
                        "scope": ceiling},
     }
     key = _ensure_key(state_dir)
     path = authorization_path(state_dir, job_id)
-    if path.exists():
-        existing = _unseal(path, key, "authorization")
-        if (existing.get("base_rev") == body["base_rev"] and existing.get("scope") == body["scope"]
-                and (existing.get("derived_from") or {}).get("auth_id") == body["derived_from"]["auth_id"]):
-            return existing
-        raise JobError("derived_authorization_exists", f"a different authorization already exists for {job_id}",
-                       "Refuse: derived authority is create-only.")
-    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
-    return body
+    if _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        return body
+    existing = _unseal(path, key, "authorization")
+    if _derived_identity(existing) == _derived_identity(body):
+        return existing
+    raise JobError("derived_authorization_exists", f"a different authorization already exists for {job_id}",
+                   "Refuse: derived authority is create-only.")
 
 
 def record_approval(
@@ -392,13 +523,6 @@ def record_approval(
         raise JobError("approval_invalid", "decision must be 'granted' or 'refused'", _FIX_AUTH)
 
     path = approval_path(state_dir, job_id, gate)
-    if path.exists():
-        raise JobError(
-            "approval_exists",
-            "this gate already has a recorded decision",
-            "A gate is decided once; start a new job for new work.",
-        )
-
     key = _ensure_key(state_dir)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
@@ -410,7 +534,12 @@ def record_approval(
         "by": by or _current_user(),
         "at": _utc_now(),
     }
-    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
+    if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        raise JobError(
+            "approval_exists",
+            "this gate already has a recorded decision",
+            "A gate is decided once; start a new job for new work.",
+        )
     return body
 
 
@@ -428,7 +557,14 @@ def create_job(
     workflow_ref: str | None = None,
     packet: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a job that narrows an existing authorization."""
+    """Create a job that narrows an existing authorization.
+
+    A workflow-native job carries its validated intent packet: the packet's
+    ``job_id`` and repository must be this job's, its ``workflow_ref`` must equal
+    the argument exactly (an omitted argument inherits the packet's pin), and the
+    packet bytes are persisted once at ``packets/<job_id>.json`` with their digest
+    sealed into the job. Legacy packet-free jobs keep working unchanged.
+    """
 
     authorization = load_authorization(state_dir, job_id)
     packet_digest = ""
@@ -438,7 +574,22 @@ def create_job(
             raise JobError("packet_job_mismatch", "the packet names another job", "Refuse: packet and job identity must match.")
         if str((packet.get("repository") or {}).get("identity")) != str(authorization.get("repo")):
             raise JobError("packet_repo_mismatch", "the packet names another repository", "Refuse.")
-        workflow_ref = workflow_ref or str(packet.get("workflow_ref") or "") or None
+        pinned = str(packet.get("workflow_ref") or "")
+        if workflow_ref is None:
+            workflow_ref = pinned
+        elif str(workflow_ref) != pinned:
+            raise JobError("workflow_ref_mismatch",
+                           f"workflow_ref {workflow_ref!r} is not the packet's pinned {pinned!r}",
+                           "Refuse: a job runs under exactly the protocol it was admitted with.")
+
+    path = job_path(state_dir, job_id)
+    if path.exists():
+        raise JobError(
+            "job_exists",
+            "a job already exists for this id",
+            "Pick a new job id; the recorded job is the record.",
+        )
+
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "job",
@@ -468,43 +619,69 @@ def create_job(
     }
     _enforce_narrowing(body, authorization)
 
-    path = job_path(state_dir, job_id)
-    if path.exists():
-        raise JobError(
-            "job_exists",
-            "a job already exists for this id",
-            "Pick a new job id; the recorded job is the record.",
-        )
+    if packet is not None:
+        packets.store_packet(state_dir, job_id, packet)
     save_job(state_dir, body)
     return body
 
 
 def load_job(state_dir: Path, job_id: str) -> dict[str, Any]:
-    try:
-        key = _load_key(state_dir)
-    except LeaseError as exc:
+    """Load a sealed job. Absent, unreadable and unsealed are different answers."""
+
+    path = job_path(state_dir, job_id)
+    if not path.exists():
         raise JobError(
             "job_missing",
             f"no job exists for id {job_id!r}",
             _FIX_AUTH,
+        )
+    try:
+        key = _load_key(state_dir)
+    except LeaseError as exc:
+        raise JobError(
+            "job_unsealed",
+            f"job {job_id!r} exists but its signing key is missing; it is not absent",
+            _FIX_TAMPERED,
         ) from exc
-    return _unseal(job_path(state_dir, job_id), key, "job")
+    return _unseal(path, key, "job")
 
 
 def save_job(state_dir: Path, job: Mapping[str, Any]) -> None:
+    """Persist a job, refusing to overwrite an unreadable one or change its packet identity."""
+
+    job_id = _job_id(str(job.get("job_id") or ""))
+    path = job_path(state_dir, job_id)
+    goal = job.get("goal") or {}
+    digest = str(goal.get("packet_digest") or "")
     previous = None
-    try:
-        previous = _unseal(job_path(Path(state_dir), str(job.get("job_id"))), _load_key(Path(state_dir)), "job")
-    except Exception:  # noqa: BLE001 - first save
-        previous = None
+    if path.exists():
+        try:
+            key = _load_key(state_dir)
+        except LeaseError as exc:
+            raise JobError(
+                "job_unsealed",
+                f"job {job_id!r} exists but its signing key is missing; refusing to overwrite it",
+                _FIX_TAMPERED,
+            ) from exc
+        # An unreadable, unsealed or tampered document raises here: it is never
+        # treated as "no previous job" and never replaced.
+        previous = _unseal(path, key, "job")
     if previous is not None:
-        before = (previous.get("goal") or {}).get("packet_digest")
-        after = (job.get("goal") or {}).get("packet_digest")
-        if before and after and before != after:
+        before = str((previous.get("goal") or {}).get("packet_digest") or "")
+        if before and not digest:
+            raise JobError("packet_digest_missing",
+                           "the sealed job carries a packet digest and this save would drop it",
+                           "Refuse: a job keeps the packet it was admitted under.")
+        if before != digest:
             raise JobError("packet_identity_changed", "the job would resume under a different packet identity",
                            "Refuse: a sealed job keeps the protocol and packet it started with.")
+    if digest:
+        try:
+            packets.verify_stored(state_dir, job_id, digest)
+        except packets.PacketError as exc:
+            raise JobError(exc.code, exc.message, exc.fix) from exc
     key = _ensure_key(state_dir)
-    _atomic_write(job_path(state_dir, job["job_id"]), _canonical(_seal(job, key)) + b"\n")
+    _atomic_write(path, _canonical(_seal(job, key)) + b"\n")
 
 
 def transition(
