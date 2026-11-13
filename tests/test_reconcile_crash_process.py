@@ -163,5 +163,7 @@ class ProcessCrash:
         adopted = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 1)
 
         assert adopted.status == "ok"
-        assert "stale lock" in adopted.detail
-        assert not lock.exists()
+        assert "recovered lock" in adopted.detail
+        # The file is deliberately kept: ownership is the kernel lock, not the
+        # file's existence, so unlinking would allow a second inode to appear.
+        assert lock.exists()

@@ -25,6 +25,11 @@ import hashlib
 import json
 import os
 import time
+
+try:  # POSIX advisory locks; bundlebees targets Linux and CI is ubuntu
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback keeps O_EXCL
+    fcntl = None  # type: ignore[assignment]
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -220,11 +225,33 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def read_intent(path: Path) -> dict[str, Any] | None:
+    """Read an intent, refusing to guess. A corrupt intent is not permission."""
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    return data if isinstance(data, dict) else None
+    except OSError as exc:
+        raise ReconcileError(
+            "intent_unreadable",
+            f"intent {path.name} cannot be read",
+            "Inspect it by hand; do not dispatch until it is understood.",
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ReconcileError(
+            "intent_corrupt",
+            f"intent {path.name} is not valid JSON",
+            "Inspect it by hand; a corrupt intent is never permission to POST again.",
+        ) from exc
+    if not isinstance(data, dict):
+        raise ReconcileError(
+            "intent_corrupt",
+            f"intent {path.name} is not an object",
+            "Inspect it by hand; a corrupt intent is never permission to POST again.",
+        )
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -233,21 +260,29 @@ def read_intent(path: Path) -> dict[str, Any] | None:
 
 
 class _Lock:
-    def __init__(self, path: Path) -> None:
+    """A job lock held by the kernel, not by file existence.
+
+    ``flock`` is released automatically when the process dies, so a crashed tick
+    cannot wedge the job and no heuristic steal is needed. The file itself is
+    never unlinked: deleting it would let a later process create a *new* inode
+    while another still holds the old one, which is how two writers appear.
+    """
+
+    def __init__(self, fd: int, path: Path, note: str | None = None) -> None:
+        self.fd = fd
         self.path = path
-        self.held = False
-        self.stolen: str | None = None
-
-    def __enter__(self) -> "_Lock":  # pragma: no cover - replaced by _acquire
-        return self
-
-    def __exit__(self, *_exc: Any) -> None:
-        self.release()
+        self.held = True
+        self.stolen = note
 
     def release(self) -> None:
-        if self.held:
+        if not self.held:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
             try:
-                self.path.unlink()
+                os.close(self.fd)
             except OSError:
                 pass
             self.held = False
@@ -273,47 +308,64 @@ def _acquire_lock(
     clock: float,
     stale_after_s: float = DEFAULT_STALE_LOCK_S,
 ) -> _Lock | None:
-    """Take the job lock, or return None when a live holder owns it.
+    """Take the job lock, or return None when another live process owns it.
 
-    A lock left by a dead process (or older than ``stale_after_s``) is moved
-    aside and retried once, so a killed tick cannot wedge the job. The stale
-    file is kept for the audit trail rather than deleted.
+    Ownership is kernel-held: a lock is unavailable exactly while some process
+    holds it, regardless of how old the file looks. ``stale_after_s`` is kept for
+    reporting only — age is never grounds to take a lock from a live holder.
     """
 
     path = lock_path(state_dir, job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    stolen_note: str | None = None
 
-    for _attempt in range(2):
-        lock = _Lock(path)
+    if fcntl is None:  # pragma: no cover - non-POSIX fallback
+        return None if path.exists() else _exclusive_lock(path, clock)
+
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+
+    previous = ""
+    try:
+        previous = os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+    except OSError:
+        previous = ""
+
+    payload = json.dumps({"pid": os.getpid(), "at": _iso(clock)}).encode("utf-8")
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, payload, 0)
+        os.fsync(fd)
+    except OSError:
+        pass
+
+    note = None
+    if previous:
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        except FileExistsError:
-            holder = read_intent(path) or {}
-            pid = holder.get("pid")
-            started = _epoch(holder.get("at"))
-            dead = not _holder_alive(pid)
-            too_old = started is not None and clock - started > float(stale_after_s)
-            if not dead and not too_old:
-                return None
-            stale = path.with_name(f"{path.name}.stale.{int(clock)}.{os.getpid()}")
-            try:
-                os.replace(path, stale)
-            except OSError:
-                return None
-            stolen_note = f"stale lock from pid {pid} moved to {stale.name}"
-            continue
-        except OSError:
-            return None
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"pid": os.getpid(), "at": _iso(clock)}))
-            handle.flush()
-            os.fsync(handle.fileno())
-        lock.held = True
-        lock.stolen = stolen_note
-        return lock
-    return None
+            old = json.loads(previous)
+        except ValueError:
+            old = {}
+        if old and old.get("pid") != os.getpid():
+            note = f"recovered lock last held by pid {old.get('pid')}"
+    return _Lock(fd, path, note)
+
+
+def _exclusive_lock(path: Path, clock: float) -> _Lock | None:  # pragma: no cover
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return None
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(json.dumps({"pid": os.getpid(), "at": _iso(clock)}).encode())
+    fd2 = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    return _Lock(fd2, path)
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +425,25 @@ def _fingerprint(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, A
     }
 
 
-def _matches(entry: Mapping[str, Any], fingerprint: Mapping[str, Any], written_at: float) -> bool:
-    """Strict identity: an incomplete journal entry is never proof of anything."""
+def _matches(
+    entry: Mapping[str, Any],
+    fingerprint: Mapping[str, Any],
+    written_at: float,
+    *,
+    job_id: str,
+    task_id: str,
+) -> bool:
+    """Strict identity: an incomplete or foreign journal entry is never proof."""
 
     if not _attempt_id(entry):
         return False
     brief = _brief_of(entry)
     if not brief:
+        return False
+
+    if str(brief.get("job_id") or "") != job_id:
+        return False
+    if str(brief.get("task_id") or "") != task_id:
         return False
 
     objective = brief.get("objective")
@@ -498,13 +562,25 @@ def _run(
     changed = _reap(job, attempts, transitions)
 
     # 3. One heavy operation at most: integrate, else verify.
+    integration = job.setdefault("integration", {"wave": 1, "state": "pending"})
     in_flight = {"dispatching", "dispatched", "running", "verifying"}
     wave_ready = (
         any(t.get("state") == "verified" for t in job["tasks"])
         and not any(t.get("state") in in_flight for t in job["tasks"])
     )
-    if wave_ready and integrator is not None and (job.get("integration") or {}).get("state") != "accepted":
-        result = _integrate(state_dir, job, integrator, transitions)
+    if wave_ready and integrator is not None and not integration.get("terminal"):
+        stalled = [t["task_id"] for t in job["tasks"] if t.get("state") in {"failed", "rejected"}]
+        if stalled and not job.get("allow_partial_wave"):
+            result = _stop_wave(
+                state_dir,
+                job,
+                clock,
+                "wave_incomplete",
+                f"tasks {', '.join(stalled)} did not complete; refusing to integrate a partial wave",
+            )
+            jobs.save_job(state_dir, job)
+            return result
+        result = _integrate(state_dir, job, integrator, clock, transitions)
         jobs.save_job(state_dir, job)
         return result
 
@@ -556,7 +632,17 @@ def _reconcile_uncertain(
 
     if intent.get("status") == INTENT_DISPATCHED and intent.get("attempt_id"):
         entry = adapter.get_attempt(str(intent["attempt_id"]))
-        if entry is not None:
+        if (
+            entry is not None
+            and _attempt_id(entry) == str(intent["attempt_id"])
+            and _matches(
+                entry,
+                intent.get("fingerprint") or _fingerprint(job, task),
+                float(intent.get("written_at") or 0.0),
+                job_id=job_id,
+                task_id=task_id,
+            )
+        ):
             attempt_id = str(intent["attempt_id"])
             task.setdefault("attempts", [])
             if attempt_id not in task["attempts"]:
@@ -586,7 +672,11 @@ def _reconcile_uncertain(
     elapsed = max(0.0, clock - first)
     fingerprint = intent.get("fingerprint") or _fingerprint(job, task)
     written_at = float(intent.get("written_at") or 0.0)
-    matches = [entry for entry in attempts if _matches(entry, fingerprint, written_at)]
+    matches = [
+        entry
+        for entry in attempts
+        if _matches(entry, fingerprint, written_at, job_id=job_id, task_id=task_id)
+    ]
 
     if len(matches) > 1:
         return _escalate(state_dir, job, task, intent, clock, "dispatch_ambiguous", f"{len(matches)} journal entries match task {task_id}; refusing to choose")
@@ -688,9 +778,11 @@ def _reap(job: dict[str, Any], attempts: Sequence[Mapping[str, Any]], transition
         state = _state_of(by_id[attempt_id])
         current = task.get("state")
         if state in {"succeeded", "completed", "done"} and current in {"dispatched", "running"}:
-            jobs.transition(job, str(task["task_id"]), "running", actor="reconciler", reason="worker started")
+            if current == "dispatched":
+                jobs.transition(job, str(task["task_id"]), "running", actor="reconciler", reason="worker started")
+                transitions.append(f"{task['task_id']}->running")
             jobs.transition(job, str(task["task_id"]), "verifying", actor="reconciler", reason="worker finished")
-            transitions.extend([f"{task['task_id']}->running", f"{task['task_id']}->verifying"])
+            transitions.append(f"{task['task_id']}->verifying")
             changed = True
         elif state in {"failed", "cancelled", "canceled", "error"} and current in {"dispatched", "running"}:
             jobs.transition(job, str(task["task_id"]), "rejected", actor="reconciler", reason=f"worker ended {state}")
@@ -743,42 +835,94 @@ def _verify(
     return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} rejected")
 
 
+def _stop_wave(state_dir: Path, job: dict[str, Any], clock: float, code: str, detail: str) -> TickResult:
+    """End the wave once: terminal, recorded once, never re-claimed."""
+
+    integration = job.setdefault("integration", {"wave": 1})
+    if integration.get("terminal"):
+        return TickResult(status="idle", detail="wave already stopped")
+    integration.update(terminal=True, state="stopped", stopped=code, evidence=detail)
+    job.setdefault("escalations", []).append(
+        {"at": _iso(clock), "task_id": "integration", "code": code, "detail": detail}
+    )
+    return TickResult(status="escalated", detail=detail, evidence=code)
+
+
+def _wave_number(integration: Mapping[str, Any]) -> int:
+    """Accept the job schema's "w1" as well as a plain integer."""
+
+    value = integration.get("wave", 1)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(1, value)
+    text = str(value or "").strip().lower().lstrip("w")
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return 1
+
+
 def _integrate(
     state_dir: Path,
     job: dict[str, Any],
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    clock: float,
     transitions: list[str],
 ) -> TickResult:
+    integration = job.setdefault("integration", {"wave": 1})
+    if integration.get("terminal"):
+        return TickResult(status="idle", detail="integration budget exhausted")
+
     verdict = integrator(dict(job))
     ok, evidence = _verdict(verdict, "integrator")
-    integration = job.setdefault("integration", {"wave": "w1"})
     integration["attempts"] = int(integration.get("attempts") or 0) + 1
     integration["evidence"] = evidence
     integration["state"] = "accepted" if ok else "failed"
 
     if ok:
-        # Accept the wave and unblock dependants: verified -> integrating -> accepted.
+        # Accept the wave, then open the next one so dependants can complete.
         for task in job["tasks"]:
             if task.get("state") == "verified":
                 task_id = str(task["task_id"])
                 jobs.transition(job, task_id, "integrating", actor="reconciler", reason="wave accepted")
                 jobs.transition(job, task_id, "accepted", actor="reconciler", reason="wave accepted", evidence=evidence)
                 transitions.append(f"{task_id}->accepted")
+        wave = _wave_number(integration)
+        accepted = list(integration.get("accepted_waves") or [])
+        accepted.append({"wave": wave, "at": _iso(clock), "evidence": evidence})
+        integration.update(
+            accepted_waves=accepted,
+            wave=wave + 1,
+            attempts=0,
+            state="pending",
+        )
         transitions.append("integration->accepted")
-        return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail="integration accepted")
+        return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail=f"wave {wave} accepted")
 
     transitions.append("integration->failed")
-    if integration["attempts"] >= 2:
+    if int(integration["attempts"]) >= 2:
+        integration["terminal"] = True
         job.setdefault("escalations", []).append(
             {
-                "at": _iso(time.time()),
+                "at": _iso(clock),
                 "task_id": "integration",
                 "code": "integration_failed",
                 "detail": f"two integration attempts failed; last: {evidence}",
             }
         )
-        return TickResult(status="escalated", transitions=tuple(transitions), action="integrate", detail="integration failed twice", evidence="integration_failed")
-    return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail="integration failed; one retry remains", evidence="integration_failed")
+        return TickResult(
+            status="escalated",
+            transitions=tuple(transitions),
+            action="integrate",
+            detail="integration failed twice; budget exhausted",
+            evidence="integration_failed",
+        )
+    return TickResult(
+        status="ok",
+        transitions=tuple(transitions),
+        action="integrate",
+        detail="integration failed; one retry remains",
+        evidence="integration_failed",
+    )
 
 
 # --- dispatch --------------------------------------------------------------
