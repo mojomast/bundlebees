@@ -6,8 +6,11 @@ import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 from bundlebees_plugin import faults
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class FaultsContract(unittest.TestCase):
@@ -37,7 +40,7 @@ class FaultsContract(unittest.TestCase):
         faults.register("queue.before_ack", lambda **payload: None)
         script = "from bundlebees_plugin import faults; print(faults.registered()); print(faults.checkpoint('queue.before_ack', x=1))"
         done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                              cwd=os.getcwd(), env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"})
+                              cwd=str(ROOT), env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), ["()", "None"],
                          "a fresh process must not inherit an armed checkpoint")
