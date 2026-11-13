@@ -459,6 +459,17 @@ def add_parsers(subparsers: Any) -> None:
     tick.add_argument("--gitleaks", default=None)
     tick.add_argument("--state-dir", default=None)
     tick.set_defaults(command="job", job_handler="tick")
+    queue = sub.add_parser("queue", help="Feature queue: status, run --once, inspect, doctor.")
+    qsub = queue.add_subparsers(dest="queue_handler")
+    qsub.add_parser("status")
+    run = qsub.add_parser("run")
+    run.add_argument("--once", action="store_true", help="One deterministic pass (required for now).")
+    run.add_argument("--repo", required=True, help="Repository worktree used by verification/integration.")
+    run.add_argument("--state-dir", default=None)
+    inspect = qsub.add_parser("inspect")
+    inspect.add_argument("feature_id")
+    qsub.add_parser("doctor")
+    queue.set_defaults(command="queue")
 
     note = sub.add_parser("note", help="Record a decision for the pending handoff.")
     note.add_argument("--job-id", required=True)
@@ -475,6 +486,56 @@ def add_parsers(subparsers: Any) -> None:
     rep.add_argument("--job-id", required=True)
     rep.add_argument("--state-dir", default=None)
     rep.set_defaults(command="job", job_handler="report")
+
+
+def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
+    from . import queue as queue_mod
+
+    config = {}
+    getter = getattr(ctx, "config", None)
+    if isinstance(getter, Mapping):
+        config = dict(getter)
+    queue_file = Path((config.get("queue") or {}).get("file") or (Path(state_dir) / "queue.json"))
+    backend = queue_mod.JsonQueue(queue_file)
+    handler = getattr(args, "queue_handler", None)
+
+    if handler == "status":
+        items = backend.list_items()
+        print(json.dumps({"queue": str(queue_file), "items": [
+            {"feature_id": item.feature_id, "status": item.status, "job_id": item.job_id,
+             "repo": item.repo, "depends_on": list(item.depends_on)} for item in items]}, indent=2))
+        return 0
+
+    if handler == "inspect":
+        record = queue_mod.QueueStore(state_dir).read(args.feature_id)
+        if record is None:
+            print(json.dumps({"error": "not_claimed", "feature_id": args.feature_id}, indent=2))
+            return 1
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return 0
+
+    if handler == "doctor":
+        enabled = bool((config.get("provisioning") or {}).get("enabled"))
+        print(json.dumps({"state_dir": str(state_dir), "queue": str(queue_file),
+                          "queue_exists": queue_file.exists(), "provisioning_enabled": enabled,
+                          "items": len(backend.list_items())}, indent=2))
+        return 0
+
+    if handler == "run":
+        if not args.once:
+            print(json.dumps({"error": "loop_not_enabled", "detail": "--once is required; no daemon or cron is installed"}, indent=2))
+            return 2
+        client = client_factory()
+        provisioner = provisioner_factory() if provisioner_factory is not None else None
+
+        def one_tick(job_id: str):
+            return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner)
+
+        result = queue_mod.run_once(state_dir, backend, tick=one_tick)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print(json.dumps({"error": "queue_handler_required"}, indent=2))
+    return 2
 
 
 def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
