@@ -447,6 +447,11 @@ class CrashRecoveryTwoFeatures(unittest.TestCase):
         pid = int(child.marker["pid"])
         with self.assertRaises(ProcessLookupError, msg=f"the crashed coordinator {pid} is still alive"):
             os.kill(pid, 0)
+        # The worker is a different process and did not die with the coordinator:
+        # its ledger, not the coordinator's memory, is what the restart reads.
+        self.assertNotEqual(pid, self.worker_proc.pid, "the worker ran inside the coordinator process")
+        self.assertIsNone(self.worker_proc.poll(), "the worker service died with the coordinator")
+        self.assertTrue(self.worker_ledger.exists(), "the worker ledger is not durable")
         return child.marker
 
     # -------------------------------------------------------------- evidence
