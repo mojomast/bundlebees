@@ -25,7 +25,7 @@ def grant(**overrides) -> G.Grant:
         hosts=("worker-1",),
         profiles=("smoke",),
         task_scopes=("smoke/",),
-        limits=G.Limits(max_bees=1, max_jobs=2, max_concurrent_jobs=1, wall_clock_s=1800, budget_units=2),
+        limits=G.Limits(max_bees=1, max_jobs=2, max_concurrent_jobs=2, wall_clock_s=1800, budget_units=2),
     )
     body.update(overrides)
     return G.Grant(**body)
@@ -97,7 +97,6 @@ class DerivationTests(Harness):
         self.assertTrue(authorization["budget_reservation"].endswith(".json"))
 
     def test_an_expired_grant_is_refused(self):
-        self.store.enroll(grant(), statement="one smoke job")
         later = G.GrantStore(self.root, key=KEY, tty=lambda: True, now=lambda: time.time() + 7200)
         with self.assertRaises(G.GrantError) as caught:
             later.derive("grant-smoke", job_id="job_1", repo="mojomast/rizzstack-smoke", host="worker-1",
@@ -155,13 +154,71 @@ class DerivationTests(Harness):
         self.assertEqual(results.count("ok"), 2)
         self.assertEqual(results.count("budget_exhausted") + results.count("jobs_exhausted"), 4)
 
-    def test_releasing_a_reservation_frees_the_budget(self):
-        self.derive(job_id="job_1")
-        self.derive(job_id="job_2")
-        self.store.release("grant-smoke", "job_1")
+    def test_active_concurrency_is_limited_independently_of_lifetime_jobs(self):
+        self.store.enroll(grant(grant_id="grant-wide", limits=G.Limits(
+            max_bees=1, max_jobs=5, max_concurrent_jobs=1, wall_clock_s=1800, budget_units=5), task_scopes=("smoke/",)),
+            statement="wide")
+        self.store.derive("grant-wide", job_id="job_1", repo="mojomast/rizzstack-smoke", host="worker-1",
+                          profile="smoke", source_rev=SHA, assigned_files=["smoke/a.py"], bees=1, wall_clock_s=60)
 
-        authorization = self.derive(job_id="job_3")
-        self.assertEqual(authorization["job_id"], "job_3")
+        with self.assertRaises(G.GrantError) as caught:
+            self.store.derive("grant-wide", job_id="job_2", repo="mojomast/rizzstack-smoke", host="worker-1",
+                              profile="smoke", source_rev=SHA, assigned_files=["smoke/a.py"], bees=1, wall_clock_s=60)
+        self.assertEqual(caught.exception.code, "concurrency_exhausted")
+
+        self.store.complete("grant-wide", "job_1")
+        second = self.store.derive("grant-wide", job_id="job_2", repo="mojomast/rizzstack-smoke", host="worker-1",
+                                   profile="smoke", source_rev=SHA, assigned_files=["smoke/a.py"], bees=1, wall_clock_s=60)
+        self.assertEqual(second["job_id"], "job_2")
+
+    def test_completing_a_job_does_not_replenish_the_cumulative_budget(self):
+        self.store.enroll(grant(grant_id="grant-budget", limits=G.Limits(
+            max_bees=1, max_jobs=5, max_concurrent_jobs=5, wall_clock_s=1800, budget_units=2)), statement="budget")
+        kwargs = dict(repo="mojomast/rizzstack-smoke", host="worker-1", profile="smoke",
+                      source_rev=SHA, assigned_files=["smoke/a.py"], bees=1, wall_clock_s=60)
+        self.store.derive("grant-budget", job_id="job_1", **kwargs)
+        self.store.derive("grant-budget", job_id="job_2", **kwargs)
+        self.store.complete("grant-budget", "job_1")
+
+        with self.assertRaises(G.GrantError) as caught:
+            self.store.derive("grant-budget", job_id="job_3", **kwargs)
+        self.assertEqual(caught.exception.code, "budget_exhausted")
+
+    def test_an_empty_scope_is_never_unrestricted(self):
+        with self.assertRaises(G.GrantError) as caught:
+            self.derive(assigned_files=[])
+        self.assertEqual(caught.exception.code, "scope_empty")
+
+    def test_a_grant_with_no_scopes_refuses_derivation_unless_explicitly_unrestricted(self):
+        self.store.enroll(grant(grant_id="grant-narrow", task_scopes=()), statement="no scopes")
+        with self.assertRaises(G.GrantError) as caught:
+            self.store.derive("grant-narrow", job_id="job_1", repo="mojomast/rizzstack-smoke", host="worker-1",
+                              profile="smoke", source_rev=SHA, assigned_files=["smoke/a.py"], bees=1, wall_clock_s=60)
+        self.assertEqual(caught.exception.code, "scope_not_granted")
+
+        self.store.enroll(grant(grant_id="grant-any", task_scopes=(), unrestricted_scope=True), statement="any file")
+        authorization = self.store.derive("grant-any", job_id="job_2", repo="mojomast/rizzstack-smoke", host="worker-1",
+                                          profile="smoke", source_rev=SHA, assigned_files=["src/anything.py"], bees=1, wall_clock_s=60)
+        self.assertEqual(authorization["assigned_files"], ["src/anything.py"])
+
+    def test_a_reservation_is_idempotent_for_the_same_request(self):
+        first = self.derive(job_id="job_1")
+        again = self.derive(job_id="job_1")
+        self.assertEqual(first["request_digest"], again["request_digest"])
+        self.assertEqual(first["budget_reservation"], again["budget_reservation"])
+
+        with self.assertRaises(G.GrantError) as caught:
+            self.derive(job_id="job_1", assigned_files=["smoke/other.py"])
+        self.assertEqual(caught.exception.code, "reservation_conflict")
+
+    def test_invalid_job_ids_and_absolute_scopes_are_refused(self):
+        with self.assertRaises(G.GrantError) as caught:
+            self.derive(job_id="../escape")
+        self.assertEqual(caught.exception.code, "job_id_invalid")
+
+        with self.assertRaises(G.GrantError) as caught:
+            self.derive(assigned_files=["/etc/passwd"])
+        self.assertEqual(caught.exception.code, "scope_invalid")
 
 
 if __name__ == "__main__":
