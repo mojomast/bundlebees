@@ -15,6 +15,10 @@ from typing import Any, Mapping
 from . import job as jobs
 from . import provisioning as P
 
+import contextlib
+import os
+import time
+
 
 class ProvisionBindError(Exception):
     def __init__(self, code: str, message: str, fix: str = "") -> None:
@@ -52,6 +56,50 @@ def request_for(job: Mapping[str, Any], task: Mapping[str, Any], spec: Mapping[s
     }
 
 
+@contextlib.contextmanager
+def _tick_lock(state_dir: Path, job_id: str):
+    """One provisioning advance per job at a time; a held lock is not a crash."""
+    directory = Path(state_dir) / "provisioning"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{job_id}.lock"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise ProvisionBindError("tick_in_progress", f"another tick is provisioning {job_id}", "Let it finish; do not duplicate the request.")
+    try:
+        os.write(fd, json.dumps({"pid": os.getpid(), "at": time.time()}).encode())
+        os.fsync(fd)
+        yield
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def _authorization_matches(state_dir: Path, job: Mapping[str, Any], spec: Mapping[str, Any]) -> None:
+    """A provisioning spec may narrow M1 authority, never widen it."""
+    authorization = jobs.load_authorization(state_dir, str(job["job_id"]))
+    goal = job.get("goal") or {}
+    allowed_repos = {str(authorization.get("repo") or ""), str(goal.get("repo") or "")} - {""}
+    allowed_revs = {str(authorization.get("base_rev") or ""), str(goal.get("base_rev") or "")} - {""}
+    if spec["repo"] not in allowed_repos:
+        raise ProvisionBindError("provisioning_repo_not_authorized", f"{spec['repo']} is not the authorized repository", "Fix the job; the spec cannot widen authority.")
+    if spec["source_rev"] not in allowed_revs:
+        raise ProvisionBindError("provisioning_rev_not_authorized", f"{spec['source_rev']} is not the authorized revision", "Pin the authorized revision.")
+    scope = {str(item) for item in authorization.get("scope") or []}
+    files = {str(item) for item in task_files(job, spec)}
+    if scope and not files <= scope:
+        raise ProvisionBindError("provisioning_scope_not_authorized", f"leased files outside the authorization: {sorted(files - scope)}", "Narrow the task.")
+
+
+def task_files(job: Mapping[str, Any], spec: Mapping[str, Any]) -> list[str]:
+    files: list[str] = []
+    for task in job.get("tasks") or []:
+        if _spec(task, job) and _spec(task, job)["project"] == spec["project"]:
+            files.extend(str(item) for item in task.get("lease") or [])
+    return files
+
+
 def advance(
     state_dir: Path,
     job: dict[str, Any],
@@ -65,6 +113,17 @@ def advance(
     the read-only receipt lookup; it is never repeated blindly.
     """
 
+    with _tick_lock(state_dir, str(job["job_id"])):
+        return _advance_locked(state_dir, job, provisioner=provisioner, expect_host=expect_host)
+
+
+def _advance_locked(
+    state_dir: Path,
+    job: dict[str, Any],
+    *,
+    provisioner: Any,
+    expect_host: str | None = None,
+) -> dict[str, Any]:
     outcomes: list[dict[str, Any]] = []
     changed = False
 
@@ -75,6 +134,7 @@ def advance(
         if isinstance(task.get("binding"), Mapping) and task["binding"].get("receipt_digest"):
             continue
 
+        _authorization_matches(state_dir, job, spec)
         key = stable_key(str(job["job_id"]), str(task["task_id"]))
         intent = task.get("provisioning")
         if not isinstance(intent, Mapping):
@@ -84,16 +144,12 @@ def advance(
             jobs.save_job(state_dir, job)
 
         request = intent.get("request") or request_for(job, task, spec, key)
-        intent["state"] = "preparing"
-        intent["attempts"] = int(intent.get("attempts") or 0) + 1
-        jobs.save_job(state_dir, job)
-
+        prior_state = str(intent.get("state") or "requested")
         receipt = None
-        try:
-            receipt = provisioner.provision(request)
-            intent["state"] = "ready"
-        except P.ProvisionUncertain as exc:
-            intent.update(state="uncertain", detail=str(exc))
+
+        if prior_state in ("preparing", "uncertain", "ready"):
+            # The POST may already have landed. Reconcile read-only; never re-POST.
+            intent["state"] = "uncertain" if prior_state != "ready" else "ready"
             jobs.save_job(state_dir, job)
             try:
                 receipt = provisioner.authoritative_receipt(
@@ -103,10 +159,32 @@ def advance(
                     expect_host=expect_host or spec["host"] or None,
                 )
             except P.ProvisionError as lookup_exc:
-                intent["detail"] = f"{exc}; lookup: {lookup_exc}"
+                intent.update(state="uncertain", detail=f"reconciled without a POST: {lookup_exc}")
                 jobs.save_job(state_dir, job)
                 outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
                 continue
+        else:
+            intent["state"] = "preparing"
+            intent["attempts"] = int(intent.get("attempts") or 0) + 1
+            jobs.save_job(state_dir, job)
+            try:
+                receipt = provisioner.provision(request)
+                intent["state"] = "ready"
+            except P.ProvisionUncertain as exc:
+                intent.update(state="uncertain", detail=str(exc))
+                jobs.save_job(state_dir, job)
+                try:
+                    receipt = provisioner.authoritative_receipt(
+                        key,
+                        expect_repo=spec["repo"], expect_rev=spec["source_rev"],
+                        expect_profile=spec["profile"], expect_project=spec["project"],
+                        expect_host=expect_host or spec["host"] or None,
+                    )
+                except P.ProvisionError as lookup_exc:
+                    intent["detail"] = f"{exc}; lookup: {lookup_exc}"
+                    jobs.save_job(state_dir, job)
+                    outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
+                    continue
 
         binding = P.Binding(
             repo=spec["repo"], source_rev=spec["source_rev"], host=spec["host"] or receipt.host,
@@ -139,15 +217,20 @@ class BoundLauncher:
     differs from the bound identity, is refused before it reaches the launcher.
     """
 
-    def __init__(self, inner: Any, bindings: Mapping[str, str]) -> None:
+    def __init__(self, inner: Any, bindings: Mapping[str, str],
+                 validators: Mapping[str, Any] | None = None) -> None:
         self._inner = inner
         self._bindings = dict(bindings)
+        self._validators = dict(validators or {})
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
     def post_attempt(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
         task_id = str(brief.get("task_id") or "")
+        validator = self._validators.get(task_id)
+        if validator is not None:
+            validator()   # authoritative receipt revalidation, immediately pre-POST
         bound = self._bindings.get(task_id)
         project = str(brief.get("project") or "")
         if bound is None:

@@ -25,23 +25,29 @@ from bundlebees_plugin import job as jobs
 from bundlebees_plugin import job_cli, leases, provisioning as P
 
 HYVV_SRC = os.environ.get("HYVV_SRC", "")
+REQUIRE_HYVV = os.environ.get("REQUIRE_HYVV") == "1"
+HAS_HYVV = bool(HYVV_SRC) and Path(HYVV_SRC, "provisioning.py").exists()
 SHA = ""
 
 
-def git(args, cwd):
+def git(args, cwd, check=True):
     done = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
-    if done.returncode != 0:
+    if check and done.returncode != 0:
         raise AssertionError(f"git {args}: {done.stderr}")
     return done
 
 
-@unittest.skipUnless(HYVV_SRC and Path(HYVV_SRC, "provisioning.py").exists(),
+@unittest.skipUnless(HAS_HYVV or REQUIRE_HYVV,
                      "set HYVV_SRC to a hyvv checkout to run the real-implementation slice")
 class VerticalSlice(unittest.TestCase):
     def setUp(self):
+        if not HAS_HYVV:
+            self.fail("HYVV_SRC must point at the pinned hyvv checkout when REQUIRE_HYVV=1")
         self._tmp = tempfile.TemporaryDirectory()
+        self.host_posts = 0
+        self.lookup_status = 200
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         sys.path.insert(0, HYVV_SRC)
@@ -95,6 +101,8 @@ class VerticalSlice(unittest.TestCase):
                 self.wfile.write(payload)
 
             def do_GET(self):
+                if self.path.startswith("/v1/provision/receipts/") and fixture.lookup_status != 200:
+                    return self._send(fixture.lookup_status, {"error": "receipt_stale", "message": "the workspace moved"})
                 if self.path == "/v1/provision/capabilities":
                     return self._send(200, real.capabilities())
                 if self.path.startswith("/v1/provision/receipts/"):
@@ -109,6 +117,7 @@ class VerticalSlice(unittest.TestCase):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 try:
+                    fixture.host_posts += 1
                     return self._send(200, real.provision(body))
                 except hyvv.ProvisionError as exc:
                     return self._send(409 if exc.code in ("journal_conflict", "provision_in_progress") else 400, exc.to_dict())
@@ -118,6 +127,22 @@ class VerticalSlice(unittest.TestCase):
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
         self.addCleanup(self.httpd.shutdown)
         self.addCleanup(self.httpd.server_close)
+
+        self.contract_path = self.tmp / "smoke.contract.json"
+        import hashlib
+        self.contract_body = {
+            "contract_version": "acdd/1", "id": "SMOKE-answer", "title": "answer() returns 42",
+            "outcome": {"summary": "answer() == 42", "observable_behavior": ["answer() == 42"]},
+            "source_rev": self.sha,
+            "scope": {"assigned_files": ["smoke/answer.py"], "test_files": ["tests/test_smoke.py"]},
+            "acceptance_criteria": [{"id": "AC-001", "statement": "answer() == 42",
+                                     "tests": ["tests/test_smoke.py::test_answer_is_42"], "verification": "test"}],
+            "tdd": {"applicable": True, "test_first": True},
+            "verification": {"independent": True}, "evidence_required": ["red", "green"],
+            "authorization": {"human_gates": ["merge", "release", "deploy", "publish"]},
+        }
+        self.contract_path.write_text(json.dumps(self.contract_body, indent=2, sort_keys=True) + "\n")
+        self.contract_sha = hashlib.sha256(self.contract_path.read_bytes()).hexdigest()
 
         self.state = self.tmp / "state"
         self.state.mkdir()
@@ -134,8 +159,10 @@ class VerticalSlice(unittest.TestCase):
             "acceptance": {"criteria": ["answer() == 42"],
                            "tests": ["tests/test_smoke.py::test_answer_is_42"],
                            "commands": ["python -m pytest -q"]},
+            "contract": self.contract_body,
+            "contract_sha256": self.contract_sha,
             "provision": {"repo": "mojomast/smoke-real", "source_rev": self.sha, "host": socket.gethostname(),
-                          "profile": "smoke", "project": "smoke-real", "contract_sha256": "c" * 64},
+                          "profile": "smoke", "project": "smoke-real", "contract_sha256": self.contract_sha},
         }])
 
     def transport(self, method, path, body):
@@ -167,6 +194,10 @@ class VerticalSlice(unittest.TestCase):
         binding = job["tasks"][0]["binding"]
         self.assertEqual(binding["project"], "smoke-real")
         self.assertEqual(len(binding["receipt_digest"]), 64)
+        workspace = Path(registry["smoke-real"]["path"])
+        self.assertEqual(git(["rev-parse", "HEAD"], workspace).stdout.strip(), self.sha)
+        self.assertNotEqual(git(["symbolic-ref", "-q", "HEAD"], workspace, check=False).returncode, 0)
+        self.assertEqual(git(["status", "--porcelain"], workspace).stdout.strip(), "")
         lease = leases.load_lease(self.state, launcher.attempt_id)
         self.assertEqual(lease["brief"]["project"], "smoke-real")
         self.assertEqual(lease["brief"]["source_rev"], self.sha)
@@ -198,6 +229,84 @@ class VerticalSlice(unittest.TestCase):
         job = jobs.load_job(self.state, "job_slice")
         self.assertEqual(job["tasks"][0]["provisioning"]["state"], "bound")
         self.assertEqual(len(launcher.posts), 1)
+
+    def test_a_provisioning_job_without_a_provisioner_is_refused(self):
+        launcher = FakeLauncher()
+        outcome = job_cli.tick(self.state, "job_slice", client=launcher, repo=self.tmp / "work")
+
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(len(launcher.posts), 0)
+        self.assertEqual(self.host_posts, 0)
+
+    def test_a_spec_cannot_widen_the_authorized_repository(self):
+        from bundlebees_plugin import provision_bind
+
+        job = jobs.load_job(self.state, "job_slice")
+        task = job["tasks"][0]
+        spec = dict(task["provision"], repo="mojomast/other-repo")
+        with self.assertRaises(provision_bind.ProvisionBindError) as caught:
+            provision_bind._authorization_matches(self.state, job, spec)
+        self.assertEqual(caught.exception.code, "provisioning_repo_not_authorized")
+
+        spec = dict(task["provision"], source_rev="f" * 40)
+        with self.assertRaises(provision_bind.ProvisionBindError) as caught:
+            provision_bind._authorization_matches(self.state, job, spec)
+        self.assertEqual(caught.exception.code, "provisioning_rev_not_authorized")
+
+    def test_a_new_job_cannot_spoof_trusted_task_state(self):
+        jobs.record_authorization(
+            self.state, job_id="job_spoof", statement="spoof attempt", repo="mojomast/smoke-real",
+            base_rev=self.sha, scope=["smoke/answer.py"], bees=1, wall_clock_s=600,
+            require_tty=False, interactive=False, by="reviewer",
+        )
+        job = jobs.create_job(self.state, job_id="job_spoof", tasks=[{
+            "task_id": "T1", "objective": "x", "lease": ["smoke/answer.py"],
+            "acceptance": {"criteria": ["c"], "tests": ["t"], "commands": ["c"]},
+            "state": "succeeded", "attempts": ["att_forged"], "binding": {"project": "evil"},
+            "provisioning": {"state": "bound"},
+        }])
+
+        task = job["tasks"][0]
+        self.assertEqual(task["state"], "pending")
+        self.assertEqual(task["attempts"], [])
+        self.assertIsNone(task["binding"])
+        self.assertIsNone(task["provisioning"])
+
+    def test_a_crash_after_the_host_accepted_is_recovered_without_a_second_post(self):
+        key = __import__("bundlebees_plugin.provision_bind", fromlist=["stable_key"]).stable_key("job_slice", "T1")
+        # The host already applied this exact request; the coordinator died before
+        # persisting the response.
+        self.real.provision({"repo": "mojomast/smoke-real", "source_rev": self.sha, "profile": "smoke",
+                             "project": "smoke-real", "job_id": "job_slice", "idempotency_key": key})
+        job = jobs.load_job(self.state, "job_slice")
+        job["tasks"][0]["provisioning"] = {"state": "preparing", "key": key, "attempts": 1,
+                                           "request": {"repo": "mojomast/smoke-real", "source_rev": self.sha,
+                                                       "profile": "smoke", "project": "smoke-real",
+                                                       "job_id": "job_slice", "idempotency_key": key}}
+        jobs.save_job(self.state, job)
+
+        launcher = FakeLauncher()
+        provisioner = P.HyvvProvisioner(self.transport, expect_host=socket.gethostname())
+        outcome = job_cli.tick(self.state, "job_slice", client=launcher, repo=self.tmp / "work",
+                               provisioner=provisioner, expect_host=socket.gethostname())
+
+        self.assertEqual(outcome["status"], "ok", outcome)
+        self.assertEqual(self.host_posts, 0, "the tick must not POST again; it reconciles read-only")
+        self.assertEqual(jobs.load_job(self.state, "job_slice")["tasks"][0]["provisioning"]["attempts"], 1)
+        self.assertEqual(len(launcher.posts), 1)
+        self.assertEqual(jobs.load_job(self.state, "job_slice")["tasks"][0]["provisioning"]["state"], "bound")
+
+    def test_a_validator_refusal_blocks_the_dispatch_post(self):
+        from bundlebees_plugin import provision_bind
+
+        launcher = FakeLauncher()
+        wrapped = provision_bind.BoundLauncher(
+            launcher, {"T1": "smoke-real", "T1:rev": self.sha},
+            {"T1": lambda: (_ for _ in ()).throw(P.ProvisionDenied("receipt_stale", "moved", "stop"))},
+        )
+        with self.assertRaises(P.ProvisionDenied):
+            wrapped.post_attempt({"task_id": "T1", "project": "smoke-real", "source_rev": self.sha})
+        self.assertEqual(launcher.posts, [])
 
 
 class FakeLauncher:

@@ -348,7 +348,7 @@ def create_job(
             "repo": authorization["repo"],
             "base_rev": authorization["base_rev"],
         },
-        "tasks": [_normalize_task(task) for task in tasks],
+        "tasks": [_normalize_task(task, for_create=True) for task in tasks],
         "integration": {"wave": "w1", "state": "pending", "evidence": None},
         "approval_gate": {
             "required": True,
@@ -448,7 +448,7 @@ def _require_dependencies_accepted(job: Mapping[str, Any], task: Mapping[str, An
 # ---------------------------------------------------------------------------
 
 
-def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_task(task: Mapping[str, Any], *, for_create: bool = False) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
     if not task_id:
         raise JobError("job_invalid", "every task needs a task_id", _FIX_TRANSITION)
@@ -458,7 +458,8 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
     depends_on = task.get("depends_on") or []
     if not isinstance(depends_on, (list, tuple)):
         raise JobError("job_invalid", f"task {task_id} depends_on must be a list", _FIX_TRANSITION)
-    return {
+    provision = task.get("provision")
+    body = {
         "task_id": task_id,
         "objective": str(task.get("objective") or ""),
         "lease": lease,
@@ -467,14 +468,21 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "contract_sha256": task.get("contract_sha256"),
         "acceptance": task.get("acceptance"),
         "contract": task.get("contract"),
-        "provision": task.get("provision"),
-        "binding": task.get("binding"),
-        "provisioning": task.get("provisioning"),
-        "state": str(task.get("state") or "pending"),
-        "attempts": list(task.get("attempts") or []),
-        "verify": None,
-        "intent": None,
+        "provision": dict(provision) if isinstance(provision, Mapping) else None,
     }
+    if for_create:
+        # A new job always starts at the beginning: an author-supplied state,
+        # attempt list, binding or verification is never trusted as history.
+        body.update(binding=None, provisioning=None, state="pending", attempts=[], verify=None, intent=None)
+    else:
+        # Restoring a persisted document: these fields are written by the
+        # coordinator, not by the caller of create_job().
+        body.update(
+            binding=task.get("binding"), provisioning=task.get("provisioning"),
+            state=str(task.get("state") or "pending"), attempts=list(task.get("attempts") or []),
+            verify=task.get("verify"), intent=task.get("intent"),
+        )
+    return body
 
 
 def _normalize_scope(scope: Iterable[Any]) -> list[str]:

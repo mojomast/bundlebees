@@ -195,22 +195,54 @@ def tick(
     job = jobs.load_job(state_dir, job_id)
     job = _hydrate_contracts(state_dir, job, repo)
 
-    if provisioner is not None:
-        from . import provision_bind
+    from . import provision_bind
 
+    required = [task for task in job.get("tasks") or [] if isinstance(task.get("provision"), Mapping)]
+    if required and provisioner is None:
+        # A provisioning-required task must never fall back to the legacy path.
+        return {"status": "blocked", "action": "provision", "transitions": [],
+                "detail": "this job requires provisioning but no provisioner was supplied; refusing to dispatch",
+                "evidence": {"tasks": [str(task["task_id"]) for task in required]},
+                "exactly_once": False, "handoff": None}
+
+    if provisioner is not None:
         outcome = provision_bind.advance(state_dir, job, provisioner=provisioner, expect_host=expect_host)
         job = jobs.load_job(state_dir, job_id)
         if outcome.get("blocked"):
             return {"status": "uncertain", "action": "provision", "transitions": [],
                     "detail": "provisioning outcome is uncertain; reconciled by receipt lookup, not re-POSTed",
                     "evidence": outcome, "exactly_once": False, "handoff": None}
+        unbound = [task["task_id"] for task in job.get("tasks") or []
+                   if isinstance(task.get("provision"), Mapping) and not (task.get("binding") or {}).get("receipt_digest")]
+        if unbound:
+            return {"status": "blocked", "action": "provision", "transitions": [],
+                    "detail": f"tasks {unbound} are not bound to a verified receipt; refusing to dispatch",
+                    "evidence": outcome, "exactly_once": False, "handoff": None}
 
     adapter = LauncherAdapter(client)
-    from . import provision_bind
-
     bindings = provision_bind.bindings_for(job)
+    validators = {}
+    if provisioner is not None:
+        for task in job.get("tasks") or []:
+            binding_doc = task.get("binding")
+            if not isinstance(binding_doc, Mapping) or not binding_doc.get("receipt_digest"):
+                continue
+            key = provision_bind.stable_key(str(job_id), str(task["task_id"]))
+
+            def _check(binding_doc=binding_doc, key=key):
+                receipt = provisioner.authoritative_receipt(
+                    key, expect_repo=str(binding_doc["repo"]), expect_rev=str(binding_doc["source_rev"]),
+                    expect_profile=str(binding_doc["profile"]), expect_project=str(binding_doc["project"]),
+                    expect_host=str(binding_doc["host"]),
+                )
+                from . import provisioning as _P
+
+                _P.Binding(**{k: binding_doc[k] for k in ("repo", "source_rev", "host", "profile", "project", "receipt_digest", "contract_sha256")},
+                           workspace=binding_doc.get("workspace") or "").validate(receipt, contract_sha256=str(binding_doc["contract_sha256"]))
+
+            validators[str(task["task_id"])] = _check
     if bindings:
-        adapter = provision_bind.BoundLauncher(adapter, bindings)
+        adapter = provision_bind.BoundLauncher(adapter, bindings, validators)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
         from . import acdd_cli
