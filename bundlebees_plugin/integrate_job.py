@@ -14,6 +14,7 @@ has always enforced. Nothing here weakens it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -55,16 +56,31 @@ def _wave_number(job: Mapping[str, Any]) -> int:
         return 1
 
 
-def job_wave_id(job: Mapping[str, Any]) -> str:
-    """Wave records are per job: two jobs in one state dir both use "w1".
+import hashlib as _hashlib
 
-    Returns ``<job_id>.w<N>`` so a record can never be recovered for another job.
+
+def job_wave_id(job: Mapping[str, Any]) -> str:
+    """Wave records are per job and always within the 64-char record limit.
+
+    M1 allows job ids up to 96 characters while wave ids allow 64, so long ids are
+    shortened with a digest of the *full* id: unique, deterministic, and stable
+    across restarts.
     """
     job_id = str(job.get("job_id") or "").strip()
     if not job_id:
         raise IntegrateError("bad_job_id", "the job has no id", "Fix the job document.")
     safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in job_id)
-    return f"{safe}.w{_wave_number(job)}"
+    suffix = f".w{_wave_number(job)}"
+    if len(safe) + len(suffix) > 64:
+        digest = _hashlib.sha256(job_id.encode()).hexdigest()[:16]
+        safe = f"{safe[:44]}.{digest}"
+    return f"{safe}{suffix}"
+
+
+def _legacy_names(job: Mapping[str, Any]) -> list[str]:
+    job_id = str(job.get("job_id") or "").strip()
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in job_id)
+    return [f"w{_wave_number(job)}", f"{safe}.w{_wave_number(job)}"]
 
 
 def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> dict[str, Any] | None:
@@ -86,7 +102,21 @@ def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequ
     recorded = record.get("attempts") if isinstance(record, dict) else None
     if not isinstance(recorded, list) or sorted(str(a) for a in recorded) != sorted(str(a) for a in attempts):
         return None
-    target.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    body = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)          # atomic: two recoverers see one result
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return record
 
 
@@ -131,12 +161,14 @@ def integrate(
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
     wave = wave_id or job_wave_id(job)
-    legacy = f"w{_wave_number(job)}"
 
     # Crash recovery: an accepted wave record already on disk is the result.
     # Restore the durable ref if the crash happened before it was updated, and
     # report recovery so the caller does not count it as a new attempt.
-    adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
+    for legacy in _legacy_names(job):
+        adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
+        if adopted is not None:
+            break
     existing = _accepted_wave_record(state_dir, wave)
     if existing is not None:
         head = str(existing.get("head_sha") or "")
