@@ -466,6 +466,8 @@ def add_parsers(subparsers: Any) -> None:
     run.add_argument("--once", action="store_true", help="One deterministic pass (required for now).")
     run.add_argument("--repo", required=True, help="Repository worktree used by verification/integration.")
     run.add_argument("--state-dir", default=None)
+    run.add_argument("--backend", choices=["json", "kanban"], default="json",
+                     help="Queue backend. json is the deterministic local/test store; kanban uses the configured CLI.")
     inspect = qsub.add_parser("inspect")
     inspect.add_argument("feature_id")
     qsub.add_parser("doctor")
@@ -496,7 +498,18 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
     if isinstance(getter, Mapping):
         config = dict(getter)
     queue_file = Path((config.get("queue") or {}).get("file") or (Path(state_dir) / "queue.json"))
-    backend = queue_mod.JsonQueue(queue_file)
+    backend_name = getattr(args, "backend", "json")
+    if backend_name == "kanban":
+        import shutil
+        import subprocess
+
+        hermes = shutil.which("hermes")
+        if hermes is None:
+            print(json.dumps({"error": "kanban_unavailable", "detail": "the hermes CLI is not on PATH"}, indent=2))
+            return 2
+        backend = queue_mod.KanbanQueue(lambda argv: subprocess.run([hermes, *argv], capture_output=True, text=True))
+    else:
+        backend = queue_mod.JsonQueue(queue_file)
     handler = getattr(args, "queue_handler", None)
 
     if handler == "status":

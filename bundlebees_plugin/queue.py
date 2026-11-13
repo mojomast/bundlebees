@@ -152,15 +152,30 @@ class QueueStore:
     def write(self, feature_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
         body = dict(record, feature_id=feature_id, updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         path = self.path(feature_id)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(body, indent=2, sort_keys=True), encoding="utf-8")
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
         return body
+
+    def active(self) -> list[dict[str, Any]]:
+        records = []
+        for path in sorted(self.root.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            record.setdefault("feature_id", path.stem)
+            if record.get("state") in ("claimed", "running"):
+                records.append(record)
+        return records
 
     def claim(self, feature_id: str, *, job_id: str) -> dict[str, Any]:
         """O_EXCL claim: two consumers cannot both take the same feature."""
         path = self.path(feature_id)
-        record = {"state": "claimed", "job_id": job_id, "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        record = {"feature_id": feature_id, "state": "claimed", "job_id": job_id, "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                   "pid": os.getpid()}
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -182,55 +197,74 @@ def eligible(items: list[Item], done: set[str]) -> Item | None:
 
 
 def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None) -> dict[str, Any]:
-    """Claim one eligible feature and advance it through the existing tick.
+    """One pass: reconcile active work first, then admit at most one new feature.
 
-    ``tick(job_id)`` is the production job tick (already wired to provisioning,
-    launcher, verifier and integrator). This function never interprets a queue
-    status as completion: the job document is the evidence.
+    A feature that is claimed or running is never dropped from scheduling because
+    of its displayed status, and completion is derived from the job document.
     """
 
     store = QueueStore(state_dir)
-    items = queue.list_items()
-    done = {item.feature_id for item in items if item.status == "ready_for_review"}
+    items = {item.feature_id: item for item in queue.list_items()}
+    done = {feature_id for feature_id, item in items.items() if _job_accepted(state_dir, item.job_id)}
 
-    item = eligible(items, done)
+    # 1. Advance existing work before admitting anything new.
+    for record in store.active():
+        feature_id = str(record.get("feature_id"))
+        item = items.get(feature_id)
+        if item is None:
+            continue
+        job = _load_job_or_none(state_dir, item.job_id)
+        if job is None:
+            store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist"))
+            queue.set_status(feature_id, "needs_approval", {"detail": "claimed but no job; authorization or packet must be re-registered"})
+            return {"action": "blocked", "feature": feature_id, "job": item.job_id,
+                    "detail": "a claim exists but its job does not; recreate the authorized job, then re-run"}
+        result = tick(item.job_id)
+        status = str(result.get("status") or "") if hasattr(result, "get") else ""
+        if _job_accepted(state_dir, item.job_id):
+            store.write(feature_id, dict(record, state="ready_for_review", evidence=result))
+            queue.set_status(feature_id, "ready_for_review", {"job_id": item.job_id})
+            return {"action": "ready_for_review", "feature": feature_id, "job": item.job_id, "status": status}
+        if status in ("blocked", "failed", "error"):
+            store.write(feature_id, dict(record, state="blocked" if status == "blocked" else "failed", evidence=result))
+            queue.set_status(feature_id, "blocked" if status == "blocked" else "failed",
+                             {"detail": str(result.get("detail") or "")[:400]})
+            return {"action": status, "feature": feature_id, "job": item.job_id, "status": status}
+        store.write(feature_id, dict(record, state="running", evidence=result))
+        queue.set_status(feature_id, "running", {"job_id": item.job_id})
+        return {"action": "advanced", "feature": feature_id, "job": item.job_id, "status": status}
+
+    # 2. Admit one eligible feature, judged only against evidence.
+    item = eligible(list(items.values()), done)
     if item is None:
         return {"action": "idle", "feature": None}
 
-    record = store.read(item.feature_id)
-    if record is None:
-        record = store.claim(item.feature_id, job_id=item.job_id)
-        queue.set_status(item.feature_id, "claimed", {"job_id": item.job_id})
-
-    # The crash window: claimed, but the job may not exist yet.
-    job = _load_job_or_none(state_dir, item.job_id)
-    if job is None:
-        return {"action": "blocked", "feature": item.feature_id,
-                "detail": f"claimed, but job {item.job_id} does not exist", "state": "needs_approval"}
+    record = store.claim(item.feature_id, job_id=item.job_id)
+    queue.set_status(item.feature_id, "claimed", {"job_id": item.job_id})
+    if _load_job_or_none(state_dir, item.job_id) is None:
+        store.write(item.feature_id, dict(record, state="needs_approval", detail="job missing at claim time"))
+        queue.set_status(item.feature_id, "needs_approval", {"detail": "no authorized job for this feature"})
+        return {"action": "blocked", "feature": item.feature_id, "job": item.job_id,
+                "detail": "claimed, but the authorized job does not exist"}
 
     result = tick(item.job_id)
-
-    state = str(getattr(result, "get", lambda *_: None)("status") or "")
-    transitions = list(result.get("transitions") or []) if hasattr(result, "get") else []
-    accepted = _job_accepted(state_dir, item.job_id)
-
-    if accepted:
+    status = str(result.get("status") or "") if hasattr(result, "get") else ""
+    if _job_accepted(state_dir, item.job_id):
         store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result))
-        queue.set_status(item.feature_id, "ready_for_review", {"job_id": item.job_id, "transitions": transitions})
-        outcome = "ready_for_review"
-    elif state in ("blocked", "failed", "error"):
-        store.write(item.feature_id, dict(record, state=state, evidence=result))
-        queue.set_status(item.feature_id, "blocked" if state == "blocked" else "failed", {"detail": str(result.get("detail") or "")[:400]})
-        outcome = state
+        queue.set_status(item.feature_id, "ready_for_review", {"job_id": item.job_id})
+        action = "ready_for_review"
+    elif status in ("blocked", "failed", "error"):
+        store.write(item.feature_id, dict(record, state="blocked", evidence=result))
+        queue.set_status(item.feature_id, "blocked", {"detail": str(result.get("detail") or "")[:400]})
+        action = "blocked"
     else:
         store.write(item.feature_id, dict(record, state="running", evidence=result))
         queue.set_status(item.feature_id, "running", {"job_id": item.job_id})
-        outcome = "running"
+        action = "running"
 
     if on_status is not None:
-        on_status(item.feature_id, outcome)
-    return {"action": outcome, "feature": item.feature_id, "job": item.job_id,
-            "transitions": transitions, "status": state}
+        on_status(item.feature_id, action)
+    return {"action": action, "feature": item.feature_id, "job": item.job_id, "status": status}
 
 
 def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:

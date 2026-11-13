@@ -113,6 +113,37 @@ class QueueTests(unittest.TestCase):
             Q.KanbanQueue(lambda args: Out()).list_items()
         self.assertEqual(caught.exception.code, "kanban_invalid")
 
+    def test_a_running_feature_continues_to_be_advanced(self):
+        Q.QueueStore(self.tmp).write("f1", {"state": "running", "job_id": "job_1"})
+        patcher = mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        accepted = mock.patch.object(Q, "_job_accepted", lambda state_dir, job_id: True)
+        accepted.start()
+        self.addCleanup(accepted.stop)
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_1"])
+        self.assertEqual(result["action"], "ready_for_review")
+        self.assertEqual(self.queue.get("f1").status, "ready_for_review")
+
+    def test_dependencies_unlock_on_job_evidence_not_card_status(self):
+        self.queue.set_status("f1", "ready_for_review")   # card says done
+        accepted = mock.patch.object(Q, "_job_accepted", lambda state_dir, job_id: False)
+        accepted.start()
+        self.addCleanup(accepted.stop)
+        patcher = mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertNotIn("job_2", called, "f2 must not run while f1 has no accepted evidence")
+        self.assertIn(result["action"], {"idle", "blocked"})
+
 
 if __name__ == "__main__":
     unittest.main()
