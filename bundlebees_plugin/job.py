@@ -151,9 +151,33 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
         raise
 
 
+def _without_seal(body: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in body.items() if k != "seal"}
+
+
 def _seal(body: Mapping[str, Any], key: bytes) -> dict[str, Any]:
     document = dict(body)
     return {"body": document, "mac": _sign(document, key)}
+
+
+def verify_seal(body: Mapping[str, Any], key: bytes, what: str) -> dict[str, Any]:
+    """Verify a sealed object already in memory (used by sealed policy files)."""
+    provided = body.get("seal")
+    expected = hmac.new(key, _canonical(_without_seal(body)), hashlib.sha256).hexdigest()
+    if not isinstance(provided, str) or not hmac.compare_digest(provided, expected):
+        raise JobError("seal_invalid", f"the {what} seal does not verify", "Refuse it; re-enroll from a trusted copy.")
+    return _without_seal(body)
+
+
+def open_sealed(envelope: Mapping[str, Any], key: bytes, what: str) -> dict[str, Any]:
+    """Open the on-disk ``{"body", "mac"}`` envelope and verify it."""
+    body, mac = envelope.get("body"), envelope.get("mac")
+    if not isinstance(body, Mapping) or not isinstance(mac, str):
+        raise JobError("seal_invalid", f"the {what} envelope is malformed", "Refuse it.")
+    expected = hmac.new(key, _canonical(body), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        raise JobError("seal_invalid", f"the {what} seal does not verify", "Refuse it; re-enroll from a trusted copy.")
+    return dict(body)
 
 
 def _unseal(path: Path, key: bytes, what: str) -> dict[str, Any]:
@@ -330,6 +354,13 @@ def record_derived_authorization(
     }
     key = _ensure_key(state_dir)
     path = authorization_path(state_dir, job_id)
+    if path.exists():
+        existing = _unseal(path, key, "authorization")
+        if (existing.get("base_rev") == body["base_rev"] and existing.get("scope") == body["scope"]
+                and (existing.get("derived_from") or {}).get("auth_id") == body["derived_from"]["auth_id"]):
+            return existing
+        raise JobError("derived_authorization_exists", f"a different authorization already exists for {job_id}",
+                       "Refuse: derived authority is create-only.")
     _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
     return body
 

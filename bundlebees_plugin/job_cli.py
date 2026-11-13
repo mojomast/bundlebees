@@ -563,7 +563,12 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
             return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner,
                         gitleaks=scanner)
 
-        result = queue_mod.run_once(state_dir, backend, tick=one_tick)
+        handoff_context = None
+        mirror = (config.get("transport") or {}).get("mirror")
+        if mirror:
+            handoff_context = {"worktree": str(Path(args.repo)), "mirror": str(mirror),
+                               "repo_identity": str((config.get("queue") or {}).get("repo") or "")}
+        result = queue_mod.run_once(state_dir, backend, tick=one_tick, handoff_context=handoff_context)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     print(json.dumps({"error": "queue_handler_required"}, indent=2))

@@ -130,6 +130,13 @@ class TwoFeatures(unittest.TestCase):
                           "project": "smoke-answer", "contract_sha256": self.sha_a},
         }])
 
+        from bundlebees_plugin import handoff as handoff_mod
+        handoff_mod.enroll_policy(
+            self.state, policy_id="policy-b", statement="Feature B may build on Feature A's accepted commit",
+            repo=REPO, root_rev=self.root, dependencies=["job_a"], scope=["smoke/double.py"],
+            bees=1, wall_clock_s=1800, contract_template=self.contracts["B"], gates=("merge",),
+            host=self.host, profile="smoke", project="smoke-double", workflow_ref=WORKFLOW_REF,
+        )
         self.queue_file = self.state / "queue.json"
         self.queue_file.write_text(json.dumps({
             "feature-a": {"repo": REPO, "job_id": "job_a", "status": "queued"},
@@ -210,51 +217,13 @@ class TwoFeatures(unittest.TestCase):
                             provisioner=self.provisioner, expect_host=self.host, gitleaks=GITLEAKS,
                             suite_command=[sys.executable, "-m", "pytest", *suite])
 
-    def _create_feature_b(self):
-        """Derive Feature B's authority from A's accepted commit, once."""
-        if self._b_created:
-            return
-        accepted, _ = transport.accepted_commit(self.state, jobs.load_job(self.state, "job_a"))
-        receipt = transport.publish(self.state, "job_a", repo=self.work, mirror=self.mirror,
-                                    repo_identity=REPO, root_rev=self.root)
-        self.assertEqual(receipt["source_sha"], accepted)
-
-        policy = descendants.DescendantPolicy.parse({
-            "repo": REPO, "base_rev": self.root, "scope": ["smoke/double.py"],
-            "budget": {"bees": 1, "wall_clock_s": 1800},
-            "descendant": {"policy": descendants.POLICY, "dependencies": ["job_a"]},
-        })
-        derived = descendants.derive(policy, candidate_rev=accepted, repo=REPO, worktree=self.work,
-                                     assigned_files=["smoke/double.py"], state_dir=self.state,
-                                     bees=1, wall_clock_s=1800)
-        jobs.record_derived_authorization(self.state, job_id="job_b", parent_job_id="job_a",
-                                          statement="Feature B on A's accepted commit", repo=REPO,
-                                          candidate_rev=derived["base_rev"], scope=["smoke/double.py"],
-                                          bees=1, wall_clock_s=1800, dependencies=["job_a"], root_rev=self.root,
-                                          policy_scope=["smoke/double.py"])
-        from bundlebees_plugin import contract as contract_mod
-        body = dict(self.contracts["B"], source_rev=accepted)
-        contract_b = contract_mod.freeze_contract(body, approved_by="reviewer", approved_at="2026-11-13T00:00:00Z")
-        self.sha_b = contract_mod.check_frozen(contract_b)
-        jobs.create_job(self.state, job_id="job_b", summary="Feature B", workflow_ref=WORKFLOW_REF, tasks=[{
-            "task_id": "TB", "objective": "Create smoke/double.py returning 84", "lease": ["smoke/double.py"],
-            "acceptance": {"criteria": ["double_answer() == 84"],
-                           "tests": ["tests/test_double.py::test_double_is_84"],
-                           "commands": ["python -m pytest tests/test_double.py -q"]},
-            "contract": contract_b, "contract_sha256": self.sha_b,
-            "provision": {"repo": REPO, "source_rev": accepted, "host": self.host, "profile": "smoke",
-                          "project": "smoke-double", "contract_sha256": self.sha_b},
-        }])
-        self._b_created = True
-        self.accepted_a = accepted
-
     def test_two_dependent_features_reach_one_verified_history(self):
         log = []
-        for _ in range(12):
-            result = queue.run_once(self.state, self.queue, tick=self.tick)
+        for _ in range(20):
+            result = queue.run_once(self.state, self.queue, tick=self.tick,
+                                    handoff_context={"worktree": str(self.work), "mirror": str(self.mirror),
+                                                     "repo_identity": REPO})
             log.append(result)
-            if result["action"] == "ready_for_review" and result["feature"] == "feature-a":
-                self._create_feature_b()
             if result["action"] == "ready_for_review" and result["feature"] == "feature-b":
                 break
             if result["action"] == "blocked":
@@ -270,7 +239,7 @@ class TwoFeatures(unittest.TestCase):
 
         job_a = jobs.load_job(self.state, "job_a")
         job_b = jobs.load_job(self.state, "job_b")
-        self.assertEqual(job_b["goal"]["base_rev"], self.accepted_a)
+        self.assertEqual(job_b["goal"]["base_rev"], job_a["integration"]["last_commit"])
         self.assertEqual(job_a["goal"]["workflow_ref"], WORKFLOW_REF)
 
         head_b = job_b["integration"]["last_commit"]

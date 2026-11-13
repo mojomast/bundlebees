@@ -197,7 +197,32 @@ def eligible(items: list[Item], done: set[str]) -> Item | None:
     return None
 
 
-def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None) -> dict[str, Any]:
+def _handoff_dependents(state_dir: Path, items: Mapping[str, "Item"], done: set[str], context: Mapping[str, Any]) -> list[str]:
+    """Materialize queued dependents whose dependency is accepted. Production path."""
+    from . import handoff
+
+    created = []
+    for item in items.values():
+        if item.status != "queued" or not item.depends_on:
+            continue
+        if not all(dep in done for dep in item.depends_on):
+            continue
+        if _load_job_or_none(state_dir, item.job_id) is not None:
+            continue
+        dependency = items[item.depends_on[0]]
+        policy = handoff.find_policy_for_dependency(state_dir, dependency.job_id)
+        if policy is None:
+            continue
+        result = handoff.materialize(state_dir, feature_id=item.feature_id, job_id=item.job_id,
+                                     policy=policy, worktree=Path(context["worktree"]),
+                                     mirror=Path(context["mirror"]), repo_identity=str(context.get("repo_identity") or ""))
+        if result.get("created"):
+            created.append(item.feature_id)
+    return created
+
+
+def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None,
+             handoff_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """One pass: reconcile active work first, then admit at most one new feature.
 
     A feature that is claimed or running is never dropped from scheduling because
@@ -207,6 +232,10 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     store = QueueStore(state_dir)
     items = {item.feature_id: item for item in queue.list_items()}
     done = {feature_id for feature_id, item in items.items() if _job_accepted(state_dir, item.job_id)}
+    if handoff_context:
+        created = _handoff_dependents(state_dir, items, done, handoff_context)
+        if created:
+            return {"action": "handoff", "feature": created[0], "created": created}
 
     # 1. Advance existing work before admitting anything new.
     for record in store.active():
