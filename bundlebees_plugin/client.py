@@ -488,13 +488,19 @@ class _BaseClient:
                 _FIX_LAUNCHER,
             ) from exc
 
-    def _http_error(self, status: int, data: bytes) -> ClientError:
+    def _http_error(
+        self,
+        status: int,
+        data: bytes,
+        *,
+        message_from_payload: bool = True,
+    ) -> ClientError:
         message = "launcher request failed"
         try:
             payload = json.loads(data.decode("utf-8")) if data else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             payload = {}
-        if isinstance(payload, dict):
+        if message_from_payload and isinstance(payload, dict):
             candidate = payload.get("error") or payload.get("message") or payload.get("detail")
             if candidate:
                 message = str(candidate)
@@ -521,7 +527,14 @@ class _BaseClient:
             err.upstream_code = upstream
         return err
 
-    def request_json(self, method: str, path: str, payload: Any = None) -> Any:
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: Any = None,
+        *,
+        suppress_server_message: bool = False,
+    ) -> Any:
         url = self._absolute(path)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         for _ in range(MAX_REDIRECTS + 1):
@@ -590,7 +603,11 @@ class _BaseClient:
                     body = None
                 continue
             if status >= 400:
-                raise self._http_error(status, data)
+                raise self._http_error(
+                    status,
+                    data,
+                    message_from_payload=not suppress_server_message,
+                )
             return self._decode(data)
         raise ClientError(
             "launcher returned too many redirects",
@@ -720,6 +737,7 @@ ARTIFACT_VERSION = "orbit.worker-artifact/1"
 MAX_ARTIFACT_BYTES = 24 * 1_048_576
 _HEX40_64 = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX64_ANY = re.compile(r"[0-9a-fA-F]{64}")
 _CAPABILITY_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
 _COORDINATOR_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
@@ -743,6 +761,35 @@ _ARTIFACT_CODES: dict[str, tuple[str, str]] = {
 }
 
 
+_ARTIFACT_FIELDS = (
+    "artifact_version",
+    "attempt_id",
+    "source_rev",
+    "patch",
+    "patch_sha256",
+    "result_sha256",
+    "usage",
+    "worker_claims_untrusted",
+)
+
+# HTTP status -> the code Orbit uses for a typed artifact refusal.
+_ARTIFACT_HTTP_CODES: dict[int, str] = {
+    400: "invalid_attempt_id",
+    403: "not_owner",
+    409: "artifact_mismatch",
+    413: "too_large",
+    503: "launcher_unreachable",
+}
+
+_ARTIFACT_HTTP_FIXES: dict[str, str] = {
+    "invalid_attempt_id": "Check the attempt id.",
+    "not_owner": "Use the capability stored for this attempt at dispatch.",
+    "artifact_mismatch": "Reject this worker result; nothing was applied.",
+    "too_large": "The patch is over Orbit's artifact limit; split the brief.",
+    "launcher_unreachable": "Retry only when Orbit is reachable again.",
+}
+
+
 def _artifact_invalid(why: str) -> ClientError:
     return ClientError(
         f"Orbit returned an invalid worker artifact: {why}",
@@ -750,6 +797,91 @@ def _artifact_invalid(why: str) -> ClientError:
         "Reject this worker result; nothing was applied.",
         status=502,
     )
+
+
+def _artifact_malformed(field: str, *, missing: bool = False) -> ClientError:
+    kind = "missing required field" if missing else "malformed field"
+    return _artifact_invalid(f"{kind} {field!r}")
+
+
+def _artifact_http_error(exc: ClientError) -> ClientError:
+    """Map an artifact HTTP refusal to one typed error without the server text."""
+    code = exc.upstream_code or _ARTIFACT_HTTP_CODES.get(exc.status or 0)
+    if not code:
+        return exc
+    mapped = ClientError(
+        "Orbit refused the artifact request",
+        code,
+        _ARTIFACT_HTTP_FIXES.get(
+            code,
+            "Check the attempt id and capability, then retry only when Orbit is "
+            "reachable.",
+        ),
+        status=exc.status,
+    )
+    mapped.upstream_code = code
+    return mapped
+
+
+def _normalise_artifact(data: Any, attempt_id: str) -> dict[str, Any]:
+    """Validate the typed artifact body and return exactly the documented fields."""
+    if not isinstance(data, dict):
+        raise _artifact_invalid("response is not an object")
+    for field in _ARTIFACT_FIELDS:
+        if field not in data:
+            raise _artifact_malformed(field, missing=True)
+
+    artifact_version = data["artifact_version"]
+    if not isinstance(artifact_version, str):
+        raise _artifact_malformed("artifact_version")
+
+    response_attempt = data["attempt_id"]
+    if not isinstance(response_attempt, str):
+        raise _artifact_malformed("attempt_id")
+    if response_attempt != str(attempt_id):
+        raise _artifact_invalid("attempt_id does not match the request")
+
+    source_rev = data["source_rev"]
+    if not isinstance(source_rev, str):
+        raise _artifact_malformed("source_rev")
+
+    patch = data["patch"]
+    if patch is not None and not isinstance(patch, str):
+        raise _artifact_malformed("patch")
+
+    digest = data["patch_sha256"]
+    if patch is None:
+        if digest is not None:
+            raise _artifact_invalid("patch_sha256 must be null when patch is null")
+    else:
+        if not isinstance(digest, str) or not _HEX64_ANY.fullmatch(digest):
+            raise _artifact_malformed("patch_sha256")
+        computed = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+        if computed != digest.lower():
+            raise _artifact_invalid("patch_sha256 does not match the patch")
+
+    result_sha = data["result_sha256"]
+    if not isinstance(result_sha, str) or not _HEX64_ANY.fullmatch(result_sha):
+        raise _artifact_malformed("result_sha256")
+
+    usage = data["usage"]
+    if usage is not None and not isinstance(usage, dict):
+        raise _artifact_malformed("usage")
+
+    claims = data["worker_claims_untrusted"]
+    if claims is not None and not isinstance(claims, dict):
+        raise _artifact_malformed("worker_claims_untrusted")
+
+    return {
+        "artifact_version": artifact_version,
+        "attempt_id": response_attempt,
+        "source_rev": source_rev,
+        "patch": patch,
+        "patch_sha256": digest,
+        "result_sha256": result_sha,
+        "usage": usage,
+        "worker_claims_untrusted": claims,
+    }
 
 
 def _artifact_observed(observed: Mapping[str, Any]) -> dict[str, Any]:
@@ -912,11 +1044,64 @@ class OrbitAdapterClient(_BaseClient):
             raise missing
         return capability
 
-    def artifact(self, attempt_id: str) -> dict[str, Any]:
+    def artifact(
+        self,
+        attempt_id: str,
+        *,
+        capability: str | None = None,
+        coordinator: str | None = None,
+    ) -> dict[str, Any]:
         """Fetch a finished attempt's patch through Orbit's capability-gated artifact op.
 
-        Verifier-only: the result carries the raw patch and must never reach a tool response.
+        Passing ``capability`` selects the typed consumer: it posts exactly
+        ``{op, attempt_id, capability, coordinator}`` and returns the eight
+        documented artifact fields after validating the response and the patch
+        hash. Omitting it keeps the verifier path that loads the capability
+        stored at dispatch.
+
+        Verifier-only: the result carries the raw patch and must never reach a
+        tool response.
         """
+        if capability is not None:
+            return self._artifact_with_capability(
+                attempt_id, capability, coordinator
+            )
+        return self._stored_artifact(attempt_id)
+
+    def _artifact_with_capability(
+        self,
+        attempt_id: str,
+        capability: str,
+        coordinator: str | None,
+    ) -> dict[str, Any]:
+        if not isinstance(capability, str) or not capability:
+            raise ClientError(
+                "artifact capability is missing or malformed",
+                "invalid_argument",
+                "Re-dispatch from the coordinator that holds this attempt's capability.",
+            )
+        body = {
+            "op": "artifact",
+            "attempt_id": attempt_id,
+            "capability": capability,
+            "coordinator": coordinator or "Hermes",
+        }
+        saved = self._max_bytes
+        self._max_bytes = max(saved, MAX_ARTIFACT_BYTES)
+        try:
+            data = self.request_json(
+                "POST",
+                "/api/local-workers",
+                body,
+                suppress_server_message=True,
+            )
+        except ClientError as exc:
+            raise _artifact_http_error(exc) from None
+        finally:
+            self._max_bytes = saved
+        return _normalise_artifact(data, attempt_id)
+
+    def _stored_artifact(self, attempt_id: str) -> dict[str, Any]:
         capability = self._load_capability(attempt_id)
         payload: dict[str, Any] = {"attempt_id": attempt_id, "capability": capability}
         if self._coordinator:
