@@ -27,6 +27,43 @@ class QueueError(Exception):
 STATES = ("queued", "claimed", "running", "ready_for_review", "blocked", "failed", "needs_approval")
 
 
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault-injection checkpoint, if the faults lane installed one.
+
+    Imported lazily on purpose: ``bundlebees_plugin.faults`` is owned by another
+    lane and may be absent, and its absence must never break this module's
+    import. A hook that raises is *not* caught here — that raise is the
+    simulated crash.
+    """
+    try:
+        import importlib
+
+        faults = importlib.import_module(f"{__package__}.faults")
+    except ImportError:
+        return
+    fire = getattr(faults, "checkpoint", None)
+    if callable(fire):
+        fire(name, **payload)
+
+
+def _sync_dir(path: Path) -> None:
+    """Persist a directory entry created by a rename (best effort)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+
 @dataclass(frozen=True)
 class Item:
     feature_id: str
@@ -159,15 +196,44 @@ class QueueStore:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _sync_dir(path.parent)
         return body
 
     def active(self) -> list[dict[str, Any]]:
+        """Every claim that is still in flight, refusing records it cannot read.
+
+        A record that cannot be read might be an active claim, so it is a named
+        refusal rather than a silently dropped item: dropping it would let the
+        scheduler forget work that is genuinely running, and let a second
+        consumer claim the same feature. A record that is genuinely absent
+        (never written, or removed between listing and reading) is normal.
+        """
         records = []
         for path in sorted(self.root.glob("*.json")):
             try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue  # genuinely absent: nothing claimed it
+            except OSError as exc:
+                raise QueueError(
+                    "queue_state_unreadable",
+                    f"{path.stem} queue state cannot be read: {exc}",
+                    "Inspect it by hand; an unreadable record may be an active claim.",
+                ) from exc
+            try:
+                record = json.loads(text)
+            except ValueError as exc:
+                raise QueueError(
+                    "queue_state_corrupt",
+                    f"{path.stem} queue state is not valid JSON: {exc}",
+                    "Inspect it by hand; a corrupt record may be an active claim.",
+                ) from exc
+            if not isinstance(record, dict):
+                raise QueueError(
+                    "queue_state_corrupt",
+                    f"{path.stem} queue state is not a JSON object",
+                    "Inspect it by hand; a corrupt record may be an active claim.",
+                )
             record.setdefault("feature_id", path.stem)
             if record.get("state") in ("claimed", "running"):
                 records.append(record)
@@ -185,6 +251,9 @@ class QueueStore:
             raise QueueError("already_claimed", f"{feature_id} is already {existing.get('state')}", "Inspect or release it; do not run twice.") from None
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(record, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _sync_dir(path.parent)
         return record
 
 
@@ -260,8 +329,14 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         result = tick(item.job_id)
         status = str(result.get("status") or "") if hasattr(result, "get") else ""
         if _job_accepted(state_dir, item.job_id):
-            store.write(feature_id, dict(record, state="ready_for_review", evidence=result))
+            # Acknowledge the card before relaxing the local record, so a crash in
+            # between leaves a record that is still active and is re-acked on the
+            # next pass, rather than a card stuck at "running" with nothing left
+            # to drive it.
+            _checkpoint("queue.before_ack", feature_id=feature_id, job_id=item.job_id,
+                       state="ready_for_review")
             queue.set_status(feature_id, "ready_for_review", {"job_id": item.job_id})
+            store.write(feature_id, dict(record, state="ready_for_review", evidence=result))
             return {"action": "ready_for_review", "feature": feature_id, "job": item.job_id, "status": status}
         if status in ("blocked", "failed", "error"):
             store.write(feature_id, dict(record, state="blocked" if status == "blocked" else "failed", evidence=result))
@@ -288,8 +363,10 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     result = tick(item.job_id)
     status = str(result.get("status") or "") if hasattr(result, "get") else ""
     if _job_accepted(state_dir, item.job_id):
-        store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result))
+        _checkpoint("queue.before_ack", feature_id=item.feature_id, job_id=item.job_id,
+                   state="ready_for_review")
         queue.set_status(item.feature_id, "ready_for_review", {"job_id": item.job_id})
+        store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result))
         action = "ready_for_review"
     elif status in ("blocked", "failed", "error"):
         store.write(item.feature_id, dict(record, state="blocked", evidence=result))

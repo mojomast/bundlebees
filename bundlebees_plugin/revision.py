@@ -20,6 +20,10 @@ A wave is accepted only when every listed attempt has an ``ok`` verify result
 whose 40-hex sha descends from ``HEAD`` *and* a caller-supplied full test suite
 returns a non-timeout exit code of zero. An accepted wave record is final:
 later attempts to overwrite it raise ``RevisionError("wave_already_accepted")``.
+Records are published through a fsynced temporary file and a create-only link,
+so an accepted record is written once and never replaced, and a record that
+exists but cannot be read raises ``wave_unreadable``/``wave_malformed`` — it is
+never treated as absent permission to integrate again.
 The full-suite evidence comes from a disposable sandbox; its ``output_tail`` is
 scrubbed before it is stored.
 """
@@ -27,9 +31,11 @@ scrubbed before it is stored.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
@@ -39,6 +45,14 @@ from typing import Any
 from .security import child_env, scrub
 
 BASE_KEYS = ("base_rev", "source_rev", "base_sha", "base")
+
+#: Stable refusal codes for wave evidence. They are deliberately distinct:
+#: "there is no record" (normal before acceptance) must never be confused with
+#: "there is a record I cannot read" (a refusal to integrate again).
+WAVE_MISSING = "wave_missing"
+WAVE_UNREADABLE = "wave_unreadable"
+WAVE_MALFORMED = "wave_malformed"
+
 
 _WAVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -335,29 +349,140 @@ def _safe_attempt_id(attempt_id: Any) -> bool:
     return _ATTEMPT_ID_RE.fullmatch(attempt_id) is not None
 
 
+def _wave_number(value: Any) -> int:
+    """Accept the job schema's ``"w1"`` as well as a plain integer."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(1, value)
+    text = str(value or "").strip().lower().lstrip("w")
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return 1
+
+
+def wave_id_for(job_id: str, wave: Any = 1) -> str:
+    """The deterministic, job-scoped record id for one job's wave.
+
+    Identical to ``integrate_job.job_wave_id`` (a test pins the agreement): a
+    wave record must be derivable from the job document alone, because after a
+    crash the record is the only proof that the wave was accepted.
+    """
+    text = str(job_id or "").strip()
+    if not text:
+        raise RevisionError("job_invalid", "a wave record needs a job id", "Pass the job's own id.")
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in text)
+    suffix = f".w{_wave_number(wave)}"
+    if len(safe) + len(suffix) > 64:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        safe = f"{safe[:44]}.{digest}"
+    return f"{safe}{suffix}"
+
+
+def waves_dir(state_dir: Path) -> Path:
+    return Path(state_dir) / "waves"
+
+
+def wave_path(state_dir: Path, wave_id: str) -> Path:
+    if not _safe_wave_id(wave_id):
+        raise RevisionError(
+            "invalid_wave_id",
+            "wave id is not a safe record name",
+            "Use 1-64 characters from A-Z, a-z, 0-9, dot, underscore, or hyphen.",
+        )
+    return waves_dir(state_dir) / f"{wave_id}.json"
+
+
+def read_wave(state_dir: Path, wave_id: str) -> dict:
+    """Read a wave record, keeping "absent" and "unreadable" distinct.
+
+    ``wave_missing`` is the only normal answer: the wave has not been accepted
+    yet. ``wave_unreadable`` and ``wave_malformed`` are refusals — a record that
+    exists and cannot be read may be the accepted evidence that forbids a
+    second integration, so it is never treated as absent.
+    """
+    target = wave_path(state_dir, wave_id)
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RevisionError(
+            WAVE_MISSING,
+            f"no wave record exists for {wave_id}",
+            "Absent evidence is legal only before the wave is accepted.",
+        ) from exc
+    except OSError as exc:
+        raise RevisionError(
+            WAVE_UNREADABLE,
+            f"wave record {wave_id} cannot be read: {exc}",
+            "Inspect the waves directory by hand; do not integrate again until it is understood.",
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RevisionError(
+            WAVE_MALFORMED,
+            f"wave record {wave_id} is not valid JSON: {exc}",
+            "Inspect the waves directory by hand; a corrupt record is never permission to integrate again.",
+        ) from exc
+    if not isinstance(data, Mapping):
+        raise RevisionError(
+            WAVE_MALFORMED,
+            f"wave record {wave_id} is not a JSON object",
+            "Inspect the waves directory by hand; a corrupt record is never permission to integrate again.",
+        )
+    return dict(data)
+
+
+def read_wave_or_none(state_dir: Path, wave_id: str) -> dict | None:
+    """``read_wave`` with the one normal case (absence) mapped to ``None``."""
+    try:
+        return read_wave(state_dir, wave_id)
+    except RevisionError as exc:
+        if exc.code == WAVE_MISSING:
+            return None
+        raise
+
+
 def load_wave(state_dir: Path, wave_id: str) -> dict | None:
-    """Load a wave record, or return ``None`` when it is absent or unreadable."""
+    """Load a wave record, or ``None`` when it is absent or unreadable.
+
+    Kept for reporting callers. Any path that decides whether to integrate
+    again must use :func:`read_wave`, which distinguishes absence from damage.
+    """
     if not _safe_wave_id(wave_id):
         return None
-    target = Path(state_dir) / "waves" / f"{wave_id}.json"
     try:
-        text = target.read_text(encoding="utf-8")
-    except (OSError, ValueError):
+        return read_wave(state_dir, wave_id)
+    except RevisionError:
         return None
-    try:
-        data = json.loads(text)
-    except (TypeError, ValueError):
-        return None
-    return dict(data) if isinstance(data, Mapping) else None
 
 
-def _wave_is_accepted(state_dir: Path, wave_id: str) -> bool:
-    record = load_wave(state_dir, wave_id)
-    return bool(record is not None and record.get("accepted") is True)
+def _fsync_dir(path: Path) -> None:
+    """Persist the directory entry created by a link or rename (best effort).
+
+    Filesystems that cannot fsync a directory answer ``EINVAL``/``ENOTSUP``;
+    that is not a reason to refuse the record, but the attempt is always made.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def attempt_accepted(state_dir: Path, attempt_id: str) -> bool:
-    """True only when an accepted wave record lists this attempt."""
+    """True only when an accepted wave record lists this attempt.
+
+    A wave file that cannot be read is an error, not "no accepted wave": it may
+    be exactly the record that says this attempt was integrated.
+    """
     if not _safe_attempt_id(attempt_id):
         return False
     state = Path(state_dir)
@@ -366,8 +491,10 @@ def attempt_accepted(state_dir: Path, attempt_id: str) -> bool:
     except OSError:
         return False
     for path in paths:
-        record = load_wave(state, path.stem)
-        if record is None or record.get("accepted") is not True:
+        if not _safe_wave_id(path.stem):
+            continue
+        record = read_wave(state, path.stem)
+        if record.get("accepted") is not True:
             continue
         attempts = record.get("attempts")
         if not isinstance(attempts, (list, tuple)):
@@ -454,26 +581,92 @@ def _clean_record(record: Mapping[str, Any], head: str) -> dict:
     }
 
 
+def _lost_race(state_dir: Path, wave_id: str) -> RevisionError:
+    """Another writer published this wave id first; read what it published."""
+    record = read_wave_or_none(state_dir, wave_id)
+    if record is not None and record.get("accepted") is True:
+        return RevisionError(
+            "wave_already_accepted",
+            "this wave record is already accepted and final",
+            "Use a new wave id; accepted waves cannot be overwritten.",
+        )
+    return RevisionError(
+        "wave_exists",
+        f"wave record {wave_id} was published by another writer",
+        "Use a new wave id; a wave record is written once.",
+    )
+
+
 def _write_wave(state_dir: Path, wave_id: str, record: dict) -> None:
-    if _wave_is_accepted(state_dir, wave_id):
+    """Publish a wave record atomically, durably, and create-only when accepted.
+
+    The bytes go to a private temporary file that is fsynced, then linked into
+    place (create-only) or renamed over a *non-accepted* record, and finally the
+    directory is fsynced. Two concurrent writers therefore cannot both publish
+    an accepted record, and one cannot replace another's accepted record with a
+    partially written file. A record that exists but cannot be read is refused:
+    it may be the accepted evidence this write would destroy.
+    """
+    state = Path(state_dir)
+    directory = waves_dir(state)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    target = directory / f"{wave_id}.json"
+    existing = read_wave_or_none(state, wave_id)
+    if existing is not None and existing.get("accepted") is True:
         raise RevisionError(
             "wave_already_accepted",
             "this wave record is already accepted and final",
             "Use a new wave id; accepted waves cannot be overwritten.",
         )
-    waves_dir = state_dir / "waves"
-    waves_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    tmp = directory / f".{wave_id}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.chmod(waves_dir, 0o700)
-    except OSError:
-        pass
-    target = waves_dir / f"{wave_id}.json"
-    text = json.dumps(record, indent=2, sort_keys=True) + "\n"
-    target.write_text(text, encoding="utf-8")
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        if existing is None:
+            try:
+                os.link(tmp, target)
+            except FileExistsError:
+                raise _lost_race(state, wave_id) from None
+            except OSError:
+                # Filesystems without hard links: exclusive create is still atomic.
+                try:
+                    direct = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                except FileExistsError:
+                    raise _lost_race(state, wave_id) from None
+                with os.fdopen(direct, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(target, 0o600)
+        else:
+            # A non-accepted record is an attempt log, not authority: it may be
+            # replaced, but only after it has been read and understood.
+            os.replace(tmp, target)
+        _fsync_dir(directory)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    if record.get("accepted") is True:
+        written = read_wave_or_none(state, wave_id)
+        if written is None or written.get("accepted") is not True:
+            raise RevisionError(
+                "wave_write_failed",
+                f"wave record {wave_id} did not survive its own write",
+                "Inspect the state directory: the accepted record is not durable.",
+            )
 
 
 def integrate_wave(
@@ -518,7 +711,12 @@ def integrate_wave(
 
     state = Path(state_dir)
     repo = Path(workdir)
-    if _wave_is_accepted(state, wave_id):
+    # Existing evidence is read strictly, before any git or suite work. An
+    # accepted record is final; a record that exists and cannot be read is a
+    # refusal, never permission to integrate a second time; a readable,
+    # non-accepted record is only an attempt log, so a retry may replace it.
+    existing = read_wave_or_none(state, wave_id)
+    if existing is not None and existing.get("accepted") is True:
         raise RevisionError(
             "wave_already_accepted",
             "this wave record is already accepted and final",

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,91 @@ class JobCliError(Exception):
         self.code = code
         self.message = message
         self.fix = fix
+
+
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault-injection checkpoint if the faults lane installed one.
+
+    The import is lazy because ``bundlebees_plugin.faults`` is owned by another
+    lane and may be absent; its absence is a no-op, never an import failure. A
+    hook that raises propagates — that raise is the simulated crash.
+    """
+    try:
+        import importlib
+
+        faults = importlib.import_module(f"{__package__}.faults")
+    except ImportError:
+        return
+    fire = getattr(faults, "checkpoint", None)
+    if callable(fire):
+        fire(name, **payload)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery at the integration boundary
+# ---------------------------------------------------------------------------
+
+
+def _last_accepted_head(job: Mapping[str, Any]) -> str:
+    integration = job.get("integration")
+    if not isinstance(integration, Mapping):
+        return ""
+    waves = [wave for wave in (integration.get("accepted_waves") or []) if isinstance(wave, Mapping)]
+    head = str(waves[-1].get("commit") or "") if waves else ""
+    return head or str(integration.get("last_commit") or "")
+
+
+def _restore_ref(repo: Path, ref: str, head: str) -> str:
+    """Point the durable integration ref at the accepted head, or report why not.
+
+    A repository that does not exist here has no ref to repair; a repository
+    that refuses the update is a refusal, because the next wave would otherwise
+    build on the wrong base.
+    """
+    inside = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-dir"],
+                            capture_output=True, text=True)
+    if inside.returncode != 0:
+        return ""
+    current = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+                             capture_output=True, text=True)
+    if current.returncode == 0 and current.stdout.strip() == head:
+        return head
+    updated = subprocess.run(["git", "-C", str(repo), "update-ref", ref, head],
+                             capture_output=True, text=True)
+    if updated.returncode != 0:
+        raise JobCliError(
+            "integration_ref_unrestored",
+            f"could not restore {ref} to {head[:12]}: {updated.stderr.strip()[:200]}",
+            "Repair the repository refs; the next wave must build on the accepted commit.",
+        )
+    return head
+
+
+def recover(state_dir: Path, job_id: str, repo: Path | None = None) -> dict[str, Any]:
+    """Adopt an accepted wave that a crash left out of the job document.
+
+    The wave record is published before the job is saved, so a crash between the
+    two leaves proof of an accepted wave beside a job that could otherwise
+    integrate the same work again. The accepted record is adopted and persisted
+    first, then the durable ``refs/bb/integrated/<job>`` ref is restored from it.
+    Corrupt evidence raises its own code (``wave_malformed``/``wave_unreadable``);
+    it is never read as permission to integrate again.
+    """
+    job = jobs.load_job(state_dir, job_id, recover=False)
+    adopted = jobs.recover_integration(state_dir, job)
+    if adopted:
+        jobs.save_job(state_dir, job)
+    head = _last_accepted_head(job)
+    restored = ""
+    if head and repo is not None:
+        restored = _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+    recovered = (job.get("integration") or {}).get("recovered") or {}
+    return {
+        "adopted": adopted,
+        "wave_id": str(recovered.get("wave_id") or ""),
+        "head_sha": head,
+        "ref_restored": restored,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +261,26 @@ def acknowledge(state_dir: Path, job_id: str, note: str, *, now: Any = None) -> 
 # ---------------------------------------------------------------------------
 
 
+def _after_dispatch(state_dir: Path, job_id: str, result: reconcile.TickResult) -> None:
+    """Fire ``tick.after_dispatch`` once a dispatch is durable.
+
+    ``reconcile.tick`` saves the job before returning, so a hook raising here
+    simulates a crash after the dispatch was persisted and before the caller saw
+    the tick return: a restart must adopt that attempt, not dispatch a second
+    one. Nothing is fired for a tick that recorded no attempt.
+    """
+    if result.action not in {"dispatch", "adopt"}:
+        return
+    try:
+        job = jobs.load_job(state_dir, job_id, recover=False)
+    except jobs.JobError:
+        return
+    attempts = [str(attempt) for task in job.get("tasks") or [] for attempt in (task.get("attempts") or [])]
+    if not attempts:
+        return
+    _checkpoint("tick.after_dispatch", job_id=str(job_id), attempts=attempts)
+
+
 def tick(
     state_dir: Path,
     job_id: str,
@@ -192,7 +298,16 @@ def tick(
     """One mechanical tick: provisioning phase, then ordinary reconcile."""
 
     binder = LeaseBinder(state_dir)
-    job = jobs.load_job(state_dir, job_id)
+    job = jobs.load_job(state_dir, job_id, recover=False)
+    # The crash window between "wave accepted and published" and "job saved" is
+    # closed before anything else: adopt the accepted record, persist it, and
+    # point the durable ref back at the accepted head so a restart can neither
+    # integrate the same work twice nor build the next wave on the wrong base.
+    if jobs.recover_integration(state_dir, job):
+        jobs.save_job(state_dir, job)
+    head = _last_accepted_head(job)
+    if head and Path(repo).exists():
+        _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     job = _hydrate_contracts(state_dir, job, repo)
 
     from . import provision_bind
@@ -341,6 +456,7 @@ def tick(
         now=now,
     )
     handoff = record_handoff(state_dir, job_id, result)
+    _after_dispatch(state_dir, job_id, result)
     payload = {
         "status": result.status,
         "action": result.action,

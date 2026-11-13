@@ -608,7 +608,15 @@ def create_job(
             "packet_digest": packet_digest,
         },
         "tasks": [_normalize_task(task, for_create=True) for task in tasks],
-        "integration": {"wave": "w1", "state": "pending", "evidence": None},
+        "integration": {
+            "wave": "w1",
+            "state": "pending",
+            "evidence": None,
+            # The durable name of the wave record this job is working on. It is
+            # derived from the job id alone, so a crashed tick can find the
+            # record it wrote without trusting an in-memory copy.
+            "wave_id": _wave_id(_job_id(job_id), "w1"),
+        },
         "approval_gate": {
             "required": True,
             "gates": list(authorization["gates"]),
@@ -625,8 +633,136 @@ def create_job(
     return body
 
 
-def load_job(state_dir: Path, job_id: str) -> dict[str, Any]:
-    """Load a sealed job. Absent, unreadable and unsealed are different answers."""
+def _wave_index(value: Any) -> int:
+    """The raw integer a schema wave value names (``"w2"`` -> 2); 0 if unusable."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower().lstrip("w")
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
+def _wave_number(value: Any) -> int:
+    """Accept the schema's ``"w1"`` as well as a plain integer wave number."""
+    return max(1, _wave_index(value))
+
+
+def _wave_id(job_id: Any, wave: Any) -> str:
+    from . import revision  # noqa: PLC0415 - wave names are revision's business
+
+    return revision.wave_id_for(str(job_id or ""), wave)
+
+
+def _wave_record(state_dir: Path, wave_id: str) -> dict[str, Any] | None:
+    """Read one wave record: absent is ``None``, damaged is a named refusal."""
+    from . import revision  # noqa: PLC0415
+
+    try:
+        return revision.read_wave(Path(state_dir), wave_id)
+    except revision.RevisionError as exc:
+        if exc.code == revision.WAVE_MISSING:
+            return None
+        raise JobError(exc.code, exc.error, exc.fix) from exc
+
+
+def recover_integration(state_dir: Path, job: dict[str, Any]) -> bool:
+    """Adopt an accepted wave that a crash left out of this job document.
+
+    A wave record is published before the job is saved, so a crash between the
+    two leaves durable proof that the wave was accepted next to a job that does
+    not say so. Re-running integration from that state would commit the same
+    work twice, so the accepted record is adopted instead: the tasks it
+    integrated move to ``accepted``, the wave counter advances, and the record's
+    head commit becomes ``last_commit``. Evidence that exists but cannot be read
+    raises with its own code; it is never read as "no accepted wave".
+    """
+    job_id = str(job.get("job_id") or "").strip()
+    integration = job.get("integration")
+    if not job_id or not isinstance(integration, dict):
+        return False
+    wave = _wave_number(integration.get("wave", 1))
+    settled = [entry for entry in (integration.get("accepted_waves") or []) if isinstance(entry, Mapping)]
+    if any(_wave_index(entry.get("wave", 0)) >= wave for entry in settled):
+        return False
+    wave_id = _wave_id(job_id, wave)
+    record = _wave_record(state_dir, wave_id)
+    if record is None or record.get("accepted") is not True:
+        return False
+
+    named = str(record.get("wave_id") or wave_id)
+    if named != wave_id:
+        raise JobError(
+            "wave_evidence_mismatch",
+            f"wave record {wave_id} names itself {named!r}",
+            "Inspect the waves directory by hand; do not integrate again.",
+        )
+    head = str(record.get("head_sha") or "")
+    if not _is_sha(head):
+        raise JobError(
+            "wave_evidence_invalid",
+            f"accepted wave {wave_id} does not name a full commit",
+            "Inspect the wave record; an incomplete acceptance is not evidence.",
+        )
+    listed = record.get("attempts")
+    if not isinstance(listed, (list, tuple)) or not listed:
+        raise JobError(
+            "wave_evidence_invalid",
+            f"accepted wave {wave_id} lists no attempts",
+            "Inspect the wave record; an acceptance with no attempts is not evidence.",
+        )
+    pending = [task for task in job.get("tasks") or [] if task.get("state") in {"verified", "integrating"}]
+    integrated = sorted(str((task.get("attempts") or [None])[-1]) for task in pending)
+    if sorted(str(item) for item in listed) != integrated:
+        raise JobError(
+            "wave_evidence_mismatch",
+            f"accepted wave {wave_id} integrates {sorted(str(item) for item in listed)}, "
+            f"which is not this job's pending verification {integrated}",
+            "Inspect the wave record and the job; do not integrate again.",
+        )
+
+    for task in pending:
+        task_id = str(task.get("task_id") or "")
+        if task.get("state") == "verified":
+            transition(job, task_id, "integrating", actor="recovery",
+                       reason=f"wave {wave_id} was already accepted")
+        transition(job, task_id, "accepted", actor="recovery",
+                   reason=f"adopted accepted wave {wave_id} after a crash",
+                   evidence=f"recovered wave {wave_id} at {head[:12]}")
+
+    integration.update(
+        accepted_waves=[
+            *settled,
+            {
+                "wave": wave,
+                "at": str(record.get("at") or ""),
+                "evidence": f"recovered accepted wave {wave_id} at {head}",
+                "commit": head,
+                "recovered": True,
+            },
+        ],
+        wave=wave + 1,
+        wave_id=_wave_id(job_id, wave + 1),
+        attempts=0,
+        state="pending",
+        last_commit=head,
+        recovered={"wave": wave, "wave_id": wave_id, "head_sha": head,
+                   "at": str(record.get("at") or "")},
+    )
+    return True
+
+
+def load_job(state_dir: Path, job_id: str, *, recover: bool = True) -> dict[str, Any]:
+    """Load a sealed job. Absent, unreadable and unsealed are different answers.
+
+    With ``recover`` (the default) an accepted wave record that the crash window
+    left out of the document is adopted in memory, so every reader — the queue's
+    completion check included — sees the evidence that exists on disk. Nothing is
+    written here; ``save_job`` persists the adoption, and a caller that wants to
+    be explicit about it passes ``recover=False`` and calls
+    :func:`recover_integration` itself.
+    """
 
     path = job_path(state_dir, job_id)
     if not path.exists():
@@ -643,11 +779,36 @@ def load_job(state_dir: Path, job_id: str) -> dict[str, Any]:
             f"job {job_id!r} exists but its signing key is missing; it is not absent",
             _FIX_TAMPERED,
         ) from exc
-    return _unseal(path, key, "job")
+    body = _unseal(path, key, "job")
+    if recover:
+        recover_integration(Path(state_dir), body)
+    return body
+
+
+def _refuse_lost_evidence(previous: Mapping[str, Any], job: Mapping[str, Any]) -> None:
+    """A save may add accepted-wave evidence; it may never drop or rewind it."""
+    before = previous.get("integration")
+    after = job.get("integration")
+    before = before if isinstance(before, Mapping) else {}
+    after = after if isinstance(after, Mapping) else {}
+    prior = list(before.get("accepted_waves") or [])
+    current = list(after.get("accepted_waves") or [])
+    if len(current) < len(prior) or any(left != right for left, right in zip(prior, current)):
+        raise JobError(
+            "accepted_wave_dropped",
+            "this save would drop or rewrite an accepted wave record",
+            "Reload the job; accepted integration evidence is append-only.",
+        )
+    if _wave_number(before.get("wave", 1)) > _wave_number(after.get("wave", 1)):
+        raise JobError(
+            "integration_wave_regressed",
+            "this save would move the job back to an earlier wave",
+            "Reload the job; the wave counter only moves forward.",
+        )
 
 
 def save_job(state_dir: Path, job: Mapping[str, Any]) -> None:
-    """Persist a job, refusing to overwrite an unreadable one or change its packet identity."""
+    """Persist a job, refusing to overwrite an unreadable one or lose evidence."""
 
     job_id = _job_id(str(job.get("job_id") or ""))
     path = job_path(state_dir, job_id)
@@ -675,13 +836,22 @@ def save_job(state_dir: Path, job: Mapping[str, Any]) -> None:
         if before != digest:
             raise JobError("packet_identity_changed", "the job would resume under a different packet identity",
                            "Refuse: a sealed job keeps the protocol and packet it started with.")
+        _refuse_lost_evidence(previous, job)
     if digest:
         try:
             packets.verify_stored(state_dir, job_id, digest)
         except packets.PacketError as exc:
             raise JobError(exc.code, exc.message, exc.fix) from exc
+    document = dict(job)
+    integration = document.get("integration")
+    if isinstance(integration, Mapping):
+        # Keep the durable wave name truthful: it is derived from the job id and
+        # the wave counter, and a stale pin is worse than no pin at all.
+        refreshed = dict(integration)
+        refreshed["wave_id"] = _wave_id(job_id, refreshed.get("wave", 1))
+        document["integration"] = refreshed
     key = _ensure_key(state_dir)
-    _atomic_write(path, _canonical(_seal(job, key)) + b"\n")
+    _atomic_write(path, _canonical(_seal(document, key)) + b"\n")
 
 
 def transition(
