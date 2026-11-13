@@ -58,6 +58,8 @@ class Capabilities:
     profiles: tuple[str, ...]
     states: tuple[str, ...] = ()
     supports_cleanup: bool = False
+    enabled: bool = True
+    supports_receipt_lookup: bool = False
 
     @classmethod
     def parse(cls, body: Mapping[str, Any]) -> "Capabilities":
@@ -68,7 +70,8 @@ class Capabilities:
         if not isinstance(profiles, list) or not all(isinstance(item, str) for item in profiles):
             raise ProvisionIncompatible("capability_profiles", "the capability advertisement has no usable profile list", "Fix the host advertisement.")
         return cls(schema=schema, backend=str(body.get("backend") or "unknown"), profiles=tuple(profiles),
-                   states=tuple(str(s) for s in body.get("states") or ()), supports_cleanup=bool(body.get("supports_cleanup")))
+                   states=tuple(str(s) for s in body.get("states") or ()), supports_cleanup=bool(body.get("supports_cleanup")),
+                   enabled=bool(body.get("enabled", True)), supports_receipt_lookup=bool(body.get("supports_receipt_lookup", False)))
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class Receipt:
     host: str
     task_scopes: tuple[str, ...] = ()
     adopted: bool = False
+    expires_at: str = ""
 
     @classmethod
     def parse(cls, body: Mapping[str, Any], *, expect_repo: str, expect_rev: str, expect_profile: str,
@@ -103,11 +107,23 @@ class Receipt:
             raise ProvisionDenied("receipt_profile", f"receipt profile {body['profile']!r} is not the authorized {expect_profile!r}", "Stop.")
         if expect_host is not None and body["host"] != expect_host:
             raise ProvisionDenied("receipt_host", f"receipt host {body['host']!r} is not the authorized {expect_host!r}", "Stop: another host provisioned this project.")
+        expires = str(body.get("expires_at") or "")
+        if expires:
+            import calendar
+            import time as _time
+
+            try:
+                parsed = calendar.timegm(_time.strptime(expires, "%Y-%m-%dT%H:%M:%SZ"))
+            except ValueError as exc:
+                raise ProvisionIncompatible("receipt_expiry", f"receipt expiry {expires!r} is unparseable", "Treat the host as incompatible.") from exc
+            if parsed <= _time.time():
+                raise ProvisionDenied("receipt_expired", f"the receipt expired at {expires}", "Re-provision; do not dispatch an expired binding.")
         return cls(
             schema=body["schema"], status=body["status"], project=str(body["project"]), repo=str(body["repo"]),
             resolved_revision=str(body["resolved_revision"]), workspace=str(body["workspace"]),
             profile=str(body["profile"]), host=str(body["host"]),
             task_scopes=tuple(str(item) for item in body.get("task_scopes") or ()), adopted=bool(body.get("adopted")),
+            expires_at=expires,
         )
 
     def immutable(self) -> dict[str, Any]:
@@ -176,7 +192,33 @@ class HyvvProvisioner:
             raise ProvisionIncompatible("capability_missing", "the host does not advertise provisioning capabilities", "Upgrade the host to a provisioning-capable launcher; do not probe with writes.")
         if status != 200 or not isinstance(body, Mapping):
             raise ProvisionUnavailable("capability_unavailable", f"the host answered {status} for its capabilities", "Treat provisioning as unavailable.")
-        return Capabilities.parse(body)
+        caps = Capabilities.parse(body)
+        if not caps.enabled:
+            raise ProvisionUnavailable("provisioning_disabled", "the host advertises provisioning as disabled", "Enroll and enable the host policy; do not attempt a write.")
+        return caps
+
+    def authoritative_receipt(self, key: str, *, expect_repo: str, expect_rev: str, expect_profile: str,
+                              expect_project: str, expect_host: str | None = None) -> Receipt:
+        """Recover a complete receipt after a lost acknowledgement.
+
+        Uses the read-only lookup (never a re-POST) and revalidates every
+        identity, including the launcher project, before returning it.
+        """
+        caps = self.capabilities()
+        if not caps.supports_receipt_lookup:
+            raise ProvisionIncompatible("receipt_lookup_unsupported", "the host cannot return a receipt by idempotency key", "Upgrade the host; do not re-POST to discover the outcome.")
+        status, body = self.transport("GET", f"/v1/provision/receipts/{key}", None)
+        if status == 404:
+            raise ProvisionError("receipt_unknown", f"the host has no record for {key}", "The POST may not have arrived; treat as uncertain and reconcile.")
+        if status == 409:
+            raise ProvisionUncertain("receipt_stale", (body or {}).get("message", "the host's receipt is stale"), "Re-provision with a new key after inspecting the host.")
+        if status != 200 or not isinstance(body, Mapping):
+            raise ProvisionUncertain("receipt_unavailable", f"receipt lookup answered {status}", "Do not dispatch; reconcile later.")
+        if str(body.get("project")) != expect_project:
+            raise ProvisionDenied("receipt_project", f"receipt project {body.get('project')!r} is not the authorized {expect_project!r}", "Stop: the host registered another project.")
+        receipt = Receipt.parse(body, expect_repo=expect_repo, expect_rev=expect_rev,
+                                expect_profile=expect_profile, expect_host=expect_host)
+        return receipt
 
     def provision(self, request: Mapping[str, Any]) -> Receipt:
         caps = self.capabilities()

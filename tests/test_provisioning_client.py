@@ -15,8 +15,11 @@ SHA = "dde2aa42d09c05e43895b3120cb3312f765eb876"
 
 class Fixture:
     def __init__(self, *, capabilities=True, schema=P.CAPABILITY_SCHEMA, receipt_sha=SHA,
-                 provision_status=200, profiles=("smoke",)):
+                 provision_status=200, profiles=("smoke",), enabled=True, lookup=True,
+                 lookup_status=200, expired=False):
         self.requests: list[tuple[str, str, dict]] = []
+        self.enabled, self.lookup, self.lookup_status, self.expired = enabled, lookup, lookup_status, expired
+        self.stored: dict[str, dict] = {}
         self.capabilities, self.schema, self.receipt_sha = capabilities, schema, receipt_sha
         self.provision_status, self.profiles = provision_status, list(profiles)
         self.handler = self._make_handler()
@@ -58,10 +61,18 @@ class Fixture:
 
             def do_GET(self):
                 fixture.requests.append(("GET", self.path, {}))
+                if self.path.startswith("/v1/provision/receipts/"):
+                    key = self.path.rsplit("/", 1)[-1]
+                    if fixture.lookup_status != 200:
+                        return self._send(fixture.lookup_status, {"error": "receipt_stale", "message": "the workspace is gone"})
+                    if key not in fixture.stored:
+                        return self._send(404, {"error": "receipt_unknown"})
+                    return self._send(200, fixture.stored[key])
                 if self.path != P.CAPABILITY_PATH or not fixture.capabilities:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"schema": fixture.schema, "backend": "hyvv", "profiles": fixture.profiles,
-                                 "states": ["ready"], "supports_cleanup": True})
+                                 "states": ["ready"], "supports_cleanup": True, "enabled": fixture.enabled,
+                                 "supports_receipt_lookup": fixture.lookup})
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
@@ -71,13 +82,16 @@ class Fixture:
                     return self._send(200, {"state": "cleaned", "project": body.get("project")})
                 if fixture.provision_status != 200:
                     return self._send(fixture.provision_status, {"error": "host failure"})
-                self._send(200, {
+                receipt = {
                     "schema": P.CAPABILITY_SCHEMA, "status": "ready", "project": body.get("project", "rizzstack-smoke"),
+                    "expires_at": "2000-01-01T00:00:00Z" if fixture.expired else "2099-01-01T00:00:00Z",
                     "repo": body.get("repo"), "resolved_revision": fixture.receipt_sha,
                     "workspace": "C:\\Users\\kyle\\orbit-worker-fixtures\\rizzstack-smoke",
                     "profile": body.get("profile"), "host": "worker-1", "task_scopes": ["smoke/answer.py"],
                     "adopted": False,
-                })
+                }
+                fixture.stored[str(body.get("idempotency_key"))] = receipt
+                self._send(200, receipt)
 
         return Handler
 
@@ -169,6 +183,55 @@ class ClientTests(unittest.TestCase):
         fixture = self.fixture()
         result = P.HyvvProvisioner(fixture.transport).cleanup("rizzstack-smoke")
         self.assertEqual(result["state"], "cleaned")
+
+    def test_a_disabled_host_is_unavailable_before_any_write(self):
+        fixture = self.fixture(enabled=False)
+        with self.assertRaises(P.ProvisionUnavailable) as caught:
+            P.HyvvProvisioner(fixture.transport).provision(self.request())
+        self.assertEqual(caught.exception.code, "provisioning_disabled")
+        self.assertFalse([r for r in fixture.requests if r[0] == "POST"])
+
+    def test_a_lost_acknowledgement_is_recovered_by_receipt_lookup(self):
+        fixture = self.fixture(provision_status=503)
+        client = P.HyvvProvisioner(fixture.transport, expect_host="worker-1")
+        with self.assertRaises(P.ProvisionUncertain):
+            client.provision(self.request())
+
+        # The host applied it; the coordinator recovers without re-POSTing.
+        fixture.stored["prov_1"] = {
+            "schema": P.CAPABILITY_SCHEMA, "status": "ready", "project": "rizzstack-smoke",
+            "repo": REPO, "resolved_revision": SHA, "workspace": "C:\\w\\rizzstack-smoke",
+            "profile": "smoke", "host": "worker-1", "task_scopes": [],
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+        receipt = client.authoritative_receipt("prov_1", expect_repo=REPO, expect_rev=SHA,
+                                               expect_profile="smoke", expect_project="rizzstack-smoke",
+                                               expect_host="worker-1")
+        self.assertEqual(receipt.resolved_revision, SHA)
+        self.assertEqual(len([r for r in fixture.requests if r[1] == P.PROVISION_PATH]), 1)
+
+    def test_a_stale_host_receipt_is_uncertain_not_usable(self):
+        fixture = self.fixture(lookup_status=409)
+        client = P.HyvvProvisioner(fixture.transport)
+        with self.assertRaises(P.ProvisionUncertain) as caught:
+            client.authoritative_receipt("prov_1", expect_repo=REPO, expect_rev=SHA,
+                                         expect_profile="smoke", expect_project="rizzstack-smoke")
+        self.assertEqual(caught.exception.code, "receipt_stale")
+
+    def test_an_expired_receipt_cannot_be_bound(self):
+        fixture = self.fixture(expired=True)
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            P.HyvvProvisioner(fixture.transport).provision(self.request())
+        self.assertEqual(caught.exception.code, "receipt_expired")
+
+    def test_receipt_lookup_for_another_project_is_denied(self):
+        fixture = self.fixture()
+        P.HyvvProvisioner(fixture.transport).provision(self.request())
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            P.HyvvProvisioner(fixture.transport).authoritative_receipt(
+                "prov_1", expect_repo=REPO, expect_rev=SHA, expect_profile="smoke",
+                expect_project="other-project")
+        self.assertEqual(caught.exception.code, "receipt_project")
 
 
 if __name__ == "__main__":

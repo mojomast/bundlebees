@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -219,6 +223,41 @@ class DerivationTests(Harness):
         with self.assertRaises(G.GrantError) as caught:
             self.derive(assigned_files=["/etc/passwd"])
         self.assertEqual(caught.exception.code, "scope_invalid")
+
+
+class OwnerLockTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_an_active_lock_is_never_stolen_for_being_old(self):
+        lock = self.root / "g.lock"
+        lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "at": time.time() - 99999}))
+
+        with self.assertRaises(G.GrantError) as caught:
+            with G.owner_lock(lock):
+                pass
+        self.assertEqual(caught.exception.code, "grant_locked")
+
+    def test_a_dead_owners_lock_is_recovered(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        lock = self.root / "g.lock"
+        lock.write_text(json.dumps({"pid": child.pid, "host": socket.gethostname(), "at": time.time()}))
+        child.kill()
+        child.wait(timeout=10)
+
+        with G.owner_lock(lock):
+            self.assertTrue(lock.exists())
+        self.assertFalse(lock.exists())
+
+    def test_a_lock_from_another_host_is_waited_on_not_stolen(self):
+        lock = self.root / "g.lock"
+        lock.write_text(json.dumps({"pid": 1, "host": "some-other-host", "at": time.time() - 99999}))
+
+        with self.assertRaises(G.GrantError):
+            with G.owner_lock(lock):
+                pass
 
 
 if __name__ == "__main__":

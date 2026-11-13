@@ -161,8 +161,13 @@ def pid_alive(pid: int) -> bool:
 
 
 @contextlib.contextmanager
-def owner_lock(path: Path, *, stale_after: float = 300.0):
-    """Crash-safe lock: a dead owner's lock is stolen by atomic rename."""
+def owner_lock(path: Path):
+    """Crash-safe lock: only a *dead* owner's lock is stolen.
+
+    Age alone is never evidence of death: a long-running derivation is legitimate
+    and must not have its lock taken. A lock whose owner is on another host cannot
+    be verified, so it is waited on rather than stolen.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "at": time.time()}).encode()
     fd = None
@@ -175,8 +180,7 @@ def owner_lock(path: Path, *, stale_after: float = 300.0):
                 record = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 record = {}
-            dead = (record.get("host") == socket.gethostname() and not pid_alive(int(record.get("pid") or 0))) \
-                or (time.time() - float(record.get("at") or 0)) > stale_after
+            dead = record.get("host") == socket.gethostname() and not pid_alive(int(record.get("pid") or 0))
             if not dead:
                 time.sleep(0.01)
                 continue
@@ -413,15 +417,16 @@ class GrantStore:
 
     def complete(self, grant_id: str, job_id: str) -> None:
         """Mark a job finished: frees concurrency, permanently consumes budget."""
-        path = self.root / "reservations" / f"{grant_id}.{job_id}.json"
-        if not path.exists():
-            return
-        record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("spent"):
-            return
-        record.update(active=False, spent=True, completed_at=self.now())
-        _atomic(path, json.dumps(record, sort_keys=True).encode())
-        self._audit({"event": "grant.job_completed", "grant_id": grant_id, "job_id": job_id, "units": record.get("units")})
+        with owner_lock(self.grant_path(grant_id).with_suffix(".lock")):
+            path = self.root / "reservations" / f"{grant_id}.{job_id}.json"
+            if not path.exists():
+                return
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("spent"):
+                return
+            record.update(active=False, spent=True, completed_at=self.now())
+            _atomic(path, json.dumps(record, sort_keys=True).encode())
+            self._audit({"event": "grant.job_completed", "grant_id": grant_id, "job_id": job_id, "units": record.get("units")})
 
     def release(self, grant_id: str, job_id: str) -> None:
         """Backwards-compatible alias: releasing a completed job consumes it."""
