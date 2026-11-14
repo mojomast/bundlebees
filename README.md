@@ -10,11 +10,11 @@
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-54d3a1?style=flat-square&amp;labelColor=0b0f14">
   <img alt="Requires Hermes 0.23.0 or later" src="https://img.shields.io/badge/Hermes-%3E%3D0.23.0-54d3a1?style=flat-square&amp;labelColor=0b0f14">
-  <img alt="1087 tests passed" src="https://img.shields.io/badge/tests-1087_passed-54d3a1?style=flat-square&amp;labelColor=0b0f14">
+  <img alt="1087 tests passed" src="https://img.shields.io/badge/tests-1284_passed-54d3a1?style=flat-square&amp;labelColor=0b0f14">
   <img alt="4 tools, 585 o200k tokens" src="https://img.shields.io/badge/schemas-4_tools_·_585_o200k-54d3a1?style=flat-square&amp;labelColor=0b0f14">
 </p>
 
-Status: **v0.1.1** is the latest release on [`main`](https://github.com/mojomast/bundlebees) ([release](https://github.com/mojomast/bundlebees/releases/tag/v0.1.1)). `main` (`875025b`) also carries the **untagged autonomy layer** — durable jobs, a feature queue, local verification, integration, bounded recovery, RETURN packets and the agent wake-up — merged in #16–#19. The workflow protocol chapters that define packets, RETURN and recovery, and the hyvv provisioning endpoints, are delivered on their branches but **not merged** (see *What is blocked*). This is not a catalog listing yet. Requires Hermes **0.23.0** or later.
+Status: **v0.1.1** is the latest release on [`main`](https://github.com/mojomast/bundlebees) ([release](https://github.com/mojomast/bundlebees/releases/tag/v0.1.1)). The **untagged autonomy layer** is merged on `main`: durable jobs, feature queue, local verification, integration, bounded recovery, RETURN packets, the agent wake-up and authenticated remote landing ingestion. The workflow protocol and hyvv provisioning/export changes are merged on their respective `main` branches; they are **not deployed or released** (see *What is blocked*). This is not a catalog listing yet. Requires Hermes **0.23.0** or later.
 
 ## Why it exists
 
@@ -59,17 +59,17 @@ split.
 - governed mirror publication and create-only refs: exercised against local fixtures, not a second machine;
 - provisioning on a real host: the hyvv branch has never run on the live Windows host.
 
-**Blocked — do not treat as merged:**
+**Merged but not deployed or released:**
 
-- the workflow protocol PRs #33 (`feat/feature-packet`, pinned at `070b6c1`) and #32
-  (`docs/autonomy-gap-and-design`, head `4ba782e`) are open and blocked. Chapters 25–27, their validators
-  and their required CI jobs exist only on #33. Bundlebees pins that revision by commit;
-- hyvv PR #4 (`feat/worker-provisioning`, head `5bee1a8`) is open and blocked because branch protection
-  requires `bee-ci/*` required contexts that no job produces. The provisioning endpoints exist on no
-  released launcher; bundlebees pins that head by commit;
-- the workflow cold-start acceptance remains red (`CS-apply-tax … 0 signed records`);
-- merges, pushes to protected branches, releases, deploys and the final acceptance decision are human
-  acts. No code path in the loop performs them.
+- workflow PR #34 (`feat/bee-landed`, merged at `5e80a81795d71b83889486c5693c4b3a9bee2443`) supplies
+  the canonical landing-event schema, validators, CI contexts and the fixed cold-start acceptance;
+- hyvv PR #5 (`feat/bee-landed-events`, merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) supplies
+  provisioning, the canonical outbox and authenticated integer-position export. PR #4 was closed as
+  superseded by #5;
+- the running worker launcher is still the older released `0.1.16` build; provisioning and the export
+  endpoint are not deployed there and the real-bee factory canary remains **NOT RUN**;
+- merges, pushes to protected branches, releases, deploys, policy enrollment and real-TTY authorization
+  are human acts. This campaign's merges were explicitly approved; no deployment was performed.
 
 ## 60-second quickstart
 
@@ -232,8 +232,8 @@ The runtime runs a fixed protocol revision, not whatever is on a branch tip:
 | `REQUIRE_WORKFLOW=1` | a missing or unreadable checkout is a test/operation failure, not a skip |
 | `HYVV_SRC` | checkout of `hyvv` containing the provisioning contract; `REQUIRE_HYVV=1` makes it mandatory |
 
-CI pins workflow `070b6c10bdfa3e9d31b84cc83a2d9d701222082f` (the revision PR #33 was pinned at) and hyvv
-`5bee1a870ffe32ee91c6a70b7be807eaa8400801` (PR #4 head), verifies each checkout's HEAD, and fails closed
+CI pins workflow `9c69d3a987ea9544a77cdd9b5a259904eb36f006` and hyvv
+`8ffaf73000974e0ba273c72fca42e07b79c38106` (reviewed protocol revisions), verifies each checkout's HEAD, and fails closed
 when either is absent. At runtime, a missing workflow checkout refuses packet admission and every recovery
 operation (`recovery_protocol_unavailable`); there is no local fallback validator.
 
@@ -453,10 +453,10 @@ Secret (Hermes secrets, not config):
 python -m pip install -e '.[dev]'
 
 # Deterministic suite. CI pins both protocol checkouts by commit and makes them mandatory:
-#   workflow 070b6c10bdfa3e9d31b84cc83a2d9d701222082f  (the PR #33 pin)
-#   hyvv     5bee1a870ffe32ee91c6a70b7be807eaa8400801  (PR #4 head)
-WORKFLOW_SRC=<checkout-of-070b6c1> REQUIRE_WORKFLOW=1 \
-HYVV_SRC=<checkout-of-5bee1a8> REQUIRE_HYVV=1 \
+#   workflow 9c69d3a987ea9544a77cdd9b5a259904eb36f006  (reviewed protocol revision)
+#   hyvv     8ffaf73000974e0ba273c72fca42e07b79c38106  (reviewed provisioning revision)
+WORKFLOW_SRC=<checkout-of-9c69d3a> REQUIRE_WORKFLOW=1 \
+HYVV_SRC=<checkout-of-8ffaf73> REQUIRE_HYVV=1 \
 GITLEAKS="$(command -v gitleaks)" \
 python -m pytest -rs
 
