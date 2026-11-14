@@ -1008,6 +1008,13 @@ def _acceptance(
 # ---------------------------------------------------------------------------
 
 
+def _exit_block(value: Any) -> dict[str, Any] | None:
+    """Keep the RETURN schema shape: only the executed result is published."""
+    if not isinstance(value, Mapping):
+        return None
+    return {"exit_code": value.get("exit_code")}
+
+
 def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
     """One row per durable recovery request, with its validated decision.
 
@@ -1300,8 +1307,8 @@ def _manifest(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict
         "commit": str(record.get("sha") or ""),
         "files": [str(item) for item in record.get("files") or []],
         "base_rev": str(record.get("base_rev") or ""),
-        "suite": record.get("suite"),
-        "gitleaks": record.get("gitleaks"),
+        "suite": _exit_block(record.get("suite")),
+        "gitleaks": _exit_block(record.get("gitleaks")),
         "record_path": f"{verify_local.RECORD_DIR}/{verification_attempt}.json" if verification_attempt else "",
     }
     suite_value = verification_block["suite"]
