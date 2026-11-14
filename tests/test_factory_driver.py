@@ -7,6 +7,11 @@ network or real dispatch is involved.
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -350,16 +355,46 @@ def test_cli_once_emits_an_idle_pass(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert payload["landing"] is None
 
 
-def test_stack_manifest_records_the_pinned_versions():
-    doc = Path(__file__).resolve().parents[1] / "docs" / "stack-manifest.md"
-    text = doc.read_text(encoding="utf-8")
+def test_stack_manifest_records_relationships_not_frozen_builds():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "docs" / "stack-manifest.md").read_text(encoding="utf-8")
+    rows = {
+        name.strip(): pin.strip()
+        for name, pin in re.findall(r"^\| ([^|]+?) \| `([^`]+)` \|", text, re.M)
+    }
 
-    for token in ("9c69d3a", "ec37c24", "8ffaf73", "0.23.0", "0.1.16", "3.12.3"):
-        assert token in text
-    assert 'git -C "$WORKFLOW_SRC" rev-parse HEAD' in text
-    assert 'git -C "$HYVV_SRC" rev-parse HEAD' in text
-    assert 'git -C "$BUNDLEBEES_SRC" rev-parse HEAD' in text
-    assert "python3 --version" in text
+    # External revisions are full, resolvable pins.
+    for component in ("workflow", "hyvv"):
+        assert re.fullmatch(r"[0-9a-f]{40}", rows[component]), rows[component]
+    # The project does not pin itself to its containing commit.
+    assert rows["bundlebees"] == "HEAD"
+
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert rows["bundlebees package"] == project["project"]["version"]
+
+    plugin = (root / "plugin.yaml").read_text(encoding="utf-8")
+    floor = re.search(r'^requires_hermes:\s*"([^"]+)"', plugin, re.M)
+    assert floor is not None
+    assert rows["Hermes"] == floor.group(1)
+
+    fixture = (root / "tests" / "test_verify_result_shape.py").read_text(encoding="utf-8")
+    assert f'"launcher": "{rows["launcher"]}"' in fixture
+
+    assert rows["python"] == f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    # When a configured external checkout is present, its head must be the pin.
+    for component, variable in (("workflow", "WORKFLOW_SRC"), ("hyvv", "HYVV_SRC")):
+        source = os.environ.get(variable)
+        if not source:
+            continue
+        try:
+            head = subprocess.run(
+                ["git", "-C", source, "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            continue  # an injected schema fixture is not a source checkout
+        assert head == rows[component], (component, head, rows[component])
 
 
 def test_busy_session_defers_the_wake_without_consuming_handler_attempts(tmp_path: Path, monkeypatch):

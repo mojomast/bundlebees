@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+import tomllib
 
 import pytest
 from fastapi import FastAPI
@@ -431,7 +432,8 @@ def test_manifest_matches_the_hermes_dashboard_contract():
         (ROOT / "dashboard" / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["name"] == "bundlebees"
-    assert manifest["version"] == "0.1.1"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert manifest["version"] == project["project"]["version"]
     # Hermes mounts dashboard/<api> at /api/plugins/<name>/ only when "api" is set.
     assert manifest["api"] == "plugin_api.py"
     assert (ROOT / "dashboard" / manifest["api"]).is_file()
