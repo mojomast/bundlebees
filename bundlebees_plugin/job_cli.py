@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
+from . import agent_work, integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
 from . import hermes_adapter
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
@@ -127,6 +127,15 @@ def recover(
     recovered = (job.get("integration") or {}).get("recovered") or {}
 
     requests = recovery.list_requests(state_dir, job_id)
+    # Publish the queue item *before* a decision can be recorded: a request that
+    # is decided by this command still gets exactly one durable work record
+    # (pending), which the consumer closes idempotently.
+    work_items: list[dict[str, Any]] = []
+    work_error = ""
+    try:
+        work_items = agent_work.publish_outstanding(state_dir, job, now=now)
+    except (agent_work.WorkError, recovery.RecoveryError, jobs.JobError, OSError) as exc:
+        work_error = str(getattr(exc, "code", None) or type(exc).__name__)
     recorded: list[dict[str, Any]] = []
     proposals: list[str] = []
     if decision_file is not None:
@@ -198,6 +207,8 @@ def recover(
         "requests": summary["requests"],
         "decisions_recorded": recorded,
         "proposals": proposals,
+        "work": work_items,
+        "work_error": work_error,
         "supersessions": summary["supersessions"],
     }
 
@@ -552,6 +563,8 @@ def tick(
         "detail": result.detail,
         "evidence": result.evidence,
         "exactly_once": result.exactly_once,
+        "work_state": result.work_state,
+        "work_id": result.work_id,
         "handoff": handoff,
     }
     return payload

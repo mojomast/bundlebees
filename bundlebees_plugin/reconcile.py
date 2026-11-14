@@ -30,11 +30,12 @@ try:  # POSIX advisory locks; bundlebees targets Linux and CI is ubuntu
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback keeps O_EXCL
     fcntl = None  # type: ignore[assignment]
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from . import agent_work as work_queue
 from . import job as jobs
 from . import recovery as recoveries
 from .brief import BriefError, validate_brief
@@ -105,6 +106,9 @@ class TickResult:
     detail: str = ""
     exactly_once: bool = False
     evidence: str = ""
+    #: The durable agent-work state for this job's outstanding request, if any.
+    work_state: str = ""
+    work_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +518,32 @@ def tick(
         return TickResult(status="locked", detail="another live tick holds the job lock")
     try:
         job = jobs.load_job(Path(state_dir), job_id)
+        # Durable work publication is an observer of the mechanical tick, never a
+        # gate on it: a broken queue must not stop reconciliation from running.
+        work_item: dict[str, Any] | None = None
+        work_error = ""
+        try:
+            published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
+            work_item = _work_item_for(Path(state_dir), job, published)
+        except Exception as exc:  # noqa: BLE001 - publication must not block the tick
+            work_error = str(getattr(exc, "code", None) or type(exc).__name__)
         result = _run(
             Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder
         )
+        try:
+            published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
+            work_item = _work_item_for(Path(state_dir), job, published) or work_item
+        except Exception as exc:  # noqa: BLE001 - a request created this tick may be unpublishable
+            work_error = work_error or str(getattr(exc, "code", None) or type(exc).__name__)
+        work_state = str((work_item or {}).get("state") or "")
+        if not work_state and work_error:
+            work_state = "publish_failed"
+        if work_state or work_item:
+            result = replace(
+                result,
+                work_state=work_state,
+                work_id=str((work_item or {}).get("work_id") or ""),
+            )
         if lock.stolen:
             result = TickResult(
                 status=result.status,
@@ -525,6 +552,8 @@ def tick(
                 detail=(result.detail + f" [{lock.stolen}]").strip(),
                 exactly_once=result.exactly_once,
                 evidence=result.evidence,
+                work_state=result.work_state,
+                work_id=result.work_id,
             )
         return result
     finally:
@@ -750,6 +779,30 @@ def _reconcile_uncertain(
 
 
 # --- recovery --------------------------------------------------------------
+
+
+def _work_item_for(
+    state_dir: Path,
+    job: Mapping[str, Any],
+    published: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """The item whose state this tick reports: active first, else the newest.
+
+    A decision recorded outside the queue does not erase its work item; the
+    consumer still has to close it. Reading the durable items keeps the tick
+    honest about that instead of reporting "no work" once a decision exists.
+    """
+
+    if published:
+        return dict(published[0])
+    try:
+        items = work_queue.list(Path(state_dir), job_id=str(job.get("job_id") or ""))
+    except work_queue.WorkError:
+        return None
+    if not items:
+        return None
+    active = [item for item in items if str(item.get("state") or "") in {"pending", "claimed"}]
+    return active[0] if active else items[-1]
 
 
 def _authorization_for(state_dir: Path, job: Mapping[str, Any]) -> dict[str, Any] | None:
