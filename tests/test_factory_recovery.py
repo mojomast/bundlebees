@@ -526,3 +526,360 @@ driver.run_pass()
     assert lines == ["job-race"]
     item = next(item for item in work_scheduler.list_items(state) if item["work_id"] == "ws-race")
     assert item["status"] == "done"
+
+
+def _wake_record(state: Path, session: str = RAW_SESSION) -> dict:
+    key = factory_driver._safe_session(session)
+    path = state / "factory" / "wakes" / f"{key}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_child_process_exit_recovers_an_abandoned_active_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child persists an active wake and exits; restart delivers it.
+
+    The parent only reads durable state and runs the normal FactoryDriver
+    entry point.  It never calls finish_turn, release_turn, request_wake or
+    rewrites the wake file, so recovery is entirely the restart path's.
+    """
+
+    state = tmp_path / "state"
+    state.mkdir()
+    _subscribe(state)
+    _no_gateway(monkeypatch)
+    _publish(state, _event("evt-active-restart", job_id="job-active", attempt_id="att-active"))
+
+    child = r"""
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from bundlebees_plugin import factory_driver
+
+state = Path(sys.argv[1])
+session = sys.argv[4]
+driver = factory_driver.FactoryDriver(
+    state, Path(sys.argv[2]),
+    tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+    subscribers=["coordinator"], startup=False,
+)
+driver.wake.request_wake(session, subscriber="coordinator")
+turn = driver.wake.begin_turn(session)
+assert turn["started"] is True
+driver.run_pass()
+# Normal child process exit with the active turn still persisted.
+os._exit(31)
+"""
+    env = os.environ.copy()
+    env.pop("HERMES_API_URL", None)
+    env.pop("HERMES_API_KEY", None)
+    proc = subprocess.run(
+        [
+            sys.executable, "-c", child, str(state),
+            str(tmp_path / "queue.json"), str(ROOT), RAW_SESSION,
+        ],
+        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 31, proc.stderr
+
+    stored = _wake_record(state)
+    assert stored["session"] == RAW_SESSION
+    assert stored["active"]["turn"]
+    assert not factory_driver._pid_alive(stored["active"]["pid"])
+
+    inherited = factory_driver.WakeCoalescer(state)
+    status = inherited.status(RAW_SESSION)
+    assert status["pending"] is True
+    assert status["active_turn"] is False
+    assert status["abandoned_turn"] is True
+    assert status["recoverable"] is True
+    assert status["due"] is True
+
+    calls: list[str] = []
+
+    def tick(job_id: str) -> dict:
+        calls.append(job_id)
+        return {"status": "ok", "action": "ready_for_review"}
+
+    with RecordingGateway() as gateway:
+        monkeypatch.setenv("HERMES_API_URL", gateway.url)
+        monkeypatch.setenv("HERMES_API_KEY", "test-key")
+        restarted = factory_driver.FactoryDriver(
+            state, tmp_path / "queue.json", tick=tick,
+            subscribers=["coordinator"], startup=False,
+        ).run_pass()
+
+    delivery = restarted["wake_delivery"][0]
+    assert delivery["delivered"] is True
+    assert delivery["recovered"] is True
+    assert delivery["turn_finished"] is True
+    assert delivery["session"] == RAW_SESSION
+    assert delivery["subscriber"] == "coordinator"
+    assert len(gateway.requests) == 1
+    headers = {key.lower(): value for key, value in gateway.requests[0]["headers"].items()}
+    assert headers["x-hermes-session-id"] == RAW_SESSION
+    assert factory_driver.WakeCoalescer(state).status(RAW_SESSION)["pending"] is False
+
+
+def test_a_genuinely_live_owner_remains_excluded_from_duplicate_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _subscribe(state)
+    _no_gateway(monkeypatch)
+    _publish(state, _event("evt-live-owner", job_id="job-live", attempt_id="att-live"))
+    marker = tmp_path / "owner.pid"
+
+    child = r"""
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from bundlebees_plugin import factory_driver
+
+state = Path(sys.argv[1])
+session = sys.argv[4]
+driver = factory_driver.FactoryDriver(
+    state, Path(sys.argv[2]),
+    tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+    subscribers=["coordinator"], startup=False,
+)
+driver.wake.request_wake(session, subscriber="coordinator")
+turn = driver.wake.begin_turn(session)
+assert turn["started"] is True
+Path(sys.argv[5]).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(60)
+"""
+    env = os.environ.copy()
+    env.pop("HERMES_API_URL", None)
+    env.pop("HERMES_API_KEY", None)
+    process = subprocess.Popen(
+        [
+            sys.executable, "-c", child, str(state),
+            str(tmp_path / "queue.json"), str(ROOT), RAW_SESSION, str(marker),
+        ],
+        cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not marker.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert marker.exists(), process.stderr.read() if process.poll() is not None else "owner did not start"
+
+        status = factory_driver.WakeCoalescer(state).status(RAW_SESSION)
+        assert status["active_turn"] is True
+        assert status["due"] is False
+
+        with RecordingGateway() as gateway:
+            monkeypatch.setenv("HERMES_API_URL", gateway.url)
+            monkeypatch.setenv("HERMES_API_KEY", "test-key")
+            restarted = factory_driver.FactoryDriver(
+                state, tmp_path / "queue.json",
+                tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+                subscribers=["coordinator"], startup=False,
+            ).run_pass()
+
+        assert restarted["wake_delivery"] == []
+        assert gateway.requests == []
+        live = factory_driver.WakeCoalescer(state).status(RAW_SESSION)
+        assert live["active_turn"] is True
+        assert live["pending"] is True
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive cleanup
+            process.kill()
+            process.wait(timeout=10)
+
+
+def test_gateway_failure_schedules_bounded_backoff_and_release_is_not_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _subscribe(state)
+    _publish(state, _event("evt-backoff", job_id="job-backoff", attempt_id="att-backoff"))
+    clock = [1000.0]
+
+    with RecordingGateway(status=500) as gateway:
+        monkeypatch.setenv("HERMES_API_URL", gateway.url)
+        monkeypatch.setenv("HERMES_API_KEY", "test-key")
+        driver = factory_driver.FactoryDriver(
+            state, tmp_path / "queue.json",
+            tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+            subscribers=["coordinator"], startup=False,
+            now=lambda: clock[0],
+        )
+        first = driver.run_pass()
+
+        failure = first["wake_delivery"][0]
+        assert failure["delivered"] is False
+        assert failure["code"] == "hermes_notification_failed"
+        assert failure["ambiguous"] is True
+        assert failure["pending"] is True
+        assert failure["retry_after"]
+        action_id = failure["action_id"]
+
+        pending = factory_driver.WakeCoalescer(state).status(RAW_SESSION, now=lambda: clock[0])
+        assert pending["pending"] is True
+        assert pending["due"] is False
+        assert pending["retry_after"]
+
+        immediate = driver.run_pass()
+        assert immediate["wake_delivery"] == []
+        assert len(gateway.requests) == 1
+
+        clock[0] += factory_driver.MAX_WAKE_BACKOFF_S
+        gateway.status = 200
+        recovered = driver.run_pass()
+
+    delivered = recovered["wake_delivery"][0]
+    assert delivered["delivered"] is True
+    assert delivered["action_id"] == action_id
+    assert delivered["reconciled"] is True
+    assert delivered["turn_finished"] is True
+    assert len(gateway.requests) == 2
+    assert factory_driver.WakeCoalescer(state).status(
+        RAW_SESSION, now=lambda: clock[0]
+    )["pending"] is False
+
+    # A plain release is not a backoff: the same pending generation is due now.
+    release_state = tmp_path / "release-state"
+    wake = factory_driver.WakeCoalescer(release_state)
+    wake.request_wake("session-release", now=2000)
+    turn = wake.begin_turn("session-release", now=2000)
+    released = wake.release_turn("session-release", turn["turn"], now=2000)
+    assert released["released"] is True
+    assert released["retry_after"] == ""
+    assert released["retry_attempts"] == 0
+    assert released["due"] is True
+    assert wake.status("session-release", now=2000)["due"] is True
+
+
+def test_a_delivered_action_is_reconciled_without_a_second_gateway_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _subscribe(state)
+    _publish(state, _event("evt-delivered", job_id="job-delivered", attempt_id="att-delivered"))
+
+    child = r"""
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from bundlebees_plugin import factory_driver
+
+def crash_before_commit(self, *args, **kwargs):
+    os._exit(41)
+
+factory_driver.WakeCoalescer.finish_turn = crash_before_commit
+driver = factory_driver.FactoryDriver(
+    Path(sys.argv[1]), Path(sys.argv[2]),
+    tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+    subscribers=["coordinator"], startup=False,
+)
+driver.run_pass()
+"""
+    with RecordingGateway() as gateway:
+        env = os.environ.copy()
+        env["HERMES_API_URL"] = gateway.url
+        env["HERMES_API_KEY"] = "test-key"
+        proc = subprocess.run(
+            [
+                sys.executable, "-c", child, str(state),
+                str(tmp_path / "queue.json"), str(ROOT),
+            ],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 41, proc.stderr
+        assert len(gateway.requests) == 1
+
+        monkeypatch.setenv("HERMES_API_URL", gateway.url)
+        monkeypatch.setenv("HERMES_API_KEY", "test-key")
+        restarted = factory_driver.FactoryDriver(
+            state, tmp_path / "queue.json",
+            tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+            subscribers=["coordinator"], startup=False,
+        ).run_pass()
+
+    delivery = restarted["wake_delivery"][0]
+    assert delivery["delivered"] is True
+    assert delivery["reconciled"] is True
+    assert delivery["turn_finished"] is True
+    assert len(gateway.requests) == 1
+    assert factory_driver.WakeCoalescer(state).status(RAW_SESSION)["pending"] is False
+
+
+def test_an_ambiguous_dispatch_is_reconciled_instead_of_blindly_reposted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _subscribe(state)
+    _publish(state, _event("evt-ambiguous", job_id="job-ambiguous", attempt_id="att-ambiguous"))
+
+    child = r"""
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from bundlebees_plugin import factory_driver, hermes_adapter
+
+real_notify = hermes_adapter.notify_coordinator
+
+def notify_then_die(event, **kwargs):
+    real_notify(event, **kwargs)
+    os._exit(42)
+
+factory_driver.hermes_adapter.notify_coordinator = notify_then_die
+driver = factory_driver.FactoryDriver(
+    Path(sys.argv[1]), Path(sys.argv[2]),
+    tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+    subscribers=["coordinator"], startup=False,
+)
+driver.run_pass()
+"""
+    with RecordingGateway() as gateway:
+        env = os.environ.copy()
+        env["HERMES_API_URL"] = gateway.url
+        env["HERMES_API_KEY"] = "test-key"
+        proc = subprocess.run(
+            [
+                sys.executable, "-c", child, str(state),
+                str(tmp_path / "queue.json"), str(ROOT),
+            ],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 42, proc.stderr
+        assert len(gateway.requests) == 1
+
+        action_files = _files(state / "factory" / "wake-actions")
+        assert len(action_files) == 1
+        action_id = action_files[0].stem
+        stored = json.loads(action_files[0].read_text(encoding="utf-8"))
+        assert stored["status"] == "dispatching"
+        assert stored["session"] == RAW_SESSION
+
+        monkeypatch.setenv("HERMES_API_URL", gateway.url)
+        monkeypatch.setenv("HERMES_API_KEY", "test-key")
+        restarted = factory_driver.FactoryDriver(
+            state, tmp_path / "queue.json",
+            tick=lambda job_id: {"status": "ok", "action": "ready_for_review"},
+            subscribers=["coordinator"], startup=False,
+        ).run_pass()
+
+    delivery = restarted["wake_delivery"][0]
+    assert delivery["delivered"] is False
+    assert delivery["reconciled"] is True
+    assert delivery["uncertain"] is True
+    assert delivery["action_id"] == action_id
+    assert delivery["pending"] is True
+    assert len(gateway.requests) == 1
+    reconciled = json.loads(
+        (state / "factory" / "wake-actions" / f"{action_id}.json").read_text(encoding="utf-8")
+    )
+    assert reconciled["status"] == "uncertain"
+    assert reconciled["session"] == RAW_SESSION

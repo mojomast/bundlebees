@@ -226,6 +226,39 @@ def _test_sources_digest(worktree: Path, tests: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def _installed_dependency_identity() -> dict[str, Any]:
+    """Identity of the packages actually installed in this runtime.
+
+    Manifest text alone is not evidence: two environments with the same
+    ``pyproject.toml`` can resolve to different package versions.  Hash the
+    installed distribution names and versions so a changed execution
+    environment invalidates reuse even when every manifest is byte-identical.
+    """
+
+    names: set[str] = set()
+    try:
+        for distribution in _metadata.distributions():
+            try:
+                name = distribution.metadata.get("Name") or getattr(
+                    distribution, "name", None
+                )
+            except Exception:  # noqa: BLE001 - a broken distribution is still identity
+                continue
+            if name:
+                names.add(str(name))
+    except Exception:  # noqa: BLE001 - a broken install must not break verification
+        return {"available": False, "sha256": "unknown"}
+    entries = {
+        f"{name.lower()}=={_package_version(name)}" for name in sorted(names)
+    }
+    payload = "\n".join(sorted(entries)).encode("utf-8")
+    return {
+        "available": True,
+        "count": len(entries),
+        "sha256": _sha256(_DEPENDENCIES_DOMAIN, payload),
+    }
+
+
 def _dependencies_digest(worktree: Path) -> str:
     """Digest every dependency manifest that could change the test outcome."""
 
@@ -270,6 +303,9 @@ def _stack_identity() -> dict[str, Any]:
         "pytest": _package_version("pytest"),
         "platform": platform.platform(),
         "machine": platform.machine(),
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+        "dependency_environment": _installed_dependency_identity(),
     }
 
 
@@ -344,6 +380,73 @@ def _receipt_key_inputs(
             timeout=timeout,
         ),
         "stage": str(stage),
+    }
+
+
+def _test_command(
+    tests: Sequence[str], suite_command: Sequence[str] | None
+) -> list[str] | None:
+    """The exact argv used for the named-test RED/GREEN executions."""
+
+    if not list(tests):
+        return None
+    base = list(suite_command) if suite_command else ["python", "-m", "pytest", "-q"]
+    return [str(argument) for argument in base] + [str(test) for test in tests]
+
+
+def _gitleaks_identity(require_gitleaks: bool, gitleaks: str | None) -> dict[str, Any]:
+    return {
+        "required": bool(require_gitleaks),
+        "tool": None if gitleaks is None else str(gitleaks),
+    }
+
+
+def _verification_identity(
+    worktree: Path,
+    *,
+    base_rev: str,
+    source_tree_sha256: str,
+    patch_sha256: str,
+    tests: Sequence[str],
+    suite_command: Sequence[str] | None,
+    runner: TestRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+    require_gitleaks: bool,
+    gitleaks: str | None,
+) -> dict[str, Any]:
+    """Everything that can change the observed verification result.
+
+    The aggregate verify record may only be reused when this identity matches
+    exactly.  It deliberately includes both the named-test argv (which embeds
+    the suite command) and the standalone suite argv, so changing either one
+    re-earns the record instead of inheriting an accepted result.
+    """
+
+    return {
+        "base_rev": str(base_rev),
+        "source_tree_sha256": str(source_tree_sha256),
+        "patch_sha256": str(patch_sha256),
+        "test_sources_sha256": _test_sources_digest(worktree, tests),
+        "tests": [str(test) for test in tests],
+        "command": _test_command(tests, suite_command),
+        "suite_command": (
+            None if suite_command is None else [str(item) for item in suite_command]
+        ),
+        "dependencies": _dependencies_digest(worktree),
+        "dependency_environment": _installed_dependency_identity(),
+        "stack": _stack_identity(),
+        "environment": _environment_policy(runner),
+        "sandbox": _sandbox_policy(
+            runner,
+            backend=backend,
+            allow_unsafe_local=allow_unsafe_local,
+            allow_weak=allow_weak,
+            timeout=timeout,
+        ),
+        "gitleaks": _gitleaks_identity(require_gitleaks, gitleaks),
     }
 
 
@@ -796,7 +899,11 @@ def _verify_and_commit_locked(
             "Re-dispatch against the pinned revision; do not verify this artifact.",
         )
 
+    patch_sha256 = hashlib.sha256(patch.encode()).hexdigest()
+    source_tree_sha256 = _tree_digest(repo, base_rev)
+
     # 3. Idempotent restart: an accepted record with a real commit is reused.
+    # Reuse is proof about this exact execution identity, never mere presence.
     existing = read_record(state_dir, attempt_id)
     if existing and existing.get("ok") is True:
         if _record_still_valid(
@@ -805,18 +912,30 @@ def _verify_and_commit_locked(
             base_rev=base_rev,
             files=declared,
             tests=list(tests),
-            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch_sha256=patch_sha256,
             patch=patch,
             require_gitleaks=require_gitleaks,
+            suite_command=suite_command,
+            runner=runner,
+            backend=sandbox_backend,
+            allow_unsafe_local=sandbox_allow_unsafe_local,
+            allow_weak=sandbox_allow_weak,
+            timeout=sandbox_timeout,
+            gitleaks=gitleaks,
+            source_tree_sha256=source_tree_sha256,
         ):
+            _assert_sandbox_usable(
+                runner,
+                backend=sandbox_backend,
+                allow_unsafe_local=sandbox_allow_unsafe_local,
+                allow_weak=sandbox_allow_weak,
+            )
             reused = dict(existing)
-            reused.setdefault("test_cache", dict(stats))
+            # Counters describe this invocation only: a reuse executed nothing.
+            reused["test_cache"] = dict(stats)
             return reused
         # Present-but-invalid evidence is not evidence: re-run every check.
         existing = None
-
-    patch_sha256 = hashlib.sha256(patch.encode()).hexdigest()
-    source_tree_sha256 = _tree_digest(repo, base_rev)
 
     def receipt_context(stage: str) -> dict[str, Any]:
         return {
@@ -891,6 +1010,22 @@ def _verify_and_commit_locked(
                 "Reject this artifact; it changed more than its lease allows.",
             )
 
+        execution_identity = _verification_identity(
+            worktree,
+            base_rev=base_rev,
+            source_tree_sha256=source_tree_sha256,
+            patch_sha256=patch_sha256,
+            tests=tests,
+            suite_command=suite_command,
+            runner=runner,
+            backend=sandbox_backend,
+            allow_unsafe_local=sandbox_allow_unsafe_local,
+            allow_weak=sandbox_allow_weak,
+            timeout=sandbox_timeout,
+            require_gitleaks=require_gitleaks,
+            gitleaks=gitleaks,
+        )
+
         # 6. GREEN after the patch.
         green = _run_tests(
             worktree,
@@ -957,12 +1092,24 @@ def _verify_and_commit_locked(
     if diff_files != declared:
         raise VerifyError("commit_scope_mismatch", f"commit touches {diff_files}, expected {declared}", "Reject this verification.")
 
-    record = _record(attempt_id, sha, base_rev, declared, tests, red=red, suite=suite, gitleaks=scan, patch_sha256=patch_sha256, test_cache=stats)
+    record = _record(
+        attempt_id,
+        sha,
+        base_rev,
+        declared,
+        tests,
+        red=red,
+        suite=suite,
+        gitleaks=scan,
+        patch_sha256=patch_sha256,
+        test_cache=stats,
+        execution_identity=execution_identity,
+    )
     _write_record(state_dir, attempt_id, record)
     return record
 
 
-def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, patch_sha256=None, resumed=False, test_cache=None) -> dict[str, Any]:
+def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, patch_sha256=None, resumed=False, test_cache=None, execution_identity=None) -> dict[str, Any]:
     return {
         "attempt_id": attempt_id,
         "ok": True,
@@ -976,10 +1123,58 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, pa
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
         "patch_sha256": patch_sha256,
+        "execution_identity": (
+            None if execution_identity is None else dict(execution_identity)
+        ),
         "resumed": resumed,
         "test_cache": dict(test_cache or _test_cache_stats()),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _identity_for_commit(
+    repo: Path,
+    sha: str,
+    *,
+    base_rev: str,
+    source_tree_sha256: str,
+    patch_sha256: str,
+    tests: Sequence[str],
+    suite_command: Sequence[str] | None,
+    runner: TestRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+    require_gitleaks: bool,
+    gitleaks: str | None,
+) -> dict[str, Any] | None:
+    """Recompute the execution identity from the *committed* verified tree."""
+
+    scratch = repo.parent / f".bb-identity-{os.getpid()}-{time.time_ns()}"
+    if scratch.exists():
+        _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
+    try:
+        added = _run(["git", "worktree", "add", "--detach", str(scratch), sha], repo)
+        if added.returncode != 0:
+            return None
+        return _verification_identity(
+            scratch,
+            base_rev=base_rev,
+            source_tree_sha256=source_tree_sha256,
+            patch_sha256=patch_sha256,
+            tests=tests,
+            suite_command=suite_command,
+            runner=runner,
+            backend=backend,
+            allow_unsafe_local=allow_unsafe_local,
+            allow_weak=allow_weak,
+            timeout=timeout,
+            require_gitleaks=require_gitleaks,
+            gitleaks=gitleaks,
+        )
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
 
 
 def _record_still_valid(
@@ -992,12 +1187,20 @@ def _record_still_valid(
     patch_sha256: str,
     patch: str,
     require_gitleaks: bool,
+    suite_command: Sequence[str] | None = None,
+    runner: TestRunner | None = None,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    gitleaks: str | None = None,
+    source_tree_sha256: str | None = None,
 ) -> bool:
     """Reuse only a record whose *results* still apply to this exact artifact.
 
     Presence is not proof: a record claiming RED exit 0, a failed suite, a
-    mismatched patch hash, a different test list or a different base is stale and
-    must be re-earned.
+    mismatched patch hash, a different test list, base, command, runtime or
+    sandbox policy is stale and must be re-earned.
     """
 
     sha = str(record.get("sha") or "")
@@ -1026,7 +1229,34 @@ def _record_still_valid(
         scan = record.get("gitleaks")
         if not isinstance(scan, Mapping) or scan.get("exit_code") != 0:
             return False
-    return True
+
+    stored = record.get("execution_identity")
+    if not isinstance(stored, Mapping):
+        return False
+    if source_tree_sha256 is None:
+        try:
+            source_tree_sha256 = _tree_digest(repo, base_rev)
+        except VerifyError:
+            return False
+    expected = _identity_for_commit(
+        repo,
+        sha,
+        base_rev=base_rev,
+        source_tree_sha256=str(source_tree_sha256),
+        patch_sha256=patch_sha256,
+        tests=tests,
+        suite_command=suite_command,
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+        require_gitleaks=require_gitleaks,
+        gitleaks=gitleaks,
+    )
+    if expected is None:
+        return False
+    return dict(stored) == expected
 
 
 def _commit_contains_patch(repo: Path, sha: str, base_rev: str, patch: str) -> bool:
@@ -1036,7 +1266,7 @@ def _commit_contains_patch(repo: Path, sha: str, base_rev: str, patch: str) -> b
         committed = _rev(repo, f"{sha}^{{tree}}")
     except VerifyError:
         return False
-    scratch = repo.parent / f".bb-tree-check-{os.getpid()}"
+    scratch = repo.parent / f".bb-tree-check-{os.getpid()}-{time.time_ns()}"
     if scratch.exists():
         _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
     try:

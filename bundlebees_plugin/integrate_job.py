@@ -241,6 +241,124 @@ def _integration_request_lock(
     )
 
 
+def _identity_digest(identity: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        dict(identity), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(b"bundlebees-integration-identity:v1\x00" + payload).hexdigest()
+
+
+def _integration_request_identity(
+    repo: Path,
+    *,
+    job: Mapping[str, Any],
+    wave: str,
+    base_rev: str,
+    shas: Sequence[tuple[str, str]],
+    suite_command: Sequence[str],
+    runner: SuiteRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """The complete identity of a request to validate one integration wave.
+
+    The accepted-wave record is historical evidence for *this* identity only.
+    The attempt commit shas, base tree, exact suite argv, installed runtime,
+    allowed environment and sandbox policy all participate, so a changed
+    command/runtime/policy is a new validation request rather than recovery.
+    """
+
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "wave": str(wave),
+        "base_rev": str(base_rev),
+        "source_tree_sha256": verify_local._tree_digest(repo, base_rev),
+        "attempts": [
+            {"attempt_id": str(attempt_id), "sha": str(sha)}
+            for attempt_id, sha in shas
+        ],
+        "command": [str(item) for item in suite_command],
+        "stack": verify_local._stack_identity(),
+        "dependency_environment": verify_local._installed_dependency_identity(),
+        "environment": verify_local._environment_policy(runner),
+        "sandbox": verify_local._sandbox_policy(
+            runner,
+            backend=backend,
+            allow_unsafe_local=allow_unsafe_local,
+            allow_weak=allow_weak,
+            timeout=timeout,
+        ),
+    }
+
+
+def _derived_wave_id(wave: str, digest: str) -> str:
+    """A distinct, safe wave id for a changed request on the same wave number."""
+
+    candidate = f"{wave}.{digest[:16]}"
+    if len(candidate) <= 64:
+        return candidate
+    stable = hashlib.sha256(wave.encode("utf-8")).hexdigest()[:8]
+    return f"{wave[:40]}.{stable}.{digest[:12]}"[:64]
+
+
+def _wave_identity_path(state_dir: Path, wave: str) -> Path:
+    # Deliberately outside waves/: callers enumerate waves/*.json as wave
+    # records, and this sidecar is identity evidence, not another wave.
+    return Path(state_dir) / "wave-identities" / f"{wave}.json"
+
+
+def _read_wave_identity(state_dir: Path, wave: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(_wave_identity_path(state_dir, wave).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_wave_identity(
+    state_dir: Path,
+    wave: str,
+    identity: Mapping[str, Any],
+    digest: str,
+    *,
+    materialized: Mapping[str, Any] | None = None,
+) -> None:
+    path = _wave_identity_path(state_dir, wave)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(
+            {
+                "identity": dict(identity),
+                "identity_digest": str(digest),
+                "materialized": dict(materialized or {}),
+            },
+            sort_keys=True,
+            indent=2,
+        ).encode("utf-8")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise IntegrateError(
+            "receipt_io",
+            f"the integration identity could not be written: {exc}",
+            "Check that the state directory is writable and retry.",
+        ) from exc
+
+
 def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
     result = receipt.get("result")
     if not isinstance(result, Mapping):
@@ -465,14 +583,48 @@ def _integrate_locked(
 
     wave = wave_id or job_wave_id(job)
 
-    # Crash recovery: an accepted wave record already on disk is the result.
-    # Restore the durable ref if the crash happened before it was updated, and
-    # report recovery so the caller does not count it as a new attempt.
+    # The verified commits are inputs to the request identity, so read them
+    # before deciding whether an accepted wave is recovery or a stale result.
+    shas: list[tuple[str, str]] = []
+    for attempt_id in attempts:
+        record = verify_local.read_record(state_dir, attempt_id)
+        if not record or record.get("ok") is not True:
+            raise IntegrateError("not_verified", f"{attempt_id} has no accepted verify record", "Verify it first.")
+        sha = str(record.get("sha") or "")
+        if len(sha) != 40:
+            raise IntegrateError("bad_verify_record", f"{attempt_id} has no commit sha", "Re-verify it.")
+        shas.append((attempt_id, sha))
+
+    identity = _integration_request_identity(
+        repo,
+        job=job,
+        wave=wave,
+        base_rev=base_rev,
+        shas=shas,
+        suite_command=suite_command,
+        runner=runner,
+        backend=sandbox_backend,
+        allow_unsafe_local=sandbox_allow_unsafe_local,
+        allow_weak=sandbox_allow_weak,
+        timeout=sandbox_timeout,
+    )
+    identity_digest = _identity_digest(identity)
+
+    # Crash recovery: an accepted wave record already on disk is the result,
+    # but only for the execution identity it was earned under.  A changed
+    # command/runtime/policy is a new validation request and must not inherit
+    # the old accepted evidence.
     for legacy in _legacy_names(job):
         adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
         if adopted is not None:
             break
     existing = _accepted_wave_record(state_dir, wave)
+    if existing is not None:
+        stored = _read_wave_identity(state_dir, wave)
+        stored_digest = str((stored or {}).get("identity_digest") or "")
+        if stored_digest and stored_digest != identity_digest:
+            wave = _derived_wave_id(wave, identity_digest)
+            existing = _accepted_wave_record(state_dir, wave)
     if existing is not None:
         head = str(existing.get("head_sha") or "")
         if len(head) != 40:
@@ -488,6 +640,7 @@ def _integrate_locked(
             "integration_ref": ref_name,
             "start_rev": current or head,
             "recovered": True,
+            "request_identity_digest": identity_digest,
             "test_cache": dict(stats),
         }
 
@@ -495,16 +648,6 @@ def _integrate_locked(
     ref = integration_ref(str(job.get("job_id") or ""))
     ref_check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
     start_rev = ref_check.stdout.strip() if ref_check.returncode == 0 else base_rev
-
-    shas: list[tuple[str, str]] = []
-    for attempt_id in attempts:
-        record = verify_local.read_record(state_dir, attempt_id)
-        if not record or record.get("ok") is not True:
-            raise IntegrateError("not_verified", f"{attempt_id} has no accepted verify record", "Verify it first.")
-        sha = str(record.get("sha") or "")
-        if len(sha) != 40:
-            raise IntegrateError("bad_verify_record", f"{attempt_id} has no commit sha", "Re-verify it.")
-        shas.append((attempt_id, sha))
 
     root = Path(worktree_root) if worktree_root else repo.parent / ".bb-integrate"
     worktree = root / "wt"
@@ -572,6 +715,18 @@ def _integrate_locked(
             attempts,
             run_suite,
         )
+        materialized: dict[str, Any] = {
+            "wave_id": str(record.get("wave_id") or wave),
+            "head_sha": str(record.get("head_sha") or ""),
+            "accepted": bool(record.get("accepted")),
+        }
+        if materialized["head_sha"]:
+            materialized["source_tree_sha256"] = verify_local._tree_digest(
+                worktree, str(materialized["head_sha"])
+            )
+        _write_wave_identity(
+            state_dir, wave, identity, identity_digest, materialized=materialized
+        )
         if record.get("accepted"):
             head = str(record.get("head_sha") or "")
             if len(head) != 40:
@@ -601,6 +756,7 @@ def _integrate_locked(
         "integration_ref": head_ref,
         "start_rev": start_rev,
         "recovered": False,
+        "request_identity_digest": identity_digest,
         "test_cache": dict(stats),
     }
 

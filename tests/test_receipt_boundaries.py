@@ -386,3 +386,157 @@ def test_integration_suite_reuses_the_combined_receipt(tmp_path):
     assert second["ok"] is True
     assert second["test_cache"] == {"executions": 0, "hits": 1, "misses": 0}
     assert len(suite_runner.calls) == 1
+
+
+class FailingCommandRunner(CountingRunner):
+    """Returns RED before the patch and fails whenever the marker is present."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+
+    def __call__(self, workdir, argv):
+        with self.lock:
+            self.calls.append(list(argv))
+        if self.marker in argv:
+            return {"exit_code": 1, "timed_out": False, "output_tail": "deliberate failure"}
+        installed = (Path(workdir) / "pkg" / "newmod.py").is_file()
+        return {
+            "exit_code": 0 if installed else 1,
+            "timed_out": False,
+            "output_tail": "green" if installed else "red",
+        }
+
+
+def test_aggregate_record_reuse_requires_the_exact_command_identity(tmp_path):
+    repo, base = make_repo(tmp_path)
+    state = tmp_path / "state"
+    patch = make_patch(repo, base, NEW_FILES)
+    record_lease(state, "att_1", base)
+    runner = CountingRunner()
+
+    first = verify_local.verify_and_commit(
+        **verify_args(state, repo, base, patch, "att_1", runner=runner)
+    )
+    original_record_bytes = verify_local.record_path(state, "att_1").read_bytes()
+
+    # Identical input is a genuine reuse and reports this invocation's counters.
+    again = verify_local.verify_and_commit(
+        **verify_args(state, repo, base, patch, "att_1", runner=runner)
+    )
+    assert again["sha"] == first["sha"]
+    assert again["test_cache"] == {"executions": 0, "hits": 0, "misses": 0}
+    assert len(runner.calls) == 3
+    assert verify_local.record_path(state, "att_1").read_bytes() == original_record_bytes
+
+    # Keep the aggregate record on disk; a changed failing command is a new
+    # execution identity and must execute rather than inherit acceptance.
+    failing = FailingCommandRunner("__bb_deliberately_failing__")
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.verify_and_commit(
+            **verify_args(
+                state, repo, base, patch, "att_1",
+                runner=failing,
+                suite_command=SUITE + ["__bb_deliberately_failing__"],
+            )
+        )
+    assert caught.value.code in {"tests_failed", "suite_failed"}
+    assert len(failing.calls) >= 2  # RED and GREEN both ran the complete argv
+    # The old aggregate record was not replaced by a failed attempt.
+    assert verify_local.record_path(state, "att_1").read_bytes() == original_record_bytes
+
+
+def test_aggregate_record_reuse_requires_runtime_and_sandbox_identity(tmp_path, monkeypatch):
+    repo, base = make_repo(tmp_path)
+    state = tmp_path / "state"
+    patch = make_patch(repo, base, NEW_FILES)
+    record_lease(state, "att_1", base)
+    runner = CountingRunner()
+
+    first = verify_local.verify_and_commit(
+        **verify_args(state, repo, base, patch, "att_1", runner=runner)
+    )
+    assert counts(first) == (3, 0, 3)
+
+    # Changed runtime/tool identity: same files and command, different stack.
+    monkeypatch.setattr(
+        verify_local, "_stack_identity", lambda: {"python": "other-runtime"}
+    )
+    changed_runtime = verify_local.verify_and_commit(
+        **verify_args(state, repo, base, patch, "att_1", runner=runner)
+    )
+    assert counts(changed_runtime) == (3, 0, 3)
+    assert len(runner.calls) == 6
+    monkeypatch.undo()
+
+    # Changed sandbox policy: same files, command and runtime, new identity.
+    changed_policy = verify_local.verify_and_commit(
+        **verify_args(
+            state, repo, base, patch, "att_1",
+            runner=runner,
+            sandbox_timeout=601,
+        )
+    )
+    assert counts(changed_policy) == (3, 0, 3)
+    assert len(runner.calls) == 9
+    assert changed_policy["execution_identity"]["sandbox"]["timeout"] == 601
+
+
+def test_integration_wave_recovery_is_scoped_to_the_request_identity(tmp_path):
+    repo, base = make_repo(tmp_path)
+    state = tmp_path / "state"
+    patch = make_patch(repo, base, NEW_FILES)
+    record_lease(state, "att_1", base)
+    verify_local.verify_and_commit(
+        **verify_args(state, repo, base, patch, "att_1", runner=CountingRunner())
+    )
+
+    job = {
+        "job_id": "job_a",
+        "goal": {"base_rev": base},
+        "tasks": [{"task_id": "T1", "state": "verified", "attempts": ["att_1"]}],
+        "integration": {"wave": 1},
+    }
+    first_runner = CountingRunner()
+    first = integrate_job.integrate(
+        state, job, repo, suite_command=SUITE, runner=first_runner
+    )
+    assert first["ok"] is True
+    assert first["recovered"] is False
+
+    wave = integrate_job.job_wave_id(job)
+    wave_path = state / "waves" / f"{wave}.json"
+    accepted_bytes = wave_path.read_bytes()
+    accepted_head = first["record"]["head_sha"]
+
+    # Keep the accepted aggregate wave record. A changed command is a new
+    # validation request: it executes and is not reported as recovery.
+    changed_runner = CountingRunner()
+    changed = integrate_job.integrate(
+        state,
+        job,
+        repo,
+        suite_command=SUITE + ["__bb_changed_integration_command__"],
+        runner=changed_runner,
+    )
+    assert changed["ok"] is True
+    assert changed["recovered"] is False
+    assert changed["request_identity_digest"] != first["request_identity_digest"]
+    assert changed["test_cache"] == {"executions": 1, "hits": 0, "misses": 1}
+    assert len(changed_runner.calls) == 1
+    assert wave_path.read_bytes() == accepted_bytes
+    assert first["record"]["head_sha"] == accepted_head
+
+    # The identical changed request is now historically recoverable.
+    repeat_runner = CountingRunner()
+    repeat = integrate_job.integrate(
+        state,
+        job,
+        repo,
+        suite_command=SUITE + ["__bb_changed_integration_command__"],
+        runner=repeat_runner,
+    )
+    assert repeat["ok"] is True
+    assert repeat["recovered"] is True
+    assert repeat["test_cache"] == {"executions": 0, "hits": 0, "misses": 0}
+    assert len(repeat_runner.calls) == 0

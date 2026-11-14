@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import time
@@ -53,17 +54,22 @@ __all__ = [
     "run_once",
     "run_pass",
     "startup_reconcile",
+    "wake_action_id",
     "work_id_for_event",
 ]
 
 WAKE_SCHEMA = "bundlebees.factory-wake/1"
+WAKE_ACTION_SCHEMA = "bundlebees.factory-wake-action/1"
 ACTION_SCHEMA = "bundlebees.factory-action/1"
 WAKE_DIR = "wakes"
+WAKE_ACTION_DIR = "wake-actions"
 ACTION_DIR = "actions"
 WORK_RETRY_DIR = "work-retries"
 JOB_LOCK_DIR = "job-locks"
 DEFAULT_SESSION = "coordinator"
 DEFAULT_WAKE_TTL_S = 900.0
+DEFAULT_WAKE_BACKOFF_S = 5.0
+MAX_WAKE_BACKOFF_S = 300.0
 MAX_WORK_ATTEMPTS = 2
 _TERMINAL_TASK_STATES = frozenset({"accepted", "rejected", "failed", "superseded"})
 
@@ -117,6 +123,26 @@ def _safe_session(value: Any) -> str:
         return text
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
     return f"session-{digest}"
+
+
+def wake_action_id(session: Any, generation: Any, subscriber: Any = None) -> str:
+    """A stable identity for one session generation's gateway wake.
+
+    It is derived only from the raw session, the durable generation and the
+    subscriber key.  Process, turn and retry identity never enter the seed, so a
+    restart or a bounded retry resolves to the same durable action record.
+    """
+
+    seed = json.dumps(
+        {
+            "session": _raw_session(session),
+            "generation": int(generation or 0),
+            "subscriber": _safe_session(subscriber) if subscriber not in (None, "") else "",
+        },
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return "wake_" + hashlib.sha256(seed).hexdigest()[:24]
 
 
 def _fsync_dir(path: Path) -> None:
@@ -265,6 +291,10 @@ class WakeCoalescer:
             "active": record.get("active") if isinstance(record.get("active"), Mapping) else None,
             "coalesced": int(record.get("coalesced") or 0),
             "updated_at": str(record.get("updated_at") or ""),
+            "retry_after_epoch": float(record.get("retry_after_epoch") or 0.0),
+            "retry_attempts": int(record.get("retry_attempts") or 0),
+            "last_error": str(record.get("last_error") or ""),
+            "last_error_code": str(record.get("last_error_code") or ""),
         }
 
     def _save(self, session: Any, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -283,7 +313,9 @@ class WakeCoalescer:
             return True
         started = active.get("started_epoch")
         if not isinstance(started, (int, float)):
-            return True
+            # A live pid is the authority; without a readable start time there
+            # is no evidence the turn itself expired.
+            return False
         return clock - float(started) >= self.ttl_s
 
     def request_wake(
@@ -318,6 +350,16 @@ class WakeCoalescer:
                     "cursor": int(record["cursor"]),
                     "active": dict(active),
                 }
+            retry_after = float(record.get("retry_after_epoch") or 0.0)
+            if retry_after > clock:
+                return {
+                    "started": False,
+                    "reason": "backoff",
+                    "session": name,
+                    "generation": int(record["generation"]),
+                    "cursor": int(record["cursor"]),
+                    "retry_after": _iso(retry_after),
+                }
             if int(record["generation"]) <= int(record["cursor"]):
                 return {
                     "started": False,
@@ -326,23 +368,30 @@ class WakeCoalescer:
                     "generation": int(record["generation"]),
                     "cursor": int(record["cursor"]),
                 }
+            abandoned = dict(active) if isinstance(active, Mapping) else None
+            generation = int(record["generation"])
             turn = {
                 "turn": "turn-" + uuid.uuid4().hex,
-                "generation": int(record["generation"]),
+                "generation": generation,
+                "action_id": wake_action_id(name, generation, record.get("subscriber")),
                 "pid": os.getpid(),
                 "started_at": stamp,
                 "started_epoch": clock,
             }
             record["active"] = turn
+            record["retry_after_epoch"] = 0
+            record["retry_after"] = ""
             record["updated_at"] = stamp
             self._save(name, record)
             return {
                 "started": True,
                 "session": name,
-                "generation": int(record["generation"]),
+                "generation": generation,
                 "cursor": int(record["cursor"]),
                 "turn": turn["turn"],
                 "active": turn,
+                "recovered": abandoned is not None,
+                "abandoned": abandoned,
             }
 
     def finish_turn(self, session: Any, turn: Any, *, now: Any = None) -> dict[str, Any]:
@@ -365,6 +414,11 @@ class WakeCoalescer:
             record["cursor"] = max(int(record["cursor"]), started_generation)
             record["active"] = None
             record["coalesced"] = max(0, int(record["generation"]) - int(record["cursor"]))
+            record["retry_after_epoch"] = 0
+            record["retry_after"] = ""
+            record["retry_attempts"] = 0
+            record["last_error"] = ""
+            record["last_error_code"] = ""
             record["updated_at"] = stamp
             saved = self._save(name, record)
             return {
@@ -377,28 +431,114 @@ class WakeCoalescer:
                 "turn": turn_id,
             }
 
-    def release_turn(self, session: Any, turn: Any) -> dict[str, Any]:
-        """Clear an active turn without advancing the cursor (delivery failed)."""
+    def release_turn(
+        self,
+        session: Any,
+        turn: Any,
+        *,
+        now: Any = None,
+        backoff_s: float = 0.0,
+        error: str = "",
+        code: str = "",
+    ) -> dict[str, Any]:
+        """Clear an active turn without advancing the cursor (delivery failed).
+
+        Releasing a turn is not itself a retry or a backoff: the default call
+        leaves the wake immediately due.  Only a caller that knows the gateway
+        failed asks for a bounded ``backoff_s``; that explicitly schedules the
+        next attempt so repeated failures cannot spin.
+        """
+
         name = _raw_session(session)
+        stamp = _iso(now)
+        clock = _clock(now)
+        try:
+            delay = max(0.0, float(backoff_s or 0.0))
+        except (TypeError, ValueError):
+            delay = 0.0
         with _locked(self._lock_path(name)):
             record = self._load(name)
             active = record.get("active") if isinstance(record.get("active"), Mapping) else None
+            released = False
             if active is not None and str(active.get("turn")) == str(turn):
                 record["active"] = None
-                self._save(name, record)
-            record["pending"] = int(record["generation"]) > int(record["cursor"])
-            return record
+                released = True
+            # Schedule only when there is no live turn left to own the retry.
+            if delay > 0 and (released or active is None):
+                delay = min(delay, MAX_WAKE_BACKOFF_S)
+                attempts = int(record.get("retry_attempts") or 0) + 1
+                record["retry_attempts"] = attempts
+                record["retry_after_epoch"] = clock + delay
+                record["retry_after"] = _iso(clock + delay)
+            if error:
+                record["last_error"] = str(error)[:500]
+            if code:
+                record["last_error_code"] = str(code)[:120]
+            record["updated_at"] = stamp
+            saved = self._save(name, record)
+        retry_after = float(saved.get("retry_after_epoch") or 0.0)
+        saved["released"] = released
+        saved["pending"] = int(saved["generation"]) > int(saved["cursor"])
+        saved["retry_after"] = _iso(retry_after) if retry_after > clock else ""
+        saved["next_attempt_at"] = saved["retry_after"]
+        saved["due"] = bool(saved["pending"] and retry_after <= clock)
+        return saved
 
-    def status(self, session: Any) -> dict[str, Any]:
+    def commit_generation(self, session: Any, generation: Any, *, now: Any = None) -> dict[str, Any]:
+        """Advance the cursor to a generation whose remote effect is recorded.
+
+        Used to reconcile a wake action that was delivered before the process
+        died: the next pass commits that generation without sending again.
+        """
+
+        name = _raw_session(session)
+        stamp = _iso(now)
+        target = int(generation or 0)
+        with _locked(self._lock_path(name)):
+            record = self._load(name)
+            committed = int(record["cursor"]) < target
+            record["cursor"] = max(int(record["cursor"]), target)
+            active = record.get("active") if isinstance(record.get("active"), Mapping) else None
+            if active is not None and int(active.get("generation") or 0) <= target:
+                record["active"] = None
+            record["coalesced"] = max(0, int(record["generation"]) - int(record["cursor"]))
+            record["retry_after_epoch"] = 0
+            record["retry_after"] = ""
+            record["retry_attempts"] = 0
+            record["last_error"] = ""
+            record["last_error_code"] = ""
+            record["updated_at"] = stamp
+            saved = self._save(name, record)
+        return {
+            "committed": committed,
+            "session": name,
+            "generation": int(saved["generation"]),
+            "cursor": int(saved["cursor"]),
+            "pending": bool(saved["pending"]),
+        }
+
+    def status(self, session: Any, *, now: Any = None) -> dict[str, Any]:
         name = _raw_session(session)
         record = self._load(name)
-        record["pending"] = int(record["generation"]) > int(record["cursor"])
-        record["active_turn"] = bool(record.get("active"))
-        record["due"] = bool(record["pending"] and not record["active_turn"])
+        clock = _clock(now)
+        active = record.get("active") if isinstance(record.get("active"), Mapping) else None
+        active_live = active is not None and not self._expired(active, clock)
+        abandoned = active is not None and not active_live
+        retry_after = float(record.get("retry_after_epoch") or 0.0)
+        pending = int(record["generation"]) > int(record["cursor"])
+        record["pending"] = pending
+        record["active_turn"] = active_live
+        record["abandoned"] = abandoned
+        record["abandoned_turn"] = abandoned
+        record["recoverable"] = bool(abandoned and pending)
+        record["retry_attempts"] = int(record.get("retry_attempts") or 0)
+        record["retry_after"] = _iso(retry_after) if retry_after > clock else ""
+        record["next_attempt_at"] = record["retry_after"]
+        record["due"] = bool(pending and not active_live and retry_after <= clock)
         return record
 
-    def due(self, session: Any) -> bool:
-        return bool(self.status(session)["due"])
+    def due(self, session: Any, *, now: Any = None) -> bool:
+        return bool(self.status(session, now=now)["due"])
 
     def sessions(self) -> list[str]:
         """Every raw session identity with a durable wake record."""
@@ -1173,6 +1313,175 @@ class FactoryDriver:
             return None
         return dict(record)
 
+    def _wake_action_path(self, action_id: str) -> Path:
+        return self.state / "factory" / WAKE_ACTION_DIR / f"{action_id}.json"
+
+    def _read_wake_action(self, action_id: str) -> dict[str, Any]:
+        return _read_json(self._wake_action_path(action_id)) or {}
+
+    def _write_wake_action(self, action_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        record = dict(body)
+        record["schema"] = WAKE_ACTION_SCHEMA
+        record["action_id"] = action_id
+        _write_json(self._wake_action_path(action_id), record)
+        return record
+
+    def _wake_backoff_s(self, attempts: Any) -> float:
+        """Bounded exponential delay after an actual gateway failure."""
+
+        try:
+            count = max(1, int(attempts or 1))
+        except (TypeError, ValueError):
+            count = 1
+        delay = DEFAULT_WAKE_BACKOFF_S * (2 ** min(count - 1, 8))
+        return min(MAX_WAKE_BACKOFF_S, delay)
+
+    @staticmethod
+    def _wake_failure_is_ambiguous(exc: BaseException) -> bool:
+        """Whether a failed notification may already have reached the gateway.
+
+        A missing endpoint/key or a routing refusal is known not to have been
+        sent.  A timeout, transport error, non-2xx and any unknown transport
+        exception is uncertain because the POST may have landed.
+        """
+
+        code = str(getattr(exc, "code", "") or "")
+        if code in {
+            "hermes_notification_unavailable",
+            "hermes_notification_invalid",
+            "hermes_notification_too_large",
+            "hermes_session_mismatch",
+        }:
+            return False
+        return True
+
+    @staticmethod
+    def _notify_accepts_runner() -> bool:
+        """Keep the transport seam optional for a test double with a fixed signature."""
+
+        try:
+            parameters = inspect.signature(hermes_adapter.notify_coordinator).parameters
+        except (TypeError, ValueError):
+            return False
+        return "runner" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _wake_runner(self, action_id: str) -> Any:
+        """Carry the stable action identity to the gateway as an idempotency key."""
+
+        def runner(url: str, *, headers: Mapping[str, str], body: bytes, timeout_s: float):
+            carried = dict(headers)
+            carried["Idempotency-Key"] = action_id
+            carried["X-Bundlebees-Action-Id"] = action_id
+            return hermes_adapter._post_wake(  # noqa: SLF001 - same package transport seam
+                url, carried, body, timeout_s=timeout_s
+            )
+
+        return runner
+
+    def _reconcile_wake_action(
+        self, session: str, status: Mapping[str, Any], action_id: str
+    ) -> dict[str, Any] | None:
+        """Resolve a durable wake action left by a previous process.
+
+        A recorded delivery is committed without a second POST.  A leftover
+        ``dispatching`` action is ambiguous: it is marked uncertain and given a
+        bounded delay instead of being retried blindly.  Action records keyed by
+        the same stable id are reused for later bounded retries.
+        """
+
+        action = self._read_wake_action(action_id)
+        if not action:
+            return None
+        state = str(action.get("status") or "")
+        generation = int(action.get("generation") or status.get("generation") or 0)
+        if state == "delivered" and generation == int(status.get("generation") or 0):
+            committed = self.wake.commit_generation(session, generation, now=self.now)
+            return {
+                "session": session,
+                "session_key": self.wake.key_for(session),
+                "delivered": True,
+                "reconciled": True,
+                "recovered": bool(status.get("abandoned_turn")),
+                "action_id": action_id,
+                "action_state": "delivered",
+                "event_id": action.get("event_id", ""),
+                "turn": action.get("turn"),
+                "turn_finished": bool(committed.get("committed")),
+                "pending": bool(committed.get("pending")),
+                "subscriber": action.get("subscriber_identity", ""),
+            }
+        if state not in {"dispatching", "uncertain"}:
+            return None
+
+        now_epoch = _clock(self.now)
+        not_before = float(action.get("not_before_epoch") or 0.0)
+        if state == "uncertain" and not_before > now_epoch:
+            return {
+                "session": session,
+                "session_key": self.wake.key_for(session),
+                "delivered": False,
+                "reconciled": True,
+                "uncertain": True,
+                "action_id": action_id,
+                "action_state": "uncertain",
+                "turn": action.get("turn"),
+                "turn_finished": False,
+                "pending": True,
+                "retry_after": _iso(not_before),
+                "next_attempt_at": _iso(not_before),
+                "code": "wake_outcome_uncertain",
+                "fix": "Wait for the recorded reconciliation delay; do not re-POST the same wake blindly.",
+            }
+        if state == "dispatching":
+            # The process died between persisting intent and recording the
+            # result. Reconcile to uncertain and wait; never issue a fresh POST
+            # just because the owner vanished.
+            attempts = int(action.get("attempts") or 1)
+            delay = self._wake_backoff_s(attempts)
+            not_before = now_epoch + delay
+            self._write_wake_action(
+                action_id,
+                dict(
+                    action,
+                    status="uncertain",
+                    attempts=attempts,
+                    first_uncertain_at=action.get("first_uncertain_at") or _iso(now_epoch),
+                    not_before_epoch=not_before,
+                    not_before=_iso(not_before),
+                    detail="the process that dispatched this wake exited before recording its outcome",
+                ),
+            )
+            active = status.get("active") if isinstance(status.get("active"), Mapping) else {}
+            released = self.wake.release_turn(
+                session,
+                active.get("turn") if isinstance(active, Mapping) else None,
+                now=self.now,
+                backoff_s=delay,
+                error="ambiguous wake outcome",
+                code="wake_outcome_uncertain",
+            )
+            return {
+                "session": session,
+                "session_key": self.wake.key_for(session),
+                "delivered": False,
+                "reconciled": True,
+                "uncertain": True,
+                "recovered": bool(status.get("abandoned_turn")),
+                "action_id": action_id,
+                "action_state": "uncertain",
+                "turn": action.get("turn"),
+                "turn_finished": False,
+                "pending": True,
+                "retry_after": released.get("retry_after", ""),
+                "next_attempt_at": released.get("retry_after", ""),
+                "code": "wake_outcome_uncertain",
+                "fix": "Reconcile the gateway journal before retrying; the wake is not re-POSTed blindly.",
+            }
+        return None
+
     def _deliver_wakes(self) -> list[dict[str, Any]]:
         """Deliver one coalesced wake per due session through the real adapter."""
 
@@ -1180,12 +1489,23 @@ class FactoryDriver:
         sessions = self.wake.sessions() or self.subscribers_for_pass()
         fallback = (self.subscribers_for_pass() or [DEFAULT_SESSION])[0]
         for session in sessions:
-            status = self.wake.status(session)
+            status = self.wake.status(session, now=self.now)
             if not status.get("due"):
                 continue
+            generation = int(status.get("generation") or 0)
+            action_id = wake_action_id(session, generation, status.get("subscriber"))
+            reconciled = self._reconcile_wake_action(session, status, action_id)
+            if reconciled is not None:
+                results.append(reconciled)
+                continue
+            prior = self._read_wake_action(action_id)
+            prior_state = str(prior.get("status") or "")
             turn = self.wake.begin_turn(session, now=self.now)
             if not turn.get("started"):
                 continue
+            action_id = str(turn.get("active", {}).get("action_id") or action_id)
+            event: Mapping[str, Any] = {}
+            subscriber: Mapping[str, Any] | None = None
             try:
                 event_path = (
                     self.state
@@ -1195,14 +1515,62 @@ class FactoryDriver:
                 )
                 event = json.loads(event_path.read_text(encoding="utf-8"))
                 subscriber = self._subscriber_binding(event, status, fallback)
-                delivered = hermes_adapter.notify_coordinator(
-                    event,
-                    endpoint=os.environ.get("HERMES_API_URL") or None,
-                    api_key=os.environ.get("HERMES_API_KEY") or None,
-                    session=session,
-                    subscriber=subscriber,
-                    state_dir=self.state,
-                    timeout_s=float(os.environ.get("HERMES_WAKE_TIMEOUT_S") or 60.0),
+                attempts = int(prior.get("attempts") or 0) + 1
+                self._write_wake_action(
+                    action_id,
+                    {
+                        "session": session,
+                        "session_key": self.wake.key_for(session),
+                        "subscriber": _safe_session(status.get("subscriber")),
+                        "subscriber_identity": (subscriber or {}).get("identity", ""),
+                        "generation": int(turn.get("generation") or generation),
+                        "turn": turn.get("turn"),
+                        "pid": os.getpid(),
+                        "status": "dispatching",
+                        "attempts": attempts,
+                        "previous_status": prior_state,
+                        "first_uncertain_at": prior.get("first_uncertain_at", ""),
+                        "not_before_epoch": 0,
+                        "not_before": "",
+                        "event_id": _event_id(event),
+                        "updated_at": _iso(self.now),
+                    },
+                )
+                notify_kwargs = {
+                    "endpoint": os.environ.get("HERMES_API_URL") or None,
+                    "api_key": os.environ.get("HERMES_API_KEY") or None,
+                    "session": session,
+                    "subscriber": subscriber,
+                    "state_dir": self.state,
+                    "timeout_s": float(os.environ.get("HERMES_WAKE_TIMEOUT_S") or 60.0),
+                }
+                if self._notify_accepts_runner():
+                    notify_kwargs["runner"] = self._wake_runner(action_id)
+                delivered = hermes_adapter.notify_coordinator(event, **notify_kwargs)
+                self._write_wake_action(
+                    action_id,
+                    {
+                        "session": session,
+                        "session_key": self.wake.key_for(session),
+                        "subscriber": _safe_session(status.get("subscriber")),
+                        "subscriber_identity": (subscriber or {}).get("identity", ""),
+                        "generation": int(turn.get("generation") or generation),
+                        "turn": turn.get("turn"),
+                        "pid": os.getpid(),
+                        "status": "delivered",
+                        "attempts": attempts,
+                        "previous_status": prior_state,
+                        "first_uncertain_at": prior.get("first_uncertain_at", ""),
+                        "not_before_epoch": 0,
+                        "not_before": "",
+                        "event_id": delivered.get("event_id") or _event_id(event),
+                        "result": {
+                            "event_id": delivered.get("event_id"),
+                            "status": delivered.get("status"),
+                            "transport": delivered.get("transport"),
+                        },
+                        "updated_at": _iso(self.now),
+                    },
                 )
                 finished = self.wake.finish_turn(
                     session, turn.get("turn"), now=self.now
@@ -1213,6 +1581,11 @@ class FactoryDriver:
                         "session_key": self.wake.key_for(session),
                         "delivered": True,
                         "event_id": delivered.get("event_id"),
+                        "action_id": action_id,
+                        "action_state": "delivered",
+                        "attempts": attempts,
+                        "reconciled": bool(prior_state in {"failed", "uncertain", "dispatching"}),
+                        "recovered": bool(turn.get("recovered")),
                         "turn": turn.get("turn"),
                         "turn_finished": bool(finished.get("finished")),
                         "pending": bool(finished.get("pending")),
@@ -1220,7 +1593,46 @@ class FactoryDriver:
                     }
                 )
             except Exception as exc:  # noqa: BLE001 - durable wake remains pending
-                self.wake.release_turn(session, turn.get("turn"))
+                code = str(getattr(exc, "code", "") or "")
+                ambiguous = self._wake_failure_is_ambiguous(exc)
+                attempts = int(self._read_wake_action(action_id).get("attempts") or 1)
+                delay = self._wake_backoff_s(attempts) if ambiguous else 0.0
+                now_epoch = _clock(self.now)
+                action_state = "uncertain" if ambiguous else "failed"
+                self._write_wake_action(
+                    action_id,
+                    {
+                        "session": session,
+                        "session_key": self.wake.key_for(session),
+                        "subscriber": _safe_session(status.get("subscriber")),
+                        "subscriber_identity": (subscriber or {}).get("identity", ""),
+                        "generation": int(turn.get("generation") or generation),
+                        "turn": turn.get("turn"),
+                        "pid": os.getpid(),
+                        "status": action_state,
+                        "attempts": attempts,
+                        "previous_status": prior_state,
+                        "first_uncertain_at": self._read_wake_action(action_id).get(
+                            "first_uncertain_at", ""
+                        )
+                        or _iso(now_epoch),
+                        "not_before_epoch": now_epoch + delay if delay > 0 else 0.0,
+                        "not_before": _iso(now_epoch + delay) if delay > 0 else "",
+                        "event_id": _event_id(event),
+                        "error": type(exc).__name__,
+                        "code": code,
+                        "message": str(getattr(exc, "message", "") or str(exc))[:500],
+                        "updated_at": _iso(self.now),
+                    },
+                )
+                released = self.wake.release_turn(
+                    session,
+                    turn.get("turn"),
+                    now=self.now,
+                    backoff_s=delay,
+                    error=str(getattr(exc, "message", "") or str(exc)),
+                    code=code,
+                )
                 results.append(
                     {
                         "session": session,
@@ -1228,14 +1640,21 @@ class FactoryDriver:
                         "delivered": False,
                         "turn": turn.get("turn"),
                         "turn_finished": False,
+                        "action_id": action_id,
+                        "action_state": action_state,
+                        "attempts": attempts,
+                        "ambiguous": ambiguous,
+                        "reconciled": False,
                         "error": type(exc).__name__,
-                        "code": str(getattr(exc, "code", "") or ""),
+                        "code": code,
                         "message": str(getattr(exc, "message", "") or str(exc))[:500],
                         "fix": str(
                             getattr(exc, "fix", "")
                             or "Keep the wake pending and retry after the gateway recovers."
                         ),
                         "pending": True,
+                        "retry_after": released.get("retry_after", ""),
+                        "next_attempt_at": released.get("retry_after", ""),
                     }
                 )
         return results
