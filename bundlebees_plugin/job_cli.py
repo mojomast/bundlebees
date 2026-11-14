@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import integrate_job, job as jobs, leases, reconcile, verify_local
+from . import integrate_job, job as jobs, leases, reconcile, return_report, verify_local
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -514,7 +514,23 @@ def status(state_dir: Path, job_id: str) -> dict[str, Any]:
     }
 
 
-def report(state_dir: Path, job_id: str) -> dict[str, Any]:
+def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False) -> dict[str, Any]:
+    """Write and print the job acceptance report, bound to a RETURN packet.
+
+    The shallow report at ``jobs/<job>.report.json`` keeps its keys and gains a
+    ``return`` block naming the durable ``jobs/<job>/return.json`` manifest, its
+    ``RETURN.md`` rendering and the ``evidence_digest`` that binds them to the
+    evidence. Building the RETURN validates every durable relationship first, so
+    a corrupt or contradictory job is refused instead of reported as accepted.
+
+    With ``verify``, nothing is written: the durable state is rebuilt and
+    compared against the on-disk RETURN, and a mismatch raises
+    ``report_tampered``.
+    """
+
+    if verify:
+        return return_report.verify(state_dir, job_id, repo=repo)
+
     job = jobs.load_job(state_dir, job_id)
     rows = []
     for task in job.get("tasks", []):
@@ -529,6 +545,7 @@ def report(state_dir: Path, job_id: str) -> dict[str, Any]:
                 "verified": bool((record or {}).get("ok")),
             }
         )
+    manifest = return_report.build(state_dir, job_id, repo=repo)
     payload = {
         "job_id": job_id,
         "goal": job.get("goal", {}),
@@ -536,9 +553,25 @@ def report(state_dir: Path, job_id: str) -> dict[str, Any]:
         "integration": job.get("integration", {}),
         "escalations": job.get("escalations", []),
         "measurements": {"tokens": "UNKNOWN", "cost": "UNKNOWN"},
+        "return": {
+            "schema": manifest["schema"],
+            "evidence_digest": manifest["evidence_digest"],
+            "path": f"{jobs.JOBS_DIR}/{job_id}/{return_report.RETURN_FILE}",
+            "markdown": f"{jobs.JOBS_DIR}/{job_id}/{return_report.RENDER_FILE}",
+            "acceptance": {
+                item["id"] or item["statement"]: item["status"] for item in manifest["acceptance"]
+            },
+        },
+        # Local-only checks, kept out of the RETURN so the digest stays a pure
+        # function of the durable state: a receiver re-runs them from the commit
+        # ids the manifest names.
+        "checks": {
+            "repository": str(repo) if repo is not None else None,
+            "commit_presence": "verified" if repo is not None else "skipped: no --repo supplied",
+        },
     }
-    target = Path(state_dir) / "jobs" / f"{job_id}.report.json"
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    target = Path(state_dir) / jobs.JOBS_DIR / f"{job_id}.report.json"
+    return_report.write_document(target, json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n")
     return payload
 
 
@@ -608,9 +641,13 @@ def add_parsers(subparsers: Any) -> None:
     pending.add_argument("--state-dir", default=None)
     pending.set_defaults(command="job", job_handler="agent-pending")
 
-    rep = sub.add_parser("report", help="Write and print the job acceptance report.")
+    rep = sub.add_parser("report", help="Write and print the job acceptance report plus its RETURN packet.")
     rep.add_argument("--job-id", required=True)
     rep.add_argument("--state-dir", default=None)
+    rep.add_argument("--repo", default=None,
+                     help="Repository used to prove every recorded verification commit exists.")
+    rep.add_argument("--verify", action="store_true",
+                     help="Rebuild the RETURN from durable state and compare evidence_digest; writes nothing.")
     rep.set_defaults(command="job", job_handler="report")
 
 
@@ -693,7 +730,7 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
 
 def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     handler = getattr(args, "job_handler", None)
-    job_id = getattr(args, "job_id", None)
+    job_id = str(getattr(args, "job_id", None) or "")
     try:
         if handler == "authorize":
             record = jobs.record_authorization(
@@ -739,11 +776,16 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
             return 0
 
         if handler == "report":
-            print(json.dumps(report(state_dir, job_id), indent=2, sort_keys=True))
+            repo = Path(args.repo) if getattr(args, "repo", None) else None
+            if getattr(args, "verify", False):
+                result = report(state_dir, job_id, repo=repo, verify=True)
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 0 if result.get("ok") else 1
+            print(json.dumps(report(state_dir, job_id, repo=repo), indent=2, sort_keys=True))
             return 0
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")
-    except (JobCliError, jobs.JobError, reconcile.ReconcileError, verify_local.VerifyError) as exc:
+    except (JobCliError, jobs.JobError, reconcile.ReconcileError, verify_local.VerifyError, return_report.ReturnError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
         return 1
 
