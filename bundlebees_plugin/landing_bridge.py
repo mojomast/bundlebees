@@ -973,6 +973,11 @@ def _read_export_cursor(path: Path) -> Any:
     return value.get("cursor")
 
 
+def _legacy_export_cursor(cursor: Any) -> bool:
+    """True for a pre-migration event-id/hash cursor (not a position)."""
+    return isinstance(cursor, str) and bool(cursor) and not cursor.isdigit()
+
+
 def _write_export_cursor(path: Path, cursor: Any, *, now: Any = None) -> None:
     if cursor is None:
         return
@@ -1162,6 +1167,12 @@ def ingest_remote(
         after = cursor
     cursor = after if after is not None else _read_export_cursor(path)
     start_cursor = cursor
+    legacy_replay = False
+    if _legacy_export_cursor(cursor):
+        # A legacy event-id/hash cursor cannot address monotonic positions.
+        # Replay from the durable beginning; local ingestion is idempotent.
+        legacy_replay = True
+        cursor = None
     pages = 0
     processed = 0
     duplicates = 0
@@ -1174,10 +1185,20 @@ def ingest_remote(
         try:
             page = _read_export_page(client, cursor, int(limit))
         except Exception as exc:  # noqa: BLE001 - a disconnected export is retryable
+            code = (
+                getattr(exc, "upstream_code", None)
+                or getattr(exc, "code", None)
+                or "launcher_unavailable"
+            )
+            if code == "legacy_cursor" and not legacy_replay:
+                # Server-side migration: replay once from the durable beginning.
+                legacy_replay = True
+                cursor = None
+                continue
             failures.append(
                 {
                     "stage": "fetch",
-                    "error": str(getattr(exc, "code", "launcher_unavailable")),
+                    "error": str(code),
                     "message": bee_events.scrub(
                         str(getattr(exc, "error", "") or exc)
                     ),
@@ -1282,6 +1303,7 @@ def ingest_remote(
         "events": outcomes,
         "sources": outcomes,
         "failures": failures,
+        "legacy_replay": legacy_replay,
     }
 
 

@@ -217,6 +217,8 @@ class _ExportHandler(BaseHTTPRequestHandler):
             return self._send(401, b'{"error":"unauthorized"}')
         query = parse_qs(parsed.query)
         after = query.get("after", [None])[0]
+        if isinstance(after, str) and after.isdigit():
+            after = int(after)
         limit = int(query.get("limit", ["100"])[0])
         state.requests.append({"after": after, "limit": limit, "path": self.path})
         state.calls += 1
@@ -295,14 +297,14 @@ def test_client_reads_paginated_export_and_preserves_raw_event_bytes(
     def responder(after, _limit):
         if after is None:
             return 200, _page_bytes(
-                [_entry(event_a, "cursor-1", event_raw=raw_a)],
-                next_cursor="cursor-1",
+                [_entry(event_a, 1, event_raw=raw_a)],
+                next_cursor=1,
                 has_more=True,
             )
-        if after == "cursor-1":
+        if after == 1:
             return 200, _page_bytes(
-                [_entry(event_b, "cursor-2", event_raw=raw_b)],
-                next_cursor="cursor-2",
+                [_entry(event_b, 2, event_raw=raw_b)],
+                next_cursor=2,
                 has_more=False,
             )
         return 200, _page_bytes([])
@@ -320,10 +322,10 @@ def test_client_reads_paginated_export_and_preserves_raw_event_bytes(
     assert second["events"][0]["event"] == event_b
     assert second["events"][0]["event_raw"] == raw_b
     assert second["has_more"] is False
-    assert second["next_cursor"] == "cursor-2"
+    assert second["next_cursor"] == 2
     assert [request["after"] for request in export_server.state.requests] == [
         None,
-        "cursor-1",
+        1,
     ]
     assert [request["limit"] for request in export_server.state.requests] == [1, 1]
 
@@ -355,14 +357,14 @@ def test_remote_ingest_paginates_into_the_existing_bridge_and_consumer_path(
     def responder(after, _limit):
         if after is None:
             return 200, _page_bytes(
-                [_entry(event_a, "cursor-1")],
-                next_cursor="cursor-1",
+                [_entry(event_a, 1)],
+                next_cursor=1,
                 has_more=True,
             )
-        if after == "cursor-1":
+        if after == 1:
             return 200, _page_bytes(
-                [_entry(event_b, "cursor-2")],
-                next_cursor="cursor-2",
+                [_entry(event_b, 2)],
+                next_cursor=2,
                 has_more=False,
             )
         return 200, _page_bytes([])
@@ -374,12 +376,12 @@ def test_remote_ingest_paginates_into_the_existing_bridge_and_consumer_path(
     assert result["processed"] == 2
     assert result["duplicates"] == 0
     assert result["pages"] == 2
-    assert result["cursor"] == "cursor-2"
+    assert result["cursor"] == 2
     assert len(_outbox_files(state)) == 2
     assert len(_inbox_files(state)) == 2
     stored = json.loads(landing_bridge.export_cursor_path(state).read_text())
     assert stored["schema"] == landing_bridge.EXPORT_CURSOR_SCHEMA
-    assert stored["cursor"] == "cursor-2"
+    assert stored["cursor"] == 2
 
     handled: list[dict] = []
 
@@ -559,14 +561,14 @@ def test_disconnect_then_restart_replays_from_the_last_durable_cursor(
     def responder(after, _limit):
         if after is None:
             return 200, _page_bytes(
-                [_entry(event_a, "cursor-1")],
-                next_cursor="cursor-1",
+                [_entry(event_a, 1)],
+                next_cursor=1,
                 has_more=True,
             )
-        if after == "cursor-1":
+        if after == 1:
             return 200, _page_bytes(
-                [_entry(event_b, "cursor-2")],
-                next_cursor="cursor-2",
+                [_entry(event_b, 2)],
+                next_cursor=2,
                 has_more=False,
             )
         return 200, _page_bytes([])
@@ -579,12 +581,12 @@ def test_disconnect_then_restart_replays_from_the_last_durable_cursor(
     )
     assert first["failed"] == 1
     assert first["processed"] == 1
-    assert first["cursor"] == "cursor-1"
+    assert first["cursor"] == 1
     assert len(_outbox_files(state)) == 1
     assert len(_inbox_files(state)) == 1
     assert json.loads(landing_bridge.export_cursor_path(state).read_text())[
         "cursor"
-    ] == "cursor-1"
+    ] == 1
 
     export_server.state.requests.clear()
     restarted = landing_bridge.ingest_remote(
@@ -593,8 +595,8 @@ def test_disconnect_then_restart_replays_from_the_last_durable_cursor(
 
     assert restarted["failed"] == 0
     assert restarted["processed"] == 1
-    assert restarted["cursor"] == "cursor-2"
-    assert export_server.state.requests[0]["after"] == "cursor-1"
+    assert restarted["cursor"] == 2
+    assert export_server.state.requests[0]["after"] == 1
     assert len(_outbox_files(state)) == 2
     assert len(_inbox_files(state)) == 2
 
@@ -685,3 +687,29 @@ def test_production_main_wires_a_remote_landing_client_not_the_outbox(
     assert code == 0
     assert captured["landing_client"] is not None
     assert captured["launcher_outbox"] is None
+
+
+def test_legacy_hash_cursor_replays_from_the_beginning_once(export_server, tmp_path):
+    state, lease = _state_with_lease(tmp_path, "att-legacy-cursor")
+    _subscribe_file(state)
+    event = _event(lease, "att-legacy-cursor", transition="tr-legacy")
+    landing_bridge._write_export_cursor(
+        landing_bridge.export_cursor_path(state), "a" * 64
+    )
+    seen = []
+
+    def responder(after, _limit):
+        seen.append(after)
+        return 200, _page_bytes(
+            [_entry(event, 1)], next_cursor=1, has_more=False
+        )
+
+    export_server.state.responder = responder
+    result = landing_bridge.ingest_remote(state, _client(export_server), limit=1)
+
+    assert result["failed"] == 0
+    assert result["legacy_replay"] is True
+    assert result["processed"] == 1
+    assert seen == [None]
+    assert json.loads(landing_bridge.export_cursor_path(state).read_text())["cursor"] == 1
+    assert len(_outbox_files(state)) == 1
