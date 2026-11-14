@@ -1,0 +1,81 @@
+{
+  "schema": "rizzstack.project-plan/1",
+  "project_id": "pilot-todo",
+  "repo": "mojomast/bundlebees",
+  "base_rev": "770f5da00aec607c5032e7073a161e99be00c970",
+  "summary": "Build a disposable todo application with persistent storage, an HTTP API, a browser UI, validation and application-level acceptance.",
+  "acceptance": [
+    {
+      "id": "AC-STORAGE",
+      "statement": "Todos persist in a JSON store and support create, read, update, complete, search and status filtering.",
+      "test": "pilot/todo/tests/test_store.py"
+    },
+    {
+      "id": "AC-API",
+      "statement": "The stdlib HTTP API exposes list/create/read/update/complete routes with explicit JSON errors.",
+      "test": "pilot/todo/tests/test_server.py"
+    },
+    {
+      "id": "AC-UI",
+      "statement": "The browser UI supports create, edit, complete, search and status filtering with accessible controls.",
+      "test": "pilot/todo/tests/test_ui.py"
+    },
+    {
+      "id": "AC-APP",
+      "statement": "An application-level acceptance run starts the real server, exercises the API end to end and verifies persistence.",
+      "test": "pilot/todo/tests/test_acceptance.py"
+    }
+  ],
+  "features": [
+    {
+      "feature_id": "store",
+      "objective": "Implement the persistent todo store and its focused tests.",
+      "lease": [
+        "pilot/__init__.py",
+        "pilot/todo/__init__.py",
+        "pilot/todo/store.py",
+        "pilot/todo/tests/test_store.py"
+      ],
+      "depends_on": [],
+      "acceptance": {
+        "tests": ["pilot/todo/tests/test_store.py"]
+      }
+    },
+    {
+      "feature_id": "ui",
+      "objective": "Implement the accessible browser UI served by the todo app.",
+      "lease": [
+        "pilot/todo/static/index.html",
+        "pilot/todo/tests/test_ui.py"
+      ],
+      "depends_on": [],
+      "acceptance": {
+        "tests": ["pilot/todo/tests/test_ui.py"]
+      }
+    },
+    {
+      "feature_id": "http",
+      "objective": "Implement the HTTP API over the persistent todo store.",
+      "lease": [
+        "pilot/todo/server.py",
+        "pilot/todo/tests/test_server.py"
+      ],
+      "depends_on": ["store"],
+      "acceptance": {
+        "tests": ["pilot/todo/tests/test_server.py"]
+      }
+    },
+    {
+      "feature_id": "acceptance",
+      "objective": "Add and run the application-level acceptance test against the real server.",
+      "lease": [
+        "pilot/todo/acceptance.py",
+        "pilot/todo/tests/test_acceptance.py"
+      ],
+      "depends_on": ["http", "ui"],
+      "acceptance": {
+        "tests": ["pilot/todo/tests/test_acceptance.py"]
+      }
+    }
+  ]
+}

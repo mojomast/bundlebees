@@ -61,6 +61,37 @@ arguments, and is forwarded unchanged as the tick's `suite_command`. Put it last
 when omitted, the tick uses `python -m pytest -q`. `--once` prints the pass result as
 JSON and exits 0.
 
+## Project intake
+
+A project spec is validated into a task plan before any job exists. The spec
+contains `project_id`, `repo`, full `base_rev`, top-level acceptance criteria,
+and features with disjoint `lease` paths, `depends_on` and acceptance tests.
+
+```bash
+hermes bundlebees job project plan \
+  --spec pilot/todo/project.json \
+  --out "$STATE/pilot-tasks.json"
+
+hermes bundlebees job project create \
+  --job-id pilot-todo-20261114 \
+  --spec pilot/todo/project.json \
+  --state-dir "$STATE"
+
+hermes bundlebees job project status \
+  --project-id pilot-todo \
+  --state-dir "$STATE"
+```
+
+`plan` is pure and refuses malformed ids, unknown dependencies, cycles and
+overlapping leases. `create` requires the human authorization first and records
+the project next to the job; the job remains the execution authority. `status`
+reports `complete`, `active`, `blocked` or `failed` from durable task states, not
+from worker claims. Application-level acceptance is run separately:
+
+```bash
+python -m pilot.todo.acceptance --db "$STATE/pilot-todos.json"
+```
+
 ## Status
 
 Inspect the durable job, including tasks, attempts and any pending handoff:

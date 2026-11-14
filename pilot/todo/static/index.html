@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pilot Todo</title>
+<style>
+:root { color-scheme: dark; --bg:#101216; --panel:#191d24; --line:#303743; --text:#e8edf4; --muted:#9ba7b8; --accent:#6ee7b7; }
+* { box-sizing: border-box; }
+body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font:16px/1.5 system-ui,sans-serif; }
+main { max-width:760px; margin:0 auto; padding:2rem 1rem 4rem; }
+h1 { font-size:1.5rem; margin:0 0 1rem; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:1rem; margin-bottom:1rem; }
+label { display:block; color:var(--muted); font-size:.85rem; margin-bottom:.35rem; }
+input, textarea, select, button { font:inherit; }
+input, textarea, select { width:100%; padding:.65rem .75rem; color:var(--text); background:#0d1015; border:1px solid var(--line); border-radius:8px; }
+textarea { min-height:4rem; resize:vertical; }
+button { cursor:pointer; padding:.65rem 1rem; border:0; border-radius:8px; color:#07110d; background:var(--accent); font-weight:700; }
+button.secondary { color:var(--text); background:#252b35; }
+.row { display:flex; gap:.6rem; flex-wrap:wrap; }
+.row > * { flex:1 1 12rem; }
+.filters { display:flex; gap:.6rem; align-items:end; }
+ul { list-style:none; padding:0; margin:0; }
+li { display:flex; gap:.75rem; align-items:start; padding:.8rem 0; border-top:1px solid var(--line); }
+li:first-child { border-top:0; }
+li .content { flex:1; min-width:0; }
+li h2 { font-size:1rem; margin:0; overflow-wrap:anywhere; }
+li p { margin:.25rem 0 0; color:var(--muted); white-space:pre-wrap; overflow-wrap:anywhere; }
+li.done h2 { text-decoration:line-through; color:var(--muted); }
+.actions { display:flex; gap:.35rem; flex-wrap:wrap; }
+.actions button { padding:.4rem .6rem; font-size:.85rem; }
+#error-message { min-height:1.5rem; color:#fca5a5; margin:.5rem 0 0; }
+.muted { color:var(--muted); }
+@media (max-width:520px) { .filters { flex-direction:column; align-items:stretch; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pilot Todo</h1>
+  <p class="muted">A disposable proof project built through the rizzstack factory.</p>
+
+  <section class="panel" aria-labelledby="new-heading">
+    <h2 id="new-heading">New todo</h2>
+    <form id="todo-form">
+      <label for="todo-input">Title</label>
+      <input id="todo-input" name="title" maxlength="200" required autocomplete="off">
+      <label for="todo-description">Description</label>
+      <textarea id="todo-description" name="description" maxlength="2000"></textarea>
+      <div class="row" style="margin-top:.6rem">
+        <button type="submit">Add todo</button>
+      </div>
+    </form>
+    <p id="error-message" role="alert"></p>
+  </section>
+
+  <section class="panel" aria-labelledby="list-heading">
+    <h2 id="list-heading">Todos</h2>
+    <div class="filters">
+      <div>
+        <label for="search">Search</label>
+        <input id="search" type="search" placeholder="Filter by text" autocomplete="off">
+      </div>
+      <div>
+        <label for="status-filter">Status</label>
+        <select id="status-filter">
+          <option value="all">All</option>
+          <option value="open">Open</option>
+          <option value="done">Done</option>
+        </select>
+      </div>
+    </div>
+    <ul id="todo-list" aria-live="polite"></ul>
+  </section>
+</main>
+<script>
+(() => {
+  const form = document.getElementById("todo-form");
+  const title = document.getElementById("todo-input");
+  const description = document.getElementById("todo-description");
+  const list = document.getElementById("todo-list");
+  const search = document.getElementById("search");
+  const status = document.getElementById("status-filter");
+  const errorBox = document.getElementById("error-message");
+
+  function showError(message) { errorBox.textContent = message || ""; }
+
+  async function api(path, options) {
+    const response = await fetch(path, options);
+    let body = null;
+    try { body = await response.json(); } catch (_) { body = null; }
+    if (!response.ok) {
+      throw new Error((body && body.error && body.error.message) || "request failed");
+    }
+    return body;
+  }
+
+  function button(label, onClick) {
+    const node = document.createElement("button");
+    node.type = "button";
+    node.className = "secondary";
+    node.textContent = label;
+    node.addEventListener("click", onClick);
+    return node;
+  }
+
+  function render(rows) {
+    list.replaceChildren();
+    if (!rows.length) {
+      const empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "No todos yet.";
+      list.append(empty);
+      return;
+    }
+    for (const todo of rows) {
+      const item = document.createElement("li");
+      if (todo.completed) item.className = "done";
+      const content = document.createElement("div");
+      content.className = "content";
+      const heading = document.createElement("h2");
+      heading.textContent = todo.title;
+      content.append(heading);
+      if (todo.description) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = todo.description;
+        content.append(paragraph);
+      }
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      actions.append(button(todo.completed ? "Reopen" : "Complete", async () => {
+        await api(`/api/todos/${encodeURIComponent(todo.id)}/complete`, {method: "POST"});
+        await refresh();
+      }));
+      actions.append(button("Edit", async () => {
+        const next = window.prompt("New title", todo.title);
+        if (next === null || !next.trim()) return;
+        await api(`/api/todos/${encodeURIComponent(todo.id)}`, {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({title: next.trim()})
+        });
+        await refresh();
+      }));
+      item.append(content, actions);
+      list.append(item);
+    }
+  }
+
+  async function refresh() {
+    try {
+      const query = new URLSearchParams({q: search.value.trim(), status: status.value});
+      const body = await api(`/api/todos?${query.toString()}`);
+      render(body.todos || []);
+      showError("");
+    } catch (error) {
+      showError(error.message);
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api("/api/todos", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({title: title.value, description: description.value})
+      });
+      title.value = ""; description.value = ""; showError("");
+      await refresh();
+      title.focus();
+    } catch (error) {
+      showError(error.message);
+    }
+  });
+  search.addEventListener("input", refresh);
+  status.addEventListener("change", refresh);
+  refresh();
+})();
+</script>
+</body>
+</html>

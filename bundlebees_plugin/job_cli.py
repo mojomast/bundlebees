@@ -780,6 +780,22 @@ def add_parsers(subparsers: Any) -> None:
     qsub.add_parser("doctor")
     queue.set_defaults(command="queue")
 
+    project_parser = sub.add_parser("project", help="Project intake, planning and completion.")
+    psub = project_parser.add_subparsers(dest="project_handler", required=True)
+    project_plan = psub.add_parser("plan", help="Validate an intake spec and write its task plan.")
+    project_plan.add_argument("--spec", required=True)
+    project_plan.add_argument("--out", default=None, help="Write the task list to this path.")
+    project_plan.set_defaults(command="job", job_handler="project")
+    project_create = psub.add_parser("create", help="Create an authorized job from an intake spec.")
+    project_create.add_argument("--job-id", required=True)
+    project_create.add_argument("--spec", required=True)
+    project_create.add_argument("--state-dir", default=None)
+    project_create.set_defaults(command="job", job_handler="project")
+    project_status = psub.add_parser("status", help="Read project completion from the durable job.")
+    project_status.add_argument("--project-id", required=True)
+    project_status.add_argument("--state-dir", default=None)
+    project_status.set_defaults(command="job", job_handler="project")
+
     note = sub.add_parser("note", help="Record a decision for the pending handoff.")
     note.add_argument("--job-id", required=True)
     note.add_argument("--note", required=True)
@@ -900,8 +916,43 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
     return 2
 
 
+def cmd_project(ctx: Any, args: Any, *, state_dir: Path) -> int:
+    """Project intake, task planning and completion status."""
+
+    from . import project as project_mod
+    import json as _json
+
+    handler = getattr(args, "project_handler", None)
+    try:
+        if handler == "plan":
+            planned = project_mod.load_plan(Path(args.spec))
+            payload = planned["tasks"]
+            if args.out:
+                Path(args.out).write_text(_json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(_json.dumps({"project_id": planned["project_id"], "tasks": payload}, indent=2, sort_keys=True))
+            return 0
+        if handler == "create":
+            raw_spec = _json.loads(Path(args.spec).read_text(encoding="utf-8"))
+            planned = project_mod.plan(raw_spec)
+            job = jobs.create_job(state_dir, job_id=args.job_id, tasks=planned["tasks"])
+            record = project_mod.create_project(state_dir, raw_spec, job_id=args.job_id, tasks=planned["tasks"])
+            print(_json.dumps({"project_id": record["project_id"], "job_id": job["job_id"],
+                               "tasks": len(job["tasks"])}, indent=2, sort_keys=True))
+            return 0
+        if handler == "status":
+            result = project_mod.project_status(state_dir, args.project_id)
+            print(_json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        raise JobCliError("invalid_argument", "project command is required", "Use plan, create or status.")
+    except (project_mod.ProjectError, jobs.JobError) as exc:
+        print(_json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
+        return 1
+
+
 def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     handler = getattr(args, "job_handler", None)
+    if handler == "project":
+        return cmd_project(ctx, args, state_dir=state_dir)
     job_id = str(getattr(args, "job_id", None) or "")
     try:
         if handler == "authorize":
