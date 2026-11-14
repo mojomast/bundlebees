@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -120,21 +121,26 @@ def new_state(
     """An authorized job with one rejected task; the contract is frozen at *rev*."""
 
     state = tmp_path / "state"
+    envelope: dict[str, Any] = {
+        "max_attempts_per_task": max_attempts,
+        "contract_corrections_allowed": corrections,
+        "corrected_tests_allowed": list(allowed),
+    }
+    if "file_scope" in getattr(jobs, "RECOVERY_FIELDS", ()):
+        # The sealed-authorization contract names the files a correction may
+        # touch; the fixture approves them explicitly instead of inferring them.
+        envelope.update(file_scope=["tools/**", test_file], test_scope=[test_file])
     jobs.record_authorization(
         state,
         job_id="job_a",
         statement="Add contract source-rev validation to acdd-lint, nothing else.",
         repo="mojomast/workflow",
         base_rev=rev,
-        scope=["tools/**"],
+        scope=["tools/**", "tests/**"],
         bees=3,
         wall_clock_s=3600,
         interactive=True,
-        recovery={
-            "max_attempts_per_task": max_attempts,
-            "contract_corrections_allowed": corrections,
-            "corrected_tests_allowed": list(allowed),
-        },
+        recovery=envelope,
     )
     contract = frozen_contract(rev, test_file=test_file)
     jobs.create_job(
@@ -373,7 +379,8 @@ def test_the_package_quotes_the_files_at_the_pinned_revision(tmp_path):
 
 def test_a_selector_absent_at_the_pinned_revision_is_reported_not_invented(tmp_path):
     repo, rev = git_repo(tmp_path)
-    state = new_state(tmp_path, rev, test_file="tests/test_gone.py", allowed=(GOOD_TEST,))
+    state = new_state(tmp_path, rev, test_file="tests/test_gone.py",
+                      allowed=("tests/test_gone.py::test_x",))
     request = build_request(state, evidence="test_unresolved: no test was collected for tests/test_gone.py::test_x")
 
     package = adapter.build_package(state, request["request_id"], repo=repo)
