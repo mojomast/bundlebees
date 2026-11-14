@@ -553,6 +553,18 @@ def _claim(
             claim = delivery.get("claim") if isinstance(delivery.get("claim"), Mapping) else {}
             if not _claim_expired(claim, clock):
                 return {"status": "busy", "event_id": event_id}
+        not_before = _epoch(delivery.get("next_attempt_at"))
+        if (
+            state_name in ("pending", "retryable")
+            and not_before is not None
+            and clock < not_before
+        ):
+            return {
+                "status": "backoff",
+                "event_id": event_id,
+                "event": fresh,
+                "delivery": delivery,
+            }
         if attempts >= max_attempts:
             stamp = _iso(clock)
             delivery.update(
@@ -673,8 +685,15 @@ def _fail(
     error: str,
     ttl_s: float,
     max_attempts: int,
+    error_code: str = "",
+    error_fix: str = "",
+    backoff_s: float = 0.0,
 ) -> dict[str, Any]:
-    """Release for a bounded retry, or mark failed when the budget is spent."""
+    """Release for a bounded retry, or mark failed when the budget is spent.
+
+    A backoff is durable (``next_attempt_at``) and bounded by the same attempt
+    budget as the retry itself.  The default is zero so a caller opts in.
+    """
 
     del consumer, ttl_s  # a release is not a claim; it never extends a lease
     event_id = _event_id(event, path)
@@ -685,6 +704,8 @@ def _fail(
         current = _delivery_of(fresh if fresh is not None else event)
         attempts = int(current.get("attempts") or delivery.get("attempts") or 0)
         exhausted = attempts >= max_attempts
+        delay = max(0.0, float(backoff_s))
+        next_attempt = "" if exhausted or delay <= 0 else _iso(clock + delay)
         current.update(
             schema=DELIVERY_SCHEMA,
             subscriber=subscriber,
@@ -694,6 +715,9 @@ def _fail(
             attempts=attempts,
             updated_at=stamp,
             last_error=str(error)[:500],
+            last_error_code=str(error_code or error)[:120],
+            last_error_fix=str(error_fix)[:500],
+            next_attempt_at=next_attempt,
         )
         if exhausted:
             current["failed_at"] = stamp
@@ -706,6 +730,9 @@ def _fail(
         "attempts": attempts,
         "exhausted": exhausted,
         "error": str(error),
+        "error_code": str(error_code or error),
+        "fix": str(error_fix),
+        "retry_after": next_attempt,
     }
 
 
@@ -714,6 +741,13 @@ def _error_code(exc: BaseException) -> str:
     if isinstance(code, str) and code.strip():
         return code.strip()
     return type(exc).__name__
+
+
+def _error_fix(exc: BaseException) -> str:
+    fix = getattr(exc, "fix", None)
+    if isinstance(fix, str) and fix.strip():
+        return fix.strip()
+    return "Inspect the handler and the event; a failed event is retried only up to its budget."
 
 
 def _summary_result(
@@ -727,6 +761,9 @@ def _summary_result(
     result: Mapping[str, Any] | None = None,
     ack: Mapping[str, Any] | None = None,
     error: str = "",
+    error_code: str = "",
+    fix: str = "",
+    retry_after: str = "",
 ) -> dict[str, Any]:
     action = {
         "acked": "acked",
@@ -746,6 +783,9 @@ def _summary_result(
         "result": dict(result) if isinstance(result, Mapping) else None,
         "ack": dict(ack) if isinstance(ack, Mapping) else None,
         "error": str(error),
+        "error_code": str(error_code or error),
+        "fix": str(fix),
+        "retry_after": str(retry_after),
     }
 
 
@@ -763,6 +803,7 @@ def consume_once(
     now: Any = None,
     ttl_s: float = DEFAULT_CLAIM_TTL_S,
     max_attempts: int = MAX_ATTEMPTS,
+    retry_backoff_s: float = 0.0,
 ) -> dict[str, Any] | None:
     """Claim and handle at most one event; ``None`` means nothing was claimable.
 
@@ -787,6 +828,12 @@ def consume_once(
     budget = int(max_attempts)
     if budget <= 0:
         raise EventConsumerError("attempts_invalid", "max_attempts must be positive")
+    try:
+        backoff = max(0.0, float(retry_backoff_s))
+    except (TypeError, ValueError) as exc:
+        raise EventConsumerError(
+            "backoff_invalid", "retry_backoff_s must be a non-negative number"
+        ) from exc
 
     duplicates: list[dict[str, Any]] = []
     for path, event in _iter_events(state, name):
@@ -801,7 +848,7 @@ def consume_once(
             max_attempts=budget,
         )
         status = str(outcome.get("status") or "")
-        if status == "busy" or status == "vanished":
+        if status in ("busy", "vanished", "backoff"):
             continue
         if status == "failed_terminal":
             # Terminal failures are not claimable again; like a completed work
@@ -820,6 +867,8 @@ def consume_once(
                 duplicate=False,
                 attempts=int(delivery.get("attempts") or 0),
                 error=str(delivery.get("last_error") or "attempts_exhausted"),
+                error_code=str(delivery.get("last_error_code") or "attempts_exhausted"),
+                fix=str(delivery.get("last_error_fix") or ""),
             )
 
         if status != "claimed":
@@ -857,6 +906,9 @@ def consume_once(
                 error=_error_code(exc),
                 ttl_s=ttl,
                 max_attempts=budget,
+                error_code=_error_code(exc),
+                error_fix=_error_fix(exc),
+                backoff_s=backoff,
             )
             if not isinstance(exc, Exception):
                 # A process-interrupting exception still leaves a retryable
@@ -870,6 +922,9 @@ def consume_once(
                 duplicate=False,
                 attempts=int(failure["attempts"]),
                 error=str(failure["error"]),
+                error_code=str(failure.get("error_code") or ""),
+                fix=str(failure.get("fix") or ""),
+                retry_after=str(failure.get("retry_after") or ""),
             )
 
         if not created:

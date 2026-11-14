@@ -46,6 +46,7 @@ __all__ = [
     "FactoryDriver",
     "FactoryError",
     "WakeCoalescer",
+    "action_id_for_event",
     "deterministic_handler",
     "load_tick",
     "main",
@@ -56,9 +57,14 @@ __all__ = [
 ]
 
 WAKE_SCHEMA = "bundlebees.factory-wake/1"
+ACTION_SCHEMA = "bundlebees.factory-action/1"
 WAKE_DIR = "wakes"
+ACTION_DIR = "actions"
+WORK_RETRY_DIR = "work-retries"
+JOB_LOCK_DIR = "job-locks"
 DEFAULT_SESSION = "coordinator"
 DEFAULT_WAKE_TTL_S = 900.0
+MAX_WORK_ATTEMPTS = 2
 _TERMINAL_TASK_STATES = frozenset({"accepted", "rejected", "failed", "superseded"})
 
 
@@ -88,14 +94,26 @@ def _factory_dir(state_dir: Any) -> Path:
     return _state_path(state_dir) / "factory"
 
 
-def _safe_session(value: Any) -> str:
+def _raw_session(value: Any, default: str = DEFAULT_SESSION) -> str:
+    """The exact Hermes session identity, never rewritten for storage.
+
+    The gateway routes on this value, so it must survive a slot name containing
+    ``/``, spaces, ``@`` or non-ASCII text.  Only :func:`_safe_session` may turn
+    it into a filesystem component.
+    """
+
     text = str(value if value is not None else "").strip()
     if not text:
-        text = DEFAULT_SESSION
-    if len(text) > 160:
-        text = text[:160]
+        text = default
+    return text
+
+
+def _safe_session(value: Any) -> str:
+    """A storage-safe filename component for one raw session identity."""
+
+    text = _raw_session(value)
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-    if all(ch in allowed for ch in text) and text not in {".", ".."}:
+    if len(text) <= 160 and all(ch in allowed for ch in text) and text not in {".", ".."}:
         return text
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
     return f"session-{digest}"
@@ -208,6 +226,11 @@ def _locked(path: Path) -> Iterator[None]:
 class WakeCoalescer:
     """Durable per-session cursor/generation with one active turn.
 
+    The record keeps the raw Hermes session identity (the value the gateway
+    routes on) while the filename is a storage-safe key.  A session whose id
+    contains ``/`` or spaces is therefore still one durable record and never
+    escapes ``factory/wakes``.
+
     ``request_wake`` increments the generation even while a turn is running.
     ``finish_turn`` advances the cursor only to the generation the turn started
     from, so later arrivals remain pending for exactly one next turn.
@@ -218,17 +241,25 @@ class WakeCoalescer:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ttl_s = float(ttl_s)
 
+    def key_for(self, session: Any) -> str:
+        """The storage-safe filename component for a raw session identity."""
+
+        return _safe_session(session)
+
     def _path(self, session: Any) -> Path:
-        return self.root / f"{_safe_session(session)}.json"
+        return self.root / f"{self.key_for(session)}.json"
 
     def _lock_path(self, session: Any) -> Path:
-        return self.root / f"{_safe_session(session)}.lock"
+        return self.root / f"{self.key_for(session)}.lock"
 
-    def _load(self, session: str) -> dict[str, Any]:
-        record = _read_json(self._path(session)) or {}
+    def _load(self, session: Any) -> dict[str, Any]:
+        name = _raw_session(session)
+        record = _read_json(self._path(name)) or {}
         return {
             "schema": WAKE_SCHEMA,
-            "session": session,
+            "session": name,
+            "session_key": self.key_for(name),
+            "subscriber": str(record.get("subscriber") or ""),
             "generation": int(record.get("generation") or 0),
             "cursor": int(record.get("cursor") or 0),
             "active": record.get("active") if isinstance(record.get("active"), Mapping) else None,
@@ -236,13 +267,15 @@ class WakeCoalescer:
             "updated_at": str(record.get("updated_at") or ""),
         }
 
-    def _save(self, session: str, record: Mapping[str, Any]) -> dict[str, Any]:
+    def _save(self, session: Any, record: Mapping[str, Any]) -> dict[str, Any]:
+        name = _raw_session(record.get("session") or session)
         body = dict(record)
         body["schema"] = WAKE_SCHEMA
-        body["session"] = session
+        body["session"] = name
+        body["session_key"] = self.key_for(name)
         body["pending"] = int(body.get("generation") or 0) > int(body.get("cursor") or 0)
         body["active_turn"] = bool(body.get("active"))
-        _write_json(self._path(session), body)
+        _write_json(self._path(name), body)
         return dict(body)
 
     def _expired(self, active: Mapping[str, Any], clock: float) -> bool:
@@ -253,8 +286,10 @@ class WakeCoalescer:
             return True
         return clock - float(started) >= self.ttl_s
 
-    def request_wake(self, session: Any, *, now: Any = None) -> dict[str, Any]:
-        name = _safe_session(session)
+    def request_wake(
+        self, session: Any, *, now: Any = None, subscriber: Any = None
+    ) -> dict[str, Any]:
+        name = _raw_session(session)
         stamp = _iso(now)
         clock = _clock(now)
         with _locked(self._lock_path(name)):
@@ -263,10 +298,12 @@ class WakeCoalescer:
             record["coalesced"] = int(record["coalesced"]) + 1
             record["updated_at"] = stamp
             record["last_wake_epoch"] = clock
+            if subscriber not in (None, ""):
+                record["subscriber"] = _safe_session(subscriber)
             return self._save(name, record)
 
     def begin_turn(self, session: Any, *, now: Any = None) -> dict[str, Any]:
-        name = _safe_session(session)
+        name = _raw_session(session)
         stamp = _iso(now)
         clock = _clock(now)
         with _locked(self._lock_path(name)):
@@ -309,7 +346,7 @@ class WakeCoalescer:
             }
 
     def finish_turn(self, session: Any, turn: Any, *, now: Any = None) -> dict[str, Any]:
-        name = _safe_session(session)
+        name = _raw_session(session)
         stamp = _iso(now)
         with _locked(self._lock_path(name)):
             record = self._load(name)
@@ -337,11 +374,12 @@ class WakeCoalescer:
                 "cursor": int(saved["cursor"]),
                 "pending": bool(saved["pending"]),
                 "coalesced": int(saved["coalesced"]),
+                "turn": turn_id,
             }
 
     def release_turn(self, session: Any, turn: Any) -> dict[str, Any]:
         """Clear an active turn without advancing the cursor (delivery failed)."""
-        name = _safe_session(session)
+        name = _raw_session(session)
         with _locked(self._lock_path(name)):
             record = self._load(name)
             active = record.get("active") if isinstance(record.get("active"), Mapping) else None
@@ -352,7 +390,7 @@ class WakeCoalescer:
             return record
 
     def status(self, session: Any) -> dict[str, Any]:
-        name = _safe_session(session)
+        name = _raw_session(session)
         record = self._load(name)
         record["pending"] = int(record["generation"]) > int(record["cursor"])
         record["active_turn"] = bool(record.get("active"))
@@ -363,7 +401,17 @@ class WakeCoalescer:
         return bool(self.status(session)["due"])
 
     def sessions(self) -> list[str]:
-        return sorted(path.stem for path in self.root.glob("*.json") if path.is_file())
+        """Every raw session identity with a durable wake record."""
+
+        found: list[str] = []
+        for path in sorted(self.root.glob("*.json")):
+            if not path.is_file():
+                continue
+            record = _read_json(path) or {}
+            raw = record.get("session")
+            if isinstance(raw, str) and raw:
+                found.append(raw)
+        return sorted(set(found))
 
 
 # ---------------------------------------------------------------------------
@@ -385,17 +433,19 @@ def _event_id(event: Mapping[str, Any]) -> str:
 
 
 def _session_of(event: Mapping[str, Any], default: str = DEFAULT_SESSION) -> str:
+    """The raw session identity; storage safety is applied only to filenames."""
+
     for key in ("session", "session_id", "sessionId"):
         value = event.get(key)
         if value not in (None, ""):
-            return _safe_session(value)
+            return _raw_session(value, default)
     coordinator = _event_data(event).get("coordinator")
     if isinstance(coordinator, Mapping):
         for key in ("session", "session_id"):
             value = coordinator.get(key)
             if value not in (None, ""):
-                return _safe_session(value)
-    return _safe_session(default)
+                return _raw_session(value, default)
+    return _raw_session(default)
 
 
 def _slug(value: Any, limit: int = 60) -> str:
@@ -426,62 +476,151 @@ def _event_lease_files(event: Mapping[str, Any]) -> list[str]:
     return [str(item) for item in files if isinstance(item, str) and item]
 
 
+def action_id_for_event(event: Mapping[str, Any], subscriber: Any = None) -> str:
+    """A stable identity for one event's accepted work.
+
+    It is derived from the subscriber, event id and attempt, never from a
+    process, turn or retry counter, so a replay after a crash resolves to the
+    same durable action record rather than a second effect.
+    """
+
+    data = _event_data(event)
+    event_id = _event_id(event)
+    attempt = str(data.get("attempt_id") or event.get("attempt_id") or "").strip()
+    seed = json.dumps(
+        {
+            "subscriber": _safe_session(subscriber) if subscriber not in (None, "") else "",
+            "event_id": event_id,
+            "attempt_id": attempt,
+            "work_id": work_id_for_event(event),
+        },
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return "act_" + hashlib.sha256(seed).hexdigest()[:24]
+
+
+def _action_path(state: Path, action_id: str) -> Path:
+    return state / "factory" / ACTION_DIR / f"{action_id}.json"
+
+
+def _action_lock_path(state: Path, action_id: str) -> Path:
+    return state / "factory" / ACTION_DIR / ".locks" / f"{action_id}.lock"
+
+
 def deterministic_handler(
     state_dir: Any,
     event: Mapping[str, Any],
     *,
     now: Any = None,
+    subscriber: Any = None,
 ) -> dict[str, Any]:
-    """Record the verification work an event makes eligible. No model call."""
+    """Record the verification work an event makes eligible. No model call.
+
+    The handler is deliberately idempotent at the action level.  A durable
+    action record is written under the action lock once the scheduler item and
+    its job mapping exist.  A process killed after that effect but before the
+    inbox acknowledgement is written therefore replays into the same action,
+    not a second scheduler item or a second verification tick.
+    """
 
     state = _state_path(state_dir)
     work_id = work_id_for_event(event)
     lease_files = _event_lease_files(event)
     title_attempt = str(_event_data(event).get("attempt_id") or _event_id(event) or work_id)
-    try:
-        item = work_scheduler.add_item(
-            state,
-            work_id=work_id,
-            title=f"Verify landing {title_attempt}",
-            kind="tests",
-            priority=0,
-            lease_files=lease_files,
-            now=now,
+    action_id = action_id_for_event(event, subscriber)
+    action_path = _action_path(state, action_id)
+    with _locked(_action_lock_path(state, action_id)):
+        stored = _read_json(action_path)
+        if stored is not None and stored.get("status") == "recorded":
+            result = dict(stored.get("result") or {})
+            result["accepted"] = True
+            result["created"] = False
+            result["duplicate_action"] = True
+            result["action_id"] = action_id
+            result["action_state"] = "recorded"
+            try:
+                result["eligible"] = [
+                    entry["work_id"] for entry in work_scheduler.ready_items(state)
+                ]
+            except Exception:  # noqa: BLE001 - a read-only summary must not fail the replay
+                result.setdefault("eligible", [])
+            return result
+
+        existing_ids = {
+            entry["work_id"] for entry in work_scheduler.list_items(state)
+        }
+        created = work_id not in existing_ids
+        try:
+            item = work_scheduler.add_item(
+                state,
+                work_id=work_id,
+                title=f"Verify landing {title_attempt}",
+                kind="tests",
+                priority=0,
+                lease_files=lease_files,
+                now=now,
+            )
+        except work_scheduler.SchedulerError as exc:
+            if exc.code != "work_exists":
+                raise
+            item = next(
+                (entry for entry in work_scheduler.list_items(state) if entry["work_id"] == work_id),
+                {"work_id": work_id},
+            )
+            created = False
+        mapping = state / "factory" / "work-jobs"
+        mapping.mkdir(parents=True, exist_ok=True)
+        map_path = mapping / f"{work_id}.json"
+        map_body = {
+            "work_id": work_id,
+            "job_id": str(_event_data(event).get("job_id") or ""),
+            "attempt_id": str(_event_data(event).get("attempt_id") or ""),
+            "event_id": _event_id(event),
+            "action_id": action_id,
+        }
+        if not map_path.exists():
+            _write_json(map_path, map_body)
+
+        ready = [entry["work_id"] for entry in work_scheduler.ready_items(state)]
+        result = {
+            "accepted": True,
+            "event_id": _event_id(event),
+            "work_id": work_id,
+            "job_id": str(_event_data(event).get("job_id") or ""),
+            "attempt_id": str(_event_data(event).get("attempt_id") or ""),
+            "created": bool(created),
+            "duplicate_action": False,
+            "action_id": action_id,
+            "action_state": "recorded",
+            "eligible": ready,
+        }
+        _write_json(
+            action_path,
+            {
+                "schema": ACTION_SCHEMA,
+                "action_id": action_id,
+                "status": "recorded",
+                "subscriber": _safe_session(subscriber) if subscriber not in (None, "") else "",
+                "event_id": _event_id(event),
+                "work_id": work_id,
+                "job_id": result["job_id"],
+                "attempt_id": result["attempt_id"],
+                "result": result,
+                "updated_at": _iso(now),
+            },
         )
-    except work_scheduler.SchedulerError as exc:
-        if exc.code != "work_exists":
-            raise
-        item = next(
-            (entry for entry in work_scheduler.list_items(state) if entry["work_id"] == work_id),
-            {"work_id": work_id},
-        )
-    mapping = state / "factory" / "work-jobs"
-    mapping.mkdir(parents=True, exist_ok=True)
-    map_path = mapping / f"{work_id}.json"
-    map_body = {
-        "work_id": work_id,
-        "job_id": str(_event_data(event).get("job_id") or ""),
-        "attempt_id": str(_event_data(event).get("attempt_id") or ""),
-        "event_id": _event_id(event),
-    }
-    tmp = map_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(map_body, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, map_path)
-
-    ready = [entry["work_id"] for entry in work_scheduler.ready_items(state)]
-    return {
-        "accepted": True,
-        "event_id": _event_id(event),
-        "work_id": work_id,
-        "job_id": str(_event_data(event).get("job_id") or ""),
-        "attempt_id": str(_event_data(event).get("attempt_id") or ""),
-        "created": item.get("status") == "pending",
-        "eligible": ready,
-    }
+        return result
 
 
-def record_eligible_work(state_dir: Any, event: Mapping[str, Any], *, now: Any = None) -> dict[str, Any]:
-    return deterministic_handler(state_dir, event, now=now)
+def record_eligible_work(
+    state_dir: Any,
+    event: Mapping[str, Any],
+    *,
+    now: Any = None,
+    subscriber: Any = None,
+) -> dict[str, Any]:
+    return deterministic_handler(state_dir, event, now=now, subscriber=subscriber)
 
 
 # ---------------------------------------------------------------------------
@@ -709,17 +848,144 @@ class FactoryDriver:
         now: Any = None,
         wake_ttl_s: float = DEFAULT_WAKE_TTL_S,
         startup: bool = True,
+        max_work_attempts: int = MAX_WORK_ATTEMPTS,
     ) -> None:
         self.state = _state_path(state_dir)
         self.state.mkdir(parents=True, exist_ok=True)
         self.queue = queue if hasattr(queue, "list_items") else queue_mod.JsonQueue(Path(queue))
-        self.tick = tick if tick is not None else mechanical_tick(self.state)
+        self._tick = tick if tick is not None else mechanical_tick(self.state)
+        self.tick = self._serialized_tick(self._tick)
         self.launcher_outbox = Path(launcher_outbox) if launcher_outbox is not None else None
         self.subscribers = list(subscribers) if subscribers is not None else None
         self.now = now
         self.wake = WakeCoalescer(self.state, ttl_s=wake_ttl_s)
+        self.max_work_attempts = max(1, int(max_work_attempts))
         self._startup_done = not startup
         self.startup_report: dict[str, Any] | None = None
+        self._driven_this_pass: set[str] = set()
+
+    # -- durable job serialisation -----------------------------------------
+
+    def _job_lock_path(self, job_id: str) -> Path:
+        safe = "".join(ch for ch in str(job_id) if ch.isalnum() or ch in "-_.")
+        if not safe or safe != str(job_id):
+            safe = "job-" + hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:24]
+        return self.state / "factory" / JOB_LOCK_DIR / f"{safe}.lock"
+
+    def _serialized_tick(self, core: Any) -> Any:
+        """Serialise every tick for one job across processes and passes.
+
+        The durable queue is still authoritative: a live claim held by another
+        process is never ticked by this one.  The per-job flock closes the gap
+        where two scheduler items name the same job.
+        """
+
+        def tick(job_id: str) -> dict[str, Any]:
+            with _locked(self._job_lock_path(str(job_id))):
+                owner = self._live_queue_owner(str(job_id))
+                if owner is not None:
+                    return {
+                        "status": "deferred",
+                        "action": "claimed_elsewhere",
+                        "detail": f"job {job_id!r} is claimed by live pid {owner}",
+                    }
+                result = core(job_id)
+                return result if isinstance(result, dict) else {"status": str(result)}
+
+        return tick
+
+    def _live_queue_owner(self, job_id: str) -> int | None:
+        try:
+            records = queue_mod.QueueStore(self.state).active()
+        except Exception:  # noqa: BLE001 - a broken queue is handled by the queue stage
+            return None
+        for record in records:
+            if str(record.get("job_id") or "") != job_id:
+                continue
+            pid = record.get("pid")
+            try:
+                number = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if number != os.getpid() and _pid_alive(number):
+                return number
+        return None
+
+    def _owner_for(self, work_id: str) -> str:
+        return f"factory-driver:{os.getpid()}:{work_id}"
+
+    def _is_our_owner(self, owner: Any) -> bool:
+        return str(owner or "").startswith("factory-driver:")
+
+    def _recover_work_claims(self) -> list[str]:
+        """Release work claimed by a driver process that no longer exists."""
+
+        released: list[str] = []
+        try:
+            items = work_scheduler.list_items(self.state)
+        except Exception:  # noqa: BLE001
+            return released
+        for item in items:
+            if item.get("status") != "claimed":
+                continue
+            owner = str(item.get("owner") or "")
+            if not self._is_our_owner(owner):
+                continue
+            parts = owner.split(":", 2)
+            try:
+                pid = int(parts[1])
+            except (IndexError, ValueError):
+                pid = 0
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+            try:
+                work_scheduler.release(
+                    self.state, item["work_id"], owner=owner, now=self.now
+                )
+                released.append(str(item["work_id"]))
+            except Exception:  # noqa: BLE001
+                continue
+        return released
+
+    # -- bounded work retry ledger -----------------------------------------
+
+    def _work_retry_path(self, work_id: str) -> Path:
+        safe = "".join(ch for ch in str(work_id) if ch.isalnum() or ch in "-_.")
+        if not safe or safe != str(work_id):
+            safe = "work-" + hashlib.sha256(str(work_id).encode("utf-8")).hexdigest()[:24]
+        return self.state / "factory" / WORK_RETRY_DIR / f"{safe}.json"
+
+    def _retry_state(self, work_id: str) -> dict[str, Any]:
+        return _read_json(self._work_retry_path(work_id)) or {}
+
+    def _record_work_failure(self, work_id: str, exc: BaseException) -> dict[str, Any]:
+        path = self._work_retry_path(work_id)
+        with _locked(path.with_suffix(".lock")):
+            record = _read_json(path) or {}
+            attempts = int(record.get("attempts") or 0) + 1
+            exhausted = attempts >= self.max_work_attempts
+            body = {
+                "schema": "bundlebees.factory-work-retry/1",
+                "work_id": work_id,
+                "attempts": attempts,
+                "max_attempts": self.max_work_attempts,
+                "exhausted": exhausted,
+                "error": type(exc).__name__,
+                "code": str(getattr(exc, "code", "") or type(exc).__name__),
+                "message": str(getattr(exc, "message", "") or str(exc))[:500],
+                "fix": str(getattr(exc, "fix", "") or "Inspect the worker tick and retry or escalate."),
+                "updated_at": _iso(self.now),
+            }
+            _write_json(path, body)
+        return body
+
+    def _clear_work_failure(self, work_id: str) -> None:
+        try:
+            self._work_retry_path(work_id).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     def subscribers_for_pass(self) -> list[str]:
         if self.subscribers is not None:
@@ -738,6 +1004,9 @@ class FactoryDriver:
             launcher_outbox=self.launcher_outbox,
             now=self.now,
         )
+        recovered = self._recover_work_claims()
+        if recovered:
+            self.startup_report["released_work_claims"] = recovered
         return self.startup_report
 
     def _event_handler(self, subscriber: str) -> Any:
@@ -747,27 +1016,126 @@ class FactoryDriver:
             # event is acknowledged as durable work and the wake coalescer keeps
             # the pending generation until a safe boundary.
             session = _session_of(event, subscriber)
-            wake = self.wake.request_wake(session, now=self.now)
-            result = deterministic_handler(self.state, event, now=self.now)
+            wake = self.wake.request_wake(
+                session, now=self.now, subscriber=subscriber
+            )
+            result = deterministic_handler(
+                self.state, event, now=self.now, subscriber=subscriber
+            )
             wake_events = self.state / "factory" / "wake-events"
             wake_events.mkdir(parents=True, exist_ok=True)
-            tmp = wake_events / f"{session}.tmp"
-            tmp.write_text(json.dumps(event, sort_keys=True), encoding="utf-8")
-            os.replace(tmp, wake_events / f"{session}.json")
+            event_path = wake_events / f"{self.wake.key_for(session)}.json"
+            _write_json(event_path, dict(event))
             result["session"] = session
+            result["session_key"] = self.wake.key_for(session)
+            result["subscriber"] = subscriber
             result["generation"] = int(wake.get("generation") or 0)
             result["deferred"] = bool(wake.get("active"))
+            result["turn_active"] = bool(wake.get("active"))
             return result
         return handler
 
-    def _advance_ready_work(self) -> None:
-        """Advance every scheduler item whose job is durable, without manual claims."""
+    def _drive_work(self, work_id: str, job_id: str) -> dict[str, Any]:
+        """Claim one scheduler item, then run the protected job tick."""
+
+        if not work_id:
+            try:
+                return {"tick": self.tick(job_id)}
+            except Exception as exc:  # noqa: BLE001
+                failure = self._record_work_failure(job_id, exc)
+                return {
+                    "work_state": "failed",
+                    "failure": failure,
+                    "tick": {"status": "error", "error": type(exc).__name__},
+                }
+        if work_id in self._driven_this_pass:
+            return {"work_state": "already_driven_this_pass"}
+        retry = self._retry_state(work_id)
+        if retry.get("exhausted"):
+            return {"work_state": "failed", "failure": retry}
+        owner = self._owner_for(work_id)
+        try:
+            work_scheduler.claim(self.state, work_id, owner, str(self.state), now=self.now)
+        except work_scheduler.SchedulerError as exc:
+            if exc.code == "work_done":
+                self._clear_work_failure(work_id)
+                return {"work_state": "done"}
+            return {
+                "work_state": "skipped",
+                "failure": {
+                    "work_id": work_id,
+                    "code": exc.code,
+                    "message": exc.message,
+                    "fix": exc.fix,
+                },
+            }
+        self._driven_this_pass.add(work_id)
+        try:
+            tick_result = self.tick(job_id)
+        except Exception as exc:  # noqa: BLE001 - one job must not stop the pass
+            failure = self._record_work_failure(work_id, exc)
+            if failure.get("exhausted"):
+                try:
+                    work_scheduler.release(
+                        self.state, work_id, owner=owner, now=self.now
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "work_state": "retryable" if not failure.get("exhausted") else "failed",
+                "failure": failure,
+                "tick": {"status": "error", "error": type(exc).__name__},
+            }
+        try:
+            job = jobs.load_job(self.state, job_id, recover=False)
+            tasks = job.get("tasks") or []
+            done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
+        except Exception:  # noqa: BLE001
+            done = False
+        completed = done or str(tick_result.get("action") or "") in {
+            "ready_for_review",
+            "accepted",
+        }
+        if completed:
+            try:
+                work_scheduler.complete(self.state, work_id, owner=owner, now=self.now)
+                self._clear_work_failure(work_id)
+                return {"work_state": "done", "tick": tick_result}
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "work_state": f"sync_error:{type(exc).__name__}",
+                    "tick": tick_result,
+                }
+        return {"work_state": "claimed", "tick": tick_result}
+
+    def _advance_ready_work(self) -> list[dict[str, Any]]:
+        """Advance durable scheduler items after claiming them, one job at a time."""
+
+        failures: list[dict[str, Any]] = []
         mapping = self.state / "factory" / "work-jobs"
         if not mapping.is_dir():
-            return
-        for item in work_scheduler.list_items(self.state):
+            return failures
+        try:
+            items = work_scheduler.list_items(self.state)
+            ready_ids = {
+                str(entry.get("work_id") or "")
+                for entry in work_scheduler.ready_items(self.state)
+            }
+        except Exception:  # noqa: BLE001
+            return failures
+        for item in items:
             work_id = str(item.get("work_id") or "")
-            if str(item.get("status") or "") not in {"pending", "claimed"}:
+            status = str(item.get("status") or "")
+            if status == "claimed" and not self._is_our_owner(item.get("owner")):
+                continue
+            if status not in {"pending", "claimed"}:
+                continue
+            if status == "pending" and work_id not in ready_ids:
+                continue
+            if work_id in self._driven_this_pass:
+                continue
+            retry = self._retry_state(work_id)
+            if retry.get("exhausted"):
                 continue
             map_path = mapping / f"{work_id}.json"
             try:
@@ -777,28 +1145,40 @@ class FactoryDriver:
             job_id = str(body.get("job_id") or "")
             if not job_id:
                 continue
-            try:
-                tick_result = self.tick(job_id)
-            except Exception:  # noqa: BLE001 - independent work must continue
-                continue
-            try:
-                job = jobs.load_job(self.state, job_id, recover=False)
-                tasks = job.get("tasks") or []
-                done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
-            except Exception:  # noqa: BLE001
-                done = False
-            if not done and str(tick_result.get("action") or "") not in {"ready_for_review", "accepted"}:
-                continue
-            try:
-                work_scheduler.claim(self.state, work_id, "factory-driver", str(self.state))
-                work_scheduler.complete(self.state, work_id, owner="factory-driver")
-            except Exception:  # noqa: BLE001
-                pass
+            outcome = self._drive_work(work_id, job_id)
+            if outcome.get("failure"):
+                failures.append(outcome["failure"])
+        return failures
+
+    def _subscriber_binding(
+        self, event: Mapping[str, Any], wake_record: Mapping[str, Any], fallback: str
+    ) -> dict[str, Any] | None:
+        """Load the configured subscriber record that owns this event."""
+
+        identity = ""
+        coordinator = _event_data(event).get("coordinator")
+        if isinstance(coordinator, Mapping):
+            identity = str(coordinator.get("identity") or "").strip()
+        candidates = self.subscribers_for_pass()
+        name = str(wake_record.get("subscriber") or "").strip()
+        if not name:
+            name = identity if identity in candidates else fallback
+        name = _safe_session(name)
+        try:
+            path = bee_events._subscriber_path(self.state, name)
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - an unbound session still uses the explicit session
+            return None
+        if not isinstance(record, Mapping) or str(record.get("identity") or "") != name:
+            return None
+        return dict(record)
 
     def _deliver_wakes(self) -> list[dict[str, Any]]:
         """Deliver one coalesced wake per due session through the real adapter."""
+
         results: list[dict[str, Any]] = []
         sessions = self.wake.sessions() or self.subscribers_for_pass()
+        fallback = (self.subscribers_for_pass() or [DEFAULT_SESSION])[0]
         for session in sessions:
             status = self.wake.status(session)
             if not status.get("due"):
@@ -807,60 +1187,82 @@ class FactoryDriver:
             if not turn.get("started"):
                 continue
             try:
-                event_path = self.state / "factory" / "wake-events" / f"{session}.json"
+                event_path = (
+                    self.state
+                    / "factory"
+                    / "wake-events"
+                    / f"{self.wake.key_for(session)}.json"
+                )
                 event = json.loads(event_path.read_text(encoding="utf-8"))
+                subscriber = self._subscriber_binding(event, status, fallback)
                 delivered = hermes_adapter.notify_coordinator(
                     event,
                     endpoint=os.environ.get("HERMES_API_URL") or None,
                     api_key=os.environ.get("HERMES_API_KEY") or None,
                     session=session,
+                    subscriber=subscriber,
                     state_dir=self.state,
                     timeout_s=float(os.environ.get("HERMES_WAKE_TIMEOUT_S") or 60.0),
                 )
-                finished = self.wake.finish_turn(session, turn.get("turn"), now=self.now)
-                results.append({"session": session, "delivered": True,
-                                "event_id": delivered.get("event_id"),
-                                "pending": bool(finished.get("pending"))})
+                finished = self.wake.finish_turn(
+                    session, turn.get("turn"), now=self.now
+                )
+                results.append(
+                    {
+                        "session": session,
+                        "session_key": self.wake.key_for(session),
+                        "delivered": True,
+                        "event_id": delivered.get("event_id"),
+                        "turn": turn.get("turn"),
+                        "turn_finished": bool(finished.get("finished")),
+                        "pending": bool(finished.get("pending")),
+                        "subscriber": (subscriber or {}).get("identity", ""),
+                    }
+                )
             except Exception as exc:  # noqa: BLE001 - durable wake remains pending
                 self.wake.release_turn(session, turn.get("turn"))
-                results.append({"session": session, "delivered": False,
-                                "error": type(exc).__name__,
-                                "code": str(getattr(exc, "code", "") or ""),
-                                "pending": True})
+                results.append(
+                    {
+                        "session": session,
+                        "session_key": self.wake.key_for(session),
+                        "delivered": False,
+                        "turn": turn.get("turn"),
+                        "turn_finished": False,
+                        "error": type(exc).__name__,
+                        "code": str(getattr(exc, "code", "") or ""),
+                        "message": str(getattr(exc, "message", "") or str(exc))[:500],
+                        "fix": str(
+                            getattr(exc, "fix", "")
+                            or "Keep the wake pending and retry after the gateway recovers."
+                        ),
+                        "pending": True,
+                    }
+                )
         return results
 
-    def _advance_event_work(self, event_results: list[dict[str, Any]]) -> None:
-        """Drive authoritative job progress for landed work, then sync scheduler."""
+    def _advance_event_work(self, event_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drive authoritative job progress only for a newly accepted inbox ack."""
+
+        failures: list[dict[str, Any]] = []
         for entry in event_results:
+            if entry.get("state") != "acked":
+                entry["work_state"] = "duplicate_skipped" if entry.get("duplicate") else "not_acked"
+                continue
             job_id = str(entry.get("job_id") or "")
             work_id = str(entry.get("work_id") or "")
             if not job_id:
+                entry["work_state"] = "no_job"
                 continue
-            try:
-                tick_result = self.tick(job_id)
-            except Exception as exc:  # noqa: BLE001 - one job must not stop the pass
-                entry["tick"] = {"status": "error", "error": type(exc).__name__}
-                continue
-            entry["tick"] = tick_result
-            if not work_id:
-                continue
-            try:
-                job = jobs.load_job(self.state, job_id, recover=False)
-                tasks = job.get("tasks") or []
-                done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
-            except Exception:  # noqa: BLE001
-                done = False
-            if not done and str(tick_result.get("action") or "") not in {"ready_for_review", "accepted"}:
-                continue
-            try:
-                work_scheduler.claim(self.state, work_id, "factory-driver", str(self.state))
-                work_scheduler.complete(self.state, work_id, owner="factory-driver")
-                entry["work_state"] = "done"
-            except Exception as exc:  # noqa: BLE001
-                entry["work_state"] = f"sync_error:{type(exc).__name__}"
+            outcome = self._drive_work(work_id, job_id)
+            entry.update(outcome)
+            if outcome.get("failure"):
+                failures.append(outcome["failure"])
+        return failures
 
     def run_pass(self) -> dict[str, Any]:
+        self._driven_this_pass = set()
         startup = self._ensure_startup()
+        self._recover_work_claims()
         errors: list[dict[str, str]] = []
 
         queue_result: dict[str, Any]
@@ -900,15 +1302,40 @@ class FactoryDriver:
                 "state": outcome.get("state"),
                 "duplicate": bool(outcome.get("duplicate")),
                 "attempts": outcome.get("attempts"),
+                "inbox_ack": {
+                    "state": outcome.get("state"),
+                    "duplicate": bool(outcome.get("duplicate")),
+                    "attempts": outcome.get("attempts"),
+                    "error": outcome.get("error") or "",
+                },
             }
+            if outcome.get("error"):
+                entry["error"] = outcome.get("error")
+                entry["code"] = outcome.get("error_code") or outcome.get("error")
+                entry["fix"] = outcome.get("fix") or "Inspect events/inbox and events/acks."
             result = outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {}
-            for key in ("work_id", "session", "generation", "eligible"):
+            for key in (
+                "work_id",
+                "job_id",
+                "attempt_id",
+                "session",
+                "session_key",
+                "generation",
+                "eligible",
+                "created",
+                "action_id",
+                "action_state",
+                "duplicate_action",
+                "deferred",
+                "turn_active",
+            ):
                 if key in result:
                     entry[key] = result[key]
             event_results.append(entry)
 
-        self._advance_event_work(event_results)
-        self._advance_ready_work()
+        failures: list[dict[str, Any]] = []
+        failures.extend(self._advance_event_work(event_results))
+        failures.extend(self._advance_ready_work())
         wake_results = self._deliver_wakes()
 
         try:
@@ -920,17 +1347,28 @@ class FactoryDriver:
         event_activity = any(entry.get("state") in ("acked", "retryable", "failed") for entry in event_results)
         landing_activity = bool(landing_result and (landing_result.get("processed") or landing_result.get("failed")))
         queue_activity = queue_result.get("action") not in (None, "idle")
-        idle = not queue_activity and not landing_activity and not event_activity and not ready
+        idle = not queue_activity and not landing_activity and not event_activity and not ready and not failures
+
+        wake_names = sorted(
+            set(self.wake.sessions()) | set(self.subscribers_for_pass())
+        )
+        accepted_work = [
+            entry.get("work_id")
+            for entry in event_results
+            if entry.get("work_state") == "done" and entry.get("work_id")
+        ]
 
         result = {
             "action": queue_result.get("action"),
             "queue": queue_result,
             "landing": landing_result,
             "events": event_results,
+            "accepted_work": accepted_work,
             "ready": [entry["work_id"] for entry in ready],
             "ready_items": ready,
-            "wake": [self.wake.status(name) for name in self.subscribers_for_pass()],
+            "wake": [self.wake.status(name) for name in wake_names],
             "wake_delivery": wake_results,
+            "failures": failures,
             "idle": idle,
             "inference": 0,
             "model_calls": 0,
@@ -953,6 +1391,7 @@ def run_pass(
     subscribers: Sequence[str] | None = None,
     now: Any = None,
     startup: bool = True,
+    max_work_attempts: int = MAX_WORK_ATTEMPTS,
 ) -> dict[str, Any]:
     driver = FactoryDriver(
         state_dir,
@@ -962,6 +1401,7 @@ def run_pass(
         subscribers=subscribers,
         now=now,
         startup=startup,
+        max_work_attempts=max_work_attempts,
     )
     return driver.run_pass()
 

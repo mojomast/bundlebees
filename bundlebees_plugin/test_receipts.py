@@ -22,14 +22,17 @@ integrity digest does not verify is refused rather than repaired.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import hmac
 import json
 import math
 import os
 import re
+import secrets
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -37,17 +40,24 @@ from .security import scrub
 
 __all__ = [
     "ReceiptError",
+    "ReceiptClaim",
     "REQUIRED_KEY_INPUTS",
     "canonical_key",
     "receipt_key",
     "receipt_path",
     "record_receipt",
     "lookup_receipt",
+    "claim_key",
+    "claim_receipt",
 ]
 
 _FORMAT_VERSION = 1
 _KEY_DOMAIN = b"bundlebees-test-receipt:key:v1\x00"
 _RECEIPT_DOMAIN = b"bundlebees-test-receipt:receipt:v1\x00"
+_LOCK_DOMAIN = b"bundlebees-test-receipt:lock:v1\x00"
+_LOCK_DIRNAME = "receipt-locks"
+_DEFAULT_WAIT_S = 600.0
+_DEFAULT_POLL_S = 0.05
 _REQUIRED_KEY_INPUTS = (
     "source_tree_sha256",
     "patch_sha256",
@@ -87,6 +97,11 @@ _DEFAULT_ERRORS = {
         "the test receipt store could not be read or written",
         "Check that the state directory is writable and that receipts/ is a "
         "real private directory, then retry.",
+    ),
+    "receipt_busy": (
+        "another process is still executing the identical test request",
+        "Wait for the owner to finish; an abandoned owner is recovered "
+        "automatically because its lock dies with its process.",
     ),
 }
 
@@ -171,6 +186,184 @@ receipt_key = canonical_key
 def receipt_path(state_dir: Any, key_inputs: Any) -> Path:
     """Return the receipt path for ``key_inputs`` without touching the disk."""
     return Path(state_dir) / "receipts" / f"{canonical_key(key_inputs)}.json"
+
+
+# ---------------------------------------------------------------------------
+# Durable single-flight ownership
+# ---------------------------------------------------------------------------
+
+
+def _lock_name(key: str) -> str:
+    if _HEX_DIGEST_RE.fullmatch(key):
+        return key.lower()
+    return hashlib.sha256(_LOCK_DOMAIN + key.encode("utf-8")).hexdigest()
+
+
+def _lock_dir(state_dir: Any, *, create: bool) -> Path:
+    try:
+        state = Path(state_dir)
+    except TypeError as exc:
+        raise ReceiptError("receipt_invalid", "state_dir is not a path") from exc
+
+    if state.is_symlink():
+        raise ReceiptError("receipt_io", "the state directory must not be a symlink")
+    directory = state / _LOCK_DIRNAME
+    if directory.is_symlink():
+        raise ReceiptError("receipt_io", "receipt-locks/ must not be a symlink")
+    if not create:
+        return directory
+    try:
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ReceiptError("receipt_io", "receipt-locks/ must be a real directory")
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        return directory
+    except ReceiptError:
+        raise
+    except OSError as exc:
+        raise ReceiptError(
+            "receipt_io", f"the receipt lock directory could not be created: {exc}"
+        ) from exc
+
+
+class ReceiptClaim:
+    """Durable single-flight ownership of one receipt key.
+
+    Ownership is a kernel ``flock`` on a private file, so it survives as long as
+    the owning process does and is released by the kernel when that process exits
+    or crashes.  A restarted worker therefore never sees a permanent lock, and a
+    stale lock file left on disk is simply re-locked rather than trusted.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: str | None,
+        acquired: bool,
+        receipt: dict[str, Any] | None = None,
+        fd: int | None = None,
+    ) -> None:
+        self.key = key
+        self.acquired = acquired
+        self.receipt = receipt
+        self._fd = fd
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "ReceiptClaim":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()
+
+
+def claim_key(
+    state_dir: Any,
+    key: str,
+    *,
+    wait_s: float = _DEFAULT_WAIT_S,
+    poll_s: float = _DEFAULT_POLL_S,
+) -> ReceiptClaim:
+    """Acquire durable single-flight ownership for an arbitrary key.
+
+    The caller must :meth:`ReceiptClaim.release` (or use the claim as a context
+    manager).  Waiting is bounded; a live owner that never finishes yields
+    ``ReceiptError("receipt_busy")`` instead of hanging forever.
+    """
+
+    if not isinstance(key, str) or not key:
+        raise ReceiptError("receipt_invalid", "a receipt lock key must be a string")
+    try:
+        wait = max(0.0, float(wait_s))
+        poll = max(0.001, float(poll_s))
+    except (TypeError, ValueError) as exc:
+        raise ReceiptError("receipt_invalid", "lock timing must be numeric") from exc
+
+    directory = _lock_dir(state_dir, create=True)
+    path = directory / f"{_lock_name(key)}.lock"
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        except OSError as exc:
+            raise ReceiptError(
+                "receipt_io", f"the test receipt lock could not be opened: {exc}"
+            ) from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise ReceiptError(
+                    "receipt_io", f"the test receipt lock could not be taken: {exc}"
+                ) from exc
+            if time.monotonic() >= deadline:
+                raise ReceiptError("receipt_busy")
+            time.sleep(poll)
+            continue
+
+        try:
+            os.fchmod(fd, 0o600)
+            metadata = {
+                "version": 1,
+                "key": key,
+                "pid": os.getpid(),
+                "token": secrets.token_hex(16),
+                "created_at": time.time(),
+            }
+            payload = _canonical(metadata) + b"\n"
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, payload)
+            os.fsync(fd)
+        except OSError as exc:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+            raise ReceiptError(
+                "receipt_io", f"the test receipt lock could not be written: {exc}"
+            ) from exc
+        return ReceiptClaim(key=key, acquired=True, fd=fd)
+
+
+def claim_receipt(
+    state_dir: Any,
+    key_inputs: Any,
+    *,
+    cacheable: bool = True,
+    wait_s: float = _DEFAULT_WAIT_S,
+    poll_s: float = _DEFAULT_POLL_S,
+) -> ReceiptClaim:
+    """Claim single-flight ownership of the exact-key receipt.
+
+    A non-cacheable request never takes a lock: it returns an acquired no-op
+    claim so the caller executes the check without recording it.
+    """
+
+    if not isinstance(cacheable, bool):
+        raise ReceiptError("receipt_invalid", "cacheable must be a boolean")
+    if not cacheable:
+        return ReceiptClaim(key=None, acquired=True)
+    key = canonical_key(key_inputs)
+    return claim_key(state_dir, key, wait_s=wait_s, poll_s=poll_s)
 
 
 # ---------------------------------------------------------------------------
