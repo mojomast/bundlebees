@@ -247,8 +247,7 @@ class DeterministicAgent:
     def __call__(self, request):
         job = jobs.load_job(self.state_dir, str(request["job_id"]), recover=False)
         task = next(task for task in job["tasks"] if task["task_id"] == request["task_id"])
-        number = int(request.get("number") or 1)
-        new_id = f"{request['contract']['id']}-r{number}"
+        new_id = str(request["contract"]["id"])
         corrected = recovery.derive_superseding_contract(
             task, [self.replacement], adapter="deterministic-agent",
             decided_at=self.decided_at, contract_id=new_id,
@@ -401,7 +400,8 @@ class M4Dogfood(unittest.TestCase):
         }]
         job["recovery_policy"] = {"max_attempts_per_task": 3, "contract_corrections_allowed": True}
         job["tasks"][0]["recovery_policy"] = {"max_attempts_per_task": 2, "contract_corrections_allowed": False}
-        job["tasks"][1]["recovery_policy"] = {"max_attempts_per_task": 3, "contract_corrections_allowed": True}
+        job["tasks"][1]["recovery_policy"] = {"max_attempts_per_task": 3, "contract_corrections_allowed": True,
+                                              "corrected_tests_allowed": [T2_GOOD_TEST]}
         jobs.save_job(self.state, job)
 
         self.queue_file = self.state / "queue.json"
@@ -699,6 +699,26 @@ class M4Dogfood(unittest.TestCase):
         self.assertEqual(decision.get("request_digest"), request.get("request_digest"))
         self.assertEqual(decision.get("decision"), "supersede")
 
+        # M4.1 conformance: the records the runtime emitted and consumed are
+        # validated, unchanged, by the pinned workflow protocol itself.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "wf_recovery_protocol", Path(WORKFLOW_SRC) / "tools" / "recovery.py")
+        wf_recovery = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wf_recovery)
+        validated = wf_recovery.validate_pair(
+            recovery.load_request(self.state, str(request["request_id"])),
+            recovery.read_decision(self.state, request),
+            attempts_used=1, corrections_used=0)
+        self.assertEqual(validated["request"]["failure"]["code"], "test_not_found")
+        self.assertNotIn("number", request)
+        self.assertIsInstance(request["envelope"]["contract_corrections_allowed"], int)
+        self.assertEqual(decision["schema"], "rizzstack.recovery/1")
+        self.assertNotIn("decision_digest", decision)
+        self.assertNotIn("decision_digest", decisions[0])
+        self.assertEqual(decision["supersedes"]["new_contract_id"],
+                         decision["supersedes"]["contract_id"])
+
         task = self.task(T2)
         supersession = task.get("contract_supersession") or {}
         corrected = task.get("contract") or {}
@@ -715,14 +735,14 @@ class M4Dogfood(unittest.TestCase):
                          "the correction must replace the unusable selector with the approved fixture method")
         self.assertEqual(corrected.get("scope"), self.contract_2["scope"],
                          "a correction may not widen or change the lease")
-        self.assertEqual(corrected.get("id"), "T2-REACHABILITY-r1")
+        self.assertEqual(corrected.get("id"), "T2-REACHABILITY")
         # The decision named the same pair the task now carries.
         supersedes = decision.get("supersedes") or {}
         self.assertEqual(supersedes.get("contract_sha256"), self.sha_2)
         self.assertEqual(supersedes.get("new_contract_sha256"), task.get("contract_sha256"))
         # The corrective dispatch ran under the corrected contract.
         third = self.worker.posts[2]
-        self.assertEqual((third.get("contract") or {}).get("id"), "T2-REACHABILITY-r1")
+        self.assertEqual((third.get("contract") or {}).get("id"), "T2-REACHABILITY")
         self.assertEqual((third.get("contract") or {}).get("acceptance_criteria", [{}])[0].get("tests"), [T2_GOOD_TEST])
         self.assertEqual(third.get("source_rev"), self.base)
         # One supersession chain, recorded on the job too.
@@ -894,7 +914,7 @@ class M4Dogfood(unittest.TestCase):
             "neg_outside", corrections=True, max_attempts=3,
             evidence="test_not_found: named tests failed after the patch: no tests ran in 0.01s",
             code_class="specification")
-        self.assertIn(TEST_2, request["envelope"]["corrected_tests_allowed"])
+        self.assertIn(T2_GOOD_TEST, request["envelope"]["corrected_tests_allowed"])
         outside = f"{TEST_1}::SourceRev::test_valid_source_rev_is_silent"
         decision = {
             "schema": "rizzstack.recovery/1",
@@ -906,7 +926,7 @@ class M4Dogfood(unittest.TestCase):
             "supersedes": {
                 "contract_id": request["contract"]["id"],
                 "contract_sha256": request["contract"]["sha256"],
-                "new_contract_id": f"{request['contract']['id']}-r1",
+                "new_contract_id": request["contract"]["id"],
                 "new_contract_sha256": "0" * 64,
             },
             "rationale": "This correction reaches into a different test file, outside the approved envelope.",
@@ -976,7 +996,7 @@ class M4Dogfood(unittest.TestCase):
                                  "look like a second authorisation")
         decisions = recovery.list_decisions(state, job_id)
         self.assertEqual(len(decisions), 1, f"exactly one decision record, got {decisions}")
-        self.assertEqual(decisions[0]["decision_digest"], first["decision_digest"],
+        self.assertEqual(recovery.decision_digest(decisions[0]), recovery.decision_digest(first),
                          "the recorded decision was overwritten by the replay")
 
     def test_a_supersession_bound_to_a_stale_receipt_is_refused(self):

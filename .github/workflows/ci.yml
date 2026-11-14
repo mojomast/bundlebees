@@ -56,8 +56,8 @@ jobs:
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/workflow.git "$RUNNER_TEMP/workflow"
           git -C "$RUNNER_TEMP/workflow" fetch --quiet origin refs/pull/33/head
-          git -C "$RUNNER_TEMP/workflow" checkout --quiet 0878e17d4ef14001e6cd241f1bde1e22fb4c0fd4
-          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "0878e17d4ef14001e6cd241f1bde1e22fb4c0fd4"
+          git -C "$RUNNER_TEMP/workflow" checkout --quiet d75cb3c70f81bed98faf5b9006638a0f76f52765
+          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "d75cb3c70f81bed98faf5b9006638a0f76f52765"
           echo "WORKFLOW_SRC=$RUNNER_TEMP/workflow" >> "$GITHUB_ENV"
           echo "REQUIRE_WORKFLOW=1" >> "$GITHUB_ENV"
       - name: Check out hyvv provisioning contract (pinned)
