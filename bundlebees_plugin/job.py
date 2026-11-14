@@ -449,7 +449,156 @@ def _recovery_envelope(
     return out
 
 
+def _grant_job_inputs(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Extract the one repository, revision, scope and budget a repo grant covers."""
+    repos: set[str] = set()
+    revisions: set[str] = set()
+    profiles: set[str] = set()
+    hosts: set[str] = set()
+    files: set[str] = set()
+    contracts: set[str] = set()
+    wall_clock = 0
+    for task in tasks:
+        raw_provision = task.get("provision")
+        provision: Mapping[str, Any] = dict(raw_provision) if isinstance(raw_provision, Mapping) else {}
+        repo = str(provision.get("repo") or task.get("repo") or "").strip()
+        if repo:
+            repos.add(repo)
+        revision = str(provision.get("source_rev") or task.get("base_rev") or "").strip()
+        if revision:
+            revisions.add(revision)
+        profile = str(provision.get("profile") or task.get("profile") or "").strip()
+        if profile:
+            profiles.add(profile)
+        host = str(provision.get("host") or task.get("host") or "").strip()
+        if host:
+            hosts.add(host)
+        contracts.add(str(provision.get("contract_sha256") or task.get("contract_sha256") or ""))
+        for path in task.get("lease") or []:
+            text = str(path or "").strip()
+            if text:
+                files.add(text)
+        try:
+            wall_clock = max(wall_clock, int(task.get("wall_clock_s") or 0))
+        except (TypeError, ValueError):
+            raise JobError("grant_job_invalid", "task wall_clock_s must be an integer", "Use a bounded integer wall clock.")
+    if len(repos) != 1:
+        raise JobError("grant_repo_ambiguous", "a repo grant can only auto-authorize one repository per job", "Split the job or use per-job authorization.")
+    if len(revisions) != 1 or not _is_sha(next(iter(revisions))):
+        raise JobError("grant_revision_missing", "a repo grant requires one full 40-hex base revision on the job", "Pin the exact base revision.")
+    return {
+        "repo": next(iter(repos)),
+        "source_rev": next(iter(revisions)),
+        "profile": next(iter(profiles), ""),
+        "host": next(iter(hosts), ""),
+        "assigned_files": sorted(files) or ["**"],
+        "contract_sha256": next((item for item in contracts if item), ""),
+        "bees": max(1, len(tasks)),
+        "wall_clock_s": max(60, wall_clock or 3600),
+    }
+
+
+def authorize_from_repo_grant(state_dir: Path, *, job_id: str, tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Derive and seal a job authorization from a human-enrolled repo grant.
+
+    The grant is the authority. This function only narrows it to the job's
+    repository, pinned revision, file leases and budget; the per-job TTY path is
+    deliberately not used here, because the human's one-time grant is the
+    approval. It refuses rather than falling back when no usable grant exists.
+    """
+    from . import grants as grant_mod
+    from .leases import LeaseError, _load_key
+
+    shape = _grant_job_inputs(tasks)
+    try:
+        key = _load_key(Path(state_dir))
+    except LeaseError as exc:
+        raise JobError("grant_missing", "no standing grant key exists for this state directory", "Enroll a repo grant in a real terminal.") from exc
+    store = grant_mod.GrantStore(Path(state_dir), key=key)
+    try:
+        grant = store.find_active_for_repo(shape["repo"])
+    except grant_mod.GrantError as exc:
+        raise JobError(exc.code, exc.message, exc.fix) from exc
+    try:
+        derived = store.derive(
+            grant.grant_id,
+            job_id=job_id,
+            repo=shape["repo"],
+            host=shape["host"] or "*",
+            profile=shape["profile"] or "*",
+            source_rev=shape["source_rev"],
+            assigned_files=shape["assigned_files"],
+            bees=shape["bees"],
+            wall_clock_s=shape["wall_clock_s"],
+            contract_sha256=shape["contract_sha256"],
+        )
+    except grant_mod.GrantError as exc:
+        raise JobError(exc.code, exc.message, exc.fix) from exc
+
+    body = {
+        "schema_version": JOB_SCHEMA_VERSION,
+        "kind": "authorization",
+        "job_id": _job_id(job_id),
+        "auth_id": secrets.token_hex(8),
+        "statement": grant.statement,
+        "repo": shape["repo"],
+        "base_rev": shape["source_rev"],
+        "scope": list(derived["assigned_files"]),
+        "budget": {"bees": int(shape["bees"]), "wall_clock_s": int(shape["wall_clock_s"])},
+        "gates": sorted({_slug(gate) for gate in grant_mod.EXCLUDED_ACTIONS}),
+        "by": f"repo-grant:{grant.grant_id}",
+        "at": _utc_now(),
+        "authority": "repo-grant",
+        "grant": {
+            "grant_id": grant.grant_id,
+            "statement": grant.statement,
+            "approved_by": grant.approved_by,
+            "approved_at": grant.approved_at,
+            "expires_at": grant.expires_at,
+            "digest": grant.digest,
+        },
+        "grant_id": grant.grant_id,
+        "grant_statement": grant.statement,
+        "grant_approved_at": grant.approved_at,
+        "recovery_digest": recovery_digest({}),
+        "derivation_digest": derived.get("digest", ""),
+    }
+    key = _ensure_key(Path(state_dir))
+    path = authorization_path(Path(state_dir), job_id)
+    if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        existing = load_authorization(Path(state_dir), job_id)
+        if str(existing.get("authority") or "") == "repo-grant" and str(existing.get("job_id")) == str(job_id):
+            return existing
+        raise JobError("authorization_exists", "an authorization already exists for this job id", "Use a new job id.")
+    return body
+
+
+def release_repo_grant_for_job(state_dir: Path, job_id: str) -> None:
+    """Release a repo-grant reservation once every task in the job is accepted."""
+    try:
+        job = load_job(Path(state_dir), job_id, recover=False)
+    except JobError:
+        return
+    raw_authorization = job.get("authorization")
+    authorization: Mapping[str, Any] = raw_authorization if isinstance(raw_authorization, Mapping) else {}
+    if str(authorization.get("authority") or "") != "repo-grant":
+        return
+    grant_id = str(authorization.get("grant_id") or "")
+    tasks = job.get("tasks") or []
+    if not grant_id or not tasks or any(str(task.get("state")) != "accepted" for task in tasks):
+        return
+    try:
+        from . import grants as grant_mod
+        from .leases import _load_key
+
+        store = grant_mod.GrantStore(Path(state_dir), key=_load_key(Path(state_dir)))
+        store.complete(grant_id, job_id)
+    except Exception:  # noqa: BLE001 - reservation cleanup must not invalidate an accepted job
+        return
+
+
 def record_authorization(
+
     state_dir: Path,
     *,
     job_id: str,
@@ -832,6 +981,11 @@ def create_job(
             # document; this pin is what makes a recovery block rewritten after
             # admission visible instead of authoritative.
             "recovery_digest": str(authorization.get("recovery_digest") or ""),
+            "authority": str(authorization.get("authority") or "human"),
+            "grant": dict(authorization.get("grant") or {}),
+            "grant_id": str(authorization.get("grant_id") or ""),
+            "grant_statement": str(authorization.get("grant_statement") or ""),
+            "grant_approved_at": str(authorization.get("grant_approved_at") or ""),
         },
         "goal": {
             "summary": str(summary or authorization["statement"]),

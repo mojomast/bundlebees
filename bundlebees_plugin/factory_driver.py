@@ -1242,6 +1242,7 @@ class FactoryDriver:
             "accepted",
         }
         if completed:
+            jobs.release_repo_grant_for_job(self.state, job_id)
             try:
                 work_scheduler.complete(self.state, work_id, owner=owner, now=self.now)
                 self._clear_work_failure(work_id)

@@ -245,7 +245,6 @@ def _build_parser(parser: Any) -> Any:
     job_cli.add_parsers(subparsers)
     return group
 
-
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
@@ -280,10 +279,12 @@ def _dispatch(ctx: Any, args: Any) -> int:
                     _config(ctx), _client_for(ctx)
                 ),
             )
+        if command == "repo":
+            return job_cli.cmd_repo(ctx, args, state_dir=_state_dir(ctx, args))
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job, repo.",
         )
     except CliError as exc:
         _print_error(exc)

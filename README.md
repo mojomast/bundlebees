@@ -198,6 +198,26 @@ hermes bundlebees job report --job-id job_a --repo /path/to/workflow --verify
 ]
 ```
 
+### Standing repository grants
+
+A human can enroll one repository grant in a real terminal instead of authorizing
+each job. The grant covers bounded implementation work in the whole repository;
+merges, protected pushes, releases, deploys, worker changes, and secret access
+remain explicit human gates. See [docs/repo-grants.md](docs/repo-grants.md).
+
+```bash
+hermes bundlebees repo grant \
+  --repo mojomast/rizzstack-smoke \
+  --max-bees 3 --wall-clock-max 3600 --expires never \
+  --statement "Standing approval for bounded smoke work in rizzstack-smoke."
+hermes bundlebees repo list
+hermes bundlebees repo revoke --repo mojomast/rizzstack-smoke
+```
+
+After a grant exists, `job create` auto-authorizes a matching job and records
+the grant id, statement and approval time in its evidence. Missing, expired,
+revoked, malformed or tampered grants fail closed.
+
 Add `contract_path` and `contract_sha256` to run a task under a frozen `acdd/1` contract; a task that
 declares a contract refuses to dispatch if the file is missing or its hash changed.
 
