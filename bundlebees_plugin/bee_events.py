@@ -59,6 +59,9 @@ from .security import contains_address, looks_like_secret, scrub
 
 __all__ = [
     "SCHEMA",
+    "EVENT_TYPE",
+    "SOURCE",
+    "EVENT_ID_PREFIX",
     "MAX_EVENT_BYTES",
     "MAX_HTTP_BODY_BYTES",
     "EventError",
@@ -78,7 +81,10 @@ __all__ = [
     "dedupe_by_event_id",
 ]
 
-SCHEMA = "rizzstack.bee-landed/1"
+SCHEMA = "rizzstack.bee.landed/1"
+EVENT_TYPE = "rizzstack.bee.landed.v1"
+SOURCE = "rizzstack://bundlebees"
+EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
 DELIVERY_SCHEMA = "rizzstack.bee-delivery/1"
 ACK_SCHEMA = "rizzstack.bee-ack/1"
 SUBSCRIBER_SCHEMA = "rizzstack.bee-subscriber/1"
@@ -111,7 +117,8 @@ _VERIFIED_LOCK = threading.Lock()
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
-_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_EVENT_ID_RE = re.compile(r"^urn:rizzstack:bee-landed:[0-9a-f]{32}$")
+_SOURCE_REV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DIGEST_RE = re.compile(r"^(?:[0-9a-fA-F]{64})$")
 _BACKEND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,63}$")
@@ -203,8 +210,18 @@ def _safe_text(value: Any, name: str, pattern: re.Pattern[str], *, required: boo
         if required:
             raise EventError("event_invalid", f"{name} is required", _FIX_EVENT)
         return None
-    text = value.strip() if isinstance(value, str) else ""
-    if not text or len(text) > MAX_IDENTIFIER or not pattern.match(text):
+    if not isinstance(value, str):
+        raise EventError(
+            "event_invalid",
+            f"{name} is not a safe identifier",
+            "Use only letters, digits, dot, underscore, colon, at, plus or dash.",
+        )
+    text = value.strip()
+    if not text:
+        if required:
+            raise EventError("event_invalid", f"{name} is required", _FIX_EVENT)
+        return None
+    if len(text) > MAX_IDENTIFIER or not pattern.match(text):
         raise EventError(
             "event_invalid",
             f"{name} is not a safe identifier",
@@ -328,17 +345,176 @@ def _attempt_fields(
 
 
 def event_id_for(attempt_id: str, state: str, transition_id: str) -> str:
-    """Deterministic, filesystem-safe event identity.
+    """Return the canonical, deterministic landing-event identity.
 
-    The same attempt/state/transition always maps to the same id, which is what
-    makes recording and delivery idempotent across retries and crashes.
+    The id is ``urn:rizzstack:bee-landed:`` plus the first 32 hex characters of
+    ``sha256("attempt:state:transition")``.  The same facts always map to the
+    same id, which is what makes recording and source acknowledgement
+    idempotent across retries and crashes.
     """
 
     left = _safe_text(attempt_id, "attempt_id", _ID_RE)
     middle = _safe_text(state, "state", _ID_RE)
     right = _safe_text(transition_id, "transition_id", _ID_RE)
-    seed = "\x00".join((left or "", middle or "", right or "")).encode("utf-8")
-    return "evt_" + hashlib.sha256(seed).hexdigest()[:32]
+    seed = ":".join((left or "", middle or "", right or "")).encode("utf-8")
+    return EVENT_ID_PREFIX + hashlib.sha256(seed).hexdigest()[:32]
+
+
+_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]{0,255}$")
+
+
+def _attempt_value(attempt: Any, name: str) -> Any:
+    if isinstance(attempt, Mapping):
+        return attempt.get(name)
+    if attempt is not None and not isinstance(attempt, (str, bytes)):
+        return getattr(attempt, name, None)
+    return None
+
+
+def _canonical_coordinator(
+    value: Any, identity: Any = None, session: Any = None
+) -> dict[str, Any]:
+    ident = identity
+    sess = session
+    if isinstance(value, Mapping):
+        if ident is None:
+            ident = value.get("identity")
+        if sess is None:
+            sess = value.get("session")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if ident is None:
+            ident = getattr(value, "identity", None)
+        if sess is None:
+            sess = getattr(value, "session", None)
+    elif value is not None and ident is None:
+        ident = value
+    ident_text = _safe_text(ident, "coordinator.identity", _ID_RE, required=True)
+    out: dict[str, Any] = {"identity": ident_text}
+    session_text = _safe_text(sess, "coordinator.session", _ID_RE, required=False)
+    if session_text is not None:
+        out["session"] = session_text
+    return out
+
+
+def _canonical_backend(
+    value: Any, harness: Any = None, model: Any = None
+) -> dict[str, Any]:
+    name = harness
+    chosen = model
+    if isinstance(value, Mapping):
+        if name is None:
+            name = value.get("harness")
+        if chosen is None:
+            chosen = value.get("model")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if name is None:
+            name = getattr(value, "harness", None)
+        if chosen is None:
+            chosen = getattr(value, "model", None)
+    elif value is not None and name is None:
+        name = value
+    harness_text = _safe_text(name, "backend.harness", _BACKEND_RE, required=True)
+    out: dict[str, Any] = {"harness": harness_text}
+    model_text = _safe_text(chosen, "backend.model", _BACKEND_RE, required=False)
+    if model_text is not None:
+        out["model"] = model_text
+    return out
+
+
+def _canonical_assigned_files(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
+        raise EventError(
+            "event_invalid",
+            "lease.assigned_files must be a list of repository-relative paths",
+            _FIX_EVENT,
+        )
+    files: list[str] = []
+    for index, item in enumerate(value):
+        text = item.strip() if isinstance(item, str) else ""
+        if (
+            not text
+            or len(text) > 256
+            or not _REPO_PATH_RE.match(text)
+            or text.startswith("/")
+            or _DRIVE_RE.match(text)
+            or "\\" in text
+            or ".." in text.split("/")
+            or any(ord(ch) < 0x20 for ch in text)
+        ):
+            raise EventError(
+                "event_invalid",
+                f"lease.assigned_files[{index}] is not a repository-relative path",
+                _FIX_EVENT,
+            )
+        if looks_like_secret(text) or contains_address(text):
+            raise EventError("event_private", "lease.assigned_files carries private text", _FIX_EVENT)
+        files.append(text)
+    return files
+
+
+def _canonical_lease(
+    value: Any, sha256: Any = None, assigned_files: Any = None
+) -> dict[str, Any]:
+    digest = sha256
+    files = assigned_files
+    if isinstance(value, Mapping):
+        if digest is None:
+            digest = value.get("sha256")
+        if files is None:
+            files = value.get("assigned_files")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if digest is None:
+            digest = getattr(value, "sha256", None)
+        if files is None:
+            files = getattr(value, "assigned_files", None)
+    elif value is not None and digest is None:
+        digest = value
+    return {
+        "sha256": _safe_digest(digest, "lease.sha256", required=True),
+        "assigned_files": _canonical_assigned_files(files),
+    }
+
+
+def _canonical_result(
+    value: Any,
+    available: Any = None,
+    artifact_sha256: Any = None,
+    reference: Any = None,
+) -> dict[str, Any]:
+    present = available
+    artifact = artifact_sha256
+    ref = reference
+    if isinstance(value, Mapping):
+        if present is None:
+            present = value.get("available")
+        if artifact is None:
+            artifact = value.get("artifact_sha256")
+        if ref is None:
+            ref = value.get("reference")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if present is None:
+            present = getattr(value, "available", None)
+        if artifact is None:
+            artifact = getattr(value, "artifact_sha256", None)
+        if ref is None:
+            ref = getattr(value, "reference", None)
+    if present is None:
+        present = artifact is not None or ref is not None
+    if not isinstance(present, bool):
+        raise EventError("event_invalid", "result.available must be a boolean", _FIX_EVENT)
+    out: dict[str, Any] = {"available": present}
+    if artifact is not None:
+        out["artifact_sha256"] = _safe_digest(
+            artifact, "result.artifact_sha256", required=True
+        )
+    if ref is not None:
+        if not isinstance(ref, str) or not ref.strip():
+            raise EventError("event_invalid", "result.reference must be text", _FIX_EVENT)
+        _assert_no_private_text(ref.strip(), "result.reference")
+        out["reference"] = ref.strip()
+    return out
 
 
 def build_event(
@@ -346,18 +522,35 @@ def build_event(
     feature_id: str | None = None,
     job_id: str | None = None,
     task_id: str | None = None,
-    coordinator: str | None = None,
+    coordinator: Any = None,
     lease_sha256: str | None = None,
     artifact_sha256: str | None = None,
     reference: Any = None,
-    backend: str | None = None,
+    backend: Any = None,
     *,
     state: str | None = None,
     transition_id: str | None = None,
     attempt_id: str | None = None,
     now: Any = None,
+    coordinator_identity: str | None = None,
+    coordinator_session: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
+    source_rev: str | None = None,
+    assigned_files: Any = None,
+    lease: Any = None,
+    result: Any = None,
+    result_available: bool | None = None,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build a CloudEvents 1.0 landing event from coordinator facts.
+    """Build the canonical ``rizzstack.bee.landed/1`` CloudEvents envelope.
+
+    The envelope type is ``rizzstack.bee.landed.v1`` and ``data`` carries
+    exactly the canonical landing facts.  Aliases in the signature let older
+    callers supply a coordinator name, backend name, lease digest and artifact
+    fields directly; they are folded into the canonical ``coordinator``,
+    ``backend``, ``lease`` and ``result`` objects and never emitted as extras.
 
     ``attempt`` may be a mapping/object (with ``attempt_id``, ``state`` and
     ``transition_id``) or an attempt id when ``state``/``transition_id`` are
@@ -373,40 +566,82 @@ def build_event(
     attempt_text, state_text, transition_text = _attempt_fields(attempt, state, transition_id)
     event_id = event_id_for(attempt_text, state_text, transition_text)
 
-    feature = _safe_text(feature_id, "feature_id", _ID_RE, required=False)
-    job = _safe_text(job_id, "job_id", _ID_RE, required=False)
-    task = _safe_text(task_id, "task_id", _ID_RE, required=False)
-    coord = _safe_text(coordinator, "coordinator", _ID_RE, required=False)
-    lease = _safe_digest(lease_sha256, "lease_sha256")
-    artifact = _safe_digest(artifact_sha256, "artifact_sha256")
-    back = _safe_text(backend, "backend", _BACKEND_RE, required=False)
+    feature = _safe_text(
+        feature_id if feature_id is not None else _attempt_value(attempt, "feature_id"),
+        "feature_id",
+        _ID_RE,
+        required=False,
+    )
+    job = _safe_text(
+        job_id if job_id is not None else _attempt_value(attempt, "job_id"),
+        "job_id",
+        _ID_RE,
+        required=False,
+    )
+    task = _safe_text(
+        task_id if task_id is not None else _attempt_value(attempt, "task_id"),
+        "task_id",
+        _ID_RE,
+        required=False,
+    )
 
-    if reference is not None and not isinstance(reference, (str, Mapping, list, tuple)):
-        raise EventError("event_invalid", "reference must be text or a small object", _FIX_EVENT)
-    _assert_no_private_text(reference, "reference")
+    coord_value = coordinator if coordinator is not None else _attempt_value(attempt, "coordinator")
+    coord = _canonical_coordinator(coord_value, coordinator_identity, coordinator_session)
+
+    backend_value = backend if backend is not None else _attempt_value(attempt, "backend")
+    back = _canonical_backend(backend_value, harness, model)
+
+    source_rev_value = source_rev
+    if source_rev_value is None:
+        source_rev_value = _attempt_value(attempt, "source_rev")
+    if source_rev_value is None:
+        source_rev_value = _attempt_value(attempt, "base_rev")
+    source = _safe_text(source_rev_value, "source_rev", _SOURCE_REV_RE, required=False)
+
+    lease_value = lease if lease is not None else _attempt_value(attempt, "lease")
+    if lease_sha256 is None:
+        lease_sha256 = _attempt_value(attempt, "lease_sha256")
+    if assigned_files is None:
+        assigned_files = _attempt_value(attempt, "assigned_files")
+    lease_obj = _canonical_lease(lease_value, lease_sha256, assigned_files)
+
+    result_value = result if result is not None else _attempt_value(attempt, "result")
+    if artifact_sha256 is None:
+        artifact_sha256 = _attempt_value(attempt, "artifact_sha256")
+    if reference is None:
+        reference = _attempt_value(attempt, "reference")
+    result_obj = _canonical_result(
+        result_value, result_available, artifact_sha256, reference
+    )
 
     data: dict[str, Any] = {
         "schema": SCHEMA,
-        "attempt_id": attempt_text,
-        "state": state_text,
-        "transition_id": transition_text,
         "feature_id": feature,
         "job_id": job,
         "task_id": task,
+        "attempt_id": attempt_text,
         "coordinator": coord,
-        "lease_sha256": lease,
-        "artifact_sha256": artifact,
-        "reference": reference,
         "backend": back,
+        "state": state_text,
+        "source_rev": source,
+        "lease": lease_obj,
+        "result": result_obj,
     }
+    correlation = _safe_text(
+        correlation_id, "correlation_id", _ID_RE, required=False
+    )
+    causation = _safe_text(causation_id, "causation_id", _ID_RE, required=False)
+    if correlation is not None:
+        data["correlation_id"] = correlation
+    if causation is not None:
+        data["causation_id"] = causation
     _assert_no_private_text(data, "data")
 
     event: dict[str, Any] = {
         "specversion": "1.0",
         "id": event_id,
-        "source": "rizzstack://bundlebees",
-        "type": SCHEMA,
-        "subject": f"attempt/{attempt_text}",
+        "source": SOURCE,
+        "type": EVENT_TYPE,
         "time": _iso(_clock(now)),
         "datacontenttype": "application/json",
         "data": data,
@@ -469,6 +704,45 @@ def _validate_event_time(value: Any) -> None:
         raise EventError("event_invalid", "time must be an ISO-8601 timestamp", _FIX_EVENT) from exc
 
 
+_ENVELOPE_KEYS = {
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "subject",
+    "dataschema",
+    "data",
+}
+_DATA_KEYS = {
+    "schema",
+    "feature_id",
+    "job_id",
+    "task_id",
+    "attempt_id",
+    "coordinator",
+    "backend",
+    "state",
+    "source_rev",
+    "lease",
+    "result",
+    "correlation_id",
+    "causation_id",
+}
+_DATA_REQUIRED = _DATA_KEYS - {"correlation_id", "causation_id"}
+
+
+def _reject_extra(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
+    extras = sorted(str(key) for key in value if key not in allowed)
+    if extras:
+        raise EventError(
+            "event_invalid",
+            f"{where} has unexpected field(s): {', '.join(extras)}",
+            "Emit exactly the canonical landing shape.",
+        )
+
+
 def _validate_event_local(event: Any) -> dict[str, Any]:
     value = _event_mapping(event)
     payload = _canonical(value)
@@ -479,10 +753,11 @@ def _validate_event_local(event: Any) -> dict[str, Any]:
             "Keep free-form references and notes small; the outbox is metadata, not a log.",
         )
 
+    _reject_extra(value, _ENVELOPE_KEYS, "envelope")
     if value.get("specversion") != "1.0":
         raise EventError("event_invalid", "specversion must be 1.0", _FIX_EVENT)
-    if value.get("type") != SCHEMA:
-        raise EventError("event_invalid", f"type must be {SCHEMA}", _FIX_EVENT)
+    if value.get("type") != EVENT_TYPE:
+        raise EventError("event_invalid", f"type must be {EVENT_TYPE}", _FIX_EVENT)
     source = value.get("source")
     _validate_source(source)
     _safe_event_id(value.get("id"))
@@ -493,32 +768,83 @@ def _validate_event_local(event: Any) -> dict[str, Any]:
     data = value.get("data")
     if not isinstance(data, Mapping):
         raise EventError("event_invalid", "data must be an object", _FIX_EVENT)
+    _reject_extra(data, _DATA_KEYS, "data")
+    missing = sorted(_DATA_REQUIRED - set(data))
+    if missing:
+        raise EventError(
+            "event_invalid",
+            f"data is missing canonical field(s): {', '.join(missing)}",
+            _FIX_EVENT,
+        )
     if data.get("schema") != SCHEMA:
         raise EventError("event_invalid", f"data.schema must be {SCHEMA}", _FIX_EVENT)
 
-    attempt, state_text, transition = _attempt_fields(
-        data.get("attempt_id"), data.get("state"), data.get("transition_id")
-    )
-    expected = event_id_for(attempt, state_text, transition)
-    if value.get("id") != expected:
-        raise EventError(
-            "event_id_mismatch",
-            "event id does not match attempt/state/transition",
-            "Do not edit an event id; rebuild the event.",
-        )
-    if data.get("event_id") not in (None, expected):
-        raise EventError("event_id_mismatch", "data.event_id does not match the envelope id", _FIX_EVENT)
-
-    for name in ("feature_id", "job_id", "task_id", "coordinator", "backend"):
+    _safe_text(data.get("attempt_id"), "attempt_id", _ID_RE, required=True)
+    _safe_text(data.get("state"), "state", _ID_RE, required=True)
+    for name in ("feature_id", "job_id", "task_id"):
         item = data.get(name)
         if item is not None and not isinstance(item, str):
             raise EventError("event_invalid", f"data.{name} must be text or null", _FIX_EVENT)
-    _safe_digest(data.get("lease_sha256"), "lease_sha256")
-    _safe_digest(data.get("artifact_sha256"), "artifact_sha256")
+        if item is not None:
+            _safe_text(item, name, _ID_RE, required=False)
+    source_rev = data.get("source_rev")
+    if source_rev is not None:
+        _safe_text(source_rev, "source_rev", _SOURCE_REV_RE, required=False)
 
-    subject = value.get("subject")
-    if subject is not None and (not isinstance(subject, str) or len(subject) > 256):
-        raise EventError("event_invalid", "subject is not safe text", _FIX_EVENT)
+    coordinator = data.get("coordinator")
+    if not isinstance(coordinator, Mapping):
+        raise EventError("event_invalid", "data.coordinator must be an object", _FIX_EVENT)
+    _reject_extra(coordinator, {"identity", "session"}, "data.coordinator")
+    _safe_text(coordinator.get("identity"), "coordinator.identity", _ID_RE, required=True)
+    if coordinator.get("session") is not None:
+        _safe_text(coordinator.get("session"), "coordinator.session", _ID_RE, required=False)
+
+    backend = data.get("backend")
+    if not isinstance(backend, Mapping):
+        raise EventError("event_invalid", "data.backend must be an object", _FIX_EVENT)
+    _reject_extra(backend, {"harness", "model"}, "data.backend")
+    _safe_text(backend.get("harness"), "backend.harness", _BACKEND_RE, required=True)
+    if backend.get("model") is not None:
+        _safe_text(backend.get("model"), "backend.model", _BACKEND_RE, required=False)
+
+    lease = data.get("lease")
+    if not isinstance(lease, Mapping):
+        raise EventError("event_invalid", "data.lease must be an object", _FIX_EVENT)
+    _reject_extra(lease, {"sha256", "assigned_files"}, "data.lease")
+    _safe_digest(lease.get("sha256"), "lease.sha256", required=True)
+    if not isinstance(lease.get("assigned_files"), (list, tuple)):
+        raise EventError(
+            "event_invalid", "lease.assigned_files must be a list", _FIX_EVENT
+        )
+    if _canonical_assigned_files(lease.get("assigned_files")) != list(
+        lease.get("assigned_files")
+    ):
+        raise EventError(
+            "event_invalid",
+            "lease.assigned_files contains a non-canonical path",
+            _FIX_EVENT,
+        )
+
+    result = data.get("result")
+    if not isinstance(result, Mapping):
+        raise EventError("event_invalid", "data.result must be an object", _FIX_EVENT)
+    _reject_extra(
+        result, {"available", "artifact_sha256", "reference"}, "data.result"
+    )
+    if not isinstance(result.get("available"), bool):
+        raise EventError("event_invalid", "result.available must be a boolean", _FIX_EVENT)
+    if result.get("artifact_sha256") is not None:
+        _safe_digest(result.get("artifact_sha256"), "result.artifact_sha256", required=True)
+    if result.get("reference") is not None:
+        ref = result.get("reference")
+        if not isinstance(ref, str) or not ref.strip():
+            raise EventError("event_invalid", "result.reference must be text", _FIX_EVENT)
+        _assert_no_private_text(ref, "result.reference")
+
+    for name in ("correlation_id", "causation_id"):
+        item = data.get(name)
+        if item is not None:
+            _safe_text(item, name, _ID_RE, required=False)
 
     _assert_no_private_text(data, "data")
     for key, item in value.items():
@@ -539,6 +865,12 @@ def _workflow_schema_path() -> Path:
     root = Path(raw).expanduser()
     names = (
         "bee-landed.schema.json",
+        "bee.landed.schema.json",
+        "bee-landed.v1.schema.json",
+        "rizzstack.bee.landed.schema.json",
+        "rizzstack-bee-landed.schema.json",
+        "landed.schema.json",
+        "bee.landed.v1.schema.json",
         "bee-landed-event.schema.json",
         "bee_landed.schema.json",
         "bee-events.schema.json",
