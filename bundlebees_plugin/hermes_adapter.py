@@ -1986,3 +1986,201 @@ def adopt_proposal(
             recovery.request_ordinal(state, request_id),
         )),
     }
+
+
+# ---------------------------------------------------------------------------
+# Coordinator notification: use a documented continuation, never an invented
+# gateway API
+# ---------------------------------------------------------------------------
+
+
+def notify_coordinator(
+    event: Mapping[str, Any], *, runner: Any = None, session: str | None = None
+) -> dict[str, Any]:
+    """Deliver one landing event to an existing Hermes session, or refuse.
+
+    Hermes has no documented "notify" gateway API.  It does document session
+    continuation (``--resume <session>`` / ``--continue``), so this adapter
+    probes the installed CLI's own help output for one of those flags and then
+    runs the documented one-shot continuation.  It never guesses a port, a
+    socket, a webhook or a gateway endpoint.
+
+    ``session`` is the coordinator session the caller intends to notify.  When
+    the event names a session too, a mismatch is refused: a notification may
+    not be delivered to an unrelated conversation.  ``runner`` is the same
+    injection seam used by :func:`invoke_hermes`; when no runner is supplied the
+    installed CLI is probed and invoked directly.
+
+    Failure is closed.  A missing binary, a help output without a continuation
+    flag, a timeout or a non-zero exit all raise :class:`ProposalError`; none
+    of them returns a record that claims the notification was sent.
+    """
+
+    if not isinstance(event, Mapping):
+        raise ProposalError(
+            "hermes_notification_invalid", "the event is not a mapping", _FIX
+        )
+
+    def first_text(*values: Any) -> str:
+        for value in values:
+            if isinstance(value, Mapping):
+                value = value.get("id") or value.get("session_id") or value.get("name")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    event_session = first_text(
+        event.get("session_id"),
+        event.get("session"),
+        event.get("coordinator_session"),
+        event.get("target_session"),
+        event.get("target"),
+    )
+    target = str(session).strip() if session is not None else ""
+    if target and event_session and target != event_session:
+        raise ProposalError(
+            "hermes_session_mismatch",
+            f"the event is for session {event_session!r}, not the requested {target!r}",
+            "Refuse: a notification to an unrelated session is not this event's continuation.",
+        )
+    target = target or event_session
+    if not target:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "neither the event nor the caller names a coordinator session",
+            "Pass session=<Hermes session id> or include session_id on the event.",
+        )
+
+    raw_message = event.get("message")
+    if raw_message in (None, ""):
+        raw_message = event.get("text")
+    if raw_message in (None, ""):
+        raw_message = event.get("summary")
+    if raw_message in (None, ""):
+        raw_message = json.dumps(dict(event), sort_keys=True, ensure_ascii=True)
+    message = str(raw_message)
+    if not message.strip():
+        raise ProposalError(
+            "hermes_notification_invalid", "the event has no message to deliver", _FIX
+        )
+    if len(message) > _MAX_PROMPT:
+        raise ProposalError(
+            "hermes_notification_too_large",
+            f"the notification is {len(message)} characters",
+            _FIX,
+        )
+
+    binary = str(os.environ.get("HERMES_BIN") or "").strip()
+    if not binary:
+        binary = str(shutil.which("hermes") or "").strip()
+    if not binary and runner is None:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "the hermes CLI is not on PATH, so no documented continuation command exists",
+            "Install Hermes or set HERMES_BIN; this adapter does not invent a gateway API.",
+        )
+    binary = binary or "hermes"
+
+    def invoke(argv: list[str], *, timeout_s: int) -> tuple[int | None, bytes, bytes]:
+        if runner is not None:
+            kwargs: dict[str, Any] = {"timeout_s": timeout_s, "prompt": "", "cwd": Path.cwd()}
+            if _runner_accepts_env(runner):
+                kwargs["env"] = dict(os.environ)
+            done = runner(argv, **kwargs)
+            return _completed_parts(done)
+        try:
+            done = subprocess.run(
+                argv,
+                capture_output=True,
+                text=False,
+                timeout=timeout_s,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            out = getattr(exc, "stdout", None) or getattr(exc, "output", None) or b""
+            err = getattr(exc, "stderr", None) or b""
+            if isinstance(out, str):
+                out = out.encode("utf-8")
+            if isinstance(err, str):
+                err = err.encode("utf-8")
+            return None, out, err
+        return done.returncode, done.stdout or b"", done.stderr or b""
+
+    resume_flag = ""
+    help_text = ""
+    for probe in ([binary, "--help"], [binary, "chat", "--help"]):
+        try:
+            rc, out, err = invoke(probe, timeout_s=15)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise ProposalError(
+                "hermes_notification_unavailable",
+                f"the Hermes CLI cannot be probed: {type(exc).__name__}: {_diagnostic(exc)}",
+                "Refuse: an unprobed continuation command is not a notification path.",
+            ) from exc
+        text = (out + b"\n" + err).decode("utf-8", "replace")
+        short_resume = re.search(r"(?:^|\s)-r(?:\s|,|=|$)", text) is not None
+        short_continue = re.search(r"(?:^|\s)-c(?:\s|,|=|$)", text) is not None
+        if rc == 0 and any(
+            token in text for token in ("--resume", "--continue")
+        ) or (rc == 0 and short_resume) or (rc == 0 and short_continue):
+            help_text = text
+            if "--resume" in text:
+                resume_flag = "--resume"
+            elif short_resume:
+                resume_flag = "-r"
+            elif "--continue" in text:
+                resume_flag = "--continue"
+            else:
+                resume_flag = "-c"
+            break
+    if not resume_flag:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "the installed Hermes CLI does not document a session continuation command",
+            "Probe `hermes --help` and `hermes chat --help`; do not invent a gateway API.",
+        )
+
+    argv = [binary, "chat", resume_flag, target, "-Q", "-q", message]
+    started = time.monotonic()
+    try:
+        rc, out, err = invoke(argv, timeout_s=DEFAULT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the documented continuation cannot be started: {type(exc).__name__}: {_diagnostic(exc)}",
+            _FIX,
+        ) from exc
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if rc is None:
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the documented continuation did not finish within {DEFAULT_TIMEOUT_S}s",
+            _FIX,
+        )
+    if rc != 0:
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the documented continuation exited {rc}: {_diagnostic(err)}",
+            _FIX,
+        )
+
+    message_bytes = message.encode("utf-8")
+    public_argv = [*argv[:-1], f"<message sha256={hashlib.sha256(message_bytes).hexdigest()} "
+                   f"bytes={len(message_bytes)}>"]
+    return {
+        "schema": "rizzstack.hermes-notification/1",
+        "sent": True,
+        "delivered": True,
+        "ok": True,
+        "event_id": first_text(event.get("event_id"), event.get("id")),
+        "session": target,
+        "continuation": resume_flag,
+        "command": public_argv,
+        "exit_code": rc,
+        "elapsed_ms": elapsed_ms,
+        "probing_help": bool(help_text),
+        "stdout_bytes": len(out),
+        "stdout_sha256": hashlib.sha256(out).hexdigest(),
+        "stderr_bytes": len(err),
+        "stderr_sha256": hashlib.sha256(err).hexdigest(),
+    }
