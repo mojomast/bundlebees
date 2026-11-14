@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
+from . import hermes_adapter
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -94,6 +95,10 @@ def recover(
     *,
     decision_file: Any = None,
     adapter: Any = None,
+    hermes: bool = False,
+    hermes_timeout: int = 300,
+    hermes_model: str | None = None,
+    hermes_provider: str | None = None,
     now: Any = None,
 ) -> dict[str, Any]:
     """Crash-adopt an accepted wave and handle the recovery request.
@@ -123,6 +128,7 @@ def recover(
 
     requests = recovery.list_requests(state_dir, job_id)
     recorded: list[dict[str, Any]] = []
+    proposals: list[str] = []
     if decision_file is not None:
         try:
             payload = json.loads(Path(str(decision_file)).read_text(encoding="utf-8"))
@@ -139,6 +145,27 @@ def recover(
         recorded.append(recovery.record_decision(
             state_dir, target, payload, adapter=str(payload.get("adapter") or "file"), now=now,
         ))
+    elif hermes:
+        if repo is None:
+            raise JobCliError(
+                "repo_required",
+                "--hermes needs --repo: the evidence package quotes the contract's files at the pinned revision",
+                "Pass the repository the job targets; no model is asked without its evidence.",
+            )
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            outcome = hermes_adapter.decide_with_hermes(
+                state_dir,
+                str(request["request_id"]),
+                repo=Path(repo),
+                timeout_s=hermes_timeout,
+                model=hermes_model,
+                provider=hermes_provider,
+                now=now,
+            )
+            proposals.append(str(outcome["proposal"]))
+            recorded.append(outcome["decision"])
     elif adapter is not None:
         for request in requests:
             if recovery.read_decision(state_dir, request) is not None:
@@ -170,6 +197,7 @@ def recover(
         "request": outstanding,
         "requests": summary["requests"],
         "decisions_recorded": recorded,
+        "proposals": proposals,
         "supersessions": summary["supersessions"],
     }
 
@@ -730,6 +758,14 @@ def add_parsers(subparsers: Any) -> None:
                         help="JSON decision to validate and record against its request.")
     choice.add_argument("--deterministic", action="store_true",
                         help="Record the deterministic adapter's decision for every outstanding request.")
+    choice.add_argument("--hermes", action="store_true",
+                        help="Ask the configured Hermes model for one strict JSON proposal per outstanding "
+                             "request; the pinned validator still decides whether it may be recorded.")
+    rec.add_argument("--hermes-timeout", type=int, default=300,
+                     help="Seconds one Hermes proposal turn may take (default 300); a timeout decides nothing.")
+    rec.add_argument("--hermes-model", default=None, help="Model for --hermes (default: the configured one).")
+    rec.add_argument("--hermes-provider", default=None,
+                     help="Provider for --hermes (default: the configured one).")
     rec.set_defaults(command="job", job_handler="recover")
 
     rep = sub.add_parser("report", help="Write and print the job acceptance report plus its RETURN packet.")
@@ -873,6 +909,10 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                 Path(args.repo) if getattr(args, "repo", None) else None,
                 decision_file=getattr(args, "decision_file", None),
                 adapter="deterministic" if getattr(args, "deterministic", False) else None,
+                hermes=bool(getattr(args, "hermes", False)),
+                hermes_timeout=int(getattr(args, "hermes_timeout", 300) or 300),
+                hermes_model=getattr(args, "hermes_model", None),
+                hermes_provider=getattr(args, "hermes_provider", None),
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
