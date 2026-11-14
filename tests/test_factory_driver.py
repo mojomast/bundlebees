@@ -360,3 +360,37 @@ def test_stack_manifest_records_the_pinned_versions():
     assert 'git -C "$HYVV_SRC" rev-parse HEAD' in text
     assert 'git -C "$BUNDLEBEES_SRC" rev-parse HEAD' in text
     assert "python3 --version" in text
+
+
+def test_busy_session_defers_the_wake_without_consuming_handler_attempts(tmp_path: Path, monkeypatch):
+    state = tmp_path / "state"
+    outbox = tmp_path / "outbox"
+    state.mkdir()
+    lease_record = _lease(state)
+    _subscribe(state)
+    _job(state)
+    queue_path = _queue_file(tmp_path, {
+        "f1": {"repo": "mojomast/smoke-real", "job_id": JOB, "title": "busy", "status": "queued"},
+    })
+    driver = factory_driver.FactoryDriver(
+        state, queue_path, tick=FakeWorker(outbox, lease_record),
+        launcher_outbox=outbox, subscribers=["coordinator"], startup=False,
+    )
+    driver.wake.request_wake("session-1")
+    active = driver.wake.begin_turn("session-1")
+    assert active["started"] is True
+
+    first = driver.run_pass()
+    assert first["events"][0]["state"] == "acked"
+    assert first["wake_delivery"] == []
+    assert driver.wake.status("session-1")["pending"] is True
+
+    driver.wake.finish_turn("session-1", active["turn"])
+    calls = []
+    monkeypatch.setattr(factory_driver.hermes_adapter, "notify_coordinator",
+                        lambda event, **kw: (calls.append(event["id"]) or
+                                             {"event_id": event["id"], "delivered": True}))
+    second = driver.run_pass()
+    assert second["wake_delivery"][0]["delivered"] is True
+    assert len(calls) == 1
+    assert driver.wake.status("session-1")["pending"] is False

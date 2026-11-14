@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
 
 from . import bee_events
 from . import job_cli
+from . import hermes_adapter
 from . import event_consumer
 from . import job as jobs
 from . import landing_bridge
@@ -337,6 +338,18 @@ class WakeCoalescer:
                 "pending": bool(saved["pending"]),
                 "coalesced": int(saved["coalesced"]),
             }
+
+    def release_turn(self, session: Any, turn: Any) -> dict[str, Any]:
+        """Clear an active turn without advancing the cursor (delivery failed)."""
+        name = _safe_session(session)
+        with _locked(self._lock_path(name)):
+            record = self._load(name)
+            active = record.get("active") if isinstance(record.get("active"), Mapping) else None
+            if active is not None and str(active.get("turn")) == str(turn):
+                record["active"] = None
+                self._save(name, record)
+            record["pending"] = int(record["generation"]) > int(record["cursor"])
+            return record
 
     def status(self, session: Any) -> dict[str, Any]:
         name = _safe_session(session)
@@ -736,6 +749,11 @@ class FactoryDriver:
             session = _session_of(event, subscriber)
             wake = self.wake.request_wake(session, now=self.now)
             result = deterministic_handler(self.state, event, now=self.now)
+            wake_events = self.state / "factory" / "wake-events"
+            wake_events.mkdir(parents=True, exist_ok=True)
+            tmp = wake_events / f"{session}.tmp"
+            tmp.write_text(json.dumps(event, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, wake_events / f"{session}.json")
             result["session"] = session
             result["generation"] = int(wake.get("generation") or 0)
             result["deferred"] = bool(wake.get("active"))
@@ -776,6 +794,40 @@ class FactoryDriver:
                 work_scheduler.complete(self.state, work_id, owner="factory-driver")
             except Exception:  # noqa: BLE001
                 pass
+
+    def _deliver_wakes(self) -> list[dict[str, Any]]:
+        """Deliver one coalesced wake per due session through the real adapter."""
+        results: list[dict[str, Any]] = []
+        sessions = self.wake.sessions() or self.subscribers_for_pass()
+        for session in sessions:
+            status = self.wake.status(session)
+            if not status.get("due"):
+                continue
+            turn = self.wake.begin_turn(session, now=self.now)
+            if not turn.get("started"):
+                continue
+            try:
+                event_path = self.state / "factory" / "wake-events" / f"{session}.json"
+                event = json.loads(event_path.read_text(encoding="utf-8"))
+                delivered = hermes_adapter.notify_coordinator(
+                    event,
+                    endpoint=os.environ.get("HERMES_API_URL") or None,
+                    api_key=os.environ.get("HERMES_API_KEY") or None,
+                    session=session,
+                    state_dir=self.state,
+                    timeout_s=float(os.environ.get("HERMES_WAKE_TIMEOUT_S") or 60.0),
+                )
+                finished = self.wake.finish_turn(session, turn.get("turn"), now=self.now)
+                results.append({"session": session, "delivered": True,
+                                "event_id": delivered.get("event_id"),
+                                "pending": bool(finished.get("pending"))})
+            except Exception as exc:  # noqa: BLE001 - durable wake remains pending
+                self.wake.release_turn(session, turn.get("turn"))
+                results.append({"session": session, "delivered": False,
+                                "error": type(exc).__name__,
+                                "code": str(getattr(exc, "code", "") or ""),
+                                "pending": True})
+        return results
 
     def _advance_event_work(self, event_results: list[dict[str, Any]]) -> None:
         """Drive authoritative job progress for landed work, then sync scheduler."""
@@ -857,6 +909,7 @@ class FactoryDriver:
 
         self._advance_event_work(event_results)
         self._advance_ready_work()
+        wake_results = self._deliver_wakes()
 
         try:
             ready = work_scheduler.ready_items(self.state)
@@ -877,6 +930,7 @@ class FactoryDriver:
             "ready": [entry["work_id"] for entry in ready],
             "ready_items": ready,
             "wake": [self.wake.status(name) for name in self.subscribers_for_pass()],
+            "wake_delivery": wake_results,
             "idle": idle,
             "inference": 0,
             "model_calls": 0,
