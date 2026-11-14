@@ -93,33 +93,63 @@ to an operator.
 ## Hermes notification adapter
 
 ```python
-notify_coordinator(event, *, runner=None, session=None)
+notify_coordinator(
+    event,
+    *,
+    endpoint=None,
+    api_key=None,
+    session=None,
+    runner=None,
+    timeout_s=60,
+)
 ```
 
-Hermes has no documented "send a coordinator notification" gateway API, so this
-adapter does not invent one. It probes the installed CLI's own help output for a
-documented session continuation (`--resume` / `--continue`) and invokes the
-documented one-shot form:
+For a stateless / API-server session the documented resume is the gateway wake
+path from Hermes `gateway/wake.py`, not a CLI continuation flag. The adapter
+sends exactly one request:
 
 ```
-hermes chat --resume <session> -Q -q <message>
+POST <endpoint>/v1/chat/completions
+Authorization: Bearer <key>
+X-Hermes-Session-Id: <raw session id>
+Content-Type: application/json
+
+{"model": "hermes-agent",
+ "messages": [{"role": "user", "content": "<sanitized event message>"}],
+ "stream": false}
 ```
 
-or `--continue` when that is the flag the installed CLI documents.
+`endpoint` defaults to `HERMES_API_URL` and `api_key` to `HERMES_API_KEY`.
+Neither value is logged, returned, or included in a refusal message. The
+configured `session` (or, when omitted, the event's own session) must equal the
+event's session; a mismatch is refused before any request is made.
+
+The request body carries only an allowlisted projection of the event:
+`event_id`, `type`, `job_id`, `task_id`, `attempt_id`, `state`, `source_rev`
+and `result_reference`. Arbitrary event fields — messages, tokens, credentials,
+private paths — are never forwarded. Values are additionally scrubbed: secret
+shapes (`sk-…`, `Bearer …`, `token=…`) become `<redacted>` and absolute POSIX or
+Windows paths collapse to their basename. The content is a compact JSON object.
 
 The adapter fails closed:
 
-* no `hermes` binary / `HERMES_BIN` and no probe seam: `ProposalError`
+* no `HERMES_API_URL` (or `endpoint` argument):
   `hermes_notification_unavailable`;
-* help output with no continuation flag: `hermes_notification_unavailable`;
-* event session differs from the requested coordinator session:
+* no `HERMES_API_KEY` (or `api_key` argument):
+  `hermes_notification_unavailable`;
+* non-http(s) endpoint: `hermes_notification_unavailable`;
+* event session differs from the configured session:
   `hermes_session_mismatch`;
-* timeout or non-zero continuation exit: `hermes_notification_failed`.
+* non-2xx gateway status, timeout, or transport error:
+  `hermes_notification_failed`.
 
-No refusal returns a record claiming `sent: true`. On success the result carries
-only the public command (the message is replaced by its digest), the session,
-the continuation flag, exit code and bounded stream digests.
+No refusal returns a record claiming `sent: true` or `delivered: true`. On
+success the result carries only delivery metadata: schema, session, transport,
+path, model, HTTP status, elapsed time, timeout, and message/response byte
+counts and digests. It never carries the endpoint, the key, or an authorization
+header.
 
-`runner` is the same injection seam used by `invoke_hermes`; tests use it to
-simulate a missing CLI, a CLI with no continuation support, and a failed
-continuation without touching the network.
+`runner` is an optional transport seam with the signature
+`runner(url, *, headers, body, timeout_s) -> (status, body)`. Tests use it for
+transport-level timeouts; most tests use a loopback HTTP server to prove the
+wire format without touching an external service.

@@ -11,14 +11,18 @@ exists for:
   bounded;
 * an event addressed to another subscriber is never claimed;
 * replay is explicit and gives one more handling decision;
-* the Hermes notification adapter refuses when no documented continuation
-  command can be probed, and never reports success for a refused session.
+* the Hermes notification adapter wakes a stateless session through the
+  documented gateway chat-completions endpoint, fails closed without an
+  endpoint/key or on a non-2xx/timeout, and never leaks credentials.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
+import logging
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -360,102 +364,360 @@ def test_the_consumer_writes_only_inbox_and_acks(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The notification adapter fails closed
+# The notification adapter uses the documented gateway wake path
 # ---------------------------------------------------------------------------
 
 
-class GatewayRunner:
-    """A fake installed CLI that documents (or does not document) continuation."""
+class RecordingGateway:
+    """A loopback HTTP server that records one wake request and answers it."""
 
-    def __init__(
-        self,
-        *,
-        help_text: bytes = b"usage: hermes [--resume SESSION] [--continue]\n",
-        help_returncode: int = 0,
-        continuation_returncode: int = 0,
-    ) -> None:
-        self.help_text = help_text
-        self.help_returncode = help_returncode
-        self.continuation_returncode = continuation_returncode
-        self.calls: list[list[str]] = []
+    def __init__(self, *, status: int = 200, delay: float = 0.0, response: bytes = b'{"ok":true}') -> None:
+        self.status = status
+        self.delay = delay
+        self.response = response
+        self.requests: list[dict] = []
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.url = ""
 
-    def __call__(self, argv, *, timeout_s, prompt, cwd):
-        self.calls.append(list(argv))
-        if "--help" in argv:
-            return subprocess.CompletedProcess(
-                argv, self.help_returncode, stdout=self.help_text, stderr=b""
-            )
-        return subprocess.CompletedProcess(
-            argv, self.continuation_returncode, stdout=b"", stderr=b""
-        )
+    def __enter__(self) -> "RecordingGateway":
+        gateway = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length)
+                gateway.requests.append(
+                    {
+                        "path": self.path,
+                        "headers": dict(self.headers.items()),
+                        "body": body,
+                    }
+                )
+                if gateway.delay:
+                    time.sleep(gateway.delay)
+                try:
+                    self.send_response(gateway.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(gateway.response)))
+                    self.end_headers()
+                    self.wfile.write(gateway.response)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args) -> None:  # noqa: D401 - silence the test server
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        return self
+
+    def __exit__(self, *exc) -> None:
+        assert self.server is not None
+        self.server.shutdown()
+        self.server.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
 
 
-def test_missing_hermes_gateway_is_a_not_run_refusal(tmp_path, monkeypatch):
-    monkeypatch.delenv("HERMES_BIN", raising=False)
-    monkeypatch.setattr(adapter.shutil, "which", lambda name: None)
+def wake_event(**overrides) -> dict:
+    event = {
+        "event_id": "evt-1",
+        "type": "landing",
+        "session_id": "coordinator-session",
+        "job_id": "job-1",
+        "task_id": "task-1",
+        "attempt_id": "attempt-1",
+        "state": "landed",
+        "source_rev": "deadbeef",
+        "result_reference": "recovery/job-1/task-1.1.proposal.json",
+        "message": "landed",
+        "token": "event-token-should-never-be-sent",
+        "private_path": "/home/cua/private/state",
+    }
+    event.update(overrides)
+    return event
 
-    with pytest.raises(adapter.ProposalError) as caught:
-        adapter.notify_coordinator(
-            {"event_id": "evt-1", "session_id": "coordinator-session", "message": "landed"}
-        )
 
-    assert caught.value.code == "hermes_notification_unavailable"
-    assert "gateway api" in caught.value.fix.lower()
+def test_notification_posts_to_the_gateway_wake_endpoint(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
 
-
-def test_notification_refuses_an_unrelated_session(tmp_path):
-    runner = GatewayRunner()
-
-    with pytest.raises(adapter.ProposalError) as caught:
-        adapter.notify_coordinator(
-            {"event_id": "evt-1", "session_id": "someone-else", "message": "landed"},
-            runner=runner,
+    with RecordingGateway() as gateway:
+        result = adapter.notify_coordinator(
+            wake_event(),
+            endpoint=gateway.url,
+            api_key="test-key",
             session="coordinator-session",
         )
 
+    assert result["sent"] is True
+    assert result["delivered"] is True
+    assert result["transport"] == "gateway"
+    assert result["path"] == "/v1/chat/completions"
+    assert result["status"] == 200
+    assert result["event_id"] == "evt-1"
+    assert result["session"] == "coordinator-session"
+
+    assert len(gateway.requests) == 1
+    request = gateway.requests[0]
+    assert request["path"] == "/v1/chat/completions"
+    headers = {key.lower(): value for key, value in request["headers"].items()}
+    assert headers["x-hermes-session-id"] == "coordinator-session"
+    assert headers["authorization"] == "Bearer test-key"
+    body = json.loads(request["body"])
+    assert body["stream"] is False
+    assert body["model"]
+    assert body["messages"][0]["role"] == "user"
+    content = json.loads(body["messages"][0]["content"])
+    assert content["event_id"] == "evt-1"
+    assert content["type"] == "landing"
+
+
+def test_notification_reads_endpoint_and_key_from_the_environment(monkeypatch):
+    with RecordingGateway() as gateway:
+        monkeypatch.setenv("HERMES_API_URL", gateway.url)
+        monkeypatch.setenv("HERMES_API_KEY", "environment-key")
+        result = adapter.notify_coordinator(wake_event(), session="coordinator-session")
+
+    assert result["sent"] is True
+    assert len(gateway.requests) == 1
+    headers = {key.lower(): value for key, value in gateway.requests[0]["headers"].items()}
+    assert headers["authorization"] == "Bearer environment-key"
+
+
+def test_a_non_2xx_gateway_response_is_never_sent(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    with RecordingGateway(status=503) as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                wake_event(),
+                endpoint=gateway.url,
+                api_key="test-key",
+                session="coordinator-session",
+            )
+
+    assert caught.value.code == "hermes_notification_failed"
+    assert "503" in caught.value.message
+    assert len(gateway.requests) == 1
+
+
+def test_a_timed_out_gateway_request_is_never_sent(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    with RecordingGateway(delay=0.5) as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                wake_event(),
+                endpoint=gateway.url,
+                api_key="test-key",
+                session="coordinator-session",
+                timeout_s=0.1,
+            )
+
+    assert caught.value.code == "hermes_notification_failed"
+    assert "did not answer" in caught.value.message
+    assert len(gateway.requests) == 1
+
+
+def test_notification_refuses_an_unrelated_session(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    with RecordingGateway() as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                wake_event(session_id="someone-else"),
+                endpoint=gateway.url,
+                api_key="test-key",
+                session="coordinator-session",
+            )
+
     assert caught.value.code == "hermes_session_mismatch"
-    assert runner.calls == []
+    assert gateway.requests == []
 
 
-def test_notification_without_a_documented_continuation_refuses(tmp_path):
-    runner = GatewayRunner(help_text=b"usage: hermes [--version] [--help]\n")
+def test_configured_session_requires_an_event_session(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    with RecordingGateway() as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                wake_event(session_id=""),
+                endpoint=gateway.url,
+                api_key="test-key",
+                session="coordinator-session",
+            )
+
+    assert caught.value.code == "hermes_session_mismatch"
+    assert gateway.requests == []
+
+
+def test_missing_endpoint_is_a_not_run_refusal(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.notify_coordinator(wake_event(), session="coordinator-session")
+
+    assert caught.value.code == "hermes_notification_unavailable"
+    assert "HERMES_API_URL" in caught.value.message
+
+
+def test_missing_key_is_a_not_run_refusal(monkeypatch):
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
 
     with pytest.raises(adapter.ProposalError) as caught:
         adapter.notify_coordinator(
-            {"event_id": "evt-1", "session_id": "coordinator-session", "message": "landed"},
-            runner=runner,
+            wake_event(),
+            endpoint="http://127.0.0.1:1",
+            session="coordinator-session",
         )
 
     assert caught.value.code == "hermes_notification_unavailable"
-    assert all("--resume" not in call and "--continue" not in call for call in runner.calls)
+    assert "HERMES_API_KEY" in caught.value.message
 
 
-def test_notification_uses_the_documented_continuation(tmp_path):
-    runner = GatewayRunner()
+def test_a_non_http_endpoint_is_refused(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.notify_coordinator(
+            wake_event(),
+            endpoint="file:///tmp/socket",
+            api_key="test-key",
+            session="coordinator-session",
+        )
+
+    assert caught.value.code == "hermes_notification_unavailable"
+    assert "http(s)" in caught.value.message
+
+
+def test_the_payload_contains_only_sanitized_event_fields(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    event = wake_event(
+        message="secret happened at /home/cua/private/state and token=do-not-send",
+        token="event-token-should-never-be-sent",
+        private_path="/home/cua/private/state",
+        result_reference="/home/cua/private/result.json",
+    )
+    with RecordingGateway() as gateway:
+        adapter.notify_coordinator(
+            event,
+            endpoint=gateway.url,
+            api_key="test-key",
+            session="coordinator-session",
+        )
+
+    raw_body = gateway.requests[0]["body"]
+    body = json.loads(raw_body)
+    content_text = body["messages"][0]["content"]
+    content = json.loads(content_text)
+
+    assert set(content) == {
+        "event_id",
+        "type",
+        "job_id",
+        "task_id",
+        "attempt_id",
+        "state",
+        "source_rev",
+        "result_reference",
+    }
+    assert content["event_id"] == "evt-1"
+    assert content["result_reference"] == "result.json"
+    assert "event-token-should-never-be-sent" not in raw_body.decode("utf-8")
+    assert "/home/cua" not in raw_body.decode("utf-8")
+    assert "private_path" not in content_text
+    assert "do-not-send" not in raw_body.decode("utf-8")
+
+
+def test_successful_delivery_does_not_log_or_return_credentials(monkeypatch, caplog):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    caplog.set_level(logging.DEBUG)
+    key = "sk-live-should-never-appear-123456"
+
+    with RecordingGateway() as gateway:
+        result = adapter.notify_coordinator(
+            wake_event(),
+            endpoint=gateway.url,
+            api_key=key,
+            session="coordinator-session",
+        )
+
+    rendered = json.dumps(result)
+    assert key not in rendered
+    assert gateway.url not in rendered
+    assert key not in caplog.text
+
+
+def test_a_refused_delivery_does_not_log_or_return_credentials(monkeypatch, caplog):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    caplog.set_level(logging.DEBUG)
+    key = "sk-live-should-never-appear-987654"
+
+    with RecordingGateway(status=401) as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                wake_event(),
+                endpoint=gateway.url,
+                api_key=key,
+                session="coordinator-session",
+            )
+
+    assert caught.value.code == "hermes_notification_failed"
+    assert key not in caplog.text
+    assert key not in str(caught.value)
+    assert gateway.url not in str(caught.value)
+
+
+def test_an_injected_transport_is_used_without_network(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    calls = []
+
+    def runner(url, *, headers, body, timeout_s):
+        calls.append({"url": url, "headers": headers, "body": body, "timeout_s": timeout_s})
+        return 200, b'{"ok":true}'
 
     result = adapter.notify_coordinator(
-        {"event_id": "evt-1", "session_id": "coordinator-session", "message": "landed"},
+        wake_event(),
+        endpoint="http://127.0.0.1:9/v1",
+        api_key="test-key",
+        session="coordinator-session",
         runner=runner,
     )
 
     assert result["sent"] is True
-    assert result["delivered"] is True
-    assert result["event_id"] == "evt-1"
-    assert result["session"] == "coordinator-session"
-    assert result["continuation"] == "--resume"
-    continuation = runner.calls[-1]
-    assert continuation[0].endswith("hermes")
-    assert continuation[1:4] == ["chat", "--resume", "coordinator-session"]
-    assert continuation[-1] == "landed"
-    assert result["command"][-1].startswith("<message sha256=")
+    assert calls[0]["headers"]["X-Hermes-Session-Id"] == "coordinator-session"
+    assert calls[0]["url"] == "http://127.0.0.1:9/v1/chat/completions"
 
 
-def test_a_failed_continuation_is_never_reported_as_sent(tmp_path):
-    runner = GatewayRunner(continuation_returncode=3)
+def test_an_injected_transport_timeout_is_never_sent(monkeypatch):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+
+    def runner(url, *, headers, body, timeout_s):
+        raise TimeoutError("simulated timeout")
 
     with pytest.raises(adapter.ProposalError) as caught:
         adapter.notify_coordinator(
-            {"event_id": "evt-1", "session_id": "coordinator-session", "message": "landed"},
+            wake_event(),
+            endpoint="http://127.0.0.1:9",
+            api_key="test-key",
+            session="coordinator-session",
             runner=runner,
         )
 

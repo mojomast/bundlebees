@@ -7,11 +7,16 @@ event identities so a consumer can deduplicate.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import stat
 import sys
+import threading
 import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -63,6 +68,62 @@ def _read(path: Path):
 
 def _code(excinfo):
     return getattr(excinfo.value, "code", None)
+
+
+@pytest.fixture(autouse=True)
+def _clear_replay_cache():
+    events._clear_delivery_replay_cache()
+    yield
+    events._clear_delivery_replay_cache()
+
+
+def _signed_headers(secret: str, body: bytes, *, now=None, delivery_id=None):
+    moment = time.time() if now is None else now
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    headers = {
+        "X-Rizzstack-Timestamp": str(int(moment)),
+        "X-Rizzstack-Signature": f"sha256={digest}",
+    }
+    if delivery_id is not None:
+        headers["X-Rizzstack-Delivery-Id"] = delivery_id
+    return headers
+
+
+def _header(headers, name):
+    wanted = name.lower()
+    for key, value in headers.items():
+        if key.lower() == wanted:
+            return value
+    return None
+
+
+class _CaptureHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        self.server.requests.append({"headers": dict(self.headers), "body": body})
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args):
+        return
+
+
+@contextmanager
+def _http_capture():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CaptureHandler)
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _write_pinned_schema(root: Path, *, required_backend: bool = True) -> Path:
@@ -582,3 +643,175 @@ def test_delivery_payload_does_not_leak_the_state_directory(tmp_path):
     text = (_inbox(state) / f"{event['id']}.json").read_text(encoding="utf-8")
     assert str(tmp_path) not in text
     assert "private-state-dir" not in text
+
+
+# ---------------------------------------------------------------------------
+# HTTP delivery: HMAC authentication, replay protection and bounds
+# ---------------------------------------------------------------------------
+
+
+def test_subscribe_http_secret_is_private_and_never_returned(tmp_path):
+    state = tmp_path / "state"
+    secret = "fixture-http-secret-" + "7" * 12
+    subscriber = {
+        "identity": "hook",
+        "url": "https://example.invalid/hook",
+        "secret": secret,
+    }
+    first = events.subscribe(state, subscriber)
+    assert first["created"] is True
+    assert first["url"] == "https://example.invalid/hook"
+    assert "secret" not in first
+    assert secret not in json.dumps(first)
+
+    stored = _read(state / "events" / "subscribers" / "hook.json")
+    assert stored["secret"] == secret
+    assert stat.S_IMODE((state / "events" / "subscribers" / "hook.json").stat().st_mode) == 0o600
+
+    second = events.subscribe(state, subscriber)
+    assert second["created"] is False
+    assert "secret" not in second
+    assert secret not in json.dumps(second)
+
+
+def test_http_delivery_signs_the_raw_body_and_verifies(tmp_path):
+    secret = "fixture-delivery-secret-" + "8" * 12
+    state = tmp_path / "state"
+    event = _event()
+    events.record_landing(state, event)
+
+    with _http_capture() as server:
+        url = f"http://127.0.0.1:{server.server_address[1]}/hook"
+        events.subscribe(state, {"identity": "hook", "url": url, "secret": secret})
+        result = events.deliver_pending(state)
+
+        assert result["delivered"] == 1
+        assert result["failed"] == 0
+        assert secret not in json.dumps(result)
+        assert len(server.requests) == 1
+        request = server.requests[0]
+        body = request["body"]
+        assert body == events._canonical(event)
+        assert secret.encode("utf-8") not in body
+
+        expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        assert _header(request["headers"], "X-Rizzstack-Signature") == f"sha256={expected}"
+        assert _header(request["headers"], "X-Rizzstack-Delivery-Id").startswith("dlv_")
+        assert events.verify_delivery(request["headers"], body, secret, time.time()) is True
+
+    record = _read(_inbox(state, "hook") / f"{event['id']}.json")
+    assert record["attempts"] == 1
+    assert secret not in json.dumps(record)
+
+
+def test_verify_delivery_rejects_a_tampered_body():
+    secret = "fixture-tamper-secret-" + "9" * 12
+    body = b'{"event":"original"}'
+    headers = _signed_headers(secret, body, delivery_id="dlv_tamper_1")
+
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body + b" ", secret, time.time())
+    assert _code(exc) == "delivery_signature_invalid"
+
+
+def test_verify_delivery_rejects_a_duplicate_delivery_id_replay():
+    secret = "fixture-replay-secret-" + "a" * 12
+    body = b'{"event":"replay"}'
+    headers = _signed_headers(secret, body, delivery_id="dlv_replay_1")
+
+    assert events.verify_delivery(headers, body, secret, time.time()) is True
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body, secret, time.time())
+    assert _code(exc) == "delivery_replayed"
+
+
+def test_verify_delivery_rejects_a_stale_timestamp():
+    secret = "fixture-stale-secret-" + "b" * 12
+    body = b'{"event":"stale"}'
+    now = time.time()
+    headers = _signed_headers(secret, body, now=now - 360, delivery_id="dlv_stale_1")
+
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body, secret, now, tolerance_s=300)
+    assert _code(exc) == "delivery_stale"
+
+
+def test_verify_delivery_rejects_a_missing_secret():
+    secret = "fixture-missing-secret-" + "c" * 12
+    body = b'{"event":"missing-secret"}'
+    headers = _signed_headers(secret, body, delivery_id="dlv_no_secret_1")
+
+    for missing in (None, ""):
+        with pytest.raises(events.EventError) as exc:
+            events.verify_delivery(headers, body, missing, time.time())
+        assert _code(exc) == "secret_missing"
+
+
+def test_http_delivery_without_a_secret_remains_pending(tmp_path):
+    state = tmp_path / "state"
+    event = _event()
+    events.record_landing(state, event)
+    events.subscribe(state, {"identity": "hook", "url": "http://127.0.0.1:9/hook"})
+
+    result = events.deliver_pending(state)
+    assert result["delivered"] == 0
+    assert result["failed"] == 1
+    assert result["failures"][0]["error"] == "secret_missing"
+    assert result["pending"] == 1
+    assert not (_inbox(state, "hook") / f"{event['id']}.json").exists()
+
+
+def test_verify_delivery_refuses_an_oversized_body():
+    secret = "fixture-oversize-secret-" + "d" * 12
+    body = b"x" * (events.MAX_HTTP_BODY_BYTES + 1)
+    headers = _signed_headers(secret, body, delivery_id="dlv_oversize_1")
+
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body, secret, time.time())
+    assert _code(exc) == "delivery_oversized"
+
+
+def test_http_delivery_refuses_a_body_over_the_limit(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    event = _event()
+    events.record_landing(state, event)
+    events.subscribe(
+        state,
+        {"identity": "hook", "url": "http://127.0.0.1:9/hook", "secret": "fixture-limit"},
+    )
+    monkeypatch.setattr(events, "MAX_HTTP_BODY_BYTES", 32)
+
+    result = events.deliver_pending(state)
+    assert result["delivered"] == 0
+    assert result["failed"] == 1
+    assert result["failures"][0]["error"] == "delivery_oversized"
+    assert result["pending"] == 1
+
+
+def test_http_delivery_retries_a_transient_failure(tmp_path, monkeypatch):
+    secret = "fixture-retry-secret-" + "e" * 12
+    state = tmp_path / "state"
+    event = _event()
+    events.record_landing(state, event)
+    monkeypatch.setattr(events, "HTTP_RETRY_BACKOFF_S", 0)
+
+    calls = {"n": 0}
+    real_urlopen = events.urlrequest.urlopen
+
+    def flaky(request, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise events.urlerror.URLError("simulated transient failure")
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(events.urlrequest, "urlopen", flaky)
+
+    with _http_capture() as server:
+        url = f"http://127.0.0.1:{server.server_address[1]}/hook"
+        events.subscribe(state, {"identity": "hook", "url": url, "secret": secret})
+        result = events.deliver_pending(state)
+
+        assert result["delivered"] == 1
+        assert result["failed"] == 0
+        assert calls["n"] == 2
+        assert len(server.requests) == 1

@@ -1,10 +1,16 @@
-"""Durable landing-event outbox and file-subscriber delivery.
+"""Durable landing-event outbox and subscriber delivery.
 
 A bee "lands" when its attempt reaches a state transition that the coordinator
-wants other local processes to observe.  This module is deliberately small and
-filesystem-only: there is no broker, database, daemon or outbound network call.
-The operator (or a later tick) calls :func:`deliver_pending`, which copies every
-undelivered event into each subscriber's inbox.
+wants other local processes to observe.  This module is deliberately small:
+there is no broker, database or daemon.  The operator (or a later tick) calls
+:func:`deliver_pending`, which copies every undelivered event into each file
+subscriber's inbox or POSTs it to an http(s) subscriber.
+
+HTTP deliveries are authenticated with HMAC-SHA256 over the exact JSON body
+using the subscription secret.  A receiver can authenticate a delivery with
+:func:`verify_delivery`, which rejects stale timestamps, a wrong signature and a
+replayed delivery id.  Secrets are never placed in event payloads, delivery
+summaries or logs; they are stored only in the private subscriber record.
 
 Layout under ``state_dir``::
 
@@ -34,20 +40,27 @@ a conservative subset validator handles the keywords landing schemas use.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from .security import contains_address, looks_like_secret, scrub
 
 __all__ = [
     "SCHEMA",
     "MAX_EVENT_BYTES",
+    "MAX_HTTP_BODY_BYTES",
     "EventError",
     "event_id_for",
     "build_event",
@@ -56,6 +69,7 @@ __all__ = [
     "subscribe",
     "unsubscribe",
     "deliver_pending",
+    "verify_delivery",
     "acknowledge",
     "replay",
     "pending_deliveries",
@@ -76,8 +90,24 @@ ACKS_DIR = "acks"
 DELIVERY_DIR = "delivery"
 
 MAX_EVENT_BYTES = 64 * 1024
+MAX_HTTP_BODY_BYTES = 256 * 1024
 MAX_IDENTIFIER = 128
 _MAX_READ_BYTES = 2 * MAX_EVENT_BYTES
+
+HTTP_TIMEOUT_S = 5.0
+HTTP_RETRIES = 2
+HTTP_RETRY_BACKOFF_S = 0.05
+DEFAULT_TIMESTAMP_TOLERANCE_S = 300
+
+TIMESTAMP_HEADER = "X-Rizzstack-Timestamp"
+SIGNATURE_HEADER = "X-Rizzstack-Signature"
+DELIVERY_ID_HEADER = "X-Rizzstack-Delivery-Id"
+EVENT_ID_HEADER = "X-Rizzstack-Event-Id"
+VERIFIED_SCHEMA = "rizzstack.bee-delivery-verified/1"
+
+_MAX_VERIFIED_DELIVERIES = 4096
+_VERIFIED_DELIVERIES: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+_VERIFIED_LOCK = threading.Lock()
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
@@ -987,6 +1017,20 @@ def _subscriber_path(state_dir: Any, identity: str) -> Path:
     return _events_dir(state_dir) / SUBSCRIBERS_DIR / f"{_safe_identity(identity)}.json"
 
 
+def _normalize_secret(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise EventError("subscriber_invalid", "secret must be text", _FIX_SUBSCRIBER)
+    if not value or len(value) > 4096 or any(ord(ch) < 0x20 for ch in value):
+        raise EventError(
+            "subscriber_invalid",
+            "secret must be non-empty text without control characters",
+            _FIX_SUBSCRIBER,
+        )
+    return value
+
+
 def _normalize_subscriber(subscriber: Any) -> dict[str, Any]:
     if not isinstance(subscriber, Mapping):
         raise EventError("subscriber_invalid", "subscriber must be an object", _FIX_SUBSCRIBER)
@@ -994,6 +1038,7 @@ def _normalize_subscriber(subscriber: Any) -> dict[str, Any]:
     url = subscriber.get("url")
     file_target = subscriber.get("file")
     session = subscriber.get("session")
+    secret = _normalize_secret(subscriber.get("secret"))
 
     if (url is None) == (file_target is None):
         raise EventError(
@@ -1017,6 +1062,7 @@ def _normalize_subscriber(subscriber: Any) -> dict[str, Any]:
             "identity": identity,
             "url": text,
             "file": None,
+            "secret": secret,
             "session": _optional_session(session),
         }
     if not isinstance(file_target, str) or not file_target.strip():
@@ -1028,6 +1074,7 @@ def _normalize_subscriber(subscriber: Any) -> dict[str, Any]:
         "identity": identity,
         "url": None,
         "file": file_target,
+        "secret": secret,
         "session": _optional_session(session),
     }
 
@@ -1041,26 +1088,38 @@ def _optional_session(session: Any) -> str | None:
     return text
 
 
+def _public_subscriber(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A subscriber view safe to return or log: the secret is never included."""
+
+    return {key: value for key, value in record.items() if key != "secret"}
+
+
 def subscribe(state_dir: Any, subscriber: Mapping[str, Any]) -> dict[str, Any]:
-    """Record a subscriber durably; identical re-subscription is idempotent."""
+    """Record a subscriber durably; identical re-subscription is idempotent.
+
+    An http(s) subscriber may carry a ``secret`` used to sign deliveries.  The
+    secret is persisted in the private subscriber record with ``0600``
+    permissions and is never returned by this function.
+    """
 
     value = _normalize_subscriber(subscriber)
     path = _subscriber_path(state_dir, value["identity"])
+    fields = ("identity", "url", "file", "session", "secret")
     existing = _read_regular(path)
     if existing is not None:
         record = _decode(existing, path)
-        comparable = {key: record.get(key) for key in ("identity", "url", "file", "session")}
-        wanted = {key: value[key] for key in ("identity", "url", "file", "session")}
+        comparable = {key: record.get(key) for key in fields}
+        wanted = {key: value[key] for key in fields}
         if comparable != wanted:
             raise EventError(
                 "subscriber_conflict",
                 f"subscriber {value['identity']} is already subscribed with different settings",
                 "Unsubscribe first if the target must change.",
             )
-        return {**record, "created": False}
+        return {**_public_subscriber(record), "created": False}
     value["subscribed_at"] = _iso(_clock(None), microseconds=True)
     record, created = _create_only_json(path, value)
-    return {**record, "created": created}
+    return {**_public_subscriber(record), "created": created}
 
 
 def unsubscribe(state_dir: Any, subscriber: Any) -> bool:
@@ -1184,6 +1243,354 @@ def _ack_exists(state_dir: Any, identity: str, event_id: str) -> bool:
     return _read_regular(_ack_path(state_dir, identity, event_id)) is not None
 
 
+# ---------------------------------------------------------------------------
+# HTTP delivery signing and verification
+# ---------------------------------------------------------------------------
+
+
+def _header_value(headers: Any, name: str) -> str | None:
+    """Case-insensitive header lookup that also accepts an email.message object."""
+
+    if headers is None:
+        return None
+    value: Any = None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        try:
+            value = getter(name)
+        except (TypeError, ValueError):
+            value = None
+    if value is None:
+        try:
+            items = headers.items()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        wanted = name.lower()
+        for key, item in items:
+            if isinstance(key, str) and key.lower() == wanted:
+                value = item
+                break
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _timestamp_header_value(now: Any = None) -> str:
+    return str(int(_clock(now)))
+
+
+def _signature_for(secret: str, body: bytes) -> str:
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def _http_body(event: Mapping[str, Any]) -> bytes:
+    return _canonical(event)
+
+
+def _http_headers(
+    record: Mapping[str, Any], body: bytes, secret: str, *, now: Any = None
+) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        TIMESTAMP_HEADER: _timestamp_header_value(now),
+        SIGNATURE_HEADER: _signature_for(secret, body),
+        DELIVERY_ID_HEADER: str(record.get("delivery_id") or ""),
+        EVENT_ID_HEADER: str(record.get("event_id") or ""),
+    }
+
+
+def _send_http(url: str, body: bytes, headers: Mapping[str, str]) -> None:
+    """POST *body* once, retrying transient failures a bounded number of times.
+
+    Error text never contains the subscriber URL or response body, so a secret
+    embedded in either cannot leak into a summary or log.
+    """
+
+    last: EventError | None = None
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            request = urlrequest.Request(url, data=body, headers=dict(headers), method="POST")
+            with urlrequest.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if callable(getcode) else 200
+                reader = getattr(response, "read", None)
+                if callable(reader):
+                    reader(0)
+            if 200 <= int(status) < 300:
+                return
+            last = EventError(
+                "delivery_http_error",
+                f"subscriber returned HTTP {int(status)}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+        except urlerror.HTTPError as exc:
+            last = EventError(
+                "delivery_http_error",
+                f"subscriber returned HTTP {exc.code}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+            if exc.code < 500:
+                break
+        except (urlerror.URLError, TimeoutError, OSError) as exc:
+            last = EventError(
+                "delivery_http_failed",
+                f"http delivery failed: {type(exc).__name__}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+        except ValueError:
+            last = EventError(
+                "delivery_http_failed",
+                "http delivery failed: invalid URL",
+                "Re-subscribe with a valid http(s) URL.",
+            )
+            break
+        if attempt < HTTP_RETRIES and HTTP_RETRY_BACKOFF_S > 0:
+            time.sleep(HTTP_RETRY_BACKOFF_S * (2**attempt))
+    raise last or EventError(
+        "delivery_http_failed",
+        "http delivery failed",
+        "Check the subscriber endpoint; the event remains pending.",
+    )
+
+
+def _publish_http_delivery(
+    state_dir: Any,
+    identity: str,
+    event: Mapping[str, Any],
+    url: str,
+    secret: str,
+) -> dict[str, Any]:
+    """Sign and POST one event, then persist the inbox record on success."""
+
+    event_id = _safe_event_id(event.get("id"))
+    path = _delivery_path(state_dir, identity, event_id)
+    existing = _read_regular(path)
+    if existing is not None:
+        return _decode(existing, path)
+
+    body = _http_body(event)
+    if len(body) > MAX_HTTP_BODY_BYTES:
+        raise EventError(
+            "delivery_oversized",
+            f"http delivery body is {len(body)} bytes; the limit is {MAX_HTTP_BODY_BYTES}",
+            "Keep the event small; the delivery body limit is 256 KiB.",
+        )
+
+    attempts = _next_attempt(state_dir, identity, event_id)
+    record = _delivery_record(identity, event, attempts)
+    headers = _http_headers(record, body, secret)
+    _send_http(url, body, headers)
+    stored, _created = _create_only_json(path, record)
+    return stored
+
+
+def _body_bytes(body: Any) -> bytes:
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, bytearray):
+        return bytes(body)
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, Mapping):
+        return _canonical(body)
+    raise EventError(
+        "delivery_invalid",
+        "body must be bytes, text or a JSON object",
+        "Verify the exact body bytes that were received.",
+    )
+
+
+def _parse_signature(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip()
+    if text.lower().startswith("sha256="):
+        text = text[7:].strip()
+    elif "=" in text:
+        return None
+    if len(text) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in text):
+        return None
+    return text.lower()
+
+
+def _parse_timestamp(value: str | None) -> float:
+    if not value:
+        raise EventError(
+            "delivery_timestamp_missing",
+            f"{TIMESTAMP_HEADER} is required",
+            "Sign every delivery with a fresh timestamp.",
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError as exc:
+            raise EventError(
+                "delivery_timestamp_invalid",
+                f"{TIMESTAMP_HEADER} must be epoch seconds or ISO-8601",
+                "Sign every delivery with a fresh timestamp.",
+            ) from exc
+    if not math.isfinite(parsed):
+        raise EventError(
+            "delivery_timestamp_invalid",
+            f"{TIMESTAMP_HEADER} must be finite",
+            "Sign every delivery with a fresh timestamp.",
+        )
+    return parsed
+
+
+def _replay_key(secret: str, identifier: str) -> tuple[str, str]:
+    secret_fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    return secret_fingerprint, identifier
+
+
+def _clear_delivery_replay_cache() -> None:
+    """Forget in-memory replay markers (principally for tests)."""
+
+    with _VERIFIED_LOCK:
+        _VERIFIED_DELIVERIES.clear()
+
+
+def _verified_disk_path(state_dir: Any, key: tuple[str, str]) -> Path:
+    token = hashlib.sha256(f"{key[0]}\x00{key[1]}".encode("utf-8")).hexdigest()
+    return _events_dir(state_dir) / "verified" / f"{token}.json"
+
+
+def _check_and_record_replay(
+    state_dir: Any | None, key: tuple[str, str], *, now: float
+) -> None:
+    if state_dir is None:
+        with _VERIFIED_LOCK:
+            if key in _VERIFIED_DELIVERIES:
+                raise EventError(
+                    "delivery_replayed",
+                    "this delivery id was already verified",
+                    "Treat a repeated delivery id as a replay and discard it.",
+                )
+            _VERIFIED_DELIVERIES[key] = None
+            _VERIFIED_DELIVERIES.move_to_end(key)
+            while len(_VERIFIED_DELIVERIES) > _MAX_VERIFIED_DELIVERIES:
+                _VERIFIED_DELIVERIES.popitem(last=False)
+        return
+
+    path = _verified_disk_path(state_dir, key)
+    existing = _read_regular(path)
+    if existing is not None:
+        raise EventError(
+            "delivery_replayed",
+            "this delivery id was already verified",
+            "Treat a repeated delivery id as a replay and discard it.",
+        )
+    payload = _canonical(
+        {
+            "schema": VERIFIED_SCHEMA,
+            "delivery_id": key[1],
+            "verified_at": _iso(now, microseconds=True),
+        }
+    )
+    try:
+        created = _create_only_payload(path, payload)
+    except OSError as exc:
+        raise EventError(
+            "delivery_write_failed",
+            f"cannot persist the replay marker: {type(exc).__name__}",
+            "Check the state directory is writable.",
+        ) from exc
+    if not created:
+        raise EventError(
+            "delivery_replayed",
+            "this delivery id was already verified",
+            "Treat a repeated delivery id as a replay and discard it.",
+        )
+
+
+def verify_delivery(
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any = None,
+    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
+    *,
+    state_dir: Any = None,
+) -> bool:
+    """Authenticate an HMAC-signed HTTP delivery.
+
+    The signature header is ``sha256=<hex>`` over the exact raw ``body`` bytes.
+    ``TIMESTAMP_HEADER`` must be within ``tolerance_s`` of ``now`` and the
+    delivery id header is remembered so the same delivery cannot be accepted
+    twice.  ``state_dir`` is optional; when supplied, replay markers are
+    persisted there instead of only in this process.
+
+    Raises :class:`EventError` with a stable code on every refusal and returns
+    ``True`` for a valid, fresh, not-yet-seen delivery.
+    """
+
+    raw = _body_bytes(body)
+    if len(raw) > MAX_HTTP_BODY_BYTES:
+        raise EventError(
+            "delivery_oversized",
+            f"http delivery body is {len(raw)} bytes; the limit is {MAX_HTTP_BODY_BYTES}",
+            "Keep the delivery body at or below 256 KiB.",
+        )
+
+    if not isinstance(secret, str) or not secret:
+        raise EventError(
+            "secret_missing",
+            "an HMAC secret is required to verify a delivery",
+            "Configure the subscriber secret on both sides of the delivery.",
+        )
+
+    try:
+        tolerance = float(DEFAULT_TIMESTAMP_TOLERANCE_S if tolerance_s is None else tolerance_s)
+    except (TypeError, ValueError) as exc:
+        raise EventError(
+            "delivery_timestamp_invalid",
+            "tolerance_s must be numeric",
+            "Pass the allowed clock skew in seconds.",
+        ) from exc
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise EventError(
+            "delivery_timestamp_invalid",
+            "tolerance_s must be a non-negative finite number",
+            "Pass the allowed clock skew in seconds.",
+        )
+
+    timestamp = _parse_timestamp(_header_value(headers, TIMESTAMP_HEADER))
+    current = _clock(now)
+    if abs(current - timestamp) > tolerance:
+        raise EventError(
+            "delivery_stale",
+            "delivery timestamp is outside the allowed window",
+            "Reject the delivery and ask the sender for a fresh retry.",
+        )
+
+    provided = _parse_signature(_header_value(headers, SIGNATURE_HEADER))
+    if provided is None:
+        raise EventError(
+            "delivery_signature_invalid",
+            f"{SIGNATURE_HEADER} is missing or malformed",
+            "Reject the delivery; a valid sha256=<hex> signature is required.",
+        )
+    expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, provided):
+        raise EventError(
+            "delivery_signature_invalid",
+            "delivery signature does not match the body",
+            "Reject the delivery; the body or signature was altered.",
+        )
+
+    identifier = _header_value(headers, DELIVERY_ID_HEADER) or provided
+    _check_and_record_replay(state_dir, _replay_key(secret, identifier), now=current)
+    return True
+
+
 def pending_deliveries(state_dir: Any, subscriber: Any = None) -> list[dict[str, str]]:
     """Crash-recovery scan: outbox events with no inbox record for a subscriber.
 
@@ -1204,30 +1611,59 @@ def pending_deliveries(state_dir: Any, subscriber: Any = None) -> list[dict[str,
     return pending
 
 
-def deliver_pending(state_dir: Any, subscriber: Any = None) -> dict[str, Any]:
-    """Copy every undelivered outbox event into subscriber inboxes.
+def _subscriber_records(state_dir: Any, subscriber: Any = None) -> list[dict[str, Any]]:
+    if subscriber is None:
+        return _iter_subscribers(state_dir)
+    identity = _safe_identity(subscriber)
+    path = _subscriber_path(state_dir, identity)
+    raw = _read_regular(path)
+    if raw is None:
+        # Preserve the legacy behaviour of delivering to an identity that has
+        # no durable subscription: without a record there is no url or secret,
+        # so it uses the file transport.
+        return [{"identity": identity, "url": None, "file": None, "secret": None}]
+    return [_decode(raw, path)]
 
-    Delivery is at-least-once.  A failed write leaves the event pending and the
-    next call retries it with the same ids; an existing delivery is never
-    rewritten (except through :func:`replay`).
+
+def deliver_pending(state_dir: Any, subscriber: Any = None) -> dict[str, Any]:
+    """Deliver every undelivered outbox event to each subscriber.
+
+    File subscribers get an atomically written inbox record.  http(s)
+    subscribers get a signed POST whose body is the exact canonical event JSON;
+    the inbox record is written only after the endpoint accepts it.  Delivery is
+    at-least-once.  A failed write or POST leaves the event pending and the next
+    call retries it with the same ids; an existing delivery is never rewritten
+    (except through :func:`replay`).  Secrets are never included in the result,
+    failures or event payloads.
     """
 
     events = _iter_outbox(state_dir)
-    if subscriber is None:
-        subscribers = [_safe_identity(item) for item in _iter_subscribers(state_dir)]
-    else:
-        subscribers = [_safe_identity(subscriber)]
+    subscribers = _subscriber_records(state_dir, subscriber)
 
     delivered: list[dict[str, Any]] = []
     skipped = 0
     failures: list[dict[str, str]] = []
-    for identity in subscribers:
+    for subscription in subscribers:
+        identity = _safe_identity(subscription)
+        url = subscription.get("url")
+        secret = subscription.get("secret")
         for event_id, event in events:
             if _delivery_exists(state_dir, identity, event_id):
                 skipped += 1
                 continue
             try:
-                record = _publish_delivery(state_dir, identity, event)
+                if url is not None:
+                    if not isinstance(secret, str) or not secret:
+                        raise EventError(
+                            "secret_missing",
+                            f"http subscriber {identity} has no delivery secret",
+                            "Unsubscribe and re-subscribe with a secret.",
+                        )
+                    record = _publish_http_delivery(
+                        state_dir, identity, event, str(url), secret
+                    )
+                else:
+                    record = _publish_delivery(state_dir, identity, event)
             except Exception as exc:  # noqa: BLE001 - one subscriber must not stop the scan
                 failures.append(
                     {
