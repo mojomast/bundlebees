@@ -27,12 +27,14 @@ import datetime as _dt
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
+from . import job_cli
 from . import acdd_cli, adapters, leases, metrics, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
@@ -159,6 +161,11 @@ def _build_parser(parser: Any) -> Any:
         help="Clean git worktree to use. Defaults to the configured worktree.",
     )
     verify.add_argument(
+        "--commit-local",
+        action="store_true",
+        help="Verify in an isolated worktree and create a local commit; never push.",
+    )
+    verify.add_argument(
         "--branch",
         default=None,
         help="Feature branch to check out and push. main/master are refused.",
@@ -235,6 +242,7 @@ def _build_parser(parser: Any) -> Any:
     doctor.set_defaults(command="doctor")
 
     acdd_cli.add_parsers(subparsers)
+    job_cli.add_parsers(subparsers)
     return group
 
 
@@ -242,6 +250,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
         if command == "verify":
+            if getattr(args, "commit_local", False):
+                return _cmd_verify_commit_local(ctx, args)
             return _cmd_verify(ctx, args)
         if command == "deploy":
             return _cmd_deploy(ctx, args)
@@ -257,10 +267,17 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
             return acdd_cli.cmd_tdd(ctx, args)
+        if command == "job":
+            return job_cli.cmd_job(
+                ctx,
+                args,
+                state_dir=_state_dir(ctx, args),
+                client_factory=lambda: _client_for(ctx),
+            )
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -1324,6 +1341,48 @@ def _host_setup_prompt_text() -> str:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+
+def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
+    """`verify --commit-local`: isolated worktree, local commit, no push."""
+
+    from . import verify_local
+
+    state_dir = _state_dir(ctx, args)
+    workdir = Path(getattr(args, "workdir", None) or os.getcwd())
+    client = _client_for(ctx)
+    attempt_id = str(args.attempt_id)
+
+    envelope = client.result_envelope(attempt_id) if hasattr(client, "result_envelope") else client.result(attempt_id)
+    patch = _result_patch(envelope)
+    if not patch:
+        raise CliError("no_result_yet", "the worker result has no patch yet", "Wait for the worker to finish.")
+    patch_block = envelope.get("patch") if isinstance(envelope.get("patch"), Mapping) else {}
+    files = [str(item.get("path")) for item in (patch_block.get("files") or []) if item.get("path")]
+    source = str(((envelope.get("source") or {}).get("repo_rev")) or "")
+    tests = list(getattr(args, "tests", None) or [])
+    gitleaks = shutil.which("gitleaks")
+
+    try:
+        record = verify_local.verify_and_commit(
+            state_dir,
+            workdir,
+            attempt_id,
+            patch=patch,
+            declared_files=files,
+            base_rev=source,
+            tests=tests,
+            gitleaks=gitleaks,
+        )
+    except verify_local.VerifyError as exc:
+        raise CliError(exc.code, exc.message, exc.fix) from exc
+
+    _print("bundlebees verify --commit-local")
+    _print(f"attempt: {attempt_id}")
+    _print(f"commit: {record['sha']}")
+    _print(f"branch: {record['branch']} (local only, not pushed)")
+    _print(f"files: {', '.join(record['files'])}")
+    return 0
 
 
 def _cmd_verify(ctx: Any, args: Any) -> int:
