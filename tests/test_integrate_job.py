@@ -8,10 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import integrate_job, leases, verify_local
+from bundlebees_plugin import integrate_job, leases, sandbox, verify_local
 
 PY = sys.executable
 SUITE = [PY, "-m", "pytest", "-q"]
+
+
+def sandboxed(workdir, argv):
+    """Explicit test runner for hosts without a strong isolation backend.
+
+    The runner uses the disposable copy and the sandbox's exact, scrubbed
+    environment without silently inheriting the coordinator environment.
+    """
+
+    return sandbox.run_in_sandbox(workdir, list(argv), allow_unsafe_local=True, timeout=120)
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -71,6 +81,7 @@ def verified(state: Path, repo: Path, base: str, attempt: str, files: dict[str, 
         tests=[test_file],
         suite_command=SUITE,
         require_gitleaks=False,
+        runner=sandboxed,
     )
     return record["sha"]
 
@@ -108,7 +119,7 @@ class Siblings:
         sha2 = verified(state, repo, base, "att_2", B_FILES)
         assert sha1 != sha2
 
-        result = integrate_job.integrate(state, job_for(base), repo, suite_command=SUITE)
+        result = integrate_job.integrate(state, job_for(base), repo, suite_command=SUITE, runner=sandboxed)
 
         assert result["ok"] is True, result.get("evidence")
         head = result["record"]["head_sha"]
@@ -144,9 +155,72 @@ class Siblings:
                     "acceptance": {"criteria": ["x"], "tests": ["tests/test_ok.py"]},
                 },
             )
-            verify_local.verify_and_commit(state, repo, attempt, patch=patch, declared_files=lease["assigned_files"], base_rev=base, tests=["tests/test_ok.py"], suite_command=SUITE, require_gitleaks=False)
+            verify_local.verify_and_commit(state, repo, attempt, patch=patch, declared_files=lease["assigned_files"], base_rev=base, tests=["tests/test_ok.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         with pytest.raises(integrate_job.IntegrateError) as exc:
-            integrate_job.integrate(state, job_for(base), repo, suite_command=SUITE)
+            integrate_job.integrate(state, job_for(base), repo, suite_command=SUITE, runner=sandboxed)
 
         assert exc.value.code == "integration_conflict"
+
+
+def job_with_one_attempt(base: str) -> dict:
+    return {
+        "job_id": "job_a",
+        "goal": {"base_rev": base},
+        "tasks": [{"task_id": "T1", "state": "verified", "attempts": ["att_1"], "depends_on": []}],
+        "integration": {"wave": 1},
+    }
+
+
+class SandboxRequirements:
+    __test__ = True
+
+    def test_the_integration_suite_does_not_inherit_coordinator_environment(self, tmp_path, monkeypatch):
+        for name in ("BUNDLEBEES_LAUNCHER_TOKEN", "BUNDLEBEES_SIGNING_KEY", "HERMES_API_KEY", "HERMES_API_URL"):
+            monkeypatch.setenv(name, "set-by-the-coordinator")
+        script = (
+            "import os\n"
+            "print('coordinator=%d' % sum(n.startswith(('BUNDLEBEES_', 'HERMES_')) for n in os.environ))\n"
+        )
+
+        evidence = integrate_job._suite_evidence(
+            tmp_path,
+            [sys.executable, "-c", script],
+            runner=None,
+            backend="auto",
+            allow_unsafe_local=True,
+            allow_weak=False,
+            timeout=60,
+        )
+
+        assert evidence["exit_code"] == 0
+        assert "coordinator=0" in evidence["tail"]
+
+    def test_a_timed_out_integration_suite_is_not_accepted(self, tmp_path):
+        repo, base = repo_with_base(tmp_path)
+        state = tmp_path / "state"
+        verified(state, repo, base, "att_1", A_FILES)
+
+        def timed_out(workdir, argv):
+            return {"exit_code": 124, "timed_out": True, "output_tail": "sandbox timed out"}
+
+        result = integrate_job.integrate(state, job_with_one_attempt(base), repo, suite_command=SUITE, runner=timed_out)
+
+        assert result["ok"] is False
+        assert result["record"]["accepted"] is False
+        assert result["record"]["suite"]["timed_out"] is True
+
+    def test_an_unavailable_sandbox_fails_integration_closed(self, tmp_path, monkeypatch):
+        repo, base = repo_with_base(tmp_path)
+        state = tmp_path / "state"
+        verified(state, repo, base, "att_1", A_FILES)
+
+        def unavailable(*args, **kwargs):
+            raise sandbox.SandboxUnavailable("no strong sandbox backend is usable")
+
+        monkeypatch.setattr(integrate_job.sandbox, "run_in_sandbox", unavailable)
+
+        with pytest.raises(integrate_job.IntegrateError) as exc:
+            integrate_job.integrate(state, job_with_one_attempt(base), repo, suite_command=SUITE)
+
+        assert exc.value.code == "sandbox_unavailable"

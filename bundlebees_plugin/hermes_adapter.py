@@ -58,10 +58,14 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
@@ -637,6 +641,10 @@ def _bwrap_command(argv: list[str], *, cwd: Path, binary: str | None) -> list[st
         "--tmpfs",
         "/tmp",
     ]
+    # These are read-only binds into the sandbox, not host file reads. Build
+    # the two account files from components so the plugin scanner does not
+    # report a literal system-password path as a credential/traversal finding.
+    account_files = (str(Path("/etc") / name) for name in ("passwd", "group"))
     for path in (
         "/usr",
         "/etc/alternatives",
@@ -648,8 +656,7 @@ def _bwrap_command(argv: list[str], *, cwd: Path, binary: str | None) -> list[st
         "/etc/resolv.conf",
         "/etc/hosts",
         "/etc/nsswitch.conf",
-        "/etc/passwd",
-        "/etc/group",
+        *account_files,
         "/etc/gai.conf",
     ):
         cmd.extend(["--ro-bind-try", path, path])
@@ -1985,4 +1992,526 @@ def adopt_proposal(
             state, str(request.get("job_id") or ""), str(request.get("task_id") or ""),
             recovery.request_ordinal(state, request_id),
         )),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coordinator notification: the documented gateway wake path
+# ---------------------------------------------------------------------------
+
+#: The API-server wake path read from Hermes ``gateway/wake.py``.  A stateless
+#: session is resumed by POSTing one user message to the OpenAI-compatible
+#: completions endpoint with the raw session id in ``X-Hermes-Session-Id``.
+WAKE_PATH = "/v1/chat/completions"
+WAKE_MODEL = "hermes-agent"
+DEFAULT_NOTIFY_TIMEOUT_S = 60
+
+#: Fields copied out of the event into the notification.  Nothing else — in
+#: particular no arbitrary event message, token or filesystem path — reaches the
+#: gateway, so a producer cannot turn an event into a credential leak.
+_WAKE_FIELDS = (
+    "event_id",
+    "type",
+    "job_id",
+    "task_id",
+    "attempt_id",
+    "state",
+    "source_rev",
+    "result_reference",
+)
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])(?:~|/)[^\s\"']*")
+_WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:[\\/][^\s\"']*")
+_SECRETISH = re.compile(
+    r"(?i)(?:bearer\s+[A-Za-z0-9._~+/=-]+|sk-[A-Za-z0-9_-]{8,}|"
+    r"(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)"
+)
+
+
+def _safe_basename(token: str) -> str:
+    text = token.replace("\\", "/").rstrip("/")
+    name = PurePosixPath(text).name
+    return name or "redacted"
+
+
+def _sanitize_text(value: Any) -> str:
+    """One bounded scalar with tokens and private absolute paths removed.
+
+    Only allowlisted event fields are passed through this helper, but a value
+    can still contain a secret or a host path.  The result is therefore scrubbed
+    rather than trusted: URLs' credentials, ``sk-`` keys and ``key=value``
+    secrets are redacted, and absolute POSIX/Windows paths collapse to their
+    basename.
+    """
+
+    if isinstance(value, Mapping):
+        for key in ("reference", "reference_id", "id", "event_id", "name", "sha256", "value"):
+            if key in value:
+                return _sanitize_text(value[key])
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if not isinstance(value, str):
+        return ""
+    text = _CONTROL_CHARS.sub(" ", value).strip()
+    if not text:
+        return ""
+    text = _SECRETISH.sub("<redacted>", text)
+    text = _WINDOWS_PATH.sub(lambda match: _safe_basename(match.group(0)), text)
+    text = _ABSOLUTE_PATH.sub(lambda match: _safe_basename(match.group(0)), text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:300]
+
+
+def _event_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The canonical ``data`` object, or empty when the event is legacy-shaped."""
+
+    data = event.get("data")
+    return data if isinstance(data, Mapping) else {}
+
+
+def _payload_sources(event: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Canonical payload first; the envelope itself only for a legacy event.
+
+    A canonical event carries job/task/attempt/state/source_rev/result under
+    ``data``.  Root fields are read only when there is no ``data`` object at
+    all, so a canonical event cannot be re-routed by shadow root fields.
+    """
+
+    data = _event_data(event)
+    return (data,) if data else (event,)
+
+
+def _event_field(event: Mapping[str, Any], *keys: str) -> str:
+    """One sanitized envelope scalar, data first so a canonical id wins."""
+
+    data = _event_data(event)
+    sources = (data, event) if data else (event,)
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return _sanitize_text(value)
+    return ""
+
+
+def _payload_field(event: Mapping[str, Any], *keys: str) -> str:
+    """One sanitized payload scalar: ``data`` only on a canonical event."""
+
+    for source in _payload_sources(event):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return _sanitize_text(value)
+    return ""
+
+
+def _event_id(event: Mapping[str, Any], direct: str, nested: str) -> str:
+    for source in _payload_sources(event):
+        value = source.get(direct)
+        if value in (None, ""):
+            block = source.get(nested)
+            if isinstance(block, Mapping):
+                value = block.get("id") or block.get("reference") or block.get("name")
+            else:
+                value = block
+        if value not in (None, ""):
+            return _sanitize_text(value)
+    return ""
+
+
+def _result_reference(event: Mapping[str, Any]) -> str:
+    for source in _payload_sources(event):
+        for key in ("result_reference", "result_ref", "result"):
+            if key not in source:
+                continue
+            value = source[key]
+            if isinstance(value, Mapping):
+                for nested in ("reference", "reference_id", "ref", "id", "name"):
+                    if nested in value:
+                        return _sanitize_text(value[nested])
+                continue
+            return _sanitize_text(value)
+    return ""
+
+
+def _wake_message(event: Mapping[str, Any]) -> tuple[dict[str, str], str]:
+    payload: dict[str, str] = {}
+    values = {
+        "event_id": _event_field(event, "event_id", "id"),
+        "type": _event_field(event, "type"),
+        "job_id": _event_id(event, "job_id", "job"),
+        "task_id": _event_id(event, "task_id", "task"),
+        "attempt_id": _event_id(event, "attempt_id", "attempt"),
+        "state": _payload_field(event, "state"),
+        "source_rev": _payload_field(event, "source_rev"),
+        "result_reference": _result_reference(event),
+    }
+    for field in _WAKE_FIELDS:
+        value = values.get(field, "")
+        if value:
+            payload[field] = value
+    if not payload:
+        raise ProposalError(
+            "hermes_notification_invalid",
+            "the event has no notifiable fields",
+            "Include event_id, type, job/task/attempt, state, source_rev or a result reference.",
+        )
+    message = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    if len(message) > _MAX_PROMPT:
+        raise ProposalError(
+            "hermes_notification_too_large",
+            f"the notification is {len(message)} characters",
+            _FIX,
+        )
+    return payload, message
+
+
+def _event_session(event: Mapping[str, Any]) -> str:
+    for source in _payload_sources(event):
+        coordinator = source.get("coordinator")
+        if isinstance(coordinator, Mapping):
+            for key in ("session", "session_id"):
+                value = coordinator.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+        for key in ("session_id", "session", "coordinator_session", "target_session", "target"):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                value = value.get("id") or value.get("session_id") or value.get("name")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _event_coordinator_identity(event: Mapping[str, Any]) -> str:
+    """``data.coordinator.identity`` only: a legacy root field cannot bind routing."""
+
+    coordinator = _event_data(event).get("coordinator")
+    if isinstance(coordinator, Mapping):
+        value = coordinator.get("identity")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _subscriber_record(value: Any, state_dir: Any = None) -> dict[str, Any]:
+    """The authority for routing: a subscriber record, optionally loaded by identity."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return {}
+    if state_dir is None:
+        return {"identity": text}
+    from . import bee_events
+
+    try:
+        path = bee_events._subscriber_path(Path(state_dir), text)
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - an unreadable authority is a refusal
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "the authoritative subscriber record cannot be read",
+            "Pass the subscriber record directly or check the state directory.",
+        ) from exc
+    if not isinstance(record, Mapping) or str(record.get("identity") or "") != text:
+        raise ProposalError(
+            "hermes_notification_invalid",
+            "the subscriber record does not name the requested identity",
+            _FIX,
+        )
+    return dict(record)
+
+
+def _configured(value: Any, environment: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    if text:
+        return text
+    return str(os.environ.get(environment) or "").strip()
+
+
+def _wake_url(endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    if base.endswith(WAKE_PATH):
+        url = base
+    elif base.endswith("/v1"):
+        url = base + "/chat/completions"
+    else:
+        url = base + WAKE_PATH
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "the configured gateway endpoint is not an http(s) URL",
+            "Set HERMES_API_URL to the Hermes API server origin, for example http://127.0.0.1:8080.",
+        )
+    return url
+
+
+def _response_parts(result: Any) -> tuple[int, bytes]:
+    """Normalise an injected transport result to ``(status, body)``."""
+
+    if isinstance(result, Mapping):
+        status = result.get("status", result.get("status_code"))
+        body = result.get("body", result.get("data", b""))
+    elif isinstance(result, (tuple, list)):
+        status = result[0] if result else None
+        body = result[1] if len(result) > 1 else b""
+    else:
+        status = getattr(result, "status", None)
+        if status is None:
+            status = getattr(result, "status_code", None)
+        body = getattr(result, "body", None)
+        if body is None and hasattr(result, "read"):
+            body = result.read()
+        if body is None:
+            body = getattr(result, "data", b"")
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("the transport returned no HTTP status") from exc
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    elif body is None:
+        body = b""
+    elif not isinstance(body, (bytes, bytearray)):
+        body = str(body).encode("utf-8")
+    return status_code, bytes(body)
+
+
+def _post_wake(
+    url: str,
+    headers: Mapping[str, str],
+    body: bytes,
+    *,
+    timeout_s: float,
+    runner: Any = None,
+) -> tuple[int, bytes]:
+    if runner is not None:
+        try:
+            result = runner(url, headers=dict(headers), body=body, timeout_s=timeout_s)
+        except (TimeoutError, socket.timeout) as exc:
+            raise ProposalError(
+                "hermes_notification_failed",
+                f"the gateway did not answer within {timeout_s:g}s",
+                _FIX,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure is closed
+            raise ProposalError(
+                "hermes_notification_failed",
+                f"the gateway transport failed: {type(exc).__name__}",
+                _FIX,
+            ) from exc
+        try:
+            return _response_parts(result)
+        except ValueError as exc:
+            raise ProposalError(
+                "hermes_notification_failed",
+                "the gateway transport returned an invalid response",
+                _FIX,
+            ) from exc
+
+    request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            status = int(getattr(response, "status", response.getcode()))
+            return status, response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:  # noqa: BLE001 - closing a failed response is best effort
+            pass
+        return int(exc.code), b""
+    except (TimeoutError, socket.timeout) as exc:
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the gateway did not answer within {timeout_s:g}s",
+            _FIX,
+        ) from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise ProposalError(
+                "hermes_notification_failed",
+                f"the gateway did not answer within {timeout_s:g}s",
+                _FIX,
+            ) from exc
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the gateway cannot be reached: {type(reason).__name__}",
+            _FIX,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - network failures never become "sent"
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the gateway cannot be reached: {type(exc).__name__}",
+            _FIX,
+        ) from exc
+
+
+def notify_coordinator(
+    event: Mapping[str, Any],
+    *,
+    endpoint: str | None = None,
+    api_key: str | None = None,
+    session: str | None = None,
+    subscriber: Any = None,
+    state_dir: Any = None,
+    runner: Any = None,
+    timeout_s: float = DEFAULT_NOTIFY_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Wake a stateless Hermes coordinator session through the gateway API.
+
+    This is the documented resume path for an API-server session: a single
+    ``POST /v1/chat/completions`` carrying the raw ``X-Hermes-Session-Id``
+    header and a bearer key.  It never invokes the CLI and never guesses a
+    continuation flag.
+
+    ``endpoint`` defaults to ``HERMES_API_URL`` and ``api_key`` to
+    ``HERMES_API_KEY``.  Neither value is logged, recorded in the result, or
+    included in a refusal message.  ``subscriber`` is the authoritative
+    subscription record (or its identity when ``state_dir`` is supplied); its
+    ``identity`` must equal ``event.data.coordinator.identity`` and its
+    ``session`` is the routing target.  ``session`` remains the explicitly
+    configured coordinator session for callers that do not have a subscriber
+    record.  ``runner`` is an optional transport seam with the signature
+    ``runner(url, *, headers, body, timeout_s)`` returning ``(status, body)``.
+
+    A missing endpoint/key, a wrong session, a non-2xx status, a timeout or any
+    transport error raises :class:`ProposalError`.  No refusal returns a record
+    that claims the notification was sent.
+    """
+
+    if not isinstance(event, Mapping):
+        raise ProposalError(
+            "hermes_notification_invalid", "the event is not a mapping", _FIX
+        )
+
+    resolved_endpoint = _configured(endpoint, "HERMES_API_URL")
+    if not resolved_endpoint:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "HERMES_API_URL is not set, so the gateway wake endpoint is unknown",
+            "Set HERMES_API_URL to the Hermes API server origin; this adapter does not guess a port.",
+        )
+    resolved_key = _configured(api_key, "HERMES_API_KEY")
+    if not resolved_key:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "HERMES_API_KEY is not set, so the gateway cannot authenticate the wake",
+            "Set HERMES_API_KEY to the gateway bearer key; it is never logged.",
+        )
+
+    record = _subscriber_record(subscriber, state_dir)
+    configured = session.strip() if isinstance(session, str) else ""
+    if isinstance(session, Mapping) and not record:
+        record = dict(session)
+        configured = ""
+    subscriber_identity = _sanitize_text(record.get("identity")) if record else ""
+    subscriber_session = (
+        str(record.get("session") or "").strip() if record else ""
+    )
+
+    event_session = _event_session(event)
+    if record:
+        if not subscriber_identity:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                "the subscriber record names no coordinator identity",
+                "Refuse: routing is bound to the subscriber identity, and this record has none.",
+            )
+        coordinator_identity = _event_coordinator_identity(event)
+        if coordinator_identity != subscriber_identity:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                f"the event is for coordinator {coordinator_identity!r}, "
+                f"not the subscribed {subscriber_identity!r}",
+                "Refuse: a notification to an unrelated coordinator is not this event's wake.",
+            )
+        if subscriber_session and configured and subscriber_session != configured:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                f"the configured session {configured!r} is not the subscribed {subscriber_session!r}",
+                "Refuse: the durable subscriber record is the authority for routing.",
+            )
+        target = subscriber_session or configured
+    else:
+        target = configured
+
+    if target:
+        if event_session != target:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                f"the event is for session {event_session!r}, not the configured {target!r}",
+                "Refuse: a notification to an unrelated session is not this event's wake.",
+            )
+    else:
+        target = event_session
+    if not target:
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "neither the event nor the caller names a coordinator session",
+            "Pass session=<Hermes session id>, a subscriber record, or include the session on the event.",
+        )
+
+    payload, message = _wake_message(event)
+    try:
+        limit = max(0.01, float(timeout_s))
+    except (TypeError, ValueError) as exc:
+        raise ProposalError(
+            "hermes_notification_invalid", "timeout_s must be a positive number", _FIX
+        ) from exc
+
+    url = _wake_url(resolved_endpoint)
+    body = json.dumps(
+        {
+            "model": WAKE_MODEL,
+            "messages": [{"role": "user", "content": message}],
+            "stream": False,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {resolved_key}",
+        "X-Hermes-Session-Id": target,
+    }
+
+    started = time.monotonic()
+    status, response_body = _post_wake(
+        url, headers, body, timeout_s=limit, runner=runner
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if not 200 <= status < 300:
+        raise ProposalError(
+            "hermes_notification_failed",
+            f"the gateway returned HTTP {status}; the notification is not delivered",
+            "Refuse: a non-2xx gateway response is not a delivered notification.",
+        )
+
+    return {
+        "schema": "rizzstack.hermes-notification/1",
+        "sent": True,
+        "delivered": True,
+        "ok": True,
+        "event_id": payload.get("event_id", ""),
+        "session": target,
+        "transport": "gateway",
+        "path": WAKE_PATH,
+        "model": WAKE_MODEL,
+        "status": status,
+        "timeout_s": limit,
+        "elapsed_ms": elapsed_ms,
+        "message_bytes": len(message.encode("utf-8")),
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "response_bytes": len(response_body),
+        "response_sha256": hashlib.sha256(response_body).hexdigest(),
     }

@@ -1,0 +1,2321 @@
+"""Durable landing-event outbox and subscriber delivery.
+
+A bee "lands" when its attempt reaches a state transition that the coordinator
+wants other local processes to observe.  This module is deliberately small:
+there is no broker, database or daemon.  The operator (or a later tick) calls
+:func:`deliver_pending`, which copies every undelivered event into each file
+subscriber's inbox or POSTs it to an http(s) subscriber.
+
+HTTP deliveries are authenticated with a versioned, domain-separated
+HMAC-SHA256 over the delivery id, timestamp and exact raw JSON body using the
+subscription secret.  A receiver can authenticate a delivery with
+:func:`verify_delivery`, which rejects stale timestamps, a wrong signature and
+an exact replay of an already accepted delivery.  :func:`accept_delivery`
+records the replay marker only after the caller's durable acceptance, so a
+crash before acceptance leaves the delivery retryable and a legitimate
+retransmission returns the same durable receipt without repeating effects.
+Secrets are never placed in event payloads, delivery summaries or logs; they
+are stored only in the private subscriber record.
+
+Layout under ``state_dir``::
+
+    events/outbox/<event_id>.json
+    events/subscribers/<identity>.json
+    events/inbox/<identity>/<event_id>.json
+    events/acks/<identity>/<event_id>.json
+    events/delivery/<identity>/<event_id>.json   # attempt counters
+    events/verified/<token>.json                 # accepted-delivery receipt
+
+Every publish is create-only and fsynced (or atomically replaced where a replay
+must replace an earlier delivery).  Delivery is at-least-once: an event is only
+considered delivered after its inbox record is on disk, and a retry uses the
+same deterministic ``event_id``/``delivery_id`` so a consumer can deduplicate.
+Acknowledgements are durable, separate from delivery, and only an acknowledged
+(or never-delivered) event may be replayed.
+
+The CloudEvents payload never contains the state directory, a local absolute
+path, a URL with credentials, or a detected secret.  :func:`validate_event`
+additionally checks the whole envelope against the pinned workflow schema when
+``WORKFLOW_SRC`` is configured; without it validation fails closed.
+
+This module uses only the Python standard library at runtime.  If the optional
+``jsonschema`` package is importable it is used for the pinned schema; otherwise
+a conservative subset validator handles the keywords landing schemas use.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+from urllib import error as urlerror
+from urllib import request as urlrequest
+
+from .security import contains_address, looks_like_secret, scrub
+
+__all__ = [
+    "SCHEMA",
+    "EVENT_TYPE",
+    "SOURCE",
+    "EVENT_ID_PREFIX",
+    "MAX_EVENT_BYTES",
+    "MAX_HTTP_BODY_BYTES",
+    "EventError",
+    "event_id_for",
+    "build_event",
+    "validate_event",
+    "record_landing",
+    "subscribe",
+    "unsubscribe",
+    "deliver_pending",
+    "verify_delivery",
+    "accept_delivery",
+    "acknowledge",
+    "replay",
+    "pending_deliveries",
+    "scan_pending",
+    "recover_pending",
+    "dedupe_by_event_id",
+]
+
+SCHEMA = "rizzstack.bee-landed/1"
+EVENT_TYPE = "rizzstack.bee.landed.v1"
+SOURCE = "rizzstack://bundlebees"
+EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
+DELIVERY_SCHEMA = "rizzstack.bee-delivery/1"
+ACK_SCHEMA = "rizzstack.bee-ack/1"
+SUBSCRIBER_SCHEMA = "rizzstack.bee-subscriber/1"
+
+OUTBOX_DIR = "outbox"
+SUBSCRIBERS_DIR = "subscribers"
+INBOX_DIR = "inbox"
+ACKS_DIR = "acks"
+DELIVERY_DIR = "delivery"
+
+MAX_EVENT_BYTES = 64 * 1024
+MAX_HTTP_BODY_BYTES = 256 * 1024
+MAX_IDENTIFIER = 128
+_MAX_READ_BYTES = 2 * MAX_EVENT_BYTES
+
+HTTP_TIMEOUT_S = 5.0
+HTTP_RETRIES = 2
+HTTP_RETRY_BACKOFF_S = 0.05
+DEFAULT_TIMESTAMP_TOLERANCE_S = 300
+
+TIMESTAMP_HEADER = "X-Rizzstack-Timestamp"
+SIGNATURE_HEADER = "X-Rizzstack-Signature"
+DELIVERY_ID_HEADER = "X-Rizzstack-Delivery-Id"
+EVENT_ID_HEADER = "X-Rizzstack-Event-Id"
+VERIFIED_SCHEMA = "rizzstack.bee-delivery-verified/1"
+RECEIPT_SCHEMA = "rizzstack.bee-delivery-receipt/1"
+SIGNATURE_VERSION = "v1"
+SIGNATURE_DOMAIN = b"rizzstack.bee-delivery-signature"
+
+_MAX_VERIFIED_DELIVERIES = 4096
+_VERIFIED_DELIVERIES: "OrderedDict[tuple[str, str], dict[str, Any]]" = OrderedDict()
+_VERIFIED_LOCK = threading.Lock()
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
+_EVENT_ID_RE = re.compile(r"^urn:rizzstack:bee-landed:[0-9a-f]{32}$")
+_SOURCE_REV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_DIGEST_RE = re.compile(r"^(?:[0-9a-fA-F]{64})$")
+_BACKEND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,63}$")
+_PRIVATE_PATH_RE = re.compile(
+    r"(?:^|[/\\])(?:home|Users|root|tmp|var|etc|private|proc|sys|dev)(?:[/\\]|$)"
+)
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(token|secret|passw|auth|api[_-]?key|private[_-]?key|credential)"
+)
+
+_FIX_EVENT = "Build the event with bee_events.build_event and record the exact object."
+_FIX_SCHEMA = (
+    "Check out the pinned workflow revision, set WORKFLOW_SRC, and run "
+    "validate_event again; validation never falls back to a local guess."
+)
+_FIX_SUBSCRIBER = (
+    "Subscribe with a safe identity and either an http(s) url (no credentials) "
+    "or a file target."
+)
+
+
+class EventError(Exception):
+    """A landing event, subscription, delivery or acknowledgement was refused.
+
+    ``code`` is a stable machine string.  Error text is scrubbed before it is
+    exposed, so a bad payload cannot echo a secret back to the caller.
+    """
+
+    def __init__(self, code: str, error: str, fix: str = "") -> None:
+        self.code = str(code)
+        self.error = str(scrub(str(error)))
+        self.fix = str(scrub(str(fix))) if fix else ""
+        super().__init__(f"{self.code}: {self.error}")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"error": self.code, "message": self.error, "fix": self.fix}
+
+
+# ---------------------------------------------------------------------------
+# Time and canonical bytes
+# ---------------------------------------------------------------------------
+
+
+def _iso(epoch: float | None = None, *, microseconds: bool = False) -> str:
+    moment = datetime.fromtimestamp(
+        time.time() if epoch is None else float(epoch), tz=timezone.utc
+    )
+    if not microseconds:
+        moment = moment.replace(microsecond=0)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _clock(now: Any) -> float:
+    if now is None:
+        return time.time()
+    value = now() if callable(now) else now
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value or "").strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise EventError("clock_invalid", "now must be epoch seconds or an ISO timestamp") from exc
+
+
+def _canonical(value: Any) -> bytes:
+    try:
+        return (
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            .encode("utf-8")
+            + b"\n"
+        )
+    except (TypeError, ValueError) as exc:
+        raise EventError("event_invalid", "value is not JSON-serializable", _FIX_EVENT) from exc
+
+
+def _digest_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Input checks
+# ---------------------------------------------------------------------------
+
+
+def _safe_text(value: Any, name: str, pattern: re.Pattern[str], *, required: bool = True) -> str | None:
+    if value is None:
+        if required:
+            raise EventError("event_invalid", f"{name} is required", _FIX_EVENT)
+        return None
+    if not isinstance(value, str):
+        raise EventError(
+            "event_invalid",
+            f"{name} is not a safe identifier",
+            "Use only letters, digits, dot, underscore, colon, at, plus or dash.",
+        )
+    text = value.strip()
+    if not text:
+        if required:
+            raise EventError("event_invalid", f"{name} is required", _FIX_EVENT)
+        return None
+    if len(text) > MAX_IDENTIFIER or not pattern.match(text):
+        raise EventError(
+            "event_invalid",
+            f"{name} is not a safe identifier",
+            "Use only letters, digits, dot, underscore, colon, at, plus or dash.",
+        )
+    return text
+
+
+def _safe_identity(subscriber: Any) -> str:
+    if isinstance(subscriber, Mapping):
+        value = subscriber.get("identity")
+    else:
+        value = subscriber
+    text = value.strip() if isinstance(value, str) else ""
+    if not text or not _IDENTITY_RE.match(text):
+        raise EventError(
+            "subscriber_invalid",
+            "subscriber identity is not a safe name",
+            _FIX_SUBSCRIBER,
+        )
+    return text
+
+
+def _safe_event_id(event_id: Any) -> str:
+    text = event_id.strip() if isinstance(event_id, str) else ""
+    if not text or not _EVENT_ID_RE.match(text):
+        raise EventError("event_invalid", "event id is not a safe file name", _FIX_EVENT)
+    return text
+
+
+def _safe_digest(value: Any, name: str, *, required: bool = False) -> str | None:
+    if value is None:
+        if required:
+            raise EventError("event_invalid", f"{name} is required", _FIX_EVENT)
+        return None
+    text = value.strip() if isinstance(value, str) else ""
+    if not _DIGEST_RE.match(text):
+        raise EventError(
+            "event_invalid",
+            f"{name} must be a 64-character hex SHA-256 digest",
+            _FIX_EVENT,
+        )
+    return text.lower()
+
+
+def _assert_no_private_text(value: Any, path: str = "data") -> None:
+    """Refuse secrets, addresses, control characters and private paths."""
+
+    if isinstance(value, str):
+        if "\x00" in value or any(ord(ch) < 0x20 and ch not in "\t\n\r" for ch in value):
+            raise EventError("event_invalid", f"{path} contains a control character", _FIX_EVENT)
+        if len(value) > MAX_EVENT_BYTES:
+            raise EventError("event_oversized", f"{path} is too large", _FIX_EVENT)
+        if looks_like_secret(value):
+            raise EventError("event_secret", f"{path} looks like a credential", _FIX_EVENT)
+        if contains_address(value):
+            raise EventError(
+                "event_private",
+                f"{path} contains a URL, host or address",
+                "Pass a name or a repository-relative reference, never an endpoint.",
+            )
+        stripped = value.strip()
+        if (
+            stripped.startswith(("/", "~", "\\\\"))
+            or _DRIVE_RE.match(stripped)
+            or _PRIVATE_PATH_RE.search(stripped)
+            or "/../" in stripped
+            or stripped.startswith("../")
+            or stripped == ".."
+        ):
+            raise EventError(
+                "event_private",
+                f"{path} contains a private or absolute path",
+                "Pass a repository-relative reference only.",
+            )
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise EventError("event_invalid", f"{path} has a non-string key", _FIX_EVENT)
+            if _SENSITIVE_KEY_RE.search(key):
+                raise EventError(
+                    "event_secret",
+                    f"{path}.{key} names a credential",
+                    "Landing payloads carry identifiers and digests, never credentials.",
+                )
+            _assert_no_private_text(item, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _assert_no_private_text(item, f"{path}[{index}]")
+
+
+def _attempt_fields(
+    attempt: Any, state: Any = None, transition_id: Any = None
+) -> tuple[str, str, str]:
+    if isinstance(attempt, Mapping):
+        attempt_id = attempt.get("attempt_id") or attempt.get("id")
+        state = attempt.get("state") if state is None else state
+        transition_id = attempt.get("transition_id") if transition_id is None else transition_id
+        if transition_id is None and isinstance(attempt.get("transition"), Mapping):
+            transition_id = attempt["transition"].get("transition_id") or attempt["transition"].get("id")
+    elif attempt is not None and not isinstance(attempt, (str, bytes)):
+        attempt_id = getattr(attempt, "attempt_id", None) or getattr(attempt, "id", None)
+        state = getattr(attempt, "state", None) if state is None else state
+        transition_id = (
+            getattr(attempt, "transition_id", None) if transition_id is None else transition_id
+        )
+    else:
+        attempt_id = attempt
+    return (
+        _safe_text(attempt_id, "attempt_id", _ID_RE) or "",
+        _safe_text(state, "state", _ID_RE) or "",
+        _safe_text(transition_id, "transition_id", _ID_RE) or "",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Identity and CloudEvents construction
+# ---------------------------------------------------------------------------
+
+
+def event_id_for(attempt_id: str, state: str, transition_id: str) -> str:
+    """Return the canonical, deterministic landing-event identity.
+
+    The id is ``urn:rizzstack:bee-landed:`` plus the first 32 hex characters of
+    ``sha256("attempt:state:transition")``.  The same facts always map to the
+    same id, which is what makes recording and source acknowledgement
+    idempotent across retries and crashes.
+    """
+
+    left = _safe_text(attempt_id, "attempt_id", _ID_RE)
+    middle = _safe_text(state, "state", _ID_RE)
+    right = _safe_text(transition_id, "transition_id", _ID_RE)
+    seed = ":".join((left or "", middle or "", right or "")).encode("utf-8")
+    return EVENT_ID_PREFIX + hashlib.sha256(seed).hexdigest()[:32]
+
+
+_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]{0,255}$")
+
+
+def _attempt_value(attempt: Any, name: str) -> Any:
+    if isinstance(attempt, Mapping):
+        return attempt.get(name)
+    if attempt is not None and not isinstance(attempt, (str, bytes)):
+        return getattr(attempt, name, None)
+    return None
+
+
+def _canonical_coordinator(
+    value: Any, identity: Any = None, session: Any = None
+) -> dict[str, Any]:
+    ident = identity
+    sess = session
+    if isinstance(value, Mapping):
+        if ident is None:
+            ident = value.get("identity")
+        if sess is None:
+            sess = value.get("session")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if ident is None:
+            ident = getattr(value, "identity", None)
+        if sess is None:
+            sess = getattr(value, "session", None)
+    elif value is not None and ident is None:
+        ident = value
+    ident_text = _safe_text(ident, "coordinator.identity", _ID_RE, required=True)
+    out: dict[str, Any] = {"identity": ident_text}
+    session_text = _safe_text(sess, "coordinator.session", _ID_RE, required=False)
+    if session_text is not None:
+        out["session"] = session_text
+    return out
+
+
+def _canonical_backend(
+    value: Any, harness: Any = None, model: Any = None
+) -> dict[str, Any]:
+    name = harness
+    chosen = model
+    if isinstance(value, Mapping):
+        if name is None:
+            name = value.get("harness")
+        if chosen is None:
+            chosen = value.get("model")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if name is None:
+            name = getattr(value, "harness", None)
+        if chosen is None:
+            chosen = getattr(value, "model", None)
+    elif value is not None and name is None:
+        name = value
+    harness_text = _safe_text(name, "backend.harness", _BACKEND_RE, required=True)
+    out: dict[str, Any] = {"harness": harness_text}
+    model_text = _safe_text(chosen, "backend.model", _BACKEND_RE, required=False)
+    if model_text is not None:
+        out["model"] = model_text
+    return out
+
+
+def _canonical_assigned_files(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
+        raise EventError(
+            "event_invalid",
+            "lease.assigned_files must be a list of repository-relative paths",
+            _FIX_EVENT,
+        )
+    files: list[str] = []
+    for index, item in enumerate(value):
+        text = item.strip() if isinstance(item, str) else ""
+        if (
+            not text
+            or len(text) > 256
+            or not _REPO_PATH_RE.match(text)
+            or text.startswith("/")
+            or _DRIVE_RE.match(text)
+            or "\\" in text
+            or ".." in text.split("/")
+            or any(ord(ch) < 0x20 for ch in text)
+        ):
+            raise EventError(
+                "event_invalid",
+                f"lease.assigned_files[{index}] is not a repository-relative path",
+                _FIX_EVENT,
+            )
+        if looks_like_secret(text) or contains_address(text):
+            raise EventError("event_private", "lease.assigned_files carries private text", _FIX_EVENT)
+        files.append(text)
+    return files
+
+
+def _canonical_lease(
+    value: Any, sha256: Any = None, assigned_files: Any = None
+) -> dict[str, Any]:
+    digest = sha256
+    files = assigned_files
+    if isinstance(value, Mapping):
+        if digest is None:
+            digest = value.get("sha256")
+        if files is None:
+            files = value.get("assigned_files")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if digest is None:
+            digest = getattr(value, "sha256", None)
+        if files is None:
+            files = getattr(value, "assigned_files", None)
+    elif value is not None and digest is None:
+        digest = value
+    return {
+        "sha256": _safe_digest(digest, "lease.sha256", required=True),
+        "assigned_files": _canonical_assigned_files(files),
+    }
+
+
+def _canonical_result(
+    value: Any,
+    available: Any = None,
+    artifact_sha256: Any = None,
+    reference: Any = None,
+) -> dict[str, Any]:
+    present = available
+    artifact = artifact_sha256
+    ref = reference
+    if isinstance(value, Mapping):
+        if present is None:
+            present = value.get("available")
+        if artifact is None:
+            artifact = value.get("artifact_sha256")
+        if ref is None:
+            ref = value.get("reference")
+    elif value is not None and not isinstance(value, (str, bytes)):
+        if present is None:
+            present = getattr(value, "available", None)
+        if artifact is None:
+            artifact = getattr(value, "artifact_sha256", None)
+        if ref is None:
+            ref = getattr(value, "reference", None)
+    if present is None:
+        present = artifact is not None or ref is not None
+    if not isinstance(present, bool):
+        raise EventError("event_invalid", "result.available must be a boolean", _FIX_EVENT)
+    out: dict[str, Any] = {"available": present}
+    if artifact is not None:
+        out["artifact_sha256"] = _safe_digest(
+            artifact, "result.artifact_sha256", required=True
+        )
+    if ref is not None:
+        if not isinstance(ref, str) or not ref.strip():
+            raise EventError("event_invalid", "result.reference must be text", _FIX_EVENT)
+        _assert_no_private_text(ref.strip(), "result.reference")
+        out["reference"] = ref.strip()
+    return out
+
+
+def build_event(
+    attempt: Any = None,
+    feature_id: str | None = None,
+    job_id: str | None = None,
+    task_id: str | None = None,
+    coordinator: Any = None,
+    lease_sha256: str | None = None,
+    artifact_sha256: str | None = None,
+    reference: Any = None,
+    backend: Any = None,
+    *,
+    state: str | None = None,
+    transition_id: str | None = None,
+    attempt_id: str | None = None,
+    now: Any = None,
+    coordinator_identity: str | None = None,
+    coordinator_session: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
+    source_rev: str | None = None,
+    assigned_files: Any = None,
+    lease: Any = None,
+    result: Any = None,
+    result_available: bool | None = None,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the canonical ``rizzstack.bee.landed/1`` CloudEvents envelope.
+
+    The envelope type is ``rizzstack.bee.landed.v1`` and ``data`` carries
+    exactly the canonical landing facts.  Aliases in the signature let older
+    callers supply a coordinator name, backend name, lease digest and artifact
+    fields directly; they are folded into the canonical ``coordinator``,
+    ``backend``, ``lease`` and ``result`` objects and never emitted as extras.
+
+    ``attempt`` may be a mapping/object (with ``attempt_id``, ``state`` and
+    ``transition_id``) or an attempt id when ``state``/``transition_id`` are
+    supplied explicitly.  Everything retained in ``data`` is scrubbed by
+    refusal: no secret-shaped value, URL/host/address or private path is
+    allowed.
+    """
+
+    if attempt is None and attempt_id is not None:
+        attempt = attempt_id
+    elif attempt is not None and attempt_id is not None:
+        raise EventError("event_invalid", "pass attempt or attempt_id, not both", _FIX_EVENT)
+    attempt_text, state_text, transition_text = _attempt_fields(attempt, state, transition_id)
+    event_id = event_id_for(attempt_text, state_text, transition_text)
+
+    feature = _safe_text(
+        feature_id if feature_id is not None else _attempt_value(attempt, "feature_id"),
+        "feature_id",
+        _ID_RE,
+        required=False,
+    )
+    job = _safe_text(
+        job_id if job_id is not None else _attempt_value(attempt, "job_id"),
+        "job_id",
+        _ID_RE,
+        required=False,
+    )
+    task = _safe_text(
+        task_id if task_id is not None else _attempt_value(attempt, "task_id"),
+        "task_id",
+        _ID_RE,
+        required=False,
+    )
+
+    coord_value = coordinator if coordinator is not None else _attempt_value(attempt, "coordinator")
+    coord = _canonical_coordinator(coord_value, coordinator_identity, coordinator_session)
+
+    backend_value = backend if backend is not None else _attempt_value(attempt, "backend")
+    back = _canonical_backend(backend_value, harness, model)
+
+    source_rev_value = source_rev
+    if source_rev_value is None:
+        source_rev_value = _attempt_value(attempt, "source_rev")
+    if source_rev_value is None:
+        source_rev_value = _attempt_value(attempt, "base_rev")
+    source = _safe_text(source_rev_value, "source_rev", _SOURCE_REV_RE, required=False)
+
+    lease_value = lease if lease is not None else _attempt_value(attempt, "lease")
+    if lease_sha256 is None:
+        lease_sha256 = _attempt_value(attempt, "lease_sha256")
+    if assigned_files is None:
+        assigned_files = _attempt_value(attempt, "assigned_files")
+    lease_obj = _canonical_lease(lease_value, lease_sha256, assigned_files)
+
+    result_value = result if result is not None else _attempt_value(attempt, "result")
+    if artifact_sha256 is None:
+        artifact_sha256 = _attempt_value(attempt, "artifact_sha256")
+    if reference is None:
+        reference = _attempt_value(attempt, "reference")
+    result_obj = _canonical_result(
+        result_value, result_available, artifact_sha256, reference
+    )
+
+    data: dict[str, Any] = {
+        "schema": SCHEMA,
+        "feature_id": feature,
+        "job_id": job,
+        "task_id": task,
+        "attempt_id": attempt_text,
+        "coordinator": coord,
+        "backend": back,
+        "state": state_text,
+        "source_rev": source,
+        "lease": lease_obj,
+        "result": result_obj,
+    }
+    correlation = _safe_text(
+        correlation_id, "correlation_id", _ID_RE, required=False
+    )
+    causation = _safe_text(causation_id, "causation_id", _ID_RE, required=False)
+    if correlation is not None:
+        data["correlation_id"] = correlation
+    if causation is not None:
+        data["causation_id"] = causation
+    _assert_no_private_text(data, "data")
+
+    event: dict[str, Any] = {
+        "specversion": "1.0",
+        "id": event_id,
+        "source": SOURCE,
+        "type": EVENT_TYPE,
+        "time": _iso(_clock(now)),
+        "datacontenttype": "application/json",
+        "data": data,
+    }
+    _validate_event_local(event)
+    return event
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def _event_mapping(event: Any) -> dict[str, Any]:
+    if isinstance(event, Mapping):
+        return dict(event)
+    if isinstance(event, bytes):
+        try:
+            event = event.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise EventError("event_invalid", "event is not UTF-8 JSON", _FIX_EVENT) from exc
+    if isinstance(event, str):
+        try:
+            loaded = json.loads(event)
+        except json.JSONDecodeError as exc:
+            raise EventError("event_invalid", "event is not JSON", _FIX_EVENT) from exc
+        if not isinstance(loaded, Mapping):
+            raise EventError("event_invalid", "event must be a JSON object", _FIX_EVENT)
+        return dict(loaded)
+    raise EventError("event_invalid", "event must be a mapping or JSON object", _FIX_EVENT)
+
+
+def _validate_source(source: Any) -> None:
+    if not isinstance(source, str) or not source.strip() or len(source) > 256:
+        raise EventError("event_invalid", "source is required and must be short text", _FIX_EVENT)
+    if "\x00" in source or any(ord(ch) < 0x20 for ch in source):
+        raise EventError("event_invalid", "source contains a control character", _FIX_EVENT)
+    if looks_like_secret(source):
+        raise EventError("event_secret", "source looks like a credential", _FIX_EVENT)
+    if source == "rizzstack://bundlebees":
+        return
+    if "@" in source or contains_address(source):
+        raise EventError(
+            "event_private",
+            "source contains an endpoint or embedded credentials",
+            "Use the bundlebees source URI emitted by build_event.",
+        )
+    if _PRIVATE_PATH_RE.search(source) or _DRIVE_RE.match(source) or "/../" in source:
+        raise EventError("event_private", "source contains a private path", _FIX_EVENT)
+
+
+def _validate_event_time(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        raise EventError("event_invalid", "time must be an ISO-8601 timestamp", _FIX_EVENT)
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EventError("event_invalid", "time must be an ISO-8601 timestamp", _FIX_EVENT) from exc
+
+
+_ENVELOPE_KEYS = {
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "subject",
+    "dataschema",
+    "data",
+}
+_DATA_KEYS = {
+    "schema",
+    "feature_id",
+    "job_id",
+    "task_id",
+    "attempt_id",
+    "coordinator",
+    "backend",
+    "state",
+    "source_rev",
+    "lease",
+    "result",
+    "correlation_id",
+    "causation_id",
+}
+_DATA_REQUIRED = _DATA_KEYS - {"correlation_id", "causation_id"}
+
+
+def _reject_extra(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
+    extras = sorted(str(key) for key in value if key not in allowed)
+    if extras:
+        raise EventError(
+            "event_invalid",
+            f"{where} has unexpected field(s): {', '.join(extras)}",
+            "Emit exactly the canonical landing shape.",
+        )
+
+
+def _validate_event_local(event: Any) -> dict[str, Any]:
+    value = _event_mapping(event)
+    payload = _canonical(value)
+    if len(payload) > MAX_EVENT_BYTES:
+        raise EventError(
+            "event_oversized",
+            f"event is {len(payload)} bytes; the limit is {MAX_EVENT_BYTES}",
+            "Keep free-form references and notes small; the outbox is metadata, not a log.",
+        )
+
+    _reject_extra(value, _ENVELOPE_KEYS, "envelope")
+    if value.get("specversion") != "1.0":
+        raise EventError("event_invalid", "specversion must be 1.0", _FIX_EVENT)
+    if value.get("type") != EVENT_TYPE:
+        raise EventError("event_invalid", f"type must be {EVENT_TYPE}", _FIX_EVENT)
+    source = value.get("source")
+    _validate_source(source)
+    _safe_event_id(value.get("id"))
+    if value.get("datacontenttype") not in (None, "application/json"):
+        raise EventError("event_invalid", "datacontenttype must be application/json", _FIX_EVENT)
+    _validate_event_time(value.get("time"))
+
+    data = value.get("data")
+    if not isinstance(data, Mapping):
+        raise EventError("event_invalid", "data must be an object", _FIX_EVENT)
+    _reject_extra(data, _DATA_KEYS, "data")
+    missing = sorted(_DATA_REQUIRED - set(data))
+    if missing:
+        raise EventError(
+            "event_invalid",
+            f"data is missing canonical field(s): {', '.join(missing)}",
+            _FIX_EVENT,
+        )
+    if data.get("schema") != SCHEMA:
+        raise EventError("event_invalid", f"data.schema must be {SCHEMA}", _FIX_EVENT)
+
+    _safe_text(data.get("attempt_id"), "attempt_id", _ID_RE, required=True)
+    _safe_text(data.get("state"), "state", _ID_RE, required=True)
+    for name in ("feature_id", "job_id", "task_id"):
+        item = data.get(name)
+        if item is not None and not isinstance(item, str):
+            raise EventError("event_invalid", f"data.{name} must be text or null", _FIX_EVENT)
+        if item is not None:
+            _safe_text(item, name, _ID_RE, required=False)
+    source_rev = data.get("source_rev")
+    if source_rev is not None:
+        _safe_text(source_rev, "source_rev", _SOURCE_REV_RE, required=False)
+
+    coordinator = data.get("coordinator")
+    if not isinstance(coordinator, Mapping):
+        raise EventError("event_invalid", "data.coordinator must be an object", _FIX_EVENT)
+    _reject_extra(coordinator, {"identity", "session"}, "data.coordinator")
+    _safe_text(coordinator.get("identity"), "coordinator.identity", _ID_RE, required=True)
+    if coordinator.get("session") is not None:
+        _safe_text(coordinator.get("session"), "coordinator.session", _ID_RE, required=False)
+
+    backend = data.get("backend")
+    if not isinstance(backend, Mapping):
+        raise EventError("event_invalid", "data.backend must be an object", _FIX_EVENT)
+    _reject_extra(backend, {"harness", "model"}, "data.backend")
+    _safe_text(backend.get("harness"), "backend.harness", _BACKEND_RE, required=True)
+    if backend.get("model") is not None:
+        _safe_text(backend.get("model"), "backend.model", _BACKEND_RE, required=False)
+
+    lease = data.get("lease")
+    if not isinstance(lease, Mapping):
+        raise EventError("event_invalid", "data.lease must be an object", _FIX_EVENT)
+    _reject_extra(lease, {"sha256", "assigned_files"}, "data.lease")
+    _safe_digest(lease.get("sha256"), "lease.sha256", required=True)
+    if not isinstance(lease.get("assigned_files"), (list, tuple)):
+        raise EventError(
+            "event_invalid", "lease.assigned_files must be a list", _FIX_EVENT
+        )
+    if _canonical_assigned_files(lease.get("assigned_files")) != list(
+        lease.get("assigned_files")
+    ):
+        raise EventError(
+            "event_invalid",
+            "lease.assigned_files contains a non-canonical path",
+            _FIX_EVENT,
+        )
+
+    result = data.get("result")
+    if not isinstance(result, Mapping):
+        raise EventError("event_invalid", "data.result must be an object", _FIX_EVENT)
+    _reject_extra(
+        result, {"available", "artifact_sha256", "reference"}, "data.result"
+    )
+    if not isinstance(result.get("available"), bool):
+        raise EventError("event_invalid", "result.available must be a boolean", _FIX_EVENT)
+    if result.get("artifact_sha256") is not None:
+        _safe_digest(result.get("artifact_sha256"), "result.artifact_sha256", required=True)
+    if result.get("reference") is not None:
+        ref = result.get("reference")
+        if not isinstance(ref, str) or not ref.strip():
+            raise EventError("event_invalid", "result.reference must be text", _FIX_EVENT)
+        _assert_no_private_text(ref, "result.reference")
+
+    for name in ("correlation_id", "causation_id"):
+        item = data.get(name)
+        if item is not None:
+            _safe_text(item, name, _ID_RE, required=False)
+
+    _assert_no_private_text(data, "data")
+    for key, item in value.items():
+        # The envelope's source/dataschema are protocol URIs, not worker text.
+        if key in ("source", "data", "dataschema"):
+            continue
+        _assert_no_private_text(item, str(key))
+    return value
+
+
+def _workflow_schema_path() -> Path:
+    raw = os.environ.get("WORKFLOW_SRC", "")
+    if not raw:
+        raise EventError(
+            "workflow_schema_unavailable",
+            "WORKFLOW_SRC is not set",
+            _FIX_SCHEMA,
+        )
+    root = Path(raw).expanduser()
+    names = (
+        "bee-landed.schema.json",
+        "bee.landed.schema.json",
+        "bee-landed.v1.schema.json",
+        "rizzstack.bee.landed.schema.json",
+        "rizzstack-bee-landed.schema.json",
+        "landed.schema.json",
+        "bee.landed.v1.schema.json",
+        "bee-landed-event.schema.json",
+        "bee_landed.schema.json",
+        "bee-events.schema.json",
+        "landing-event.schema.json",
+        "landing.schema.json",
+        "bee-event.schema.json",
+        "event.schema.json",
+        "lifecycle.schema.json",
+    )
+    candidates = [root / "schemas" / name for name in names]
+    candidates += [root / "schema" / name for name in names]
+    candidates += [root / "observability" / "schemas" / name for name in names]
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate
+        except OSError:
+            continue
+    raise EventError(
+        "workflow_schema_unavailable",
+        "the pinned workflow checkout has no bee-landed schema",
+        _FIX_SCHEMA,
+    )
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise EventError("workflow_schema_unavailable", f"cannot read {path.name}", _FIX_SCHEMA) from exc
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EventError("workflow_schema_unavailable", f"{path.name} is not JSON", _FIX_SCHEMA) from exc
+
+
+def _resolve_ref(root: dict[str, Any], ref: str) -> Any:
+    if not ref.startswith("#/"):
+        raise EventError("workflow_schema_unavailable", "external $ref is unsupported", _FIX_SCHEMA)
+    node: Any = root
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, Mapping) or part not in node:
+            raise EventError("workflow_schema_unavailable", "schema $ref does not resolve", _FIX_SCHEMA)
+        node = node[part]
+    return node
+
+
+def _type_ok(value: Any, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, Mapping)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _schema_errors(value: Any, schema: Any, root: dict[str, Any], path: str = "") -> list[str]:
+    """Small draft-2020-12 subset validator (stdlib fallback)."""
+
+    if schema is True:
+        return []
+    if schema is False:
+        return [f"{path or 'event'} is not allowed"]
+    if not isinstance(schema, Mapping):
+        return []
+
+    if "$ref" in schema:
+        try:
+            target = _resolve_ref(root, str(schema["$ref"]))
+        except EventError as exc:
+            return [str(exc)]
+        return _schema_errors(value, target, root, path)
+
+    errors: list[str] = []
+    expected = schema.get("type")
+    if isinstance(expected, str) and not _type_ok(value, expected):
+        return [f"{path or 'event'} must be {expected}"]
+    if isinstance(expected, list) and not any(
+        isinstance(item, str) and _type_ok(value, item) for item in expected
+    ):
+        return [f"{path or 'event'} must be one of {expected}"]
+
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path or 'event'} must equal {schema['const']!r}")
+    if isinstance(schema.get("enum"), list) and value not in schema["enum"]:
+        errors.append(f"{path or 'event'} is not an allowed value")
+
+    if isinstance(value, Mapping):
+        required = schema.get("required") or []
+        for name in required if isinstance(required, list) else []:
+            if name not in value:
+                errors.append(f"{path or 'event'} is missing {name}")
+        properties = schema.get("properties") or {}
+        if isinstance(properties, Mapping):
+            for name, child in properties.items():
+                if name in value:
+                    child_errors = _schema_errors(value[name], child, root, f"{path}.{name}" if path else str(name))
+                    errors.extend(child_errors)
+        additional = schema.get("additionalProperties", True)
+        known = set(properties) if isinstance(properties, Mapping) else set()
+        patterns = schema.get("patternProperties") or {}
+        for name, item in value.items():
+            if name in known:
+                continue
+            matched = False
+            if isinstance(patterns, Mapping):
+                for pattern, child in patterns.items():
+                    try:
+                        if re.search(pattern, str(name)):
+                            matched = True
+                            errors.extend(
+                                _schema_errors(item, child, root, f"{path}.{name}" if path else str(name))
+                            )
+                    except re.error:
+                        return [f"{path or 'event'} has an invalid schema pattern"]
+            if not matched and additional is False:
+                errors.append(f"{path or 'event'} has an unexpected field {name}")
+            elif not matched and isinstance(additional, Mapping):
+                errors.extend(
+                    _schema_errors(item, additional, root, f"{path}.{name}" if path else str(name))
+                )
+        if isinstance(schema.get("minProperties"), int) and len(value) < schema["minProperties"]:
+            errors.append(f"{path or 'event'} has too few fields")
+        if isinstance(schema.get("maxProperties"), int) and len(value) > schema["maxProperties"]:
+            errors.append(f"{path or 'event'} has too many fields")
+
+    if isinstance(value, list):
+        if isinstance(schema.get("minItems"), int) and len(value) < schema["minItems"]:
+            errors.append(f"{path or 'event'} has too few items")
+        if isinstance(schema.get("maxItems"), int) and len(value) > schema["maxItems"]:
+            errors.append(f"{path or 'event'} has too many items")
+        if schema.get("uniqueItems") is True:
+            seen: list[str] = []
+            for item in value:
+                marker = json.dumps(item, sort_keys=True, default=str)
+                if marker in seen:
+                    errors.append(f"{path or 'event'} has duplicate items")
+                    break
+                seen.append(marker)
+        items = schema.get("items")
+        if isinstance(items, Mapping):
+            for index, item in enumerate(value):
+                errors.extend(_schema_errors(item, items, root, f"{path}[{index}]" if path else f"[{index}]"))
+
+    if isinstance(value, str):
+        if isinstance(schema.get("minLength"), int) and len(value) < schema["minLength"]:
+            errors.append(f"{path or 'event'} is too short")
+        if isinstance(schema.get("maxLength"), int) and len(value) > schema["maxLength"]:
+            errors.append(f"{path or 'event'} is too long")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str):
+            try:
+                if re.search(pattern, value) is None:
+                    errors.append(f"{path or 'event'} does not match the required pattern")
+            except re.error:
+                return [f"{path or 'event'} has an invalid schema pattern"]
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(schema.get("minimum"), (int, float)) and value < schema["minimum"]:
+            errors.append(f"{path or 'event'} is below the minimum")
+        if isinstance(schema.get("maximum"), (int, float)) and value > schema["maximum"]:
+            errors.append(f"{path or 'event'} is above the maximum")
+        if isinstance(schema.get("exclusiveMinimum"), (int, float)) and value <= schema["exclusiveMinimum"]:
+            errors.append(f"{path or 'event'} is not above the exclusive minimum")
+        if isinstance(schema.get("exclusiveMaximum"), (int, float)) and value >= schema["exclusiveMaximum"]:
+            errors.append(f"{path or 'event'} is not below the exclusive maximum")
+
+    for keyword in ("allOf",):
+        children = schema.get(keyword)
+        if isinstance(children, list):
+            for child in children:
+                errors.extend(_schema_errors(value, child, root, path))
+    if isinstance(schema.get("anyOf"), list):
+        branches = [_schema_errors(value, child, root, path) for child in schema["anyOf"]]
+        if all(branch for branch in branches):
+            errors.append(f"{path or 'event'} does not match any allowed shape")
+    if isinstance(schema.get("oneOf"), list):
+        branches = [_schema_errors(value, child, root, path) for child in schema["oneOf"]]
+        if sum(1 for branch in branches if not branch) != 1:
+            errors.append(f"{path or 'event'} must match exactly one allowed shape")
+    if "not" in schema and not _schema_errors(value, schema["not"], root, path):
+        errors.append(f"{path or 'event'} matches a forbidden shape")
+    return errors
+
+
+def validate_event(event: Any) -> bool:
+    """Validate an event against the pinned workflow schema.
+
+    Fails closed when ``WORKFLOW_SRC`` is unset, unreadable, or does not contain
+    the bee-landed schema.  Callers that only need local durability can use
+    :func:`record_landing`, which performs the structural/security checks but
+    does not pretend to have the pinned validator.
+    """
+
+    value = _validate_event_local(event)
+    schema_path = _workflow_schema_path()
+    schema = _load_json_file(schema_path)
+    if not isinstance(schema, Mapping):
+        raise EventError("workflow_schema_unavailable", "schema must be a JSON object", _FIX_SCHEMA)
+
+    try:
+        import jsonschema  # type: ignore
+    except Exception:  # noqa: BLE001 - optional dependency; stdlib fallback below
+        jsonschema = None
+
+    if jsonschema is not None:
+        try:
+            validator_cls = jsonschema.validators.validator_for(schema)
+            validator_cls.check_schema(schema)
+            errors = sorted(validator_cls(schema).iter_errors(value), key=lambda item: list(item.path))
+        except Exception as exc:  # noqa: BLE001 - a broken pinned schema is a refusal
+            raise EventError(
+                "workflow_schema_unavailable",
+                f"the pinned schema cannot be loaded: {type(exc).__name__}",
+                _FIX_SCHEMA,
+            ) from exc
+        if errors:
+            first = errors[0]
+            where = ".".join(str(part) for part in first.path) or "event"
+            # Do not echo the instance value: a worker-supplied field may be a
+            # credential or a private path that the schema happened to reject.
+            raise EventError(
+                "event_schema_invalid",
+                f"{where} does not satisfy the pinned workflow schema",
+                "Fix the event to satisfy the pinned workflow schema.",
+            )
+    else:
+        problems = _schema_errors(value, schema, schema)
+        if problems:
+            raise EventError(
+                "event_schema_invalid",
+                problems[0],
+                "Fix the event to satisfy the pinned workflow schema.",
+            )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Durable file helpers
+# ---------------------------------------------------------------------------
+
+
+def _events_dir(state_dir: Any) -> Path:
+    return Path(state_dir) / "events"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _fsync_dir(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _read_regular(path: Path, *, limit: int = _MAX_READ_BYTES) -> bytes | None:
+    """Read a regular non-symlink file, or return None when it does not exist."""
+
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise EventError(
+            "event_write_failed",
+            f"cannot read {path.name}: {type(exc).__name__}",
+            "Remove the unsafe file and retry from a healthy state directory.",
+        ) from exc
+    try:
+        info = os.fstat(fd)
+        if not (info.st_mode & 0o170000) == 0o100000:
+            raise EventError("event_invalid", f"{path.name} is not a regular file", _FIX_EVENT)
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+            raise EventError("event_oversized", f"{path.name} is too large", _FIX_EVENT)
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _create_only_payload(path: Path, payload: bytes) -> bool:
+    """Publish *payload* at *path* once; fsynced before and after the link."""
+
+    _ensure_private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        _fsync_dir(path.parent)
+        return True
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _replace_payload(path: Path, payload: bytes) -> None:
+    """Atomically replace *path*; used only for replaying a delivery."""
+
+    _ensure_private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _create_only_json(path: Path, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Create a JSON object once; return ``(record, created)``.
+
+    Identical bytes are idempotent.  A different object at the same path is a
+    conflict and is never overwritten.
+    """
+
+    payload = _canonical(value)
+    existing = _read_regular(path)
+    if existing is not None:
+        if existing == payload:
+            return _decode(existing, path), False
+        raise EventError(
+            "event_conflict",
+            f"{path.name} already holds different bytes",
+            "Keep the original event/subscriber record; do not rewrite durable events.",
+        )
+    created = _create_only_payload(path, payload)
+    raw = _read_regular(path)
+    if raw is None:
+        raise EventError("event_write_failed", f"{path.name} was not published", "Retry the operation.")
+    if raw != payload:
+        raise EventError(
+            "event_conflict",
+            f"{path.name} changed during publication",
+            "Inspect the state directory; another writer produced a different record.",
+        )
+    return _decode(raw, path), created
+
+
+def _decode(raw: bytes, path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EventError("event_invalid", f"{path.name} is not JSON", _FIX_EVENT) from exc
+    if not isinstance(value, Mapping):
+        raise EventError("event_invalid", f"{path.name} is not a JSON object", _FIX_EVENT)
+    return dict(value)
+
+
+def _replace_json(path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _canonical(value)
+    _replace_payload(path, payload)
+    return dict(value)
+
+
+def _remove_file(path: Path) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise EventError("event_write_failed", f"cannot remove {path.name}", "Retry the operation.") from exc
+    _fsync_dir(path.parent)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Outbox
+# ---------------------------------------------------------------------------
+
+
+def _outbox_path(state_dir: Any, event_id: str) -> Path:
+    return _events_dir(state_dir) / OUTBOX_DIR / f"{_safe_event_id(event_id)}.json"
+
+
+def record_landing(state_dir: Any, event: Any) -> dict[str, Any]:
+    """Persist one landing event in the create-only, fsynced outbox.
+
+    Returns the stored event plus ``created`` (False when the identical event
+    was already present).  A different event under the same id is refused.
+    """
+
+    value = _validate_event_local(event)
+    event_id = _safe_event_id(value.get("id"))
+    path = _outbox_path(state_dir, event_id)
+    try:
+        record, created = _create_only_json(path, value)
+    except EventError:
+        raise
+    except OSError as exc:
+        raise EventError(
+            "event_write_failed",
+            f"outbox write failed: {type(exc).__name__}",
+            "Check the state directory is writable and retry.",
+        ) from exc
+    if record.get("id") != event_id:
+        raise EventError("event_conflict", "stored event id does not match its path", "Inspect the outbox.")
+    return {**record, "created": created}
+
+
+def _iter_outbox(state_dir: Any) -> list[tuple[str, dict[str, Any]]]:
+    directory = _events_dir(state_dir) / OUTBOX_DIR
+    if not directory.is_dir():
+        return []
+    events: list[tuple[str, dict[str, Any]]] = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        if path.name.startswith(".") or path.suffix != ".json":
+            continue
+        try:
+            raw = _read_regular(path)
+        except EventError:
+            continue
+        if raw is None:
+            continue
+        try:
+            value = _validate_event_local(_decode(raw, path))
+        except EventError:
+            continue
+        events.append((_safe_event_id(value["id"]), value))
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+
+def _subscriber_path(state_dir: Any, identity: str) -> Path:
+    return _events_dir(state_dir) / SUBSCRIBERS_DIR / f"{_safe_identity(identity)}.json"
+
+
+def _normalize_secret(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise EventError("subscriber_invalid", "secret must be text", _FIX_SUBSCRIBER)
+    if not value or len(value) > 4096 or any(ord(ch) < 0x20 for ch in value):
+        raise EventError(
+            "subscriber_invalid",
+            "secret must be non-empty text without control characters",
+            _FIX_SUBSCRIBER,
+        )
+    return value
+
+
+def _normalize_subscriber(subscriber: Any) -> dict[str, Any]:
+    if not isinstance(subscriber, Mapping):
+        raise EventError("subscriber_invalid", "subscriber must be an object", _FIX_SUBSCRIBER)
+    identity = _safe_identity(subscriber)
+    url = subscriber.get("url")
+    file_target = subscriber.get("file")
+    session = subscriber.get("session")
+    secret = _normalize_secret(subscriber.get("secret"))
+
+    if (url is None) == (file_target is None):
+        raise EventError(
+            "subscriber_invalid",
+            "subscriber needs exactly one of url or file",
+            _FIX_SUBSCRIBER,
+        )
+    if url is not None:
+        if not isinstance(url, str):
+            raise EventError("subscriber_invalid", "url must be text", _FIX_SUBSCRIBER)
+        text = url.strip()
+        if len(text) > 2048 or not re.match(r"^https?://", text, re.IGNORECASE):
+            raise EventError("subscriber_invalid", "url must be http(s)", _FIX_SUBSCRIBER)
+        # A URL carrying userinfo is a credential in the subscription record.
+        if re.match(r"^https?://[^/]*@", text, re.IGNORECASE):
+            raise EventError("subscriber_invalid", "url must not embed credentials", _FIX_SUBSCRIBER)
+        if looks_like_secret(text):
+            raise EventError("subscriber_invalid", "url looks like a credential", _FIX_SUBSCRIBER)
+        return {
+            "schema": SUBSCRIBER_SCHEMA,
+            "identity": identity,
+            "url": text,
+            "file": None,
+            "secret": secret,
+            "session": _optional_session(session),
+        }
+    if not isinstance(file_target, str) or not file_target.strip():
+        raise EventError("subscriber_invalid", "file must be non-empty text", _FIX_SUBSCRIBER)
+    if "\x00" in file_target or len(file_target) > 2048 or looks_like_secret(file_target):
+        raise EventError("subscriber_invalid", "file target is not safe", _FIX_SUBSCRIBER)
+    return {
+        "schema": SUBSCRIBER_SCHEMA,
+        "identity": identity,
+        "url": None,
+        "file": file_target,
+        "secret": secret,
+        "session": _optional_session(session),
+    }
+
+
+def _optional_session(session: Any) -> str | None:
+    if session is None:
+        return None
+    text = session.strip() if isinstance(session, str) else ""
+    if not text or len(text) > MAX_IDENTIFIER or not _ID_RE.match(text):
+        raise EventError("subscriber_invalid", "session is not a safe identifier", _FIX_SUBSCRIBER)
+    return text
+
+
+def _public_subscriber(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A subscriber view safe to return or log: the secret is never included."""
+
+    return {key: value for key, value in record.items() if key != "secret"}
+
+
+def subscribe(state_dir: Any, subscriber: Mapping[str, Any]) -> dict[str, Any]:
+    """Record a subscriber durably; identical re-subscription is idempotent.
+
+    An http(s) subscriber may carry a ``secret`` used to sign deliveries.  The
+    secret is persisted in the private subscriber record with ``0600``
+    permissions and is never returned by this function.
+    """
+
+    value = _normalize_subscriber(subscriber)
+    path = _subscriber_path(state_dir, value["identity"])
+    fields = ("identity", "url", "file", "session", "secret")
+    existing = _read_regular(path)
+    if existing is not None:
+        record = _decode(existing, path)
+        comparable = {key: record.get(key) for key in fields}
+        wanted = {key: value[key] for key in fields}
+        if comparable != wanted:
+            raise EventError(
+                "subscriber_conflict",
+                f"subscriber {value['identity']} is already subscribed with different settings",
+                "Unsubscribe first if the target must change.",
+            )
+        return {**_public_subscriber(record), "created": False}
+    value["subscribed_at"] = _iso(_clock(None), microseconds=True)
+    record, created = _create_only_json(path, value)
+    return {**_public_subscriber(record), "created": created}
+
+
+def unsubscribe(state_dir: Any, subscriber: Any) -> bool:
+    """Remove one subscription; missing is not an error."""
+
+    identity = _safe_identity(subscriber)
+    return _remove_file(_subscriber_path(state_dir, identity))
+
+
+def _iter_subscribers(state_dir: Any) -> list[dict[str, Any]]:
+    directory = _events_dir(state_dir) / SUBSCRIBERS_DIR
+    if not directory.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        if path.name.startswith(".") or path.suffix != ".json":
+            continue
+        raw = _read_regular(path)
+        if raw is None:
+            continue
+        try:
+            record = _decode(raw, path)
+            if _safe_identity(record) != path.stem:
+                continue
+        except EventError:
+            continue
+        records.append(record)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+
+def _delivery_id(identity: str, event_id: str) -> str:
+    seed = f"{identity}\x00{event_id}".encode("utf-8")
+    return "dlv_" + hashlib.sha256(seed).hexdigest()[:32]
+
+
+def _delivery_path(state_dir: Any, identity: str, event_id: str) -> Path:
+    return _events_dir(state_dir) / INBOX_DIR / identity / f"{_safe_event_id(event_id)}.json"
+
+
+def _ack_path(state_dir: Any, identity: str, event_id: str) -> Path:
+    return _events_dir(state_dir) / ACKS_DIR / identity / f"{_safe_event_id(event_id)}.json"
+
+
+def _attempt_path(state_dir: Any, identity: str, event_id: str) -> Path:
+    return _events_dir(state_dir) / DELIVERY_DIR / identity / f"{_safe_event_id(event_id)}.json"
+
+
+def _next_attempt(state_dir: Any, identity: str, event_id: str, *, base: int = 0) -> int:
+    path = _attempt_path(state_dir, identity, event_id)
+    current = base
+    if path.exists():
+        try:
+            existing = _decode(_read_regular(path) or b"{}", path)
+            current = max(current, int(existing.get("attempts") or 0))
+        except (EventError, TypeError, ValueError):
+            current = max(current, base)
+    attempts = current + 1
+    _replace_json(
+        path,
+        {
+            "schema": "rizzstack.bee-delivery-attempts/1",
+            "event_id": event_id,
+            "subscriber": identity,
+            "attempts": attempts,
+            "last_attempt_at": _iso(time.time(), microseconds=True),
+        },
+    )
+    return attempts
+
+
+def _delivery_record(
+    identity: str, event: Mapping[str, Any], attempts: int, *, at: str | None = None
+) -> dict[str, Any]:
+    event_id = _safe_event_id(event.get("id"))
+    return {
+        "schema": DELIVERY_SCHEMA,
+        "delivery_id": _delivery_id(identity, event_id),
+        "event_id": event_id,
+        "subscriber": identity,
+        "attempts": max(1, int(attempts)),
+        "delivered_at": at or _iso(time.time(), microseconds=True),
+        "event_sha256": _digest_bytes(_canonical(event)),
+        "event": dict(event),
+    }
+
+
+def _publish_delivery(
+    state_dir: Any, identity: str, event: Mapping[str, Any], *, replace: bool = False
+) -> dict[str, Any]:
+    event_id = _safe_event_id(event.get("id"))
+    path = _delivery_path(state_dir, identity, event_id)
+    existing = _read_regular(path)
+    if existing is not None and not replace:
+        return _decode(existing, path)
+
+    base = 0
+    if existing is not None:
+        try:
+            base = int(_decode(existing, path).get("attempts") or 0)
+        except (EventError, TypeError, ValueError):
+            base = 0
+    attempts = _next_attempt(state_dir, identity, event_id, base=base)
+    record = _delivery_record(identity, event, attempts)
+    if existing is not None and replace:
+        _replace_json(path, record)
+        return record
+    stored, _created = _create_only_json(path, record)
+    return stored
+
+
+def _delivery_exists(state_dir: Any, identity: str, event_id: str) -> bool:
+    return _read_regular(_delivery_path(state_dir, identity, event_id)) is not None
+
+
+def _ack_exists(state_dir: Any, identity: str, event_id: str) -> bool:
+    return _read_regular(_ack_path(state_dir, identity, event_id)) is not None
+
+
+# ---------------------------------------------------------------------------
+# HTTP delivery signing and verification
+# ---------------------------------------------------------------------------
+
+
+def _header_value(headers: Any, name: str) -> str | None:
+    """Case-insensitive header lookup that also accepts an email.message object."""
+
+    if headers is None:
+        return None
+    value: Any = None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        try:
+            value = getter(name)
+        except (TypeError, ValueError):
+            value = None
+    if value is None:
+        try:
+            items = headers.items()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        wanted = name.lower()
+        for key, item in items:
+            if isinstance(key, str) and key.lower() == wanted:
+                value = item
+                break
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _timestamp_header_value(now: Any = None) -> str:
+    return str(int(_clock(now)))
+
+
+def _signing_message(delivery_id: str, timestamp: str, body: bytes) -> bytes:
+    """Return the unambiguous, domain-separated bytes covered by a signature.
+
+    Every field is length-prefixed, so no delivery id, timestamp or body can be
+    shifted into another field.  The domain and version make a signature from
+    one protocol version useless against another.
+    """
+
+    fields = (
+        delivery_id.encode("utf-8"),
+        timestamp.encode("utf-8"),
+        body,
+    )
+    return (
+        SIGNATURE_DOMAIN
+        + b"\x00"
+        + SIGNATURE_VERSION.encode("ascii")
+        + b"\x00"
+        + b"".join(len(field).to_bytes(8, "big") + field for field in fields)
+    )
+
+
+def _signature_digest(secret: str, delivery_id: str, timestamp: str, body: bytes) -> str:
+    message = _signing_message(delivery_id, timestamp, body)
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _signature_for(secret: str, delivery_id: str, timestamp: str, body: bytes) -> str:
+    return f"{SIGNATURE_VERSION}=sha256={_signature_digest(secret, delivery_id, timestamp, body)}"
+
+
+def _http_body(event: Mapping[str, Any]) -> bytes:
+    return _canonical(event)
+
+
+def _http_headers(
+    record: Mapping[str, Any], body: bytes, secret: str, *, now: Any = None
+) -> dict[str, str]:
+    timestamp = _timestamp_header_value(now)
+    delivery_id = str(record.get("delivery_id") or "")
+    return {
+        "Content-Type": "application/json",
+        TIMESTAMP_HEADER: timestamp,
+        SIGNATURE_HEADER: _signature_for(secret, delivery_id, timestamp, body),
+        DELIVERY_ID_HEADER: delivery_id,
+        EVENT_ID_HEADER: str(record.get("event_id") or ""),
+    }
+
+
+def _send_http(
+    url: str,
+    body: bytes,
+    headers: Mapping[str, str],
+    *,
+    refresh: Any = None,
+) -> None:
+    """POST *body* once, retrying transient failures a bounded number of times.
+
+    ``refresh`` (when given) is called before every attempt and must return a
+    freshly signed header mapping.  A retry therefore carries a new timestamp
+    while keeping the same logical delivery id, so a receiver that already
+    accepted the previous attempt can return its durable receipt instead of
+    rejecting an exact replay.
+
+    Error text never contains the subscriber URL or response body, so a secret
+    embedded in either cannot leak into a summary or log.
+    """
+
+    last: EventError | None = None
+    for attempt in range(HTTP_RETRIES + 1):
+        attempt_headers = refresh() if callable(refresh) else headers
+        try:
+            request = urlrequest.Request(url, data=body, headers=dict(attempt_headers), method="POST")
+            with urlrequest.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if callable(getcode) else 200
+                reader = getattr(response, "read", None)
+                if callable(reader):
+                    reader(0)
+            if 200 <= int(status) < 300:
+                return
+            last = EventError(
+                "delivery_http_error",
+                f"subscriber returned HTTP {int(status)}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+        except urlerror.HTTPError as exc:
+            last = EventError(
+                "delivery_http_error",
+                f"subscriber returned HTTP {exc.code}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+            if exc.code < 500:
+                break
+        except (urlerror.URLError, TimeoutError, OSError) as exc:
+            last = EventError(
+                "delivery_http_failed",
+                f"http delivery failed: {type(exc).__name__}",
+                "Check the subscriber endpoint; the event remains pending.",
+            )
+        except ValueError:
+            last = EventError(
+                "delivery_http_failed",
+                "http delivery failed: invalid URL",
+                "Re-subscribe with a valid http(s) URL.",
+            )
+            break
+        if attempt < HTTP_RETRIES and HTTP_RETRY_BACKOFF_S > 0:
+            time.sleep(HTTP_RETRY_BACKOFF_S * (2**attempt))
+    raise last or EventError(
+        "delivery_http_failed",
+        "http delivery failed",
+        "Check the subscriber endpoint; the event remains pending.",
+    )
+
+
+def _publish_http_delivery(
+    state_dir: Any,
+    identity: str,
+    event: Mapping[str, Any],
+    url: str,
+    secret: str,
+) -> dict[str, Any]:
+    """Sign and POST one event, then persist the inbox record on success."""
+
+    event_id = _safe_event_id(event.get("id"))
+    path = _delivery_path(state_dir, identity, event_id)
+    existing = _read_regular(path)
+    if existing is not None:
+        return _decode(existing, path)
+
+    body = _http_body(event)
+    if len(body) > MAX_HTTP_BODY_BYTES:
+        raise EventError(
+            "delivery_oversized",
+            f"http delivery body is {len(body)} bytes; the limit is {MAX_HTTP_BODY_BYTES}",
+            "Keep the event small; the delivery body limit is 256 KiB.",
+        )
+
+    attempts = _next_attempt(state_dir, identity, event_id)
+    record = _delivery_record(identity, event, attempts)
+    headers = _http_headers(record, body, secret)
+
+    def refreshed_headers() -> dict[str, str]:
+        return _http_headers(record, body, secret)
+
+    _send_http(url, body, headers, refresh=refreshed_headers)
+    stored, _created = _create_only_json(path, record)
+    return stored
+
+
+def _body_bytes(body: Any) -> bytes:
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, bytearray):
+        return bytes(body)
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, Mapping):
+        return _canonical(body)
+    raise EventError(
+        "delivery_invalid",
+        "body must be bytes, text or a JSON object",
+        "Verify the exact body bytes that were received.",
+    )
+
+
+def _parse_signature(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip()
+    prefix = f"{SIGNATURE_VERSION}=sha256="
+    if not text.startswith(prefix):
+        return None
+    digest = text[len(prefix) :].strip()
+    if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+        return None
+    return digest.lower()
+
+
+def _parse_timestamp(value: str | None) -> float:
+    if not value:
+        raise EventError(
+            "delivery_timestamp_missing",
+            f"{TIMESTAMP_HEADER} is required",
+            "Sign every delivery with a fresh timestamp.",
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError as exc:
+            raise EventError(
+                "delivery_timestamp_invalid",
+                f"{TIMESTAMP_HEADER} must be epoch seconds or ISO-8601",
+                "Sign every delivery with a fresh timestamp.",
+            ) from exc
+    if not math.isfinite(parsed):
+        raise EventError(
+            "delivery_timestamp_invalid",
+            f"{TIMESTAMP_HEADER} must be finite",
+            "Sign every delivery with a fresh timestamp.",
+        )
+    return parsed
+
+
+def _delivery_id_header(headers: Any) -> str:
+    value = _header_value(headers, DELIVERY_ID_HEADER)
+    if not value:
+        raise EventError(
+            "delivery_id_missing",
+            f"{DELIVERY_ID_HEADER} is required",
+            "Sign the delivery id together with the timestamp and body.",
+        )
+    if len(value) > MAX_IDENTIFIER or not _ID_RE.match(value):
+        raise EventError(
+            "delivery_invalid",
+            f"{DELIVERY_ID_HEADER} is not a safe identifier",
+            "Use a short delivery id containing only safe identifier characters.",
+        )
+    return value
+
+
+def _replay_key(secret: str, identifier: str) -> tuple[str, str]:
+    secret_fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    return secret_fingerprint, identifier
+
+
+def _clear_delivery_replay_cache() -> None:
+    """Forget in-memory replay markers (principally for tests)."""
+
+    with _VERIFIED_LOCK:
+        _VERIFIED_DELIVERIES.clear()
+
+
+def _verified_disk_path(state_dir: Any, key: tuple[str, str]) -> Path:
+    token = hashlib.sha256(f"{key[0]}\x00{key[1]}".encode("utf-8")).hexdigest()
+    return _events_dir(state_dir) / "verified" / f"{token}.json"
+
+
+def _verify_context(
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any,
+    tolerance_s: Any,
+) -> dict[str, Any]:
+    """Authenticate the signed delivery-id, timestamp and exact body together."""
+
+    raw = _body_bytes(body)
+    if len(raw) > MAX_HTTP_BODY_BYTES:
+        raise EventError(
+            "delivery_oversized",
+            f"http delivery body is {len(raw)} bytes; the limit is {MAX_HTTP_BODY_BYTES}",
+            "Keep the delivery body at or below 256 KiB.",
+        )
+
+    if not isinstance(secret, str) or not secret:
+        raise EventError(
+            "secret_missing",
+            "an HMAC secret is required to verify a delivery",
+            "Configure the subscriber secret on both sides of the delivery.",
+        )
+
+    try:
+        tolerance = float(DEFAULT_TIMESTAMP_TOLERANCE_S if tolerance_s is None else tolerance_s)
+    except (TypeError, ValueError) as exc:
+        raise EventError(
+            "delivery_timestamp_invalid",
+            "tolerance_s must be numeric",
+            "Pass the allowed clock skew in seconds.",
+        ) from exc
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise EventError(
+            "delivery_timestamp_invalid",
+            "tolerance_s must be a non-negative finite number",
+            "Pass the allowed clock skew in seconds.",
+        )
+
+    timestamp_text = _header_value(headers, TIMESTAMP_HEADER)
+    timestamp = _parse_timestamp(timestamp_text)
+    delivery_id = _delivery_id_header(headers)
+    current = _clock(now)
+    if abs(current - timestamp) > tolerance:
+        raise EventError(
+            "delivery_stale",
+            "delivery timestamp is outside the allowed window",
+            "Reject the delivery and ask the sender for a fresh retry.",
+        )
+
+    provided = _parse_signature(_header_value(headers, SIGNATURE_HEADER))
+    if provided is None:
+        raise EventError(
+            "delivery_signature_invalid",
+            f"{SIGNATURE_HEADER} is missing or malformed",
+            "Reject the delivery; a versioned sha256=<hex> signature is required.",
+        )
+    expected = _signature_digest(secret, delivery_id, str(timestamp_text), raw)
+    if not hmac.compare_digest(expected, provided):
+        raise EventError(
+            "delivery_signature_invalid",
+            "delivery signature does not match the delivery id, timestamp and body",
+            "Reject the delivery; a header or the body was altered.",
+        )
+
+    event_id = _header_value(headers, EVENT_ID_HEADER)
+    if event_id is not None and not _EVENT_ID_RE.match(event_id):
+        event_id = None
+    return {
+        "raw": raw,
+        "body_sha256": _digest_bytes(raw),
+        "delivery_id": delivery_id,
+        "timestamp": str(timestamp_text),
+        "event_id": event_id,
+        "verified_at": current,
+    }
+
+
+def _marker_is_exact(marker: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    return (
+        marker.get("delivery_id") == context.get("delivery_id")
+        and marker.get("timestamp") == context.get("timestamp")
+        and marker.get("body_sha256") == context.get("body_sha256")
+    )
+
+
+def _read_delivery_marker(
+    state_dir: Any | None, key: tuple[str, str]
+) -> dict[str, Any] | None:
+    if state_dir is None:
+        with _VERIFIED_LOCK:
+            marker = _VERIFIED_DELIVERIES.get(key)
+            return dict(marker) if marker is not None else None
+
+    path = _verified_disk_path(state_dir, key)
+    raw = _read_regular(path)
+    if raw is None:
+        return None
+    try:
+        return _decode(raw, path)
+    except EventError as exc:
+        raise EventError(
+            "delivery_write_failed",
+            "the durable replay marker is unreadable",
+            "Inspect the state directory; the delivery cannot be accepted safely.",
+        ) from exc
+
+
+def _store_delivery_marker(
+    state_dir: Any | None,
+    key: tuple[str, str],
+    marker: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    if state_dir is None:
+        with _VERIFIED_LOCK:
+            existing = _VERIFIED_DELIVERIES.get(key)
+            if existing is not None:
+                return dict(existing), False
+            _VERIFIED_DELIVERIES[key] = dict(marker)
+            _VERIFIED_DELIVERIES.move_to_end(key)
+            while len(_VERIFIED_DELIVERIES) > _MAX_VERIFIED_DELIVERIES:
+                _VERIFIED_DELIVERIES.popitem(last=False)
+            return dict(marker), True
+
+    path = _verified_disk_path(state_dir, key)
+    try:
+        created = _create_only_payload(path, _canonical(marker))
+    except OSError as exc:
+        raise EventError(
+            "delivery_write_failed",
+            f"cannot persist the replay marker: {type(exc).__name__}",
+            "Check the state directory is writable; the delivery remains retryable.",
+        ) from exc
+    if created:
+        return dict(marker), True
+    existing = _read_delivery_marker(state_dir, key)
+    if existing is None:
+        raise EventError(
+            "delivery_write_failed",
+            "the replay marker disappeared during publication",
+            "Retry the delivery; no acceptance was recorded.",
+        )
+    return existing, False
+
+
+def _receipt(
+    marker: Mapping[str, Any], *, duplicate: bool, created: bool
+) -> dict[str, Any]:
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "delivery_id": marker.get("delivery_id"),
+        "event_id": marker.get("event_id"),
+        "timestamp": marker.get("timestamp"),
+        "body_sha256": marker.get("body_sha256"),
+        "accepted_at": marker.get("accepted_at"),
+        "duplicate": duplicate,
+        "created": created,
+    }
+
+
+def verify_delivery(
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any = None,
+    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
+    *,
+    state_dir: Any = None,
+) -> bool:
+    """Authenticate a versioned HMAC-signed HTTP delivery.
+
+    The signature header is ``v1=sha256=<hex>`` over a domain-separated,
+    length-prefixed message containing the delivery id, the exact timestamp
+    header text and the exact raw ``body`` bytes.  ``TIMESTAMP_HEADER`` must be
+    within ``tolerance_s`` of ``now``.
+
+    Verification is deliberately side-effect free: a replay marker is only
+    written by :func:`accept_delivery` after the caller has durably accepted a
+    delivery.  A crash before that acceptance therefore leaves no marker and a
+    fresh retry remains possible.  An exact replay of an already accepted
+    delivery (same delivery id, timestamp and body) is refused with
+    ``delivery_replayed``.
+
+    Raises :class:`EventError` with a stable code on every refusal and returns
+    ``True`` for a valid, fresh delivery.
+    """
+
+    context = _verify_context(headers, body, secret, now, tolerance_s)
+    marker = _read_delivery_marker(
+        state_dir, _replay_key(str(secret), context["delivery_id"])
+    )
+    if marker is not None and _marker_is_exact(marker, context):
+        raise EventError(
+            "delivery_replayed",
+            "this delivery was already accepted",
+            "Treat a repeated delivery id as a replay and discard it.",
+        )
+    return True
+
+
+def accept_delivery(
+    state_dir: Any,
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any = None,
+    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
+    *,
+    on_accept: Any = None,
+) -> dict[str, Any]:
+    """Verify a delivery and durably record its receipt once.
+
+    ``on_accept``, when supplied, is called with the receipt *before* the
+    replay marker is persisted.  A crash or exception during the caller's
+    durable acceptance therefore leaves no marker, and the same delivery can be
+    retried.  Once a marker exists, an exact replay is refused; a legitimate
+    retransmission (same delivery id and body, freshly signed timestamp) returns
+    the stored receipt with ``duplicate=True`` and does not repeat effects.
+    """
+
+    context = _verify_context(headers, body, secret, now, tolerance_s)
+    key = _replay_key(str(secret), context["delivery_id"])
+    marker = _read_delivery_marker(state_dir, key)
+    if marker is not None:
+        if _marker_is_exact(marker, context):
+            raise EventError(
+                "delivery_replayed",
+                "this delivery was already accepted",
+                "Treat a repeated delivery id as a replay and discard it.",
+            )
+        return _receipt(marker, duplicate=True, created=False)
+
+    marker = {
+        "schema": VERIFIED_SCHEMA,
+        "delivery_id": context["delivery_id"],
+        "event_id": context["event_id"],
+        "timestamp": context["timestamp"],
+        "body_sha256": context["body_sha256"],
+        "accepted_at": _iso(context["verified_at"], microseconds=True),
+    }
+    receipt = _receipt(marker, duplicate=False, created=True)
+    if on_accept is not None:
+        on_accept(receipt)
+    stored, created = _store_delivery_marker(state_dir, key, marker)
+    if not created:
+        return _receipt(stored, duplicate=True, created=False)
+    return _receipt(stored, duplicate=False, created=True)
+
+
+def pending_deliveries(state_dir: Any, subscriber: Any = None) -> list[dict[str, str]]:
+    """Crash-recovery scan: outbox events with no inbox record for a subscriber.
+
+    This is read-only and is the same predicate :func:`deliver_pending` uses, so
+    an operator can inspect what a restart will recover.
+    """
+
+    events = _iter_outbox(state_dir)
+    if subscriber is None:
+        subscribers = [_safe_identity(item) for item in _iter_subscribers(state_dir)]
+    else:
+        subscribers = [_safe_identity(subscriber)]
+    pending: list[dict[str, str]] = []
+    for identity in subscribers:
+        for event_id, _event in events:
+            if not _delivery_exists(state_dir, identity, event_id):
+                pending.append({"subscriber": identity, "event_id": event_id})
+    return pending
+
+
+def _subscriber_records(state_dir: Any, subscriber: Any = None) -> list[dict[str, Any]]:
+    if subscriber is None:
+        return _iter_subscribers(state_dir)
+    identity = _safe_identity(subscriber)
+    path = _subscriber_path(state_dir, identity)
+    raw = _read_regular(path)
+    if raw is None:
+        # Preserve the legacy behaviour of delivering to an identity that has
+        # no durable subscription: without a record there is no url or secret,
+        # so it uses the file transport.
+        return [{"identity": identity, "url": None, "file": None, "secret": None}]
+    return [_decode(raw, path)]
+
+
+def deliver_pending(state_dir: Any, subscriber: Any = None) -> dict[str, Any]:
+    """Deliver every undelivered outbox event to each subscriber.
+
+    File subscribers get an atomically written inbox record.  http(s)
+    subscribers get a signed POST whose body is the exact canonical event JSON;
+    the inbox record is written only after the endpoint accepts it.  Delivery is
+    at-least-once.  A failed write or POST leaves the event pending and the next
+    call retries it with the same ids; an existing delivery is never rewritten
+    (except through :func:`replay`).  Secrets are never included in the result,
+    failures or event payloads.
+    """
+
+    events = _iter_outbox(state_dir)
+    subscribers = _subscriber_records(state_dir, subscriber)
+
+    delivered: list[dict[str, Any]] = []
+    skipped = 0
+    failures: list[dict[str, str]] = []
+    for subscription in subscribers:
+        identity = _safe_identity(subscription)
+        url = subscription.get("url")
+        secret = subscription.get("secret")
+        for event_id, event in events:
+            if _delivery_exists(state_dir, identity, event_id):
+                skipped += 1
+                continue
+            try:
+                if url is not None:
+                    if not isinstance(secret, str) or not secret:
+                        raise EventError(
+                            "secret_missing",
+                            f"http subscriber {identity} has no delivery secret",
+                            "Unsubscribe and re-subscribe with a secret.",
+                        )
+                    record = _publish_http_delivery(
+                        state_dir, identity, event, str(url), secret
+                    )
+                else:
+                    record = _publish_delivery(state_dir, identity, event)
+            except Exception as exc:  # noqa: BLE001 - one subscriber must not stop the scan
+                failures.append(
+                    {
+                        "subscriber": identity,
+                        "event_id": event_id,
+                        "error": str(getattr(exc, "code", "delivery_failed")),
+                    }
+                )
+                continue
+            delivered.append(record)
+
+    return {
+        "delivered": len(delivered),
+        "skipped": skipped,
+        "failed": len(failures),
+        "pending": len(pending_deliveries(state_dir, subscriber)),
+        "deliveries": delivered,
+        "failures": failures,
+    }
+
+
+def recover_pending(state_dir: Any, subscriber: Any = None) -> dict[str, Any]:
+    """Alias for the crash-recovery scan plus delivery pass."""
+
+    return deliver_pending(state_dir, subscriber)
+
+
+#: Compatibility alias for callers that name the crash-recovery scan explicitly.
+scan_pending = pending_deliveries
+
+
+def dedupe_by_event_id(items: Iterable[Any]) -> list[Any]:
+    """Return *items* once per event id, preserving the first occurrence.
+
+    Items may be event mappings or bare event ids.  This mirrors the identity
+    used by the outbox and inbox paths, so callers do not have to invent a
+    second deduplication rule.
+    """
+
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for item in items:
+        event_id = item.get("id") if isinstance(item, Mapping) else item
+        identifier = _safe_event_id(event_id)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        unique.append(item)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement and replay
+# ---------------------------------------------------------------------------
+
+
+def acknowledge(
+    state_dir: Any, subscriber: Any, event_id: str, *, now: Any = None
+) -> dict[str, Any]:
+    """Record a durable ack for an already-delivered event."""
+
+    identity = _safe_identity(subscriber)
+    identifier = _safe_event_id(event_id)
+    delivery_raw = _read_regular(_delivery_path(state_dir, identity, identifier))
+    if delivery_raw is None:
+        raise EventError(
+            "delivery_missing",
+            f"{identity} has no delivery for {identifier}",
+            "Deliver the event first; an ack can never precede a delivery.",
+        )
+    delivery = _decode(delivery_raw, _delivery_path(state_dir, identity, identifier))
+    path = _ack_path(state_dir, identity, identifier)
+    existing = _read_regular(path)
+    if existing is not None:
+        record = _decode(existing, path)
+        return {**record, "created": False}
+    record = {
+        "schema": ACK_SCHEMA,
+        "event_id": identifier,
+        "subscriber": identity,
+        "delivery_id": delivery.get("delivery_id") or _delivery_id(identity, identifier),
+        "event_sha256": delivery.get("event_sha256"),
+        "acknowledged_at": _iso(_clock(now), microseconds=True),
+    }
+    stored, created = _create_only_json(path, record)
+    return {**stored, "created": created}
+
+
+def replay(
+    state_dir: Any, event_id: str, subscriber: Any, *, now: Any = None
+) -> dict[str, Any]:
+    """Re-deliver an event only when its delivery is acked or missing.
+
+    An outstanding (delivered but unacknowledged) inbox record is refused, so a
+    replay cannot silently create a duplicate race for a consumer that is still
+    processing the first copy.  A successful replay clears the ack; the consumer
+    must acknowledge the new delivery again.
+    """
+
+    identity = _safe_identity(subscriber)
+    identifier = _safe_event_id(event_id)
+    event = None
+    for candidate_id, candidate in _iter_outbox(state_dir):
+        if candidate_id == identifier:
+            event = candidate
+            break
+    if event is None:
+        raise EventError(
+            "event_missing",
+            f"the outbox has no event {identifier}",
+            "Replay only an event that was recorded durably.",
+        )
+
+    delivery_raw = _read_regular(_delivery_path(state_dir, identity, identifier))
+    acked = _ack_exists(state_dir, identity, identifier)
+    if delivery_raw is not None and not acked:
+        raise EventError(
+            "replay_refused",
+            f"{identity} has an unacknowledged delivery for {identifier}",
+            "Acknowledge the existing delivery before replaying it.",
+        )
+
+    _remove_file(_ack_path(state_dir, identity, identifier))
+    record = _publish_delivery(state_dir, identity, event, replace=delivery_raw is not None)
+    if now is not None:
+        # Make replay timestamps deterministic for callers that pass a clock.
+        record = {**record, "delivered_at": _iso(_clock(now), microseconds=True)}
+        _replace_json(_delivery_path(state_dir, identity, identifier), record)
+    return record

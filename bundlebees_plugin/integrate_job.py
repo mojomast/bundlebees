@@ -13,13 +13,19 @@ has always enforced. Nothing here weakens it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from . import revision, verify_local
+from . import revision, sandbox, test_receipts as receipts, verify_local
+
+DEFAULT_SANDBOX_TIMEOUT_S = 900
+_MAX_SANDBOX_TIMEOUT_S = 7200
+SuiteRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
 
 
 def _checkpoint(name: str, **payload: Any) -> None:
@@ -155,6 +161,341 @@ def verified_attempts(job: Mapping[str, Any]) -> list[str]:
     return attempts
 
 
+def _suite_evidence(
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    runner: SuiteRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run the full suite in the sandbox and return revision's evidence shape.
+
+    No child inherits the coordinator environment (``BUNDLEBEES_*``/``HERMES_*``
+    are absent because the sandbox builds an exact environment), the cwd is the
+    disposable copy of *workdir*, and a missing backend fails closed with
+    ``IntegrateError("sandbox_unavailable")``.
+    """
+
+    bounded = max(1, min(int(timeout), _MAX_SANDBOX_TIMEOUT_S))
+    try:
+        if runner is not None:
+            evidence = runner(Path(workdir), list(argv))
+        else:
+            evidence = sandbox.run_in_sandbox(
+                Path(workdir),
+                list(argv),
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=bounded,
+            )
+    except sandbox.SandboxUnavailable as exc:
+        raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+    except ValueError as exc:
+        raise IntegrateError(
+            "invalid_argument",
+            f"unknown verify_isolation backend: {exc}",
+            "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
+        ) from exc
+    if not isinstance(evidence, Mapping):
+        raise IntegrateError(
+            "sandbox_evidence",
+            "the suite runner returned no evidence",
+            "Check the sandbox runner and retry.",
+        )
+    try:
+        exit_code = int(evidence.get("exit_code"))
+    except (TypeError, ValueError):
+        exit_code = 1
+    return {
+        "exit_code": exit_code,
+        "timed_out": bool(evidence.get("timed_out")),
+        "tail": str(evidence.get("output_tail") or evidence.get("tail") or "").strip()[-300:],
+        "junit": evidence.get("junit"),
+        "backend": evidence.get("backend"),
+    }
+
+
+def _test_cache_stats() -> dict[str, int]:
+    return {"executions": 0, "hits": 0, "misses": 0}
+
+
+def _integration_request_lock(
+    job: Mapping[str, Any],
+    *,
+    wave: str,
+    attempts: Sequence[str],
+    suite_command: Sequence[str],
+) -> str:
+    payload = {
+        "job_id": str(job.get("job_id") or ""),
+        "wave": str(wave),
+        "attempts": [str(attempt) for attempt in attempts],
+        "suite_command": [str(item) for item in suite_command],
+    }
+    return "integrate-request:" + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _identity_digest(identity: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        dict(identity), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(b"bundlebees-integration-identity:v1\x00" + payload).hexdigest()
+
+
+def _integration_request_identity(
+    repo: Path,
+    *,
+    job: Mapping[str, Any],
+    wave: str,
+    base_rev: str,
+    shas: Sequence[tuple[str, str]],
+    suite_command: Sequence[str],
+    runner: SuiteRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """The complete identity of a request to validate one integration wave.
+
+    The accepted-wave record is historical evidence for *this* identity only.
+    The attempt commit shas, base tree, exact suite argv, installed runtime,
+    allowed environment and sandbox policy all participate, so a changed
+    command/runtime/policy is a new validation request rather than recovery.
+    """
+
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "wave": str(wave),
+        "base_rev": str(base_rev),
+        "source_tree_sha256": verify_local._tree_digest(repo, base_rev),
+        "attempts": [
+            {"attempt_id": str(attempt_id), "sha": str(sha)}
+            for attempt_id, sha in shas
+        ],
+        "command": [str(item) for item in suite_command],
+        "stack": verify_local._stack_identity(),
+        "dependency_environment": verify_local._installed_dependency_identity(),
+        "environment": verify_local._environment_policy(runner),
+        "sandbox": verify_local._sandbox_policy(
+            runner,
+            backend=backend,
+            allow_unsafe_local=allow_unsafe_local,
+            allow_weak=allow_weak,
+            timeout=timeout,
+        ),
+    }
+
+
+def _derived_wave_id(wave: str, digest: str) -> str:
+    """A distinct, safe wave id for a changed request on the same wave number."""
+
+    candidate = f"{wave}.{digest[:16]}"
+    if len(candidate) <= 64:
+        return candidate
+    stable = hashlib.sha256(wave.encode("utf-8")).hexdigest()[:8]
+    return f"{wave[:40]}.{stable}.{digest[:12]}"[:64]
+
+
+def _wave_identity_path(state_dir: Path, wave: str) -> Path:
+    # Deliberately outside waves/: callers enumerate waves/*.json as wave
+    # records, and this sidecar is identity evidence, not another wave.
+    return Path(state_dir) / "wave-identities" / f"{wave}.json"
+
+
+def _read_wave_identity(state_dir: Path, wave: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(_wave_identity_path(state_dir, wave).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_wave_identity(
+    state_dir: Path,
+    wave: str,
+    identity: Mapping[str, Any],
+    digest: str,
+    *,
+    materialized: Mapping[str, Any] | None = None,
+) -> None:
+    path = _wave_identity_path(state_dir, wave)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(
+            {
+                "identity": dict(identity),
+                "identity_digest": str(digest),
+                "materialized": dict(materialized or {}),
+            },
+            sort_keys=True,
+            indent=2,
+        ).encode("utf-8")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise IntegrateError(
+            "receipt_io",
+            f"the integration identity could not be written: {exc}",
+            "Check that the state directory is writable and retry.",
+        ) from exc
+
+
+def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    result = receipt.get("result")
+    if not isinstance(result, Mapping):
+        raise IntegrateError(
+            "receipt_corrupt",
+            "the stored suite receipt has no complete result",
+            "Remove the corrupt receipt only by intending to rerun the suite.",
+        )
+    try:
+        exit_code = int(result.get("exit_code"))
+    except (TypeError, ValueError) as exc:
+        raise IntegrateError(
+            "receipt_corrupt",
+            "the stored suite receipt has no exit code",
+            "Remove the corrupt receipt only by intending to rerun the suite.",
+        ) from exc
+    timed_out = result.get("timed_out", False)
+    if not isinstance(timed_out, bool):
+        raise IntegrateError(
+            "receipt_corrupt",
+            "the stored suite receipt has an invalid timeout flag",
+            "Remove the corrupt receipt only by intending to rerun the suite.",
+        )
+    tail = result.get("tail", "")
+    if tail is None:
+        tail = ""
+    if not isinstance(tail, str):
+        raise IntegrateError(
+            "receipt_corrupt",
+            "the stored suite receipt has an invalid output tail",
+            "Remove the corrupt receipt only by intending to rerun the suite.",
+        )
+    evidence: dict[str, Any] = {
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "tail": tail,
+        "junit": result.get("junit"),
+        "backend": result.get("backend"),
+        "receipt": {
+            "key": receipt.get("key"),
+            "hit": True,
+            "duration_s": receipt.get("duration_s"),
+        },
+    }
+    return evidence
+
+
+def _run_suite_with_receipt(
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    runner: SuiteRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+    receipt_context: Mapping[str, Any],
+) -> dict[str, Any]:
+    execute = lambda: _suite_evidence(  # noqa: E731 - local closure keeps the call site small
+        workdir,
+        argv,
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+    )
+    stats = receipt_context["stats"]
+    state_dir = receipt_context["state_dir"]
+    cacheable = bool(receipt_context.get("cacheable", True))
+    key_inputs = verify_local._receipt_key_inputs(
+        workdir,
+        command=argv,
+        stage=str(receipt_context["stage"]),
+        source_tree_sha256=str(receipt_context["source_tree_sha256"]),
+        patch_sha256=str(receipt_context["patch_sha256"]),
+        tests=receipt_context.get("tests", ()),
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+    )
+
+    try:
+        hit = receipts.lookup_receipt(state_dir, key_inputs, cacheable=cacheable)
+    except receipts.ReceiptError as exc:
+        raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+    if hit is not None:
+        verify_local._assert_sandbox_usable(
+            runner,
+            backend=backend,
+            allow_unsafe_local=allow_unsafe_local,
+            allow_weak=allow_weak,
+        )
+        stats["hits"] += 1
+        return _receipt_suite_evidence(hit)
+
+    if not cacheable:
+        stats["misses"] += 1
+        stats["executions"] += 1
+        return execute()
+
+    try:
+        claim = receipts.claim_receipt(state_dir, key_inputs, cacheable=True)
+    except receipts.ReceiptError as exc:
+        raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+    try:
+        try:
+            hit = receipts.lookup_receipt(state_dir, key_inputs)
+        except receipts.ReceiptError as exc:
+            raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+        if hit is not None:
+            verify_local._assert_sandbox_usable(
+                runner,
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+            )
+            stats["hits"] += 1
+            return _receipt_suite_evidence(hit)
+
+        stats["misses"] += 1
+        started = time.monotonic()
+        evidence = execute()
+        stats["executions"] += 1
+        duration = max(0.0, time.monotonic() - started)
+        if not evidence.get("timed_out"):
+            try:
+                receipts.record_receipt(state_dir, key_inputs, evidence, duration)
+            except receipts.ReceiptError as exc:
+                raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+        return evidence
+    finally:
+        claim.release()
+
+
 def integrate(
     state_dir: Path,
     job: Mapping[str, Any],
@@ -163,9 +504,73 @@ def integrate(
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     worktree_root: Path | None = None,
     wave_id: str | None = None,
+    runner: SuiteRunner | None = None,
+    sandbox_backend: str = "auto",
+    sandbox_allow_unsafe_local: bool = False,
+    sandbox_allow_weak: bool = False,
+    sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    cacheable: bool = True,
 ) -> dict[str, Any]:
-    """Build one integrated history from verified commits, then call integrate_wave."""
+    """Build one integrated history from verified commits, then call integrate_wave.
 
+    The full regression suite runs through :func:`_suite_evidence` (or the
+    explicitly injected *runner*) so it is sandboxed, bounded and never sees the
+    coordinator's environment. An unavailable sandbox fails closed with
+    ``IntegrateError("sandbox_unavailable")``. An identical wave request is
+    single-flighted and its exact suite invocation is reused from the ledger.
+    """
+
+    wave = wave_id or job_wave_id(job)
+    attempts = verified_attempts(job)
+    try:
+        claim = receipts.claim_key(
+            state_dir,
+            _integration_request_lock(
+                job,
+                wave=wave,
+                attempts=attempts,
+                suite_command=suite_command,
+            ),
+        )
+    except receipts.ReceiptError as exc:
+        raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+    try:
+        return _integrate_locked(
+            state_dir,
+            job,
+            repo,
+            suite_command=suite_command,
+            worktree_root=worktree_root,
+            wave_id=wave,
+            runner=runner,
+            sandbox_backend=sandbox_backend,
+            sandbox_allow_unsafe_local=sandbox_allow_unsafe_local,
+            sandbox_allow_weak=sandbox_allow_weak,
+            sandbox_timeout=sandbox_timeout,
+            cacheable=cacheable,
+            stats=_test_cache_stats(),
+        )
+    finally:
+        claim.release()
+
+
+def _integrate_locked(
+    state_dir: Path,
+    job: Mapping[str, Any],
+    repo: Path,
+    *,
+    suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
+    worktree_root: Path | None = None,
+    wave_id: str | None = None,
+    runner: SuiteRunner | None = None,
+    sandbox_backend: str = "auto",
+    sandbox_allow_unsafe_local: bool = False,
+    sandbox_allow_weak: bool = False,
+    sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    cacheable: bool = True,
+    stats: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    stats = stats if stats is not None else _test_cache_stats()
     state_dir = Path(state_dir)
     repo = Path(repo)
     attempts = verified_attempts(job)
@@ -178,14 +583,48 @@ def integrate(
 
     wave = wave_id or job_wave_id(job)
 
-    # Crash recovery: an accepted wave record already on disk is the result.
-    # Restore the durable ref if the crash happened before it was updated, and
-    # report recovery so the caller does not count it as a new attempt.
+    # The verified commits are inputs to the request identity, so read them
+    # before deciding whether an accepted wave is recovery or a stale result.
+    shas: list[tuple[str, str]] = []
+    for attempt_id in attempts:
+        record = verify_local.read_record(state_dir, attempt_id)
+        if not record or record.get("ok") is not True:
+            raise IntegrateError("not_verified", f"{attempt_id} has no accepted verify record", "Verify it first.")
+        sha = str(record.get("sha") or "")
+        if len(sha) != 40:
+            raise IntegrateError("bad_verify_record", f"{attempt_id} has no commit sha", "Re-verify it.")
+        shas.append((attempt_id, sha))
+
+    identity = _integration_request_identity(
+        repo,
+        job=job,
+        wave=wave,
+        base_rev=base_rev,
+        shas=shas,
+        suite_command=suite_command,
+        runner=runner,
+        backend=sandbox_backend,
+        allow_unsafe_local=sandbox_allow_unsafe_local,
+        allow_weak=sandbox_allow_weak,
+        timeout=sandbox_timeout,
+    )
+    identity_digest = _identity_digest(identity)
+
+    # Crash recovery: an accepted wave record already on disk is the result,
+    # but only for the execution identity it was earned under.  A changed
+    # command/runtime/policy is a new validation request and must not inherit
+    # the old accepted evidence.
     for legacy in _legacy_names(job):
         adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
         if adopted is not None:
             break
     existing = _accepted_wave_record(state_dir, wave)
+    if existing is not None:
+        stored = _read_wave_identity(state_dir, wave)
+        stored_digest = str((stored or {}).get("identity_digest") or "")
+        if stored_digest and stored_digest != identity_digest:
+            wave = _derived_wave_id(wave, identity_digest)
+            existing = _accepted_wave_record(state_dir, wave)
     if existing is not None:
         head = str(existing.get("head_sha") or "")
         if len(head) != 40:
@@ -201,22 +640,14 @@ def integrate(
             "integration_ref": ref_name,
             "start_rev": current or head,
             "recovered": True,
+            "request_identity_digest": identity_digest,
+            "test_cache": dict(stats),
         }
 
     # Later waves build on the last accepted result, not on the original base.
     ref = integration_ref(str(job.get("job_id") or ""))
     ref_check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
     start_rev = ref_check.stdout.strip() if ref_check.returncode == 0 else base_rev
-
-    shas: list[tuple[str, str]] = []
-    for attempt_id in attempts:
-        record = verify_local.read_record(state_dir, attempt_id)
-        if not record or record.get("ok") is not True:
-            raise IntegrateError("not_verified", f"{attempt_id} has no accepted verify record", "Verify it first.")
-        sha = str(record.get("sha") or "")
-        if len(sha) != 40:
-            raise IntegrateError("bad_verify_record", f"{attempt_id} has no commit sha", "Re-verify it.")
-        shas.append((attempt_id, sha))
 
     root = Path(worktree_root) if worktree_root else repo.parent / ".bb-integrate"
     worktree = root / "wt"
@@ -243,14 +674,39 @@ def integrate(
                     "Resolve the conflict by re-dispatching; do not rewrite verification commits.",
                 )
 
+        combined = json.dumps(
+            {
+                "start_rev": start_rev,
+                "attempts": [[attempt_id, sha] for attempt_id, sha in shas],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        patch_sha256 = hashlib.sha256(
+            b"bundlebees-integration-identity:v1\x00" + combined.encode("utf-8")
+        ).hexdigest()
+        source_tree_sha256 = verify_local._tree_digest(worktree, "HEAD")
+        receipt_context = {
+            "state_dir": state_dir,
+            "stage": "integrate.suite",
+            "source_tree_sha256": source_tree_sha256,
+            "patch_sha256": patch_sha256,
+            "tests": [],
+            "cacheable": cacheable,
+            "stats": stats,
+        }
+
         def run_suite(workdir: Path) -> dict[str, Any]:
-            proc = subprocess.run(
+            return _run_suite_with_receipt(
+                workdir,
                 list(suite_command),
-                cwd=str(workdir),
-                capture_output=True,
-                text=True,
+                runner=runner,
+                backend=sandbox_backend,
+                allow_unsafe_local=sandbox_allow_unsafe_local,
+                allow_weak=sandbox_allow_weak,
+                timeout=sandbox_timeout,
+                receipt_context=receipt_context,
             )
-            return {"exit_code": proc.returncode, "timed_out": False, "tail": (proc.stdout or proc.stderr)[-300:]}
 
         record = revision.integrate_wave(
             state_dir,
@@ -258,6 +714,18 @@ def integrate(
             worktree,
             attempts,
             run_suite,
+        )
+        materialized: dict[str, Any] = {
+            "wave_id": str(record.get("wave_id") or wave),
+            "head_sha": str(record.get("head_sha") or ""),
+            "accepted": bool(record.get("accepted")),
+        }
+        if materialized["head_sha"]:
+            materialized["source_tree_sha256"] = verify_local._tree_digest(
+                worktree, str(materialized["head_sha"])
+            )
+        _write_wave_identity(
+            state_dir, wave, identity, identity_digest, materialized=materialized
         )
         if record.get("accepted"):
             head = str(record.get("head_sha") or "")
@@ -288,6 +756,8 @@ def integrate(
         "integration_ref": head_ref,
         "start_rev": start_rev,
         "recovered": False,
+        "request_identity_digest": identity_digest,
+        "test_cache": dict(stats),
     }
 
 
