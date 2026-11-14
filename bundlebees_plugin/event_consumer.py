@@ -62,7 +62,7 @@ DEFAULT_CLAIM_TTL_S = 900
 STATES: tuple[str, ...] = ("pending", "claimed", "retryable", "acked", "failed")
 
 _ALLOWED_ID = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    ":abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 )
 
 _FIX = (
@@ -100,7 +100,7 @@ def _safe_id(value: Any, what: str) -> str:
         raise EventConsumerError(
             "identifier_invalid",
             f"{what} {text!r} is not a safe path component",
-            "Use letters, digits, '-', '_' and '.' only, at most 160 characters.",
+            "Use letters, digits, '-', '_', ':' and '.' only, at most 160 characters.",
         )
     return text
 
@@ -365,6 +365,9 @@ def _is_for(event: Mapping[str, Any], subscriber: str) -> bool:
 def _event_payload(event: Mapping[str, Any]) -> dict[str, Any]:
     """The event as the producer wrote it, without consumer bookkeeping."""
 
+    wrapped = event.get("event")
+    if isinstance(wrapped, Mapping):
+        return dict(wrapped)
     return {key: value for key, value in event.items() if key != "_delivery"}
 
 

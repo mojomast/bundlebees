@@ -1,7 +1,7 @@
 """Canonical landing-event tests.
 
 Every test uses a real temporary directory when durability matters.  The event
-under test is exactly ``rizzstack.bee.landed/1``: CloudEvents type
+under test is exactly ``rizzstack.bee-landed/1``: CloudEvents type
 ``rizzstack.bee.landed.v1`` with the canonical ``data`` object and no legacy
 fields.
 """
@@ -200,7 +200,7 @@ def test_build_event_emits_only_the_canonical_shape():
         "correlation_id",
         "causation_id",
     }
-    assert data["schema"] == "rizzstack.bee.landed/1"
+    assert data["schema"] == "rizzstack.bee-landed/1"
     assert data["attempt_id"] == "att_bee_1"
     assert data["state"] == "landed"
     assert data["source_rev"] == SOURCE_REV
@@ -322,11 +322,11 @@ def test_validate_event_refuses_tampered_envelopes_and_data(tmp_path, monkeypatc
 
     cases = []
     wrong_type = _event()
-    wrong_type["type"] = "rizzstack.bee-landed/1"
+    wrong_type["type"] = "rizzstack.bee.landed.v2"
     cases.append((wrong_type, "event_invalid"))
 
     wrong_schema = _event()
-    wrong_schema["data"]["schema"] = "rizzstack.bee-landed/1"
+    wrong_schema["data"]["schema"] = "rizzstack.bee.landed/1"
     cases.append((wrong_schema, "event_invalid"))
 
     bad_id = _event()

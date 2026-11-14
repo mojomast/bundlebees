@@ -81,7 +81,7 @@ __all__ = [
     "dedupe_by_event_id",
 ]
 
-SCHEMA = "rizzstack.bee.landed/1"
+SCHEMA = "rizzstack.bee-landed/1"
 EVENT_TYPE = "rizzstack.bee.landed.v1"
 SOURCE = "rizzstack://bundlebees"
 EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
@@ -848,7 +848,8 @@ def _validate_event_local(event: Any) -> dict[str, Any]:
 
     _assert_no_private_text(data, "data")
     for key, item in value.items():
-        if key in ("source", "data"):
+        # The envelope's source/dataschema are protocol URIs, not worker text.
+        if key in ("source", "data", "dataschema"):
             continue
         _assert_no_private_text(item, str(key))
     return value
