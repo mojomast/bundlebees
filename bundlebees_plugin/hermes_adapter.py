@@ -396,6 +396,11 @@ def render_prompt(package: Mapping[str, Any]) -> str:
         '- "supersede": replace the acceptance test selection of the same contract with the\n'
         "  pre-approved replacements. Legal only when a correction is permitted, and\n"
         "  corrected_tests must be a non-empty subset of approved_candidate_selectors.\n"
+        "  corrected_tests is a POSITIONAL replacement for the contract's acceptance test\n"
+        "  selection: it must contain exactly as many entries as the contract selection it\n"
+        "  replaces, and each entry replaces the corresponding selector. Do not return every\n"
+        "  approved candidate just because it is allowed; return only the replacement(s) whose\n"
+        "  behaviour satisfies the stated criterion.\n"
         '- "escalate": give the decision to a human. Changes nothing and is always admissible.\n'
         "\n"
         "Reply with exactly one JSON object and nothing else. No prose, no code fence, no comments.\n"

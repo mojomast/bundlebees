@@ -70,6 +70,11 @@ TEST_2 = "tools/acdd-lint/tests/test_check_reachability.py"
 T1_TEST = f"{TEST_1}::SourceRev::test_malformed_source_rev_is_refused"
 T2_BAD_TEST = f"{TEST_2}::Reachability::test_ancestor_ok"          # does not exist: the injected defect
 T2_GOOD_TEST = f"{TEST_2}::Reachability::test_reachable_commit_is_silent"  # the approved fixture method
+T2_CANDIDATES = [
+    T2_GOOD_TEST,
+    f"{TEST_2}::Reachability::test_absent_commit_is_refused",
+    f"{TEST_2}::Reachability::test_no_repository_is_explicitly_not_checked",
+]
 
 DECIDED_AT = "2026-11-13T20:00:00Z"
 PROFILE = "factory"
@@ -340,7 +345,7 @@ class M4Dogfood(unittest.TestCase):
             assigned_file=MODULE_1, test_file=TEST_1, test_id=T1_TEST, source_rev=self.base)
         self.contract_2 = fx.acdd_contract(
             contract_id=CONTRACT_2, criterion_id="AC-001",
-            statement="a contract whose source_rev is not reachable from the repository head is refused",
+            statement="a contract whose source_rev is reachable from the repository head is accepted without a problem",
             assigned_file=MODULE_2, test_file=TEST_2, test_id=T2_BAD_TEST, source_rev=self.base)
         self.frozen_1 = contract_mod.freeze_contract(self.contract_1, approved_by="reviewer", approved_at=fx.APPROVED_AT)
         self.frozen_2 = contract_mod.freeze_contract(self.contract_2, approved_by="reviewer", approved_at=fx.APPROVED_AT)
@@ -357,7 +362,15 @@ class M4Dogfood(unittest.TestCase):
         self.authorization = jobs.record_authorization(
             self.state, job_id=JOB, statement=STATEMENT, repo=REPO, base_rev=self.base,
             scope=[MODULE_1, TEST_1, MODULE_2, TEST_2], bees=4, wall_clock_s=5400,
-            gates=GATES, require_tty=False, interactive=False, by="reviewer")
+            gates=GATES, require_tty=False, interactive=False, by="reviewer",
+            recovery={
+                "max_attempts_per_task": 3,
+                "contract_corrections_allowed": 1,
+                "corrected_tests_allowed": list(T2_CANDIDATES),
+                "file_scope": [MODULE_1, TEST_1, MODULE_2, TEST_2],
+                "test_scope": [TEST_1, TEST_2],
+                "gates": list(GATES),
+            })
 
         self.packet = fx.exact_packet(
             contract=self.frozen_1, contract_sha256=self.sha_1, workflow_ref=self.workflow_ref,
@@ -401,7 +414,7 @@ class M4Dogfood(unittest.TestCase):
         job["recovery_policy"] = {"max_attempts_per_task": 3, "contract_corrections_allowed": True}
         job["tasks"][0]["recovery_policy"] = {"max_attempts_per_task": 2, "contract_corrections_allowed": False}
         job["tasks"][1]["recovery_policy"] = {"max_attempts_per_task": 3, "contract_corrections_allowed": True,
-                                              "corrected_tests_allowed": [T2_GOOD_TEST]}
+                                              "corrected_tests_allowed": list(T2_CANDIDATES)}
         jobs.save_job(self.state, job)
 
         self.queue_file = self.state / "queue.json"
@@ -848,10 +861,17 @@ class M4Dogfood(unittest.TestCase):
         state.mkdir()
         job_id = f"job_{name}"
         job_id = "".join(ch if ch.isalnum() or ch in "_-." else "_" for ch in job_id)[:64]
+        ceiling = {"max_attempts_per_task": max_attempts,
+                   "contract_corrections_allowed": 1 if corrections else 0,
+                   "gates": list(GATES)}
+        if corrections:
+            ceiling.update({"corrected_tests_allowed": [T2_GOOD_TEST],
+                            "file_scope": [MODULE_2, TEST_2], "test_scope": [TEST_2]})
         jobs.record_authorization(
             state, job_id=job_id, statement="A bounded recovery negative fixture.", repo=REPO,
             base_rev=self.base, scope=[MODULE_1, TEST_1, MODULE_2, TEST_2], bees=4, wall_clock_s=5400,
-            gates=GATES, require_tty=False, interactive=False, by="reviewer")
+            gates=GATES, require_tty=False, interactive=False, by="reviewer",
+            recovery=ceiling)
         contract = self.frozen_2 if code_class == "specification" else contract_mod.freeze_contract(
             fx.acdd_contract(contract_id="NEG-IMPL", criterion_id="AC-001", statement="negative fixture",
                              assigned_file=MODULE_2, test_file=TEST_2, test_id=T2_GOOD_TEST,
@@ -1053,6 +1073,78 @@ class M4Dogfood(unittest.TestCase):
         self.assertEqual(job["tasks"][0]["attempts"], ["att_neg_1"])
         self.assertEqual((job.get("recovery") or {}).get("supersessions") or [], [],
                          "no contract may be superseded without explicit authorization")
+
+
+# ---------------------------------------------------------------------------
+# Supervised real-model experiment (not part of ordinary CI)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(os.environ.get("HERMES_M42_REAL") == "1",
+                     "supervised real-model run: set HERMES_M42_REAL=1")
+class M42SupervisedHermes(unittest.TestCase):
+    """One real Hermes decision through the production pipeline.
+
+    The deterministic fixture and adapter remain the CI control. Here the
+    fixture's decision step is replaced by the real adapter; nothing else in
+    the pipeline changes.
+    """
+
+    def setUp(self):
+        self.fx = M4Dogfood(
+            methodName="test_one_authorised_objective_recovers_the_injected_failure")
+        self.fx.setUp()
+        self.addCleanup(self.fx.doCleanups)
+
+        def recover():
+            from bundlebees_plugin import hermes_adapter
+
+            out = hermes_adapter.decide_with_hermes(
+                self.fx.state, self.fx.request["request_id"], repo=self.fx.work,
+                timeout_s=300)
+            print("M42_DECISION " + json.dumps({
+                "proposal": out.get("proposal"),
+                "stdout_sha256": out.get("stdout_sha256"),
+                "invocation": out.get("invocation"),
+                "decision": {k: out.get("decision", {}).get(k)
+                             for k in ("request_id", "adapter", "decision",
+                                       "corrected_tests", "rationale", "decided_at")},
+            }, default=str), flush=True)
+            self.fx.assertEqual(out["decision"]["schema"], "rizzstack.recovery/1")
+            return {"decisions_recorded": True, "decision": out["decision"]}
+
+        self.fx.recover = recover
+
+    def test_real_hermes_makes_the_recovery_decision(self):
+        M4Dogfood.test_one_authorised_objective_recovers_the_injected_failure(self.fx)
+
+    def test_real_hermes_escalates_or_is_refused_without_correction_authority(self):
+        from bundlebees_plugin import hermes_adapter, recovery
+
+        state, job_id, request = self.fx.build_rejected_job(
+            "real_noauth", corrections=False, max_attempts=2,
+            evidence="test_not_found: named tests failed after the patch: no tests ran in 0.01s",
+            code_class="specification")
+        posts_before = len(self.fx.worker.posts)
+        try:
+            out = hermes_adapter.decide_with_hermes(
+                state, request["request_id"], repo=self.fx.work, timeout_s=300)
+        except Exception as exc:  # a refused correction is an acceptable outcome
+            code = str(getattr(exc, "code", "") or type(exc).__name__)
+            print("M42_NOAUTH_REFUSED " + json.dumps({"code": code, "detail": str(exc)[:400]}),
+                  flush=True)
+            self.assertIsNone(recovery.read_decision(state, request))
+        else:
+            decision = out["decision"]
+            print("M42_NOAUTH_DECISION " + json.dumps({
+                "decision": decision.get("decision"),
+                "rationale": decision.get("rationale"),
+                "adapter": decision.get("adapter"),
+            }, default=str), flush=True)
+            self.assertEqual(decision.get("decision"), "escalate",
+                             "supersession is not authorised; the model must escalate")
+        self.assertEqual(len(self.fx.worker.posts), posts_before,
+                         "no corrective dispatch may happen without sealed authority")
 
 
 if __name__ == "__main__":
