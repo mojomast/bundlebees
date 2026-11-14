@@ -523,11 +523,18 @@ def invoke_hermes(
     if len(prompt) > _MAX_PROMPT:
         raise ProposalError("hermes_prompt_too_large", f"the prompt is {len(prompt)} characters", _FIX)
 
-    binary = str(hermes_bin or os.environ.get("HERMES_BIN") or shutil.which("hermes") or "")
-    if not binary:
-        raise ProposalError("hermes_unavailable", "the hermes CLI is not on PATH", _FIX)
-    resolved_model = str(model or _config_value(binary, "model.default") or "").strip() or None
-    resolved_provider = str(provider or _config_value(binary, "model.provider") or "").strip() or None
+    if runner is not None:
+        # An injected runner is the offline contract: it supplies the process
+        # boundary, so no installed CLI and no user config may be required.
+        binary = str(hermes_bin or os.environ.get("HERMES_BIN") or "hermes")
+        resolved_model = str(model).strip() if model else None
+        resolved_provider = str(provider).strip() if provider else None
+    else:
+        binary = str(hermes_bin or os.environ.get("HERMES_BIN") or shutil.which("hermes") or "")
+        if not binary:
+            raise ProposalError("hermes_unavailable", "the hermes CLI is not on PATH", _FIX)
+        resolved_model = str(model or _config_value(binary, "model.default") or "").strip() or None
+        resolved_provider = str(provider or _config_value(binary, "model.provider") or "").strip() or None
     if resolved_model is None:
         # `--provider` without a model is an error in Hermes; never construct it.
         resolved_provider = None
