@@ -2063,44 +2063,88 @@ def _sanitize_text(value: Any) -> str:
     return text[:300]
 
 
+def _event_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The canonical ``data`` object, or empty when the event is legacy-shaped."""
+
+    data = event.get("data")
+    return data if isinstance(data, Mapping) else {}
+
+
+def _payload_sources(event: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Canonical payload first; the envelope itself only for a legacy event.
+
+    A canonical event carries job/task/attempt/state/source_rev/result under
+    ``data``.  Root fields are read only when there is no ``data`` object at
+    all, so a canonical event cannot be re-routed by shadow root fields.
+    """
+
+    data = _event_data(event)
+    return (data,) if data else (event,)
+
+
+def _event_field(event: Mapping[str, Any], *keys: str) -> str:
+    """One sanitized envelope scalar, data first so a canonical id wins."""
+
+    data = _event_data(event)
+    sources = (data, event) if data else (event,)
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return _sanitize_text(value)
+    return ""
+
+
+def _payload_field(event: Mapping[str, Any], *keys: str) -> str:
+    """One sanitized payload scalar: ``data`` only on a canonical event."""
+
+    for source in _payload_sources(event):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return _sanitize_text(value)
+    return ""
+
+
 def _event_id(event: Mapping[str, Any], direct: str, nested: str) -> str:
-    value = event.get(direct)
-    if value in (None, ""):
-        block = event.get(nested)
-        if isinstance(block, Mapping):
-            value = block.get("id") or block.get("reference") or block.get("name")
-        else:
-            value = block
-    return _sanitize_text(value)
+    for source in _payload_sources(event):
+        value = source.get(direct)
+        if value in (None, ""):
+            block = source.get(nested)
+            if isinstance(block, Mapping):
+                value = block.get("id") or block.get("reference") or block.get("name")
+            else:
+                value = block
+        if value not in (None, ""):
+            return _sanitize_text(value)
+    return ""
 
 
 def _result_reference(event: Mapping[str, Any]) -> str:
-    for key in ("result_reference", "result_ref", "result"):
-        if key not in event:
-            continue
-        value = event[key]
-        if isinstance(value, Mapping):
-            for nested in ("reference", "reference_id", "ref", "id", "name"):
-                if nested in value:
-                    return _sanitize_text(value[nested])
-            continue
-        return _sanitize_text(value)
+    for source in _payload_sources(event):
+        for key in ("result_reference", "result_ref", "result"):
+            if key not in source:
+                continue
+            value = source[key]
+            if isinstance(value, Mapping):
+                for nested in ("reference", "reference_id", "ref", "id", "name"):
+                    if nested in value:
+                        return _sanitize_text(value[nested])
+                continue
+            return _sanitize_text(value)
     return ""
 
 
 def _wake_message(event: Mapping[str, Any]) -> tuple[dict[str, str], str]:
     payload: dict[str, str] = {}
-    raw_event_id = event.get("event_id")
-    if raw_event_id in (None, ""):
-        raw_event_id = event.get("id")
     values = {
-        "event_id": _sanitize_text(raw_event_id),
-        "type": _sanitize_text(event.get("type")),
+        "event_id": _event_field(event, "event_id", "id"),
+        "type": _event_field(event, "type"),
         "job_id": _event_id(event, "job_id", "job"),
         "task_id": _event_id(event, "task_id", "task"),
         "attempt_id": _event_id(event, "attempt_id", "attempt"),
-        "state": _sanitize_text(event.get("state")),
-        "source_rev": _sanitize_text(event.get("source_rev")),
+        "state": _payload_field(event, "state"),
+        "source_rev": _payload_field(event, "source_rev"),
         "result_reference": _result_reference(event),
     }
     for field in _WAKE_FIELDS:
@@ -2124,13 +2168,61 @@ def _wake_message(event: Mapping[str, Any]) -> tuple[dict[str, str], str]:
 
 
 def _event_session(event: Mapping[str, Any]) -> str:
-    for key in ("session_id", "session", "coordinator_session", "target_session", "target"):
-        value = event.get(key)
-        if isinstance(value, Mapping):
-            value = value.get("id") or value.get("session_id") or value.get("name")
+    for source in _payload_sources(event):
+        coordinator = source.get("coordinator")
+        if isinstance(coordinator, Mapping):
+            for key in ("session", "session_id"):
+                value = coordinator.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+        for key in ("session_id", "session", "coordinator_session", "target_session", "target"):
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                value = value.get("id") or value.get("session_id") or value.get("name")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _event_coordinator_identity(event: Mapping[str, Any]) -> str:
+    """``data.coordinator.identity`` only: a legacy root field cannot bind routing."""
+
+    coordinator = _event_data(event).get("coordinator")
+    if isinstance(coordinator, Mapping):
+        value = coordinator.get("identity")
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def _subscriber_record(value: Any, state_dir: Any = None) -> dict[str, Any]:
+    """The authority for routing: a subscriber record, optionally loaded by identity."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return {}
+    if state_dir is None:
+        return {"identity": text}
+    from . import bee_events
+
+    try:
+        path = bee_events._subscriber_path(Path(state_dir), text)
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - an unreadable authority is a refusal
+        raise ProposalError(
+            "hermes_notification_unavailable",
+            "the authoritative subscriber record cannot be read",
+            "Pass the subscriber record directly or check the state directory.",
+        ) from exc
+    if not isinstance(record, Mapping) or str(record.get("identity") or "") != text:
+        raise ProposalError(
+            "hermes_notification_invalid",
+            "the subscriber record does not name the requested identity",
+            _FIX,
+        )
+    return dict(record)
 
 
 def _configured(value: Any, environment: str) -> str:
@@ -2265,6 +2357,8 @@ def notify_coordinator(
     endpoint: str | None = None,
     api_key: str | None = None,
     session: str | None = None,
+    subscriber: Any = None,
+    state_dir: Any = None,
     runner: Any = None,
     timeout_s: float = DEFAULT_NOTIFY_TIMEOUT_S,
 ) -> dict[str, Any]:
@@ -2277,10 +2371,13 @@ def notify_coordinator(
 
     ``endpoint`` defaults to ``HERMES_API_URL`` and ``api_key`` to
     ``HERMES_API_KEY``.  Neither value is logged, recorded in the result, or
-    included in a refusal message.  ``session`` is the configured coordinator
-    session; the event must name the same session.  ``runner`` is an optional
-    transport seam with the signature ``runner(url, *, headers, body,
-    timeout_s)`` returning ``(status, body)``.
+    included in a refusal message.  ``subscriber`` is the authoritative
+    subscription record (or its identity when ``state_dir`` is supplied); its
+    ``identity`` must equal ``event.data.coordinator.identity`` and its
+    ``session`` is the routing target.  ``session`` remains the explicitly
+    configured coordinator session for callers that do not have a subscriber
+    record.  ``runner`` is an optional transport seam with the signature
+    ``runner(url, *, headers, body, timeout_s)`` returning ``(status, body)``.
 
     A missing endpoint/key, a wrong session, a non-2xx status, a timeout or any
     transport error raises :class:`ProposalError`.  No refusal returns a record
@@ -2307,8 +2404,42 @@ def notify_coordinator(
             "Set HERMES_API_KEY to the gateway bearer key; it is never logged.",
         )
 
+    record = _subscriber_record(subscriber, state_dir)
+    configured = session.strip() if isinstance(session, str) else ""
+    if isinstance(session, Mapping) and not record:
+        record = dict(session)
+        configured = ""
+    subscriber_identity = _sanitize_text(record.get("identity")) if record else ""
+    subscriber_session = (
+        str(record.get("session") or "").strip() if record else ""
+    )
+
     event_session = _event_session(event)
-    target = _configured(session, "")
+    if record:
+        if not subscriber_identity:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                "the subscriber record names no coordinator identity",
+                "Refuse: routing is bound to the subscriber identity, and this record has none.",
+            )
+        coordinator_identity = _event_coordinator_identity(event)
+        if coordinator_identity != subscriber_identity:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                f"the event is for coordinator {coordinator_identity!r}, "
+                f"not the subscribed {subscriber_identity!r}",
+                "Refuse: a notification to an unrelated coordinator is not this event's wake.",
+            )
+        if subscriber_session and configured and subscriber_session != configured:
+            raise ProposalError(
+                "hermes_session_mismatch",
+                f"the configured session {configured!r} is not the subscribed {subscriber_session!r}",
+                "Refuse: the durable subscriber record is the authority for routing.",
+            )
+        target = subscriber_session or configured
+    else:
+        target = configured
+
     if target:
         if event_session != target:
             raise ProposalError(
@@ -2322,7 +2453,7 @@ def notify_coordinator(
         raise ProposalError(
             "hermes_notification_unavailable",
             "neither the event nor the caller names a coordinator session",
-            "Pass session=<Hermes session id> or include session_id on the event.",
+            "Pass session=<Hermes session id>, a subscriber record, or include the session on the event.",
         )
 
     payload, message = _wake_message(event)

@@ -18,11 +18,20 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from . import leases
+from . import leases, sandbox
 
 RECORD_DIR = "verify-results"
+DEFAULT_SANDBOX_TIMEOUT_S = 600
+_MAX_SANDBOX_TIMEOUT_S = 7200
+_COORDINATOR_ENV_PREFIXES = ("BUNDLEBEES_", "HERMES_")
+
+#: A test runner receives the worktree and the exact argv, and returns the
+#: sandbox's evidence mapping (``exit_code``/``timed_out``/``output_tail``).
+#: Tests on hosts without a real isolation backend inject one; production uses
+#: :func:`sandbox_runner` so no child silently inherits the coordinator env.
+TestRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
 
 
 class VerifyError(Exception):
@@ -33,6 +42,23 @@ class VerifyError(Exception):
         self.fix = fix
 
 
+def _child_env() -> dict[str, str]:
+    """Environment for trusted git/gitleaks children: no coordinator secrets.
+
+    The ambient environment is preserved for normal tooling, but every
+    ``BUNDLEBEES_*`` and ``HERMES_*`` value (launcher tokens, signing keys,
+    gateway keys) is dropped rather than inherited.
+    """
+
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(_COORDINATOR_ENV_PREFIXES)
+    }
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def _run(args: Sequence[str], cwd: Path, *, timeout: float = 600.0, input_text: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         list(args),
@@ -41,8 +67,96 @@ def _run(args: Sequence[str], cwd: Path, *, timeout: float = 600.0, input_text: 
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env=_child_env(),
     )
+
+
+def sandbox_runner(
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    which: Any = None,
+    probe: Any = None,
+) -> dict[str, Any]:
+    """Run *argv* in the enforced sandbox and return its evidence.
+
+    The sandbox supplies the entire child environment (nothing from
+    ``os.environ`` reaches it, including any ``BUNDLEBEES_*``/``HERMES_*``
+    coordinator secret) and runs with its cwd inside a disposable copy of
+    *workdir*. ``SandboxUnavailable`` propagates so callers can fail closed with
+    their own named error.
+    """
+
+    bounded = max(1, min(int(timeout), _MAX_SANDBOX_TIMEOUT_S))
+    options: dict[str, Any] = {
+        "backend": backend,
+        "allow_unsafe_local": allow_unsafe_local,
+        "allow_weak": allow_weak,
+        "timeout": bounded,
+    }
+    if which is not None:
+        options["which"] = which
+    if probe is not None:
+        options["probe"] = probe
+    return sandbox.run_in_sandbox(Path(workdir), list(argv), **options)
+
+
+def _test_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(evidence, Mapping):
+        raise VerifyError(
+            "sandbox_evidence",
+            "the test runner returned no evidence",
+            "Check the sandbox runner and retry.",
+        )
+    try:
+        exit_code = int(evidence.get("exit_code"))
+    except (TypeError, ValueError):
+        exit_code = 1
+    tail = evidence.get("output_tail")
+    if tail is None:
+        tail = evidence.get("tail", "")
+    return {
+        "exit_code": exit_code,
+        "timed_out": bool(evidence.get("timed_out")),
+        "tail": str(tail or "").strip()[-300:],
+    }
+
+
+def _run_test_command(
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    runner: TestRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    try:
+        if runner is not None:
+            evidence = runner(Path(workdir), list(argv))
+        else:
+            evidence = sandbox_runner(
+                Path(workdir),
+                list(argv),
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=timeout,
+            )
+    except sandbox.SandboxUnavailable as exc:
+        raise VerifyError(exc.code, exc.error, exc.fix) from exc
+    except ValueError as exc:
+        raise VerifyError(
+            "invalid_argument",
+            f"unknown verify_isolation backend: {exc}",
+            "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
+        ) from exc
+    return _test_evidence(evidence)
 
 
 def record_path(state_dir: Path, attempt_id: str) -> Path:
@@ -104,8 +218,20 @@ def verify_and_commit(
     contract_declared: bool = False,
     worktree_root: Path | None = None,
     identity: Sequence[str] = ("-c", "user.name=bundlebees", "-c", "user.email=bees@localhost"),
+    runner: TestRunner | None = None,
+    sandbox_backend: str = "auto",
+    sandbox_allow_unsafe_local: bool = False,
+    sandbox_allow_weak: bool = False,
+    sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Verify one patch and commit it locally. Returns the verify record."""
+    """Verify one patch and commit it locally. Returns the verify record.
+
+    Every worker-produced test/suite invocation runs through
+    :func:`sandbox_runner` (or the explicitly injected *runner*) with a bounded
+    timeout, a minimal environment and a cwd inside the disposable worktree
+    copy. When the sandbox is unavailable this fails closed with
+    ``VerifyError("sandbox_unavailable")``.
+    """
 
     state_dir = Path(state_dir)
     repo = Path(repo)
@@ -210,7 +336,22 @@ def verify_and_commit(
         # 4. RED before the patch, when tests are named.
         red: dict[str, Any] | None = None
         if tests:
-            red = _run_tests(worktree, tests, suite_command)
+            red = _run_tests(
+                worktree,
+                tests,
+                suite_command,
+                runner=runner,
+                backend=sandbox_backend,
+                allow_unsafe_local=sandbox_allow_unsafe_local,
+                allow_weak=sandbox_allow_weak,
+                timeout=sandbox_timeout,
+            )
+            if red["timed_out"]:
+                raise VerifyError(
+                    "tests_timed_out",
+                    "the named tests timed out before the patch",
+                    "Increase the sandbox timeout or fix the test; a timeout is not RED evidence.",
+                )
             if red["exit_code"] == 0:
                 raise VerifyError(
                     "red_missing",
@@ -241,15 +382,44 @@ def verify_and_commit(
             )
 
         # 6. GREEN after the patch.
-        green = _run_tests(worktree, tests, suite_command)
+        green = _run_tests(
+            worktree,
+            tests,
+            suite_command,
+            runner=runner,
+            backend=sandbox_backend,
+            allow_unsafe_local=sandbox_allow_unsafe_local,
+            allow_weak=sandbox_allow_weak,
+            timeout=sandbox_timeout,
+        )
+        if green["timed_out"]:
+            raise VerifyError(
+                "tests_timed_out",
+                "the named tests timed out after the patch",
+                "Increase the sandbox timeout or fix the test; a timeout is not a pass.",
+            )
         if green["exit_code"] != 0:
             raise VerifyError("tests_failed", f"named tests failed after the patch: {green.get('tail', '')}", "Reject and re-dispatch.")
 
         suite = None
         if suite_command:
-            suite = _run(list(suite_command), worktree)
-            if suite.returncode != 0:
-                raise VerifyError("suite_failed", f"regression suite failed: {suite.stdout.strip()[-300:]}", "Reject and re-dispatch.")
+            suite = _run_suite(
+                worktree,
+                suite_command,
+                runner=runner,
+                backend=sandbox_backend,
+                allow_unsafe_local=sandbox_allow_unsafe_local,
+                allow_weak=sandbox_allow_weak,
+                timeout=sandbox_timeout,
+            )
+            if suite["timed_out"]:
+                raise VerifyError(
+                    "suite_timed_out",
+                    "the regression suite timed out after the patch",
+                    "Increase the sandbox timeout or investigate the hang.",
+                )
+            if suite["exit_code"] != 0:
+                raise VerifyError("suite_failed", f"regression suite failed: {suite.get('tail', '')}", "Reject and re-dispatch.")
 
         scan = None
         if gitleaks:
@@ -289,8 +459,8 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, pa
         "base_rev": base_rev,
         "files": list(files),
         "tests": list(tests),
-        "red": None if red is None else {"exit_code": red["exit_code"]},
-        "suite": None if suite is None else {"exit_code": suite.returncode},
+        "red": None if red is None else {"exit_code": red["exit_code"], "timed_out": bool(red.get("timed_out"))},
+        "suite": None if suite is None else {"exit_code": suite.get("exit_code"), "timed_out": bool(suite.get("timed_out"))},
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
         "patch_sha256": patch_sha256,
@@ -334,10 +504,10 @@ def _record_still_valid(
         return False
 
     red = record.get("red")
-    if not isinstance(red, Mapping) or red.get("exit_code") in (None, 0):
+    if not isinstance(red, Mapping) or red.get("exit_code") in (None, 0) or red.get("timed_out"):
         return False
     suite = record.get("suite")
-    if not isinstance(suite, Mapping) or suite.get("exit_code") != 0:
+    if not isinstance(suite, Mapping) or suite.get("exit_code") != 0 or suite.get("timed_out"):
         return False
     if require_gitleaks:
         scan = record.get("gitleaks")
@@ -369,14 +539,52 @@ def _commit_contains_patch(repo: Path, sha: str, base_rev: str, patch: str) -> b
         _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
 
 
-def _run_tests(worktree: Path, tests: Sequence[str], suite_command: Sequence[str] | None) -> dict[str, Any]:
+def _run_tests(
+    worktree: Path,
+    tests: Sequence[str],
+    suite_command: Sequence[str] | None,
+    *,
+    runner: TestRunner | None = None,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+) -> dict[str, Any]:
     if suite_command:
         base = list(suite_command)
     else:
         base = ["python", "-m", "pytest", "-q"]
     cmd = base + list(tests)
-    proc = _run(cmd, worktree)
-    return {"exit_code": proc.returncode, "tail": (proc.stdout or proc.stderr).strip()[-300:]}
+    return _run_test_command(
+        worktree,
+        cmd,
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+    )
+
+
+def _run_suite(
+    worktree: Path,
+    suite_command: Sequence[str],
+    *,
+    runner: TestRunner | None = None,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+) -> dict[str, Any]:
+    return _run_test_command(
+        worktree,
+        list(suite_command),
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+    )
 
 
 def _rev(cwd: Path, ref: str) -> str:

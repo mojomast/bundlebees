@@ -17,9 +17,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from . import revision, verify_local
+from . import revision, sandbox, verify_local
+
+DEFAULT_SANDBOX_TIMEOUT_S = 900
+_MAX_SANDBOX_TIMEOUT_S = 7200
+SuiteRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
 
 
 def _checkpoint(name: str, **payload: Any) -> None:
@@ -155,6 +159,64 @@ def verified_attempts(job: Mapping[str, Any]) -> list[str]:
     return attempts
 
 
+def _suite_evidence(
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    runner: SuiteRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run the full suite in the sandbox and return revision's evidence shape.
+
+    No child inherits the coordinator environment (``BUNDLEBEES_*``/``HERMES_*``
+    are absent because the sandbox builds an exact environment), the cwd is the
+    disposable copy of *workdir*, and a missing backend fails closed with
+    ``IntegrateError("sandbox_unavailable")``.
+    """
+
+    bounded = max(1, min(int(timeout), _MAX_SANDBOX_TIMEOUT_S))
+    try:
+        if runner is not None:
+            evidence = runner(Path(workdir), list(argv))
+        else:
+            evidence = sandbox.run_in_sandbox(
+                Path(workdir),
+                list(argv),
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=bounded,
+            )
+    except sandbox.SandboxUnavailable as exc:
+        raise IntegrateError(exc.code, exc.error, exc.fix) from exc
+    except ValueError as exc:
+        raise IntegrateError(
+            "invalid_argument",
+            f"unknown verify_isolation backend: {exc}",
+            "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
+        ) from exc
+    if not isinstance(evidence, Mapping):
+        raise IntegrateError(
+            "sandbox_evidence",
+            "the suite runner returned no evidence",
+            "Check the sandbox runner and retry.",
+        )
+    try:
+        exit_code = int(evidence.get("exit_code"))
+    except (TypeError, ValueError):
+        exit_code = 1
+    return {
+        "exit_code": exit_code,
+        "timed_out": bool(evidence.get("timed_out")),
+        "tail": str(evidence.get("output_tail") or evidence.get("tail") or "").strip()[-300:],
+        "junit": evidence.get("junit"),
+        "backend": evidence.get("backend"),
+    }
+
+
 def integrate(
     state_dir: Path,
     job: Mapping[str, Any],
@@ -163,8 +225,19 @@ def integrate(
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     worktree_root: Path | None = None,
     wave_id: str | None = None,
+    runner: SuiteRunner | None = None,
+    sandbox_backend: str = "auto",
+    sandbox_allow_unsafe_local: bool = False,
+    sandbox_allow_weak: bool = False,
+    sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Build one integrated history from verified commits, then call integrate_wave."""
+    """Build one integrated history from verified commits, then call integrate_wave.
+
+    The full regression suite runs through :func:`_suite_evidence` (or the
+    explicitly injected *runner*) so it is sandboxed, bounded and never sees the
+    coordinator's environment. An unavailable sandbox fails closed with
+    ``IntegrateError("sandbox_unavailable")``.
+    """
 
     state_dir = Path(state_dir)
     repo = Path(repo)
@@ -244,13 +317,15 @@ def integrate(
                 )
 
         def run_suite(workdir: Path) -> dict[str, Any]:
-            proc = subprocess.run(
+            return _suite_evidence(
+                workdir,
                 list(suite_command),
-                cwd=str(workdir),
-                capture_output=True,
-                text=True,
+                runner=runner,
+                backend=sandbox_backend,
+                allow_unsafe_local=sandbox_allow_unsafe_local,
+                allow_weak=sandbox_allow_weak,
+                timeout=sandbox_timeout,
             )
-            return {"exit_code": proc.returncode, "timed_out": False, "tail": (proc.stdout or proc.stderr)[-300:]}
 
         record = revision.integrate_wave(
             state_dir,

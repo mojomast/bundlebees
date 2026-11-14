@@ -422,3 +422,278 @@ def test_a_failed_outbox_publish_leaves_no_partial_file(tmp_path, monkeypatch):
     outbox = _outbox(state)
     if outbox.exists():
         assert list(outbox.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# HTTP delivery signing, freshness and replay
+# ---------------------------------------------------------------------------
+
+DELIVERY_ID = "dlv_" + "d" * 32
+DELIVERY_EVENT_ID = events.event_id_for("att_bee_1", "landed", "tr_0001")
+
+
+def _delivery_body():
+    return events._http_body(_event())
+
+
+def _delivery_headers(body, *, now, delivery_id=DELIVERY_ID, secret=SECRET):
+    record = {"delivery_id": delivery_id, "event_id": DELIVERY_EVENT_ID}
+    return events._http_headers(record, body, secret, now=now)
+
+
+def _verified_dir(state: Path):
+    return Path(state) / "events" / "verified"
+
+
+class _Response:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self, _amount=None):
+        return b""
+
+
+def test_signature_binds_delivery_id_timestamp_and_exact_body(tmp_path):
+    body = _delivery_body()
+    headers = _delivery_headers(body, now=1000)
+    assert events.verify_delivery(headers, body, SECRET, now=1000) is True
+    # Verification is side-effect free until the caller durably accepts.
+    assert not _verified_dir(tmp_path).exists()
+
+    changed_body = dict(_event())
+    changed_body["data"]["result"]["reference"] = "refs/heads/other"
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, events._http_body(changed_body), SECRET, now=1000)
+    assert _code(exc) == "delivery_signature_invalid"
+
+    changed_timestamp = dict(headers)
+    changed_timestamp[events.TIMESTAMP_HEADER] = "1001"
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(changed_timestamp, body, SECRET, now=1001)
+    assert _code(exc) == "delivery_signature_invalid"
+
+    changed_id = dict(headers)
+    changed_id[events.DELIVERY_ID_HEADER] = "dlv_" + "e" * 32
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(changed_id, body, SECRET, now=1000)
+    assert _code(exc) == "delivery_signature_invalid"
+
+
+def test_verify_requires_a_versioned_signature_over_the_headers():
+    body = _delivery_body()
+    headers = _delivery_headers(body, now=1000)
+
+    unversioned = dict(headers)
+    unversioned[events.SIGNATURE_HEADER] = headers[events.SIGNATURE_HEADER].split("=", 2)[2]
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(unversioned, body, SECRET, now=1000)
+    assert _code(exc) == "delivery_signature_invalid"
+
+    missing_id = dict(headers)
+    missing_id.pop(events.DELIVERY_ID_HEADER)
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(missing_id, body, SECRET, now=1000)
+    assert _code(exc) == "delivery_id_missing"
+
+
+def test_verify_rejects_stale_timestamps_and_honours_tolerance():
+    body = _delivery_body()
+    headers = _delivery_headers(body, now=1000)
+
+    assert events.verify_delivery(headers, body, SECRET, now=1010, tolerance_s=10) is True
+    for now in (989, 1011):
+        with pytest.raises(events.EventError) as exc:
+            events.verify_delivery(headers, body, SECRET, now=now, tolerance_s=10)
+        assert _code(exc) == "delivery_stale"
+
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body, SECRET, now=1000 + events.DEFAULT_TIMESTAMP_TOLERANCE_S + 1)
+    assert _code(exc) == "delivery_stale"
+
+
+def test_exact_replay_of_an_accepted_delivery_is_refused(tmp_path):
+    body = _delivery_body()
+    headers = _delivery_headers(body, now=1000)
+
+    receipt = events.accept_delivery(tmp_path, headers, body, SECRET, now=1000)
+    assert receipt["created"] is True
+    assert receipt["duplicate"] is False
+    assert receipt["delivery_id"] == DELIVERY_ID
+    marker_files = list(_verified_dir(tmp_path).glob("*.json"))
+    assert len(marker_files) == 1
+
+    with pytest.raises(events.EventError) as exc:
+        events.accept_delivery(tmp_path, headers, body, SECRET, now=1000)
+    assert _code(exc) == "delivery_replayed"
+
+    with pytest.raises(events.EventError) as exc:
+        events.verify_delivery(headers, body, SECRET, now=1000, state_dir=tmp_path)
+    assert _code(exc) == "delivery_replayed"
+
+
+def test_verify_does_not_persist_a_replay_marker_before_acceptance(tmp_path):
+    body = _delivery_body()
+    headers = _delivery_headers(body, now=1000)
+
+    assert events.verify_delivery(headers, body, SECRET, now=1000, state_dir=tmp_path) is True
+    assert not _verified_dir(tmp_path).exists()
+
+    # A fresh retry is still accepted because no acceptance was recorded.
+    retried = _delivery_headers(body, now=1001)
+    receipt = events.accept_delivery(tmp_path, retried, body, SECRET, now=1001)
+    assert receipt["created"] is True
+    assert len(list(_verified_dir(tmp_path).glob("*.json"))) == 1
+
+
+def test_crash_before_acceptance_leaves_the_delivery_retryable(tmp_path):
+    body = _delivery_body()
+    effects = []
+
+    def crash_before_accept(_receipt):
+        raise RuntimeError("simulated crash before durable acceptance")
+
+    with pytest.raises(RuntimeError):
+        events.accept_delivery(
+            tmp_path,
+            _delivery_headers(body, now=1000),
+            body,
+            SECRET,
+            now=1000,
+            on_accept=crash_before_accept,
+        )
+    assert not _verified_dir(tmp_path).exists()
+
+    retried = _delivery_headers(body, now=1001)
+    receipt = events.accept_delivery(
+        tmp_path, retried, body, SECRET, now=1001, on_accept=effects.append
+    )
+    assert receipt["created"] is True
+    assert len(effects) == 1
+    assert len(list(_verified_dir(tmp_path).glob("*.json"))) == 1
+
+
+def test_legitimate_retransmission_returns_the_durable_receipt_once(tmp_path):
+    body = _delivery_body()
+    effects = []
+    first = events.accept_delivery(
+        tmp_path,
+        _delivery_headers(body, now=1000),
+        body,
+        SECRET,
+        now=1000,
+        on_accept=effects.append,
+    )
+    assert first["created"] is True and len(effects) == 1
+    marker_path = next(_verified_dir(tmp_path).glob("*.json"))
+    marker_bytes = marker_path.read_bytes()
+
+    retransmitted = _delivery_headers(body, now=1001)
+    second = events.accept_delivery(
+        tmp_path, retransmitted, body, SECRET, now=1001, on_accept=effects.append
+    )
+    assert second["created"] is False
+    assert second["duplicate"] is True
+    assert second["delivery_id"] == first["delivery_id"]
+    assert second["accepted_at"] == first["accepted_at"]
+    assert len(effects) == 1
+    assert marker_path.read_bytes() == marker_bytes
+
+
+def test_durable_receipt_survives_losing_the_in_memory_cache(tmp_path):
+    body = _delivery_body()
+    first = events.accept_delivery(
+        tmp_path, _delivery_headers(body, now=1000), body, SECRET, now=1000
+    )
+    events._clear_delivery_replay_cache()
+
+    retransmitted = _delivery_headers(body, now=1001)
+    second = events.accept_delivery(tmp_path, retransmitted, body, SECRET, now=1001)
+    assert second["duplicate"] is True
+    assert second["accepted_at"] == first["accepted_at"]
+
+
+def test_http_retries_refresh_timestamp_and_keep_the_same_delivery_id(monkeypatch):
+    body = _delivery_body()
+    record = {"delivery_id": DELIVERY_ID, "event_id": DELIVERY_EVENT_ID}
+    captured = []
+    clock = iter([1000, 1001])
+    state = {"attempt": 0}
+
+    def fake_urlopen(request, timeout=None):
+        captured.append(dict(request.headers))
+        state["attempt"] += 1
+        if state["attempt"] == 1:
+            raise events.urlerror.URLError("simulated lost response")
+        return _Response()
+
+    monkeypatch.setattr(events.time, "time", lambda: next(clock))
+    monkeypatch.setattr(events.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(events.urlrequest, "urlopen", fake_urlopen)
+
+    initial = events._http_headers(record, body, SECRET, now=1000)
+    events._send_http(
+        "https://example.invalid/hook",
+        body,
+        initial,
+        refresh=lambda: events._http_headers(record, body, SECRET),
+    )
+
+    assert len(captured) == 2
+    delivery_ids = {events._header_value(item, events.DELIVERY_ID_HEADER) for item in captured}
+    timestamps = {events._header_value(item, events.TIMESTAMP_HEADER) for item in captured}
+    assert delivery_ids == {DELIVERY_ID}
+    assert len(timestamps) == 2
+    assert events.verify_delivery(captured[0], body, SECRET, now=1000) is True
+    assert events.verify_delivery(captured[1], body, SECRET, now=1001) is True
+
+
+def test_http_retry_after_an_ambiguous_acceptance_gets_a_receipt(tmp_path, monkeypatch):
+    body = _delivery_body()
+    record = {"delivery_id": DELIVERY_ID, "event_id": DELIVERY_EVENT_ID}
+    effects = []
+    clock = iter([1000, 1001])
+    state = {"attempt": 0}
+
+    def fake_urlopen(request, timeout=None):
+        state["attempt"] += 1
+        if state["attempt"] == 1:
+            events.accept_delivery(
+                tmp_path,
+                dict(request.headers),
+                request.data,
+                SECRET,
+                now=1000,
+                on_accept=effects.append,
+            )
+            raise events.urlerror.URLError("simulated lost response after acceptance")
+        result = events.accept_delivery(
+            tmp_path,
+            dict(request.headers),
+            request.data,
+            SECRET,
+            now=1001,
+            on_accept=effects.append,
+        )
+        assert result["duplicate"] is True
+        return _Response()
+
+    monkeypatch.setattr(events.time, "time", lambda: next(clock))
+    monkeypatch.setattr(events.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(events.urlrequest, "urlopen", fake_urlopen)
+
+    initial = events._http_headers(record, body, SECRET, now=1000)
+    events._send_http(
+        "https://example.invalid/hook",
+        body,
+        initial,
+        refresh=lambda: events._http_headers(record, body, SECRET),
+    )
+
+    assert state["attempt"] == 2
+    assert len(effects) == 1
+    assert len(list(_verified_dir(tmp_path).glob("*.json"))) == 1

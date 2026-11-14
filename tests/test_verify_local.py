@@ -8,10 +8,22 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import leases, verify_local
+from bundlebees_plugin import leases, sandbox, verify_local
 
 PY = sys.executable
 SUITE = [PY, "-m", "pytest", "-q"]
+
+
+def sandboxed(workdir, argv):
+    """Explicit test runner for hosts without a strong isolation backend.
+
+    This repo's test hosts may only have ``unshare``, so the tests opt into the
+    documented ``allow_unsafe_local`` escape hatch explicitly. The runner still
+    uses the disposable copy and the sandbox's exact, scrubbed environment; it
+    never silently inherits the coordinator environment.
+    """
+
+    return sandbox.run_in_sandbox(workdir, list(argv), allow_unsafe_local=True, timeout=120)
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -95,6 +107,7 @@ class HappyPath:
             tests=["tests/test_newmod.py"],
             suite_command=SUITE,
             require_gitleaks=False,
+            runner=sandboxed,
         )
 
         assert record["ok"] is True
@@ -113,8 +126,8 @@ class HappyPath:
         lease(state, base)
         patch = make_patch(repo, base, NEW_FILES)
 
-        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
-        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
+        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         assert second["sha"] == first["sha"]
         assert second.get("resumed") is False  # served from the record
@@ -135,7 +148,7 @@ class Refusals:
         patch = make_patch(repo, base, extra)
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=[], base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=[], base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         assert exc.value.code in {"lease_scope_mismatch", "patch_scope_mismatch"}
         assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""
@@ -147,7 +160,7 @@ class Refusals:
         patch = make_patch(repo, base, {"pkg/unchanged.py": "X = 1\n", "tests/test_existing.py": "from pkg.existing import VALUE\n\ndef test_value():\n    assert VALUE == 1\n"})
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=["pkg/unchanged.py", "tests/test_existing.py"], base_rev=base, tests=["tests/test_existing.py"], suite_command=SUITE, require_gitleaks=False)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=["pkg/unchanged.py", "tests/test_existing.py"], base_rev=base, tests=["tests/test_existing.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         assert exc.value.code == "red_missing"
 
@@ -162,7 +175,7 @@ class Refusals:
         lease(state, base, files=list(bad))
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(bad), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(bad), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         assert exc.value.code == "tests_failed"
         assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""
@@ -173,7 +186,7 @@ class Refusals:
         patch = make_patch(repo, base, NEW_FILES)
 
         with pytest.raises(verify_local.VerifyError) as exc:
-            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+            verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         assert exc.value.code == "lease_missing"
 
@@ -187,10 +200,10 @@ class Recovery:
         lease(state, base)
         patch = make_patch(repo, base, NEW_FILES)
 
-        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+        first = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
         verify_local.record_path(state, "att_1").unlink()
 
-        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False)
+        second = verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(NEW_FILES), base_rev=base, tests=["tests/test_newmod.py"], suite_command=SUITE, require_gitleaks=False, runner=sandboxed)
 
         # A leftover branch is not evidence: every check ran again.
         assert second["ok"] is True
@@ -199,3 +212,88 @@ class Recovery:
         assert second["suite"] is not None and second["suite"]["exit_code"] == 0
         assert second["patch_sha256"]
         assert git(repo, "rev-parse", f"{second['sha']}^").stdout.strip() == base
+
+
+class SandboxRequirements:
+    __test__ = True
+
+    def test_the_sandbox_child_does_not_inherit_coordinator_environment(self, tmp_path, monkeypatch):
+        for name in ("BUNDLEBEES_LAUNCHER_TOKEN", "BUNDLEBEES_SIGNING_KEY", "HERMES_API_KEY", "HERMES_API_URL"):
+            monkeypatch.setenv(name, "set-by-the-coordinator")
+        script = (
+            "import os\n"
+            "print('coordinator=%d' % sum(n.startswith(('BUNDLEBEES_', 'HERMES_')) for n in os.environ))\n"
+        )
+
+        evidence = verify_local.sandbox_runner(
+            tmp_path,
+            [sys.executable, "-c", script],
+            allow_unsafe_local=True,
+            timeout=60,
+        )
+
+        assert evidence["exit_code"] == 0
+        assert "coordinator=0" in evidence["output_tail"]
+
+    def test_the_sandbox_enforces_its_timeout(self, tmp_path):
+        evidence = verify_local.sandbox_runner(
+            tmp_path,
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            allow_unsafe_local=True,
+            timeout=1,
+        )
+
+        assert evidence["timed_out"] is True
+        assert evidence["exit_code"] == 124
+
+    def test_a_timed_out_test_run_is_not_red_or_green_evidence(self, tmp_path):
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        def timed_out(workdir, argv):
+            return {"exit_code": 124, "timed_out": True, "output_tail": "sandbox timed out"}
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=timed_out,
+            )
+
+        assert exc.value.code == "tests_timed_out"
+
+    def test_an_unavailable_sandbox_fails_verify_closed(self, tmp_path, monkeypatch):
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        def unavailable(*args, **kwargs):
+            raise sandbox.SandboxUnavailable("no strong sandbox backend is usable")
+
+        monkeypatch.setattr(verify_local.sandbox, "run_in_sandbox", unavailable)
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+            )
+
+        assert exc.value.code == "sandbox_unavailable"
+        assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""

@@ -6,11 +6,16 @@ there is no broker, database or daemon.  The operator (or a later tick) calls
 :func:`deliver_pending`, which copies every undelivered event into each file
 subscriber's inbox or POSTs it to an http(s) subscriber.
 
-HTTP deliveries are authenticated with HMAC-SHA256 over the exact JSON body
-using the subscription secret.  A receiver can authenticate a delivery with
-:func:`verify_delivery`, which rejects stale timestamps, a wrong signature and a
-replayed delivery id.  Secrets are never placed in event payloads, delivery
-summaries or logs; they are stored only in the private subscriber record.
+HTTP deliveries are authenticated with a versioned, domain-separated
+HMAC-SHA256 over the delivery id, timestamp and exact raw JSON body using the
+subscription secret.  A receiver can authenticate a delivery with
+:func:`verify_delivery`, which rejects stale timestamps, a wrong signature and
+an exact replay of an already accepted delivery.  :func:`accept_delivery`
+records the replay marker only after the caller's durable acceptance, so a
+crash before acceptance leaves the delivery retryable and a legitimate
+retransmission returns the same durable receipt without repeating effects.
+Secrets are never placed in event payloads, delivery summaries or logs; they
+are stored only in the private subscriber record.
 
 Layout under ``state_dir``::
 
@@ -19,6 +24,7 @@ Layout under ``state_dir``::
     events/inbox/<identity>/<event_id>.json
     events/acks/<identity>/<event_id>.json
     events/delivery/<identity>/<event_id>.json   # attempt counters
+    events/verified/<token>.json                 # accepted-delivery receipt
 
 Every publish is create-only and fsynced (or atomically replaced where a replay
 must replace an earlier delivery).  Delivery is at-least-once: an event is only
@@ -73,6 +79,7 @@ __all__ = [
     "unsubscribe",
     "deliver_pending",
     "verify_delivery",
+    "accept_delivery",
     "acknowledge",
     "replay",
     "pending_deliveries",
@@ -110,9 +117,12 @@ SIGNATURE_HEADER = "X-Rizzstack-Signature"
 DELIVERY_ID_HEADER = "X-Rizzstack-Delivery-Id"
 EVENT_ID_HEADER = "X-Rizzstack-Event-Id"
 VERIFIED_SCHEMA = "rizzstack.bee-delivery-verified/1"
+RECEIPT_SCHEMA = "rizzstack.bee-delivery-receipt/1"
+SIGNATURE_VERSION = "v1"
+SIGNATURE_DOMAIN = b"rizzstack.bee-delivery-signature"
 
 _MAX_VERIFIED_DELIVERIES = 4096
-_VERIFIED_DELIVERIES: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+_VERIFIED_DELIVERIES: "OrderedDict[tuple[str, str], dict[str, Any]]" = OrderedDict()
 _VERIFIED_LOCK = threading.Lock()
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -1615,9 +1625,35 @@ def _timestamp_header_value(now: Any = None) -> str:
     return str(int(_clock(now)))
 
 
-def _signature_for(secret: str, body: bytes) -> str:
-    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return f"sha256={digest}"
+def _signing_message(delivery_id: str, timestamp: str, body: bytes) -> bytes:
+    """Return the unambiguous, domain-separated bytes covered by a signature.
+
+    Every field is length-prefixed, so no delivery id, timestamp or body can be
+    shifted into another field.  The domain and version make a signature from
+    one protocol version useless against another.
+    """
+
+    fields = (
+        delivery_id.encode("utf-8"),
+        timestamp.encode("utf-8"),
+        body,
+    )
+    return (
+        SIGNATURE_DOMAIN
+        + b"\x00"
+        + SIGNATURE_VERSION.encode("ascii")
+        + b"\x00"
+        + b"".join(len(field).to_bytes(8, "big") + field for field in fields)
+    )
+
+
+def _signature_digest(secret: str, delivery_id: str, timestamp: str, body: bytes) -> str:
+    message = _signing_message(delivery_id, timestamp, body)
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _signature_for(secret: str, delivery_id: str, timestamp: str, body: bytes) -> str:
+    return f"{SIGNATURE_VERSION}=sha256={_signature_digest(secret, delivery_id, timestamp, body)}"
 
 
 def _http_body(event: Mapping[str, Any]) -> bytes:
@@ -1627,17 +1663,31 @@ def _http_body(event: Mapping[str, Any]) -> bytes:
 def _http_headers(
     record: Mapping[str, Any], body: bytes, secret: str, *, now: Any = None
 ) -> dict[str, str]:
+    timestamp = _timestamp_header_value(now)
+    delivery_id = str(record.get("delivery_id") or "")
     return {
         "Content-Type": "application/json",
-        TIMESTAMP_HEADER: _timestamp_header_value(now),
-        SIGNATURE_HEADER: _signature_for(secret, body),
-        DELIVERY_ID_HEADER: str(record.get("delivery_id") or ""),
+        TIMESTAMP_HEADER: timestamp,
+        SIGNATURE_HEADER: _signature_for(secret, delivery_id, timestamp, body),
+        DELIVERY_ID_HEADER: delivery_id,
         EVENT_ID_HEADER: str(record.get("event_id") or ""),
     }
 
 
-def _send_http(url: str, body: bytes, headers: Mapping[str, str]) -> None:
+def _send_http(
+    url: str,
+    body: bytes,
+    headers: Mapping[str, str],
+    *,
+    refresh: Any = None,
+) -> None:
     """POST *body* once, retrying transient failures a bounded number of times.
+
+    ``refresh`` (when given) is called before every attempt and must return a
+    freshly signed header mapping.  A retry therefore carries a new timestamp
+    while keeping the same logical delivery id, so a receiver that already
+    accepted the previous attempt can return its durable receipt instead of
+    rejecting an exact replay.
 
     Error text never contains the subscriber URL or response body, so a secret
     embedded in either cannot leak into a summary or log.
@@ -1645,8 +1695,9 @@ def _send_http(url: str, body: bytes, headers: Mapping[str, str]) -> None:
 
     last: EventError | None = None
     for attempt in range(HTTP_RETRIES + 1):
+        attempt_headers = refresh() if callable(refresh) else headers
         try:
-            request = urlrequest.Request(url, data=body, headers=dict(headers), method="POST")
+            request = urlrequest.Request(url, data=body, headers=dict(attempt_headers), method="POST")
             with urlrequest.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
                 status = getattr(response, "status", None)
                 if status is None:
@@ -1718,7 +1769,11 @@ def _publish_http_delivery(
     attempts = _next_attempt(state_dir, identity, event_id)
     record = _delivery_record(identity, event, attempts)
     headers = _http_headers(record, body, secret)
-    _send_http(url, body, headers)
+
+    def refreshed_headers() -> dict[str, str]:
+        return _http_headers(record, body, secret)
+
+    _send_http(url, body, headers, refresh=refreshed_headers)
     stored, _created = _create_only_json(path, record)
     return stored
 
@@ -1743,13 +1798,13 @@ def _parse_signature(value: str | None) -> str | None:
     if not value:
         return None
     text = value.strip()
-    if text.lower().startswith("sha256="):
-        text = text[7:].strip()
-    elif "=" in text:
+    prefix = f"{SIGNATURE_VERSION}=sha256="
+    if not text.startswith(prefix):
         return None
-    if len(text) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in text):
+    digest = text[len(prefix) :].strip()
+    if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
         return None
-    return text.lower()
+    return digest.lower()
 
 
 def _parse_timestamp(value: str | None) -> float:
@@ -1779,6 +1834,23 @@ def _parse_timestamp(value: str | None) -> float:
     return parsed
 
 
+def _delivery_id_header(headers: Any) -> str:
+    value = _header_value(headers, DELIVERY_ID_HEADER)
+    if not value:
+        raise EventError(
+            "delivery_id_missing",
+            f"{DELIVERY_ID_HEADER} is required",
+            "Sign the delivery id together with the timestamp and body.",
+        )
+    if len(value) > MAX_IDENTIFIER or not _ID_RE.match(value):
+        raise EventError(
+            "delivery_invalid",
+            f"{DELIVERY_ID_HEADER} is not a safe identifier",
+            "Use a short delivery id containing only safe identifier characters.",
+        )
+    return value
+
+
 def _replay_key(secret: str, identifier: str) -> tuple[str, str]:
     secret_fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
     return secret_fingerprint, identifier
@@ -1796,74 +1868,14 @@ def _verified_disk_path(state_dir: Any, key: tuple[str, str]) -> Path:
     return _events_dir(state_dir) / "verified" / f"{token}.json"
 
 
-def _check_and_record_replay(
-    state_dir: Any | None, key: tuple[str, str], *, now: float
-) -> None:
-    if state_dir is None:
-        with _VERIFIED_LOCK:
-            if key in _VERIFIED_DELIVERIES:
-                raise EventError(
-                    "delivery_replayed",
-                    "this delivery id was already verified",
-                    "Treat a repeated delivery id as a replay and discard it.",
-                )
-            _VERIFIED_DELIVERIES[key] = None
-            _VERIFIED_DELIVERIES.move_to_end(key)
-            while len(_VERIFIED_DELIVERIES) > _MAX_VERIFIED_DELIVERIES:
-                _VERIFIED_DELIVERIES.popitem(last=False)
-        return
-
-    path = _verified_disk_path(state_dir, key)
-    existing = _read_regular(path)
-    if existing is not None:
-        raise EventError(
-            "delivery_replayed",
-            "this delivery id was already verified",
-            "Treat a repeated delivery id as a replay and discard it.",
-        )
-    payload = _canonical(
-        {
-            "schema": VERIFIED_SCHEMA,
-            "delivery_id": key[1],
-            "verified_at": _iso(now, microseconds=True),
-        }
-    )
-    try:
-        created = _create_only_payload(path, payload)
-    except OSError as exc:
-        raise EventError(
-            "delivery_write_failed",
-            f"cannot persist the replay marker: {type(exc).__name__}",
-            "Check the state directory is writable.",
-        ) from exc
-    if not created:
-        raise EventError(
-            "delivery_replayed",
-            "this delivery id was already verified",
-            "Treat a repeated delivery id as a replay and discard it.",
-        )
-
-
-def verify_delivery(
+def _verify_context(
     headers: Any,
     body: Any,
     secret: Any,
-    now: Any = None,
-    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
-    *,
-    state_dir: Any = None,
-) -> bool:
-    """Authenticate an HMAC-signed HTTP delivery.
-
-    The signature header is ``sha256=<hex>`` over the exact raw ``body`` bytes.
-    ``TIMESTAMP_HEADER`` must be within ``tolerance_s`` of ``now`` and the
-    delivery id header is remembered so the same delivery cannot be accepted
-    twice.  ``state_dir`` is optional; when supplied, replay markers are
-    persisted there instead of only in this process.
-
-    Raises :class:`EventError` with a stable code on every refusal and returns
-    ``True`` for a valid, fresh, not-yet-seen delivery.
-    """
+    now: Any,
+    tolerance_s: Any,
+) -> dict[str, Any]:
+    """Authenticate the signed delivery-id, timestamp and exact body together."""
 
     raw = _body_bytes(body)
     if len(raw) > MAX_HTTP_BODY_BYTES:
@@ -1895,7 +1907,9 @@ def verify_delivery(
             "Pass the allowed clock skew in seconds.",
         )
 
-    timestamp = _parse_timestamp(_header_value(headers, TIMESTAMP_HEADER))
+    timestamp_text = _header_value(headers, TIMESTAMP_HEADER)
+    timestamp = _parse_timestamp(timestamp_text)
+    delivery_id = _delivery_id_header(headers)
     current = _clock(now)
     if abs(current - timestamp) > tolerance:
         raise EventError(
@@ -1909,19 +1923,198 @@ def verify_delivery(
         raise EventError(
             "delivery_signature_invalid",
             f"{SIGNATURE_HEADER} is missing or malformed",
-            "Reject the delivery; a valid sha256=<hex> signature is required.",
+            "Reject the delivery; a versioned sha256=<hex> signature is required.",
         )
-    expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    expected = _signature_digest(secret, delivery_id, str(timestamp_text), raw)
     if not hmac.compare_digest(expected, provided):
         raise EventError(
             "delivery_signature_invalid",
-            "delivery signature does not match the body",
-            "Reject the delivery; the body or signature was altered.",
+            "delivery signature does not match the delivery id, timestamp and body",
+            "Reject the delivery; a header or the body was altered.",
         )
 
-    identifier = _header_value(headers, DELIVERY_ID_HEADER) or provided
-    _check_and_record_replay(state_dir, _replay_key(secret, identifier), now=current)
+    event_id = _header_value(headers, EVENT_ID_HEADER)
+    if event_id is not None and not _EVENT_ID_RE.match(event_id):
+        event_id = None
+    return {
+        "raw": raw,
+        "body_sha256": _digest_bytes(raw),
+        "delivery_id": delivery_id,
+        "timestamp": str(timestamp_text),
+        "event_id": event_id,
+        "verified_at": current,
+    }
+
+
+def _marker_is_exact(marker: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    return (
+        marker.get("delivery_id") == context.get("delivery_id")
+        and marker.get("timestamp") == context.get("timestamp")
+        and marker.get("body_sha256") == context.get("body_sha256")
+    )
+
+
+def _read_delivery_marker(
+    state_dir: Any | None, key: tuple[str, str]
+) -> dict[str, Any] | None:
+    if state_dir is None:
+        with _VERIFIED_LOCK:
+            marker = _VERIFIED_DELIVERIES.get(key)
+            return dict(marker) if marker is not None else None
+
+    path = _verified_disk_path(state_dir, key)
+    raw = _read_regular(path)
+    if raw is None:
+        return None
+    try:
+        return _decode(raw, path)
+    except EventError as exc:
+        raise EventError(
+            "delivery_write_failed",
+            "the durable replay marker is unreadable",
+            "Inspect the state directory; the delivery cannot be accepted safely.",
+        ) from exc
+
+
+def _store_delivery_marker(
+    state_dir: Any | None,
+    key: tuple[str, str],
+    marker: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    if state_dir is None:
+        with _VERIFIED_LOCK:
+            existing = _VERIFIED_DELIVERIES.get(key)
+            if existing is not None:
+                return dict(existing), False
+            _VERIFIED_DELIVERIES[key] = dict(marker)
+            _VERIFIED_DELIVERIES.move_to_end(key)
+            while len(_VERIFIED_DELIVERIES) > _MAX_VERIFIED_DELIVERIES:
+                _VERIFIED_DELIVERIES.popitem(last=False)
+            return dict(marker), True
+
+    path = _verified_disk_path(state_dir, key)
+    try:
+        created = _create_only_payload(path, _canonical(marker))
+    except OSError as exc:
+        raise EventError(
+            "delivery_write_failed",
+            f"cannot persist the replay marker: {type(exc).__name__}",
+            "Check the state directory is writable; the delivery remains retryable.",
+        ) from exc
+    if created:
+        return dict(marker), True
+    existing = _read_delivery_marker(state_dir, key)
+    if existing is None:
+        raise EventError(
+            "delivery_write_failed",
+            "the replay marker disappeared during publication",
+            "Retry the delivery; no acceptance was recorded.",
+        )
+    return existing, False
+
+
+def _receipt(
+    marker: Mapping[str, Any], *, duplicate: bool, created: bool
+) -> dict[str, Any]:
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "delivery_id": marker.get("delivery_id"),
+        "event_id": marker.get("event_id"),
+        "timestamp": marker.get("timestamp"),
+        "body_sha256": marker.get("body_sha256"),
+        "accepted_at": marker.get("accepted_at"),
+        "duplicate": duplicate,
+        "created": created,
+    }
+
+
+def verify_delivery(
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any = None,
+    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
+    *,
+    state_dir: Any = None,
+) -> bool:
+    """Authenticate a versioned HMAC-signed HTTP delivery.
+
+    The signature header is ``v1=sha256=<hex>`` over a domain-separated,
+    length-prefixed message containing the delivery id, the exact timestamp
+    header text and the exact raw ``body`` bytes.  ``TIMESTAMP_HEADER`` must be
+    within ``tolerance_s`` of ``now``.
+
+    Verification is deliberately side-effect free: a replay marker is only
+    written by :func:`accept_delivery` after the caller has durably accepted a
+    delivery.  A crash before that acceptance therefore leaves no marker and a
+    fresh retry remains possible.  An exact replay of an already accepted
+    delivery (same delivery id, timestamp and body) is refused with
+    ``delivery_replayed``.
+
+    Raises :class:`EventError` with a stable code on every refusal and returns
+    ``True`` for a valid, fresh delivery.
+    """
+
+    context = _verify_context(headers, body, secret, now, tolerance_s)
+    marker = _read_delivery_marker(
+        state_dir, _replay_key(str(secret), context["delivery_id"])
+    )
+    if marker is not None and _marker_is_exact(marker, context):
+        raise EventError(
+            "delivery_replayed",
+            "this delivery was already accepted",
+            "Treat a repeated delivery id as a replay and discard it.",
+        )
     return True
+
+
+def accept_delivery(
+    state_dir: Any,
+    headers: Any,
+    body: Any,
+    secret: Any,
+    now: Any = None,
+    tolerance_s: float = DEFAULT_TIMESTAMP_TOLERANCE_S,
+    *,
+    on_accept: Any = None,
+) -> dict[str, Any]:
+    """Verify a delivery and durably record its receipt once.
+
+    ``on_accept``, when supplied, is called with the receipt *before* the
+    replay marker is persisted.  A crash or exception during the caller's
+    durable acceptance therefore leaves no marker, and the same delivery can be
+    retried.  Once a marker exists, an exact replay is refused; a legitimate
+    retransmission (same delivery id and body, freshly signed timestamp) returns
+    the stored receipt with ``duplicate=True`` and does not repeat effects.
+    """
+
+    context = _verify_context(headers, body, secret, now, tolerance_s)
+    key = _replay_key(str(secret), context["delivery_id"])
+    marker = _read_delivery_marker(state_dir, key)
+    if marker is not None:
+        if _marker_is_exact(marker, context):
+            raise EventError(
+                "delivery_replayed",
+                "this delivery was already accepted",
+                "Treat a repeated delivery id as a replay and discard it.",
+            )
+        return _receipt(marker, duplicate=True, created=False)
+
+    marker = {
+        "schema": VERIFIED_SCHEMA,
+        "delivery_id": context["delivery_id"],
+        "event_id": context["event_id"],
+        "timestamp": context["timestamp"],
+        "body_sha256": context["body_sha256"],
+        "accepted_at": _iso(context["verified_at"], microseconds=True),
+    }
+    receipt = _receipt(marker, duplicate=False, created=True)
+    if on_accept is not None:
+        on_accept(receipt)
+    stored, created = _store_delivery_marker(state_dir, key, marker)
+    if not created:
+        return _receipt(stored, duplicate=True, created=False)
+    return _receipt(stored, duplicate=False, created=True)
 
 
 def pending_deliveries(state_dir: Any, subscriber: Any = None) -> list[dict[str, str]]:

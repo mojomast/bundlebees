@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from bundlebees_plugin import bee_events
 from bundlebees_plugin import event_consumer as consumer
 from bundlebees_plugin import hermes_adapter as adapter
 
@@ -722,3 +723,153 @@ def test_an_injected_transport_timeout_is_never_sent(monkeypatch):
         )
 
     assert caught.value.code == "hermes_notification_failed"
+
+
+# ---------------------------------------------------------------------------
+# Canonical hyvv landing events and authoritative subscriber routing
+# ---------------------------------------------------------------------------
+
+SUBSCRIBER_SECRET = "subscriber-secret-should-never-be-sent"
+
+
+def hyvv_event(**overrides) -> dict:
+    """A real ``rizzstack.bee.landed/1`` event as the hyvv bridge emits it."""
+
+    event = {
+        "feature_id": "BEE-1",
+        "job_id": "job-1",
+        "task_id": "task-1",
+        "coordinator": {"identity": "coordinator-1", "session": "run-1"},
+        "backend": {"harness": "hyvv", "model": "deepseek-v4.1-flash"},
+        "source_rev": "a" * 40,
+        "lease": {
+            "sha256": "b" * 64,
+            "assigned_files": ["src/a.py", "tests/test_a.py"],
+        },
+        "result": {
+            "available": True,
+            "artifact_sha256": "c" * 64,
+            "reference": "refs/heads/feat/bee-events",
+        },
+    }
+    event.update(overrides)
+    return bee_events.build_event(
+        {"attempt_id": "att-bee-1", "state": "landed", "transition_id": "tr-bee-1"},
+        **event,
+    )
+
+
+def hermes_subscription(state: Path, *, identity: str = "coordinator-1",
+                        session: str = "run-1") -> dict:
+    return bee_events.subscribe(
+        state,
+        {
+            "identity": identity,
+            "url": "https://gateway.invalid/hook",
+            "secret": SUBSCRIBER_SECRET,
+            "session": session,
+        },
+    )
+
+
+def test_a_canonical_hyvv_event_wakes_its_authoritative_subscriber(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    state = tmp_path / "state"
+    hermes_subscription(state)
+    event = hyvv_event()
+
+    with RecordingGateway() as gateway:
+        result = adapter.notify_coordinator(
+            event,
+            endpoint=gateway.url,
+            api_key="test-key",
+            subscriber="coordinator-1",
+            state_dir=state,
+        )
+
+    assert result["sent"] is True
+    assert result["session"] == "run-1"
+    request = gateway.requests[0]
+    headers = {key.lower(): value for key, value in request["headers"].items()}
+    assert headers["x-hermes-session-id"] == "run-1"
+
+    raw_body = request["body"]
+    content = json.loads(
+        json.loads(raw_body)["messages"][0]["content"]
+    )
+    assert content == {
+        "event_id": event["id"],
+        "type": "rizzstack.bee.landed.v1",
+        "job_id": "job-1",
+        "task_id": "task-1",
+        "attempt_id": "att-bee-1",
+        "state": "landed",
+        "source_rev": "a" * 40,
+        "result_reference": "refs/heads/feat/bee-events",
+    }
+    assert SUBSCRIBER_SECRET not in raw_body.decode("utf-8")
+    assert "assigned_files" not in raw_body.decode("utf-8")
+
+
+def test_a_canonical_event_for_another_coordinator_is_refused(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    state = tmp_path / "state"
+    hermes_subscription(state)
+    event = hyvv_event(coordinator={"identity": "coordinator-2", "session": "run-1"})
+
+    with RecordingGateway() as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                event,
+                endpoint=gateway.url,
+                api_key="test-key",
+                subscriber="coordinator-1",
+                state_dir=state,
+            )
+
+    assert caught.value.code == "hermes_session_mismatch"
+    assert gateway.requests == []
+
+
+def test_a_canonical_event_without_a_session_is_refused(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    state = tmp_path / "state"
+    hermes_subscription(state)
+    event = hyvv_event(coordinator={"identity": "coordinator-1"})
+
+    with RecordingGateway() as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                event,
+                endpoint=gateway.url,
+                api_key="test-key",
+                subscriber="coordinator-1",
+                state_dir=state,
+            )
+
+    assert caught.value.code == "hermes_session_mismatch"
+    assert gateway.requests == []
+
+
+def test_a_root_only_legacy_event_cannot_bind_a_subscriber(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_API_URL", raising=False)
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    state = tmp_path / "state"
+    hermes_subscription(state)
+    legacy = wake_event(session_id="run-1")
+
+    with RecordingGateway() as gateway:
+        with pytest.raises(adapter.ProposalError) as caught:
+            adapter.notify_coordinator(
+                legacy,
+                endpoint=gateway.url,
+                api_key="test-key",
+                subscriber="coordinator-1",
+                state_dir=state,
+            )
+
+    assert caught.value.code == "hermes_session_mismatch"
+    assert gateway.requests == []

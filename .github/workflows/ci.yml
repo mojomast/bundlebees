@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes any in-flight matrix for that ref,
+# so duplicate matrices never run concurrently (they would burn runner time and
+# report stale results). Runs on main are never cancelled, because they back the
+# required checks that branch protection gates merges on.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   tests:
@@ -55,18 +59,18 @@ jobs:
         run: |
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/workflow.git "$RUNNER_TEMP/workflow"
-          git -C "$RUNNER_TEMP/workflow" fetch --quiet origin refs/pull/33/head
-          git -C "$RUNNER_TEMP/workflow" checkout --quiet 070b6c10bdfa3e9d31b84cc83a2d9d701222082f
-          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "070b6c10bdfa3e9d31b84cc83a2d9d701222082f"
+          git -C "$RUNNER_TEMP/workflow" fetch --quiet origin refs/heads/feat/bee-landed
+          git -C "$RUNNER_TEMP/workflow" checkout --quiet 9c69d3a987ea9544a77cdd9b5a259904eb36f006
+          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "9c69d3a987ea9544a77cdd9b5a259904eb36f006"
           echo "WORKFLOW_SRC=$RUNNER_TEMP/workflow" >> "$GITHUB_ENV"
           echo "REQUIRE_WORKFLOW=1" >> "$GITHUB_ENV"
       - name: Check out hyvv provisioning contract (pinned)
         run: |
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/hyvv.git "$RUNNER_TEMP/hyvv-contract"
-          git -C "$RUNNER_TEMP/hyvv-contract" fetch --quiet origin refs/pull/4/head
-          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet 5bee1a870ffe32ee91c6a70b7be807eaa8400801
-          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "5bee1a870ffe32ee91c6a70b7be807eaa8400801"
+          git -C "$RUNNER_TEMP/hyvv-contract" fetch --quiet origin refs/heads/feat/bee-landed-events
+          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet e991c757103a61b9ab76eaf01dd1b7b51818273d
+          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "e991c757103a61b9ab76eaf01dd1b7b51818273d"
           echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
           echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
       - name: Run test suite
