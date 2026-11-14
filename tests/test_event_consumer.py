@@ -444,7 +444,8 @@ def test_notification_uses_the_documented_continuation(tmp_path):
     assert result["session"] == "coordinator-session"
     assert result["continuation"] == "--resume"
     continuation = runner.calls[-1]
-    assert continuation[:4] == ["hermes", "chat", "--resume", "coordinator-session"]
+    assert continuation[0].endswith("hermes")
+    assert continuation[1:4] == ["chat", "--resume", "coordinator-session"]
     assert continuation[-1] == "landed"
     assert result["command"][-1].startswith("<message sha256=")
 
