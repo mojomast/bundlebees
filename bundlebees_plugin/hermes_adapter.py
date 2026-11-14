@@ -18,13 +18,24 @@ The adapter is three deliberately separate stages:
    element for the duration of the turn (visible to a local ``ps``; the package
    holds no credentials), and the persisted metadata records it as a digest
    marker instead of a second copy of the evidence. The raw stdout bytes are
-   hashed before anything parses them.
+   hashed before anything parses them. The child environment is an explicit
+   allowlist (:func:`execution_policy`): PATH/LANG plus exactly one provider
+   credential, with HOME and TMPDIR pointed at the empty temporary cwd. No
+   BUNDLEBEES_* or HERMES_* value is inherited. stdout is capped, a timeout
+   kills the whole process group, conservative rlimits are applied, and
+   bubblewrap is used only when its probe proved it can start the installed
+   Hermes. Network egress is *not* filtered — the provider call requires it —
+   and the policy records that limitation instead of implying otherwise.
 3. :func:`parse_proposal` / :func:`compile_decision` turn one strict JSON object
    into a canonical ``rizzstack.recovery/1`` decision. The model's action and
    corrected test selection are copied verbatim; every other field is derived
    from the request and the frozen task. The pinned workflow validator and
    bundlebees' own authority checks are the only gate, and the production
    :func:`bundlebees_plugin.recovery.record_decision` is the only writer.
+4. :func:`adopt_proposal` is crash recovery, not a second opinion: it re-hashes
+   and reparses an already-persisted raw answer, recompiles it through the same
+   mechanical path, and records the decision without calling the model. A
+   missing or altered proposal is refused by name and is never re-rolled.
 
 A malformed answer, an ambiguous answer, a timeout and a non-zero exit all fail
 closed. The raw answer is persisted first (``<task>.<n>.proposal.json``) so the
@@ -40,12 +51,16 @@ the invocation metadata instead.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import inspect
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -78,7 +93,58 @@ _COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 #: exposes one internal task list with no filesystem, shell or network access.
 HERMES_TOOLSET = "todo"
 
+#: The execution boundary is described by a policy document that is recorded
+#: with every proposal. It is deliberately data, not a comment: the durable
+#: record says which controls were enforced and which were not.
+POLICY_SCHEMA = "rizzstack.hermes-execution-policy/1"
+
+#: One answer may not print more than this on stdout. The limit bounds both the
+#: adapter's memory and what a hostile answer can make the coordinator persist.
+MAX_OUTPUT_BYTES = 512 * 1024
+
+DEFAULT_TIMEOUT_S = 300
+
+#: The only environment variables a model turn inherits, plus exactly one
+#: provider credential when the provider names one. Everything else — in
+#: particular BUNDLEBEES_* (signing keys, launcher tokens) and HERMES_*
+#: (session/gateway context) — is dropped rather than filtered.
+_ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "TMPDIR", "LANG")
+
+#: Provider → the one credential variable that provider needs. An unknown
+#: provider gets no credential: the adapter never guesses at a secret name.
+_PROVIDER_CREDENTIALS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+    "deepinfra": "DEEPINFRA_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "xai": "XAI_API_KEY",
+}
+
+#: Conservative rlimits for the child. Core dumps could capture the provider
+#: key, so they are disabled; file growth and open descriptors are bounded to
+#: values a normal Hermes turn never approaches. No address-space or CPU limit
+#: is imposed: a model turn legitimately needs memory and wall-clock time, and
+#: the wall-clock timeout is the control that actually applies.
+_RLIMITS: dict[str, int] = {
+    "core_bytes": 0,
+    "file_bytes": 128 * 1024 * 1024,
+    "open_files": 1024,
+}
+
+#: A proposal record is a bounded answer plus metadata; anything larger is not
+#: a record this adapter wrote and is refused before it is parsed.
+_MAX_PROPOSAL_RECORD_BYTES = 4 * 1024 * 1024
+
 _MAX_EXCERPT_BYTES = 6000
+
 _MAX_EXCERPTS_TOTAL = 24000
 _MAX_EXCERPT_FILES = 8
 _MAX_EVIDENCE_TEXT = 8000
@@ -430,6 +496,399 @@ def render_prompt(package: Mapping[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The explicit execution policy
+# ---------------------------------------------------------------------------
+
+
+def _account_home() -> Path:
+    """The OS account's home, never ``$HOME`` (which the child itself replaces)."""
+
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError, AttributeError):
+        return Path.home()
+
+
+def provider_credential(provider: str | None) -> str | None:
+    """The one credential variable *provider* needs, or ``None`` when unknown.
+
+    Never a pattern like ``*_API_KEY``: an unrecognised provider gets no
+    credential at all rather than an accidental BUNDLEBEES_* or signing key.
+    """
+
+    return _PROVIDER_CREDENTIALS.get(str(provider or "").strip().lower())
+
+
+def _dotenv_value(name: str) -> str:
+    """Read exactly one named value from the account's ``~/.hermes/.env``.
+
+    The child runs with a temporary HOME, so Hermes cannot load that file
+    itself. Only the provider credential named by the policy is read; no other
+    line is parsed into the environment and the value is never recorded.
+    """
+
+    path = _account_home() / ".hermes" / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, separator, value = line.partition("=")
+        if not separator or key.strip() != name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value
+    return ""
+
+
+def _provider_credential_value(name: str, environ: Mapping[str, str] | None = None) -> str:
+    """The credential's value from the process environment, then the account .env."""
+
+    source = os.environ if environ is None else environ
+    value = str(source.get(name) or "")
+    if value:
+        return value
+    return _dotenv_value(name)
+
+
+def _diagnostic(value: Any) -> str:
+    """The last non-empty diagnostic line, with the account home folded to ``~``."""
+
+    lines = [str(line).strip() for line in str(value or "").splitlines() if str(line).strip()]
+    line = lines[-1] if lines else "no diagnostic"
+    return line.replace(str(_account_home()), "~")[:300]
+
+
+def _hermes_support_paths(binary: str | None) -> list[str]:
+    """Read-only paths the installed Hermes needs; never the account home itself.
+
+    The launcher is a shell script that executes a pinned Python under
+    ``~/.hermes/tools`` and imports the checkout under
+    ``~/.hermes/hermes-agent``. Those two trees (and the launcher's directory)
+    are the only parts of the account home a sandboxed turn needs. The rest of
+    ``~/.hermes`` — config, ``.env``, sessions, coordinator state — is not
+    mounted.
+    """
+
+    found: list[str] = []
+    seen: set[str] = set()
+    home = _account_home()
+
+    def add(path: Path | str) -> None:
+        text = str(path)
+        if not text or text in seen:
+            return
+        try:
+            resolved = Path(text)
+        except (OSError, ValueError):
+            return
+        if not resolved.is_absolute() or text == "/" or text == str(home):
+            return
+        if not resolved.exists():
+            return
+        seen.add(text)
+        found.append(text)
+
+    if binary:
+        launcher = Path(str(binary))
+        if launcher.is_absolute():
+            add(launcher)
+            add(launcher.parent)
+            try:
+                add(launcher.resolve())
+            except OSError:
+                pass
+    add(home / ".local" / "bin")
+    add(home / ".hermes" / "hermes-agent")
+    add(home / ".hermes" / "tools")
+    return found
+
+
+def _bwrap_command(argv: list[str], *, cwd: Path, binary: str | None) -> list[str]:
+    """Wrap *argv* in a bubblewrap sandbox with an empty, disposable view.
+
+    There is deliberately no ``--unshare-net``: the provider call is over the
+    host network. Everything else is unshared, the account home is replaced by
+    read-only install mounts, and only the empty temporary cwd is writable.
+    """
+
+    cmd = [
+        shutil.which("bwrap") or "bwrap",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+        "--cap-drop",
+        "ALL",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]
+    for path in (
+        "/usr",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
+        "/etc/localtime",
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/etc/pki",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/gai.conf",
+    ):
+        cmd.extend(["--ro-bind-try", path, path])
+    for path in ("/bin", "/lib", "/lib64", "/sbin"):
+        target = Path(path)
+        if target.is_symlink():
+            try:
+                link = os.readlink(path)
+            except OSError:
+                cmd.extend(["--ro-bind-try", path, path])
+            else:
+                cmd.extend(["--symlink", link, path])
+        else:
+            cmd.extend(["--ro-bind-try", path, path])
+    for path in _hermes_support_paths(binary):
+        cmd.extend(["--ro-bind-try", path, path])
+    cmd.extend(
+        [
+            "--bind",
+            str(cwd),
+            str(cwd),
+            "--chdir",
+            str(cwd),
+            *[str(item) for item in argv],
+        ]
+    )
+    return cmd
+
+
+def _probe_bwrap(binary: str | None) -> tuple[bool, str]:
+    """Prove the exact mount set works for the installed Hermes, or say why not.
+
+    Two probes: first ``/bin/true`` through the wrapper (does this host allow
+    the namespaces and mounts at all?), then the installed ``hermes
+    --version`` through the same wrapper. A binary merely being present is
+    never accepted as isolation.
+    """
+
+    if not shutil.which("bwrap"):
+        return False, "bubblewrap_not_installed: bwrap is not on PATH"
+    cwd = Path(tempfile.mkdtemp(prefix="rizzstack-hermes-bwrap-probe-"))
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": str(cwd),
+        "TMPDIR": str(cwd),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    try:
+        try:
+            done = subprocess.run(
+                _bwrap_command(["/bin/true"], cwd=cwd, binary=binary),
+                cwd=str(cwd),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            return False, f"bubblewrap_probe_failed: {type(exc).__name__}: {_diagnostic(exc)}"
+        if done.returncode != 0:
+            return False, "bubblewrap_probe_failed: " + _diagnostic(done.stderr)
+
+        target = str(binary or "")
+        if target and not Path(target).is_absolute():
+            target = shutil.which(target) or ""
+        if not target or not Path(target).exists():
+            return False, "hermes_binary_missing: the installed hermes cannot be proved to start"
+        try:
+            done = subprocess.run(
+                _bwrap_command([target, "--version"], cwd=cwd, binary=target),
+                cwd=str(cwd),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            return False, (
+                "hermes_does_not_start_inside_bubblewrap: " + type(exc).__name__ + ": " + _diagnostic(exc)
+            )
+        if done.returncode != 0:
+            return False, "hermes_does_not_start_inside_bubblewrap: " + _diagnostic(done.stderr)
+        return True, ""
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
+
+
+def _isolation_document(works: bool, limitation: str) -> dict[str, Any]:
+    if works:
+        return {
+            "backend": "bwrap",
+            "mode": "bwrap",
+            "enforced": True,
+            "probe": "bwrap + the installed hermes --version",
+            "filesystem": (
+                "only the empty temporary cwd is writable; the coordinator home, state "
+                "directory and worker workspace are not mounted"
+            ),
+            "network": "host network namespace (provider egress is required and not filtered)",
+            "network_egress": "not_enforced",
+            "limitation": None,
+        }
+    return {
+        "backend": "none",
+        "mode": "direct",
+        "enforced": False,
+        "probe": "bwrap + the installed hermes --version",
+        "filesystem": "the host filesystem is readable and writable as the coordinator uid",
+        "network": "host network namespace (provider egress is required and not filtered)",
+        "network_egress": "not_enforced",
+        "limitation": str(limitation or "bubblewrap_unavailable: the probe did not prove isolation"),
+    }
+
+
+_REAL_PROBE_BWRAP = _probe_bwrap
+_ISOLATION_CACHE: dict[tuple[str, float], tuple[bool, str]] = {}
+
+
+def _probe_cache_key(binary: str) -> tuple[str, float]:
+    try:
+        stamp = os.path.getmtime(binary)
+    except OSError:
+        stamp = 0.0
+    return (binary, float(stamp))
+
+
+def isolation_policy(
+    binary: str | None = None, *, probe: Any = None
+) -> dict[str, Any]:
+    """Whether filesystem isolation can honestly be claimed for this host.
+
+    ``probe`` is an injection seam for tests; production calls the real
+    two-stage probe. A failed probe returns ``enforced=False`` with a named
+    limitation instead of a weaker backend that pretends to be a sandbox.
+    """
+
+    target = str(binary or shutil.which("hermes") or "")
+    checker = probe or _probe_bwrap
+    cache_key: tuple[str, float] | None = None
+    if probe is None and checker is _REAL_PROBE_BWRAP:
+        cache_key = _probe_cache_key(target)
+        cached = _ISOLATION_CACHE.get(cache_key)
+        if cached is not None:
+            return _isolation_document(*cached)
+    works, limitation = checker(target)
+    if cache_key is not None:
+        _ISOLATION_CACHE[cache_key] = (bool(works), str(limitation))
+    return _isolation_document(bool(works), str(limitation))
+
+
+def execution_policy(
+    provider: str | None,
+    *,
+    binary: str | None = None,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    probe: Any = None,
+) -> dict[str, Any]:
+    """The explicit, recordable policy for one model turn.
+
+    Every claim is either enforced by :func:`invoke_hermes` or named in
+    ``controls_not_enforced``. The policy contains variable *names*, never
+    values: a durable record must not become a second secret store.
+    """
+
+    credential = provider_credential(provider)
+    isolation = isolation_policy(binary, probe=probe)
+    allowlist = list(_ENV_ALLOWLIST)
+    if credential:
+        allowlist.append(credential)
+
+    enforced = [
+        "rules_ignored",
+        "explicit_toolset",
+        "environment_allowlist",
+        "provider_credential_only",
+        "temporary_home",
+        "temporary_tmpdir",
+        "timeout",
+        "process_group_kill",
+        "output_cap",
+        "rlimits",
+    ]
+    if isolation["enforced"]:
+        enforced.extend(["filesystem_isolation", "no_writable_coordinator_state"])
+    not_enforced = ["network_egress_allowlist"]
+    if not isolation["enforced"]:
+        not_enforced.extend(["filesystem_isolation", "coordinator_state_write_protection"])
+
+    return {
+        "schema": POLICY_SCHEMA,
+        "toolsets": HERMES_TOOLSET,
+        "ignore_rules": True,
+        "noninteractive": True,
+        "env_allowlist": allowlist,
+        "provider_credential": credential,
+        "home": "empty temporary directory",
+        "tmpdir": "empty temporary directory",
+        "timeout_s": int(timeout_s),
+        "max_output_bytes": MAX_OUTPUT_BYTES,
+        "process_group_kill": True,
+        "rlimits": dict(_RLIMITS),
+        "isolation": isolation,
+        "isolation_enforced": bool(isolation["enforced"]),
+        "limitation": isolation["limitation"],
+        "network_egress": "not_enforced",
+        "controls_enforced": enforced,
+        "controls_not_enforced": not_enforced,
+    }
+
+
+def _child_env(
+    policy: Mapping[str, Any], cwd: Path, *, environ: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build the child environment from scratch; no ambient value leaks in."""
+
+    source = os.environ if environ is None else environ
+    credential = str(policy.get("provider_credential") or "")
+    environment: dict[str, str] = {}
+    for name in policy.get("env_allowlist") or ():
+        name = str(name)
+        if name == "HOME":
+            environment["HOME"] = str(cwd)
+            continue
+        if name == "TMPDIR":
+            environment["TMPDIR"] = str(cwd)
+            continue
+        value = str(source.get(name) or "")
+        if not value and name == credential:
+            value = _provider_credential_value(name, source)
+        if value:
+            environment[name] = value
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    environment.setdefault("LANG", "C.UTF-8")
+    environment["HOME"] = str(cwd)
+    environment["TMPDIR"] = str(cwd)
+    return environment
+
+
+# ---------------------------------------------------------------------------
 # Invocation
 # ---------------------------------------------------------------------------
 
@@ -500,11 +959,173 @@ def _public_argv(argv: list[str], prompt: str) -> list[str]:
     return list(argv)
 
 
+def _runner_accepts_env(runner: Any) -> bool:
+    """Whether an injected runner can receive the child environment.
+
+    Third-party/older runners have the pre-M4.3 ``(argv, timeout_s, prompt,
+    cwd)`` shape. They still get the same argument filtering; they simply
+    cannot observe it.
+    """
+
+    try:
+        parameters = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
+    for parameter in parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "env":
+            return True
+    return False
+
+
+def _rlimit_preexec() -> Any:
+    """A ``preexec_fn`` applying conservative rlimits, or ``None`` off POSIX."""
+
+    if os.name != "posix":
+        return None
+
+    def apply_limits() -> None:
+        import resource  # POSIX-only; imported in the forked child
+
+        specs = (
+            (resource.RLIMIT_CORE, _RLIMITS["core_bytes"]),
+            (resource.RLIMIT_FSIZE, _RLIMITS["file_bytes"]),
+            (resource.RLIMIT_NOFILE, _RLIMITS["open_files"]),
+        )
+        for which, value in specs:
+            target = int(value)
+            try:
+                soft, hard = resource.getrlimit(which)
+            except (OSError, ValueError):
+                continue
+            if soft != resource.RLIM_INFINITY and soft >= 0:
+                target = min(target, soft)
+            try:
+                resource.setrlimit(which, (target, hard if hard != resource.RLIM_INFINITY else target))
+            except (OSError, ValueError):
+                pass
+
+    return apply_limits
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group (it is its own group leader)."""
+
+    try:
+        if proc.poll() is not None:
+            return
+    except OSError:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_process(
+    argv: list[str], *, cwd: Path, env: Mapping[str, str], timeout_s: int
+) -> dict[str, Any]:
+    """Run *argv* with a bounded output capture and a hard process-group kill.
+
+    stdout and stderr are drained by threads so neither pipe can block the
+    child. stdout over :data:`MAX_OUTPUT_BYTES` kills the group immediately;
+    stderr is truncated at the same bound. On timeout the group is killed and
+    whatever stdout arrived is returned for the durable refusal record.
+    """
+
+    status: dict[str, Any] = {
+        "stdout_overflow": False,
+        "stderr_truncated": False,
+        "stdout_total": 0,
+        "stderr_total": 0,
+    }
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    lock = threading.Lock()
+
+    kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": dict(env),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+        kwargs["preexec_fn"] = _rlimit_preexec()
+    proc = subprocess.Popen(argv, **kwargs)
+
+    def pump(stream: Any, name: str) -> None:
+        buffer = buffers[name]
+        while True:
+            try:
+                chunk = stream.read(65536)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            with lock:
+                status[f"{name}_total"] += len(chunk)
+                room = MAX_OUTPUT_BYTES + 1 - len(buffer)
+                if room > 0:
+                    buffer.extend(chunk[:room])
+                if name == "stdout":
+                    if status["stdout_total"] > MAX_OUTPUT_BYTES and not status["stdout_overflow"]:
+                        status["stdout_overflow"] = True
+                        _kill_process_group(proc)
+                elif len(buffer) >= MAX_OUTPUT_BYTES:
+                    status["stderr_truncated"] = True
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_process_group(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+    for thread in threads:
+        thread.join(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+    return {
+        "returncode": None if timed_out else proc.returncode,
+        "stdout": bytes(buffers["stdout"][:MAX_OUTPUT_BYTES]),
+        "stderr": bytes(buffers["stderr"]),
+        "timed_out": timed_out,
+        "stdout_overflow": bool(status["stdout_overflow"]),
+        "stdout_total": int(status["stdout_total"]),
+        "stderr_truncated": bool(status["stderr_truncated"]),
+    }
+
+
 def invoke_hermes(
     prompt: str,
     *,
     runner: Any = None,
-    timeout_s: int = 300,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
     model: str | None = None,
     provider: str | None = None,
     hermes_bin: str | None = None,
@@ -516,6 +1137,12 @@ def invoke_hermes(
     decides whether the answer is admissible. A timeout is reported with
     ``timed_out`` and whatever partial stdout the process produced, so the
     durable proposal record can carry the truth instead of a guess.
+
+    The child runs under :func:`execution_policy`: an exact environment, an
+    empty temporary HOME/TMPDIR/cwd, explicit ``-t todo``, a hard timeout with
+    process-group kill, bounded output and conservative rlimits. bubblewrap is
+    used only when :func:`_probe_bwrap` proved it can start the installed
+    Hermes; otherwise the report says isolation is not enforced and why.
     """
 
     if not isinstance(prompt, str) or not prompt.strip():
@@ -538,43 +1165,57 @@ def invoke_hermes(
     if resolved_model is None:
         # `--provider` without a model is an error in Hermes; never construct it.
         resolved_provider = None
-    argv = _hermes_argv(binary, resolved_model, resolved_provider, str(toolsets or HERMES_TOOLSET), str(prompt))
+
+    toolsets_value = str(toolsets or HERMES_TOOLSET)
+    policy = execution_policy(resolved_provider, binary=binary, timeout_s=timeout_s)
+    isolation = dict(policy["isolation"])
+    argv = _hermes_argv(binary, resolved_model, resolved_provider, toolsets_value, str(prompt))
 
     cwd = Path(tempfile.mkdtemp(prefix="rizzstack-hermes-recovery-"))
+    environment = _child_env(policy, cwd)
+    launch_argv = _bwrap_command(argv, cwd=cwd, binary=binary) if isolation["enforced"] else list(argv)
     started = time.monotonic()
     timed_out = False
+    overflow = False
+    stderr_truncated = False
     rc: int | None = None
     out = b""
     err = b""
     try:
         if runner is None:
-            try:
-                done = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    cwd=str(cwd),
-                    timeout=timeout_s,
-                    env=dict(os.environ),
-                )
-                rc, out, err = _completed_parts(done)
-            except subprocess.TimeoutExpired as exc:
-                timed_out = True
-                out = getattr(exc, "output", None) or getattr(exc, "stdout", None) or b""
-                if isinstance(out, str):
-                    out = out.encode("utf-8")
-                err = getattr(exc, "stderr", None) or b""
+            result = _run_process(launch_argv, cwd=cwd, env=environment, timeout_s=timeout_s)
+            rc = result["returncode"]
+            out = result["stdout"]
+            err = result["stderr"]
+            timed_out = bool(result["timed_out"])
+            overflow = bool(result["stdout_overflow"])
+            stderr_truncated = bool(result["stderr_truncated"])
         else:
-            done = runner(argv, timeout_s=timeout_s, prompt=str(prompt), cwd=cwd)
+            kwargs: dict[str, Any] = {"timeout_s": timeout_s, "prompt": str(prompt), "cwd": cwd}
+            if _runner_accepts_env(runner):
+                kwargs["env"] = dict(environment)
+            done = runner(argv, **kwargs)
             rc, out, err = _completed_parts(done)
+            if len(out) > MAX_OUTPUT_BYTES:
+                overflow = True
     except subprocess.TimeoutExpired as exc:
         timed_out = True
         out = getattr(exc, "output", None) or getattr(exc, "stdout", None) or b""
         if isinstance(out, str):
             out = out.encode("utf-8")
+        err = getattr(exc, "stderr", None) or b""
     except OSError as exc:
         raise ProposalError("hermes_unavailable", f"the hermes CLI cannot be started: {exc}", _FIX) from exc
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
+
+    if overflow:
+        raise ProposalError(
+            "hermes_output_too_large",
+            f"hermes wrote more than the {MAX_OUTPUT_BYTES}-byte stdout cap; the request is not decided",
+            "Refuse: an overwritten answer is not a proposal. Inspect the invocation and retry only "
+            "with a deliberate, bounded prompt.",
+        )
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     raw_prompt = str(prompt).encode("utf-8")
@@ -582,18 +1223,26 @@ def invoke_hermes(
         "argv": _public_argv(argv, str(prompt)),
         "model": resolved_model,
         "provider": resolved_provider,
-        "toolsets": str(toolsets or HERMES_TOOLSET),
+        "toolsets": toolsets_value,
         "ignore_rules": True,
         "cwd": "empty temporary directory",
+        "home": "empty temporary directory",
+        "tmpdir": "empty temporary directory",
+        "env_names": sorted(environment),
+        "policy": policy,
+        "isolation": isolation,
+        "isolation_enforced": bool(isolation["enforced"]),
         "exit_code": rc,
         "timed_out": bool(timed_out),
         "elapsed_ms": elapsed_ms,
         "prompt_sha256": hashlib.sha256(raw_prompt).hexdigest(),
         "prompt_bytes": len(raw_prompt),
         "stdout": out.decode("utf-8", "replace"),
+        "stdout_bytes": len(out),
         "stdout_sha256": hashlib.sha256(out).hexdigest(),
         "stderr_sha256": hashlib.sha256(err).hexdigest(),
         "stderr_bytes": len(err),
+        "stderr_truncated": bool(stderr_truncated),
     }
 
 
@@ -866,6 +1515,14 @@ def persist_proposal(
     or ``--deterministic`` can still record a decision for it.
     """
 
+    raw_stdout = str(invocation.get("stdout") or "")
+    if len(raw_stdout.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        raise ProposalError(
+            "hermes_output_too_large",
+            f"the raw answer is larger than the {MAX_OUTPUT_BYTES}-byte stdout cap",
+            "Refuse: an overwritten answer is not a proposal.",
+        )
+
     record = {
         "schema": PROPOSAL_RECORD_SCHEMA,
         "request_id": str(request.get("request_id") or ""),
@@ -875,6 +1532,9 @@ def persist_proposal(
         "attempt_id": str(request.get("attempt_id") or ""),
         "adapter": str(adapter),
         "recorded_at": recorded_at,
+        "policy": dict(invocation.get("policy") or {}),
+        "isolation": dict(invocation.get("isolation") or {}),
+        "isolation_enforced": bool(invocation.get("isolation_enforced")),
         "invocation": {
             key: invocation.get(key)
             for key in (
@@ -884,17 +1544,25 @@ def persist_proposal(
                 "toolsets",
                 "ignore_rules",
                 "cwd",
+                "home",
+                "tmpdir",
+                "env_names",
+                "policy",
+                "isolation",
+                "isolation_enforced",
                 "exit_code",
                 "timed_out",
                 "elapsed_ms",
                 "prompt_sha256",
                 "prompt_bytes",
+                "stdout_bytes",
                 "stdout_sha256",
                 "stderr_sha256",
                 "stderr_bytes",
+                "stderr_truncated",
             )
         },
-        "raw_stdout": str(invocation.get("stdout") or ""),
+        "raw_stdout": raw_stdout,
         "stdout_sha256": str(invocation.get("stdout_sha256") or ""),
         "parsed": dict(parsed) if isinstance(parsed, Mapping) else None,
         "parse_error": parse_error,
@@ -1039,9 +1707,269 @@ def decide_with_hermes(
         "adapter": name,
         "proposal": _relative(state, path),
         "stdout_sha256": str(invocation.get("stdout_sha256") or ""),
+        "policy": invocation.get("policy"),
+        "isolation": invocation.get("isolation"),
+        "isolation_enforced": bool(invocation.get("isolation_enforced")),
         "invocation": {
             key: invocation.get(key)
-            for key in ("argv", "model", "provider", "toolsets", "exit_code", "timed_out", "elapsed_ms")
+            for key in (
+                "argv",
+                "model",
+                "provider",
+                "toolsets",
+                "exit_code",
+                "timed_out",
+                "elapsed_ms",
+                "policy",
+                "isolation",
+                "isolation_enforced",
+            )
+        },
+        "decision": stored,
+        "decision_path": _relative(state, recovery.decision_path(
+            state, str(request.get("job_id") or ""), str(request.get("task_id") or ""),
+            recovery.request_ordinal(state, request_id),
+        )),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Crash adoption: the same durable proposal, without a second model turn
+# ---------------------------------------------------------------------------
+
+
+def _load_proposal_record(path: Path) -> dict[str, Any]:
+    """Read a persisted proposal record; a missing file is ``proposal_missing``."""
+
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError as exc:
+        raise ProposalError(
+            "proposal_missing",
+            f"no proposal is recorded at {path.name!r}; there is nothing to adopt",
+            _FIX,
+        ) from exc
+    except OSError as exc:
+        raise ProposalError(
+            "proposal_missing", f"the recorded proposal cannot be read: {exc}", _FIX
+        ) from exc
+    if size > _MAX_PROPOSAL_RECORD_BYTES:
+        raise ProposalError(
+            "proposal_tampered",
+            f"the recorded proposal is {size} bytes, larger than any answer this adapter writes",
+            _FIX,
+        )
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ProposalError(
+            "proposal_missing",
+            f"no proposal is recorded at {path.name!r}; there is nothing to adopt",
+            _FIX,
+        ) from exc
+    except OSError as exc:
+        raise ProposalError(
+            "proposal_missing", f"the recorded proposal cannot be read: {exc}", _FIX
+        ) from exc
+    try:
+        record = json.loads(payload)
+    except ValueError as exc:
+        raise ProposalError(
+            "proposal_tampered", f"the recorded proposal is not valid JSON: {exc}", _FIX
+        ) from exc
+    if not isinstance(record, dict):
+        raise ProposalError("proposal_tampered", "the recorded proposal is not one JSON object", _FIX)
+    return record
+
+
+def _proposal_identity(
+    record: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
+    """The record must be about exactly this request; anything else is tampering."""
+
+    if str(record.get("schema") or "") != PROPOSAL_RECORD_SCHEMA:
+        raise ProposalError(
+            "proposal_tampered",
+            f"the record schema is {record.get('schema')!r}, not {PROPOSAL_RECORD_SCHEMA!r}",
+            _FIX,
+        )
+    for key in ("request_id", "request_digest", "job_id", "task_id", "attempt_id"):
+        if str(record.get(key) or "") != str(request.get(key) or ""):
+            raise ProposalError(
+                "proposal_tampered",
+                f"the record's {key} does not match the durable request; it cannot be adopted",
+                _FIX,
+            )
+    invocation = _mapping(record.get("invocation"))
+    for key in ("policy", "isolation"):
+        top = record.get(key)
+        inner = invocation.get(key)
+        if isinstance(top, Mapping) and isinstance(inner, Mapping) and dict(top) != dict(inner):
+            raise ProposalError(
+                "proposal_tampered",
+                f"the record's {key} block disagrees with its invocation metadata",
+                _FIX,
+            )
+    if "isolation_enforced" in record and "isolation_enforced" in invocation:
+        if bool(record.get("isolation_enforced")) != bool(invocation.get("isolation_enforced")):
+            raise ProposalError(
+                "proposal_tampered",
+                "the record and its invocation metadata disagree about isolation_enforced",
+                _FIX,
+            )
+
+
+def _proposal_raw(record: Mapping[str, Any]) -> tuple[str, bytes]:
+    """The raw answer and its bytes, with both recorded digests verified."""
+
+    raw = record.get("raw_stdout")
+    if not isinstance(raw, str):
+        raise ProposalError("proposal_tampered", "the record carries no raw stdout string", _FIX)
+    payload = raw.encode("utf-8")
+    actual = hashlib.sha256(payload).hexdigest()
+    recorded = str(record.get("stdout_sha256") or "")
+    invocation = _mapping(record.get("invocation"))
+    invocation_digest = str(invocation.get("stdout_sha256") or "")
+    if not recorded or not hmac.compare_digest(recorded, actual):
+        raise ProposalError(
+            "proposal_tampered",
+            f"the raw answer hashes to {actual[:12]}, not the recorded {recorded[:12] or 'missing'}",
+            _FIX,
+        )
+    if invocation_digest and not hmac.compare_digest(invocation_digest, actual):
+        raise ProposalError(
+            "proposal_tampered",
+            "the invocation metadata and the record disagree about the raw answer digest",
+            _FIX,
+        )
+    return raw, payload
+
+
+def _proposal_adapter(record: Mapping[str, Any]) -> str:
+    """The record's adapter must be the canonical name for its recorded model."""
+
+    invocation = _mapping(record.get("invocation"))
+    model = str(invocation.get("model") or "").strip()
+    recorded = str(record.get("adapter") or "")
+    expected = adapter_name(model) if model else ""
+    if expected and recorded != expected:
+        raise ProposalError(
+            "proposal_tampered",
+            f"the record adapter {recorded!r} is not the canonical name for model {model!r}",
+            _FIX,
+        )
+    return _require_adapter_name(recorded)
+
+
+def adopt_proposal(
+    state_dir: Path,
+    request_id: str,
+    *,
+    repo: Path | None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Record the decision a crashed ``decide_with_hermes`` had already earned.
+
+    Crash recovery is not a second opinion. The raw answer and its digests are
+    read from ``<task>.<n>.proposal.json``; the bytes are re-hashed, the answer
+    is reparsed with the same strict parser, and the result goes through the
+    same mechanical compiler, pinned ``validate_pair`` and production
+    ``record_decision`` as a live turn. No model is asked again.
+
+    ``repo`` is accepted for API symmetry with :func:`decide_with_hermes`; the
+    adoption itself reads only durable state, because re-reading the evidence
+    package would be a new package and could never match the recorded answer.
+
+    A missing proposal refuses ``proposal_missing``. Any alteration — changed
+    raw bytes, a broken digest, a mismatched request identity or adapter, or a
+    record whose parse result disagrees with its raw answer — refuses
+    ``proposal_tampered``. Malformed answers still raise the parser's own code
+    and unauthorised answers are still refused by the pinned validator.
+    """
+
+    state = Path(state_dir)
+    request = recovery.load_request(state, request_id)
+    existing = recovery.read_decision(state, request)
+    if existing is not None:
+        raise recovery.RecoveryError(
+            "decision_exists",
+            f"request {request_id!r} already has a recorded decision; it is decided exactly once",
+            _FIX,
+        )
+    path = proposal_path(state, request)
+    if path.is_symlink():
+        raise ProposalError(
+            "proposal_tampered",
+            "the recorded proposal is a symbolic link; a proposal is a regular file",
+            _FIX,
+        )
+    if not path.is_file():
+        raise ProposalError(
+            "proposal_missing",
+            f"no proposal is recorded for {request_id!r}; there is nothing to adopt",
+            "Run --hermes once to obtain a proposal; adoption never asks the model itself.",
+        )
+    record = _load_proposal_record(path)
+    _proposal_identity(record, request)
+    raw, payload = _proposal_raw(record)
+    name = _proposal_adapter(record)
+
+    # Reparse the bytes, never the stored verdict: a malformed answer keeps its
+    # own refusal name, and a record whose parsed field disagrees is tampering.
+    parsed = parse_proposal(raw)
+    stored_parsed = record.get("parsed")
+    if stored_parsed is not None and stored_parsed != parsed:
+        raise ProposalError(
+            "proposal_tampered",
+            "the recorded parse result differs from a fresh parse of the recorded raw answer",
+            _FIX,
+        )
+    if record.get("parse_error") is not None:
+        raise ProposalError(
+            "proposal_tampered",
+            f"the record says the answer was refused as {record.get('parse_error')!r}, yet it parses",
+            _FIX,
+        )
+
+    job = jobs.load_job(state, str(request.get("job_id") or ""), recover=False)
+    task = _task_for(job, request)
+    recorded_at = record.get("recorded_at")
+    decided_at = _decided_at(now if now is not None else recorded_at)
+    decision = compile_decision(
+        request, parsed, adapter_name=name, decided_at=decided_at, task=task
+    )
+    attempts, corrections = _ledger(job, task)
+    module = recovery.protocol_validator()
+    _validate_pair(
+        module, request, decision, attempts_used=attempts, corrections_used=corrections
+    )
+    stored = recovery.record_decision(state, request_id, decision, adapter=name)
+    invocation = _mapping(record.get("invocation"))
+
+    return {
+        "request_id": str(request.get("request_id") or ""),
+        "adapter": name,
+        "proposal": _relative(state, path),
+        "stdout_sha256": hashlib.sha256(payload).hexdigest(),
+        "adopted": True,
+        "model_called": False,
+        "policy": record.get("policy") or invocation.get("policy"),
+        "isolation": record.get("isolation") or invocation.get("isolation"),
+        "isolation_enforced": bool(record.get("isolation_enforced")),
+        "invocation": {
+            key: (record.get(key) if key in ("policy", "isolation") else invocation.get(key))
+            for key in (
+                "argv",
+                "model",
+                "provider",
+                "toolsets",
+                "exit_code",
+                "timed_out",
+                "elapsed_ms",
+                "policy",
+                "isolation",
+                "isolation_enforced",
+            )
         },
         "decision": stored,
         "decision_path": _relative(state, recovery.decision_path(

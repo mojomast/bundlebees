@@ -96,6 +96,7 @@ def recover(
     decision_file: Any = None,
     adapter: Any = None,
     hermes: bool = False,
+    hermes_adopt: bool = False,
     hermes_timeout: int = 300,
     hermes_model: str | None = None,
     hermes_provider: str | None = None,
@@ -154,6 +155,24 @@ def recover(
         recorded.append(recovery.record_decision(
             state_dir, target, payload, adapter=str(payload.get("adapter") or "file"), now=now,
         ))
+    elif hermes_adopt:
+        if repo is None:
+            raise JobCliError(
+                "repo_required",
+                "--hermes-adopt needs --repo: the proposal was recorded against a pinned revision",
+                "Pass the repository the job targets; adoption never asks the model again.",
+            )
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            outcome = hermes_adapter.adopt_proposal(
+                state_dir,
+                str(request["request_id"]),
+                repo=Path(repo),
+                now=now,
+            )
+            proposals.append(str(outcome["proposal"]))
+            recorded.append(outcome["decision"])
     elif hermes:
         if repo is None:
             raise JobCliError(
@@ -164,15 +183,25 @@ def recover(
         for request in requests:
             if recovery.read_decision(state_dir, request) is not None:
                 continue
-            outcome = hermes_adapter.decide_with_hermes(
-                state_dir,
-                str(request["request_id"]),
-                repo=Path(repo),
-                timeout_s=hermes_timeout,
-                model=hermes_model,
-                provider=hermes_provider,
-                now=now,
-            )
+            if hermes_adapter.proposal_path(state_dir, request).exists():
+                # A crash after the raw answer was persisted is recovered from
+                # that durable proposal: never re-roll the model.
+                outcome = hermes_adapter.adopt_proposal(
+                    state_dir,
+                    str(request["request_id"]),
+                    repo=Path(repo),
+                    now=now,
+                )
+            else:
+                outcome = hermes_adapter.decide_with_hermes(
+                    state_dir,
+                    str(request["request_id"]),
+                    repo=Path(repo),
+                    timeout_s=hermes_timeout,
+                    model=hermes_model,
+                    provider=hermes_provider,
+                    now=now,
+                )
             proposals.append(str(outcome["proposal"]))
             recorded.append(outcome["decision"])
     elif adapter is not None:
@@ -774,6 +803,9 @@ def add_parsers(subparsers: Any) -> None:
     choice.add_argument("--hermes", action="store_true",
                         help="Ask the configured Hermes model for one strict JSON proposal per outstanding "
                              "request; the pinned validator still decides whether it may be recorded.")
+    choice.add_argument("--hermes-adopt", action="store_true",
+                        help="Adopt an already-recorded Hermes proposal after a crash: re-hash, reparse and "
+                             "validate it, without asking the model again.")
     rec.add_argument("--hermes-timeout", type=int, default=300,
                      help="Seconds one Hermes proposal turn may take (default 300); a timeout decides nothing.")
     rec.add_argument("--hermes-model", default=None, help="Model for --hermes (default: the configured one).")
@@ -923,6 +955,7 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                 decision_file=getattr(args, "decision_file", None),
                 adapter="deterministic" if getattr(args, "deterministic", False) else None,
                 hermes=bool(getattr(args, "hermes", False)),
+                hermes_adopt=bool(getattr(args, "hermes_adopt", False)),
                 hermes_timeout=int(getattr(args, "hermes_timeout", 300) or 300),
                 hermes_model=getattr(args, "hermes_model", None),
                 hermes_provider=getattr(args, "hermes_provider", None),

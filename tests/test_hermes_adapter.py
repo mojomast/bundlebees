@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -768,3 +769,385 @@ def test_the_cli_will_not_ask_a_model_without_a_repository(tmp_path):
     assert caught.value.code == "repo_required"
     assert decisions_of(state) == []
     assert proposals_of(state) == []
+
+
+# ---------------------------------------------------------------------------
+# M4.3 lane B: the explicit execution boundary
+# ---------------------------------------------------------------------------
+
+
+ENV_SENTINELS = {
+    "BUNDLEBEES_SIGNING_SECRET": "sentinel-signing-secret",
+    "BUNDLEBEES_LAUNCHER_TOKEN": "sentinel-launcher-token",
+    "HERMES_SESSION_ID": "sentinel-session",
+    "HERMES_GATEWAY_TOKEN": "sentinel-gateway",
+}
+
+
+class EnvRunner:
+    """A model double that captures the exact child environment."""
+
+    def __init__(self, payload: bytes = b"", *, returncode: int = 0) -> None:
+        self.payload = payload
+        self.returncode = returncode
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, argv, *, timeout_s, prompt, cwd, env):
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "timeout_s": timeout_s,
+                "prompt": prompt,
+                "cwd": Path(cwd),
+                "cwd_entries": sorted(path.name for path in Path(cwd).iterdir()),
+                "env": dict(env),
+            }
+        )
+        return subprocess.CompletedProcess(argv, self.returncode, stdout=self.payload, stderr=b"")
+
+
+def direct_probe(reason: str = "bubblewrap_probe_failed: synthetic: no user namespace"):
+    return lambda binary: (False, reason)
+
+
+def bwrap_probe_ok(binary):
+    return True, ""
+
+
+def test_execution_policy_names_every_control_and_only_the_provider_key():
+    policy = adapter.execution_policy("deepseek", probe=direct_probe())
+
+    assert policy["schema"] == adapter.POLICY_SCHEMA
+    assert policy["toolsets"] == "todo"
+    assert policy["env_allowlist"] == ["PATH", "HOME", "TMPDIR", "LANG", "DEEPSEEK_API_KEY"]
+    assert policy["provider_credential"] == "DEEPSEEK_API_KEY"
+    assert policy["max_output_bytes"] == 512 * 1024
+    assert policy["process_group_kill"] is True
+    assert policy["timeout_s"] == adapter.DEFAULT_TIMEOUT_S
+    assert policy["rlimits"]["core_bytes"] == 0
+    assert policy["isolation"]["enforced"] is False
+    assert policy["isolation"]["limitation"].startswith("bubblewrap_probe_failed:")
+    assert "network_egress_allowlist" in policy["controls_not_enforced"]
+    assert "filesystem_isolation" in policy["controls_not_enforced"]
+    assert "filesystem_isolation" not in policy["controls_enforced"]
+    # The policy carries names, never values.
+    assert "sk-" not in json.dumps(policy)
+
+    unknown = adapter.execution_policy("some-unknown-provider", probe=direct_probe())
+    assert unknown["provider_credential"] is None
+    assert unknown["env_allowlist"] == ["PATH", "HOME", "TMPDIR", "LANG"]
+
+
+def test_the_child_environment_is_an_allowlist_not_ambient_inheritance(tmp_path, monkeypatch):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+    for name, value in ENV_SENTINELS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-provider-key")
+    monkeypatch.setattr(adapter, "_probe_bwrap", direct_probe())
+    runner = EnvRunner(raw(proposal()))
+
+    adapter.decide_with_hermes(
+        state,
+        request["request_id"],
+        repo=repo,
+        runner=runner,
+        model="deepseek-flash",
+        provider="deepseek",
+        now=NOW,
+    )
+
+    environment = runner.calls[0]["env"]
+    assert set(environment) == {"PATH", "HOME", "TMPDIR", "LANG", "DEEPSEEK_API_KEY"}
+    assert environment["DEEPSEEK_API_KEY"] == "sk-test-provider-key"
+    assert environment["HOME"] == str(runner.calls[0]["cwd"])
+    assert environment["TMPDIR"] == str(runner.calls[0]["cwd"])
+    assert environment["PATH"] and environment["LANG"]
+    serialized = json.dumps(environment)
+    for name, value in ENV_SENTINELS.items():
+        assert name not in environment
+        assert value not in serialized
+    assert all(not key.startswith(("BUNDLEBEES_", "HERMES_")) for key in environment)
+
+    record = proposal_record(state)
+    assert record["policy"]["env_allowlist"] == [
+        "PATH", "HOME", "TMPDIR", "LANG", "DEEPSEEK_API_KEY",
+    ]
+    assert record["invocation"]["policy"] == record["policy"]
+    assert record["isolation"] == record["invocation"]["isolation"]
+    assert record["isolation_enforced"] is False
+    assert record["invocation"]["env_names"] == sorted(environment)
+    assert "sk-test-provider-key" not in json.dumps(record)
+
+
+def test_bwrap_is_recorded_only_when_the_probe_proved_it(monkeypatch):
+    monkeypatch.setattr(adapter, "_probe_bwrap", bwrap_probe_ok)
+    runner = EnvRunner(b"{}")
+
+    metadata = adapter.invoke_hermes(
+        "answer", runner=runner, model="fake-model", provider="deepseek", timeout_s=30
+    )
+
+    assert metadata["isolation"]["backend"] == "bwrap"
+    assert metadata["isolation"]["enforced"] is True
+    assert metadata["isolation_enforced"] is True
+    assert "filesystem_isolation" in metadata["policy"]["controls_enforced"]
+    assert "filesystem_isolation" not in metadata["policy"]["controls_not_enforced"]
+
+
+def test_absent_or_failing_bwrap_is_recorded_as_not_enforced(monkeypatch):
+    limitation = "bubblewrap_probe_failed: bwrap: setting up uid map: Permission denied"
+    monkeypatch.setattr(adapter, "_probe_bwrap", direct_probe(limitation))
+    runner = EnvRunner(b"{}")
+
+    metadata = adapter.invoke_hermes("answer", runner=runner, model="fake-model")
+
+    assert metadata["isolation"]["backend"] == "none"
+    assert metadata["isolation"]["enforced"] is False
+    assert metadata["isolation_enforced"] is False
+    assert metadata["isolation"]["limitation"] == limitation
+    assert "filesystem_isolation" in metadata["policy"]["controls_not_enforced"]
+    # The honest limitation explains what remains readable.
+    assert "host filesystem" in metadata["isolation"]["filesystem"].lower()
+
+
+def test_output_over_the_cap_fails_closed(monkeypatch):
+    monkeypatch.setattr(adapter, "_probe_bwrap", direct_probe())
+    runner = EnvRunner(b"x" * (adapter.MAX_OUTPUT_BYTES + 1))
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.invoke_hermes("answer", runner=runner, model="fake-model")
+
+    assert caught.value.code == "hermes_output_too_large"
+    assert "524288" in caught.value.message
+
+
+def test_a_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(adapter, "_probe_bwrap", direct_probe())
+    pid_file = tmp_path / "grandchild.pid"
+    script = tmp_path / "fake-hermes"
+    script.write_text(
+        "#!/bin/sh\n"
+        "sleep 60 &\n"
+        "child=$!\n"
+        f"printf '%s' \"$child\" > {str(pid_file)!r}\n"
+        "printf partial-answer\n"
+        "sleep 60\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    started = time.monotonic()
+    metadata = adapter.invoke_hermes(
+        "answer", hermes_bin=str(script), timeout_s=1, model="fake-model"
+    )
+    elapsed = time.monotonic() - started
+
+    assert metadata["timed_out"] is True
+    assert metadata["exit_code"] is None
+    assert "partial-answer" in metadata["stdout"]
+    assert elapsed < 15
+    grandchild = int(pid_file.read_text(encoding="utf-8").strip())
+    for _ in range(50):
+        if not Path(f"/proc/{grandchild}").exists():
+            break
+        time.sleep(0.1)
+    assert not Path(f"/proc/{grandchild}").exists(), (
+        f"the timeout killed only the direct child; grandchild {grandchild} survived"
+    )
+
+
+def simulate_crash(state: Path, repo: Path, request: dict, payload: bytes) -> tuple[Path, dict]:
+    """Persist exactly what decide_with_hermes persists, then stop before the decision."""
+
+    package = adapter.build_package(state, request["request_id"], repo=repo)
+    prompt = adapter.render_prompt(package)
+    invocation = adapter.invoke_hermes(prompt, runner=FakeRunner(payload), model="fake-model")
+    try:
+        parsed = adapter.parse_proposal(invocation["stdout"])
+        parse_error = None
+    except recovery.RecoveryError as exc:
+        parsed = None
+        parse_error = exc.code
+    path = adapter.persist_proposal(
+        state,
+        request,
+        adapter=adapter.adapter_name("fake-model"),
+        invocation=invocation,
+        parsed=parsed,
+        parse_error=parse_error,
+        recorded_at=DECIDED,
+    )
+    return path, invocation
+
+
+def test_adopt_after_crash_records_the_same_decision_without_the_model(tmp_path):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+    payload = raw(proposal()) + b"\n"
+    path, invocation = simulate_crash(state, repo, request, payload)
+    assert decisions_of(state) == []
+
+    result = adapter.adopt_proposal(state, request["request_id"], repo=repo)
+
+    assert result["adopted"] is True
+    assert result["model_called"] is False
+    assert result["stdout_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert result["proposal"] == "recovery/job_a/T1.1.proposal.json"
+    assert result["policy"] == proposal_record(state)["policy"]
+    decision = result["decision"]
+    assert decision["adapter"] == "hermes-fake-model"
+    assert decision["decision"] == "retry"
+    assert decision["rationale"] == proposal()["rationale"]
+    assert decision["decided_at"] == DECIDED
+    assert len(decisions_of(state)) == 1
+    pinned_pair_passes(recovery.load_request(state, request["request_id"]), decision)
+
+
+def test_adopt_refuses_a_missing_proposal(tmp_path):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.adopt_proposal(state, request["request_id"], repo=repo)
+
+    assert caught.value.code == "proposal_missing"
+    assert decisions_of(state) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["raw_bytes", "digest", "parsed", "identity"],
+    ids=["raw_bytes", "digest", "parsed", "identity"],
+)
+def test_adopt_refuses_an_altered_proposal(tmp_path, mutation):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+    path, _invocation = simulate_crash(state, repo, request, raw(proposal()))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "raw_bytes":
+        record["raw_stdout"] = record["raw_stdout"].replace('"retry"', '"escalate"')
+    elif mutation == "digest":
+        record["stdout_sha256"] = "0" * 64
+    elif mutation == "parsed":
+        record["parsed"] = {**record["parsed"], "action": "escalate"}
+    else:
+        record["request_id"] = "someone-elses-request"
+    path.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.adopt_proposal(state, request["request_id"], repo=repo)
+
+    assert caught.value.code == "proposal_tampered"
+    assert decisions_of(state) == []
+
+
+def test_adopt_keeps_the_malformed_refusal_and_never_decides(tmp_path):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = specification_request(state)
+    path, _invocation = simulate_crash(state, repo, request, b"not a JSON proposal")
+    assert json.loads(path.read_text())["parse_error"] == "proposal_not_json"
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        adapter.adopt_proposal(state, request["request_id"], repo=repo)
+
+    assert caught.value.code == "proposal_not_json"
+    assert decisions_of(state) == []
+
+
+def test_adopt_reaches_the_pinned_validator_for_an_unauthorised_answer(tmp_path):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+    simulate_crash(
+        state, repo, request, raw(proposal(action="supersede", corrected_tests=[GOOD_TEST]))
+    )
+
+    with pytest.raises(recovery.RecoveryError) as caught:
+        adapter.adopt_proposal(state, request["request_id"], repo=repo)
+
+    assert caught.value.code == "decision_class_mismatch"
+    assert decisions_of(state) == []
+
+
+def test_the_recover_parser_accepts_hermes_adopt():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    job_cli.add_parsers(subparsers)
+
+    args = parser.parse_args(
+        ["job", "recover", "--job-id", "job_a", "--hermes-adopt", "--repo", "/tmp/repo"]
+    )
+    assert args.hermes_adopt is True
+    assert args.hermes is False
+
+
+def test_the_cli_adopts_a_recorded_proposal_instead_of_asking_again(tmp_path, monkeypatch):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    request = implementation_request(state)
+    simulate_crash(state, repo, request, raw(proposal()))
+    monkeypatch.setattr(
+        adapter, "decide_with_hermes",
+        lambda *args, **kwargs: pytest.fail("the model was asked again after a crash"),
+    )
+
+    result = job_cli.recover(state, "job_a", repo=repo, hermes=True, now=NOW)
+
+    assert result["proposals"] == ["recovery/job_a/T1.1.proposal.json"]
+    assert len(result["decisions_recorded"]) == 1
+    assert result["decisions_recorded"][0]["decision"] == "retry"
+    assert decisions_of(state) != []
+
+
+def test_the_cli_hermes_adopt_refuses_without_a_proposal(tmp_path):
+    repo, rev = git_repo(tmp_path)
+    state = new_state(tmp_path, rev)
+    implementation_request(state)
+
+    with pytest.raises(adapter.ProposalError) as caught:
+        job_cli.recover(state, "job_a", repo=repo, hermes_adopt=True, now=NOW)
+
+    assert caught.value.code == "proposal_missing"
+    assert decisions_of(state) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the process boundary under test is POSIX")
+def test_the_real_child_process_gets_the_allowlist_and_the_rlimits(tmp_path, monkeypatch):
+    monkeypatch.setattr(adapter, "_probe_bwrap", direct_probe())
+    for name, value in ENV_SENTINELS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-real-child-key")
+    env_file = tmp_path / "child.env"
+    script = tmp_path / "fake-hermes"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"env > {str(env_file)!r}\n"
+        "echo core=$(ulimit -c) fsize=$(ulimit -f) nofile=$(ulimit -n)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    metadata = adapter.invoke_hermes(
+        "answer", hermes_bin=str(script), model="deepseek-flash", provider="deepseek", timeout_s=20
+    )
+
+    environment = dict(
+        line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if "=" in line
+    )
+    # /bin/sh adds PWD itself; everything else is exactly the adapter's allowlist.
+    assert set(environment) - {"PWD"} == {"PATH", "HOME", "TMPDIR", "LANG", "DEEPSEEK_API_KEY"}
+    assert environment["DEEPSEEK_API_KEY"] == "sk-real-child-key"
+    assert environment["HOME"] == environment["TMPDIR"]
+    assert all(name not in environment for name in ENV_SENTINELS)
+    assert all(value not in env_file.read_text(encoding="utf-8") for value in ENV_SENTINELS.values())
+    assert "core=0" in metadata["stdout"]
+    assert "nofile=1024" in metadata["stdout"]
+    assert "fsize=262144" in metadata["stdout"], "128 MiB in 512-byte blocks"
