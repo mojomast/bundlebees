@@ -554,14 +554,35 @@ def _tests_from_commands(commands: Any, workdir: Path) -> list[str]:
     return targets
 
 
+def _patch_text(value: Any) -> str | None:
+    """Patch text from a string, or from an object that carries one."""
+
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, Mapping):
+        for key in ("diff", "patch.diff", "unified_diff", "patch"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested
+    return None
+
+
 def _result_patch(result: Mapping[str, Any]) -> str | None:
+    """The patch text from a result envelope, whatever shape it arrived in.
+
+    The launcher returns ``patch`` as an object (``{diff, files}``); older
+    envelopes return a bare string. Both are the same patch, so accept both —
+    this is shape handling, not a bypass: the caller still checks the lease and
+    the files the patch touches.
+    """
+
     def find(value: Any, depth: int = 0) -> str | None:
         if depth > 3:
             return None
         if isinstance(value, Mapping):
             for key in ("patch", "unified_diff", "diff"):
-                candidate = value.get(key)
-                if isinstance(candidate, str) and candidate.strip():
+                candidate = _patch_text(value.get(key))
+                if candidate:
                     return candidate
             for key in ("result", "data", "output", "observed"):
                 nested = value.get(key)
@@ -576,7 +597,11 @@ def _result_patch(result: Mapping[str, Any]) -> str | None:
 
 def _fetch_result(client: Any, attempt_id: str) -> dict[str, Any]:
     try:
-        result = client.result(attempt_id)
+        envelope = getattr(client, "result_envelope", None)
+        if callable(envelope):
+            result = envelope(attempt_id)
+        else:
+            result = client.result(attempt_id)
     except Exception as exc:  # noqa: BLE001 - ClientError or fake error
         code = getattr(exc, "code", "launcher_error")
         fix = getattr(exc, "fix", "Check the launcher and retry when the worker finishes.")
@@ -615,6 +640,12 @@ def _fetch_result(client: Any, attempt_id: str) -> dict[str, Any]:
                 if key not in merged and key in data:
                     merged[key] = data[key]
             data = merged
+    if _result_patch(data) is None:
+        raise CliError(
+            "no_result_yet",
+            "the worker result has no patch yet",
+            "Wait for the worker to finish and collect a result with a patch.",
+        )
     return data
 
 

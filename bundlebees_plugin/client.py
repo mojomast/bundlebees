@@ -678,6 +678,39 @@ class LauncherClient(_BaseClient):
             raise
         return public_result(data)
 
+    def result_envelope(self, attempt_id: str) -> dict[str, Any]:
+        """The launcher's ``/result`` document, unredacted.
+
+        ``result()`` deliberately strips the patch from the model-facing view.
+        Coordinator-side verification needs the envelope itself, so this returns
+        it whole — the caller is responsible for the protections that make that
+        safe: the lease must exist for the attempt, the patch may only touch
+        leased files, and the result's source revision must match the brief.
+        It is never exposed through a model-facing tool.
+        """
+        try:
+            data = self.request_json(
+                "GET", f"/v1/attempts/{_quote_id(attempt_id)}/result"
+            )
+        except ClientError as exc:
+            if exc.status == 409 or exc.code == "no_result_yet":
+                raise ClientError(
+                    "no result yet",
+                    "no_result_yet",
+                    "Wait for the worker to finish, then retry.",
+                    status=409,
+                ) from exc
+            raise
+        if isinstance(data, Mapping):
+            nested = data.get("result")
+            if isinstance(nested, Mapping):
+                merged = dict(nested)
+                for key, value in data.items():
+                    merged.setdefault(key, value)
+                return merged
+            return dict(data)
+        return {"result": data}
+
     def create(
         self,
         brief: Mapping[str, Any],
