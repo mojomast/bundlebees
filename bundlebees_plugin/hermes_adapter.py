@@ -1171,7 +1171,11 @@ def invoke_hermes(
     isolation = dict(policy["isolation"])
     argv = _hermes_argv(binary, resolved_model, resolved_provider, toolsets_value, str(prompt))
 
-    cwd = Path(tempfile.mkdtemp(prefix="rizzstack-hermes-recovery-"))
+    # The model sandbox must not live under the Hermes data root: Hermes'
+    # live-system guard correctly refuses to open its state DB there, and a
+    # temp HOME under ~/.hermes is indistinguishable from a misconfigured test.
+    sandbox_root = Path("/tmp") if Path("/tmp").is_dir() else None
+    cwd = Path(tempfile.mkdtemp(prefix="rizzstack-hermes-recovery-", dir=sandbox_root))
     environment = _child_env(policy, cwd)
     launch_argv = _bwrap_command(argv, cwd=cwd, binary=binary) if isolation["enforced"] else list(argv)
     started = time.monotonic()
@@ -1243,6 +1247,10 @@ def invoke_hermes(
         "stderr_sha256": hashlib.sha256(err).hexdigest(),
         "stderr_bytes": len(err),
         "stderr_truncated": bool(stderr_truncated),
+        # Bounded failure diagnostics: the raw stream is hashed above; a tail is
+        # useful only when the process failed, and is never treated as evidence.
+        "stderr_tail": ("" if rc == 0 and not timed_out else
+                        err.decode("utf-8", "replace")[-2000:]),
     }
 
 
@@ -1560,6 +1568,7 @@ def persist_proposal(
                 "stderr_sha256",
                 "stderr_bytes",
                 "stderr_truncated",
+                "stderr_tail",
             )
         },
         "raw_stdout": raw_stdout,

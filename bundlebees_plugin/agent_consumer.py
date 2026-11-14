@@ -44,7 +44,7 @@ CRASH_ENV = "BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL"
 CRASH_EXIT_CODE = 97
 CRASH_SCHEMA = "rizzstack.agent-crash/1"
 
-ADAPTERS: tuple[str, ...] = ("hermes", "deterministic")
+ADAPTERS: tuple[str, ...] = ("hermes", "deterministic", "authorized")
 
 
 class ConsumerError(Exception):
@@ -349,7 +349,7 @@ def _run_item(
         raise ConsumerError(
             "adapter_unknown",
             f"adapter {chosen!r} is not one of {', '.join(ADAPTERS)}",
-            "Use --adapter hermes or --adapter deterministic.",
+            "Use --adapter hermes, --adapter deterministic or --adapter authorized.",
         )
     # A claim beyond the budget may still adopt a proposal or observe a decision
     # (both are inference-free), but it must never call an adapter again.
@@ -359,6 +359,52 @@ def _run_item(
             "attempts_exhausted",
             f"work item {work_id!r} has been claimed {claims} times; no adapter is invoked",
         )
+
+    if chosen == "authorized":
+        # Test-only control adapter: mechanically selects the single authorised
+        # replacement when the protocol permits exactly one. It never widens the
+        # envelope and is never used for a real-model claim.
+        task = _task_for(state, request)
+        proposed = recovery.deterministic_adapter(request, task=task)
+        allowed = list((request.get("envelope") or {}).get("corrected_tests_allowed") or [])
+        failure_class = str((request.get("failure") or {}).get("class") or "")
+        fixture_selector = os.environ.get("BUNDLEBEES_AUTHORIZED_SELECTOR", "").strip()
+        chosen_tests = ([fixture_selector] if fixture_selector in allowed else
+                        (allowed if len(allowed) == 1 else []))
+        if (proposed.get("decision") == "escalate" and failure_class == "specification"
+                and request.get("supersession_permitted") and chosen_tests
+                and int((request.get("envelope") or {}).get("contract_corrections_allowed") or 0) == 1):
+            at = recovery._iso(float(now) if now is not None else time.time())
+            contract = recovery.derive_superseding_contract(
+                task, chosen_tests, adapter="authorized-candidate", decided_at=at,
+                contract_id=str((request.get("contract") or {}).get("id") or ""),
+            )
+            from . import contract as contract_mod
+            sha = contract_mod.check_frozen(contract)
+            proposed = {
+                "schema": recovery.SCHEMA,
+                "request_id": str(request.get("request_id") or ""),
+                "request_digest": str(request.get("request_digest") or ""),
+                "adapter": "authorized-candidate",
+                "decision": "supersede",
+                "corrected_tests": chosen_tests,
+                "supersedes": {
+                    "contract_id": str((request.get("contract") or {}).get("id") or ""),
+                    "contract_sha256": str((request.get("contract") or {}).get("sha256") or ""),
+                    "new_contract_id": str(contract.get("id") or ""),
+                    "new_contract_sha256": sha,
+                },
+                "rationale": ("the protocol authorises exactly one replacement selector for this "
+                              "specification failure; the test-only adapter selects it mechanically"),
+                "decided_at": at,
+            }
+        stored = recovery.record_decision(
+            state, str(request.get("request_id") or ""), proposed, adapter=str(proposed.get("adapter") or "authorized"), now=now
+        )
+        completed = agent_work.complete(
+            state, work_id, consumer=consumer, pid=pid, decision=stored, now=now
+        )
+        return _summary("decided", completed, consumer=consumer, decision=stored)
 
     if chosen == "deterministic":
         task = _task_for(state, request)
