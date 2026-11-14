@@ -1485,6 +1485,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="gitleaks binary; required for a real tick")
     parser.add_argument("--suite-command", nargs="+", default=None,
                         help="integration suite command (default: python -m pytest -q)")
+    parser.add_argument("--provisioning", action="store_true",
+                        help="bind the configured hyvv provisioning client")
+    parser.add_argument("--provisioning-host", default=None,
+                        help="expected provisioning host policy label")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="run one pass and exit")
     mode.add_argument("--interval", nargs="?", const=1.0, type=float, default=None,
@@ -1506,12 +1510,22 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
         if not args.gitleaks:
             raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
+        client = LauncherClient(args.launcher_url, token=token)
+        provisioner = None
+        if args.provisioning:
+            from . import provisioning as provisioning_mod
+
+            provisioner = provisioning_mod.from_client(
+                {"provisioning": {"enabled": True, "host": args.provisioning_host or None}},
+                client,
+            )
         tick = make_job_tick(
             state,
-            client=LauncherClient(args.launcher_url, token=token),
+            client=client,
             repo=Path(args.repo),
             gitleaks=args.gitleaks,
             suite_command=args.suite_command,
+            provisioner=provisioner,
         )
     if tick is None:
         tick = mechanical_tick(state)
