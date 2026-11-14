@@ -1099,6 +1099,8 @@ def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, An
                 "request_path": relative,
                 "request_digest": str(request.get("request_digest") or ""),
                 "decision": decision_block,
+                "proposal": _proposal_view(state, job_id, task_id, number),
+                "work": _work_view(state, job_id, request_id),
                 "applied": bool(applied),
                 "applied_at": applied_at if applied else "",
                 "escalated": bool(escalated),
@@ -1106,6 +1108,58 @@ def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, An
             }
         )
     return rows
+
+
+def _proposal_view(state: Path, job_id: str, task_id: str, number: int) -> dict[str, Any] | None:
+    """The raw model proposal, with a digest re-proved from its bytes.
+
+    A proposal that no longer matches the stdout digest recorded at invocation
+    time refuses the RETURN: it cannot be presented as original evidence.
+    """
+    relative = f"{recovery.RECOVERY_DIR}/{job_id}/{task_id}.{number}.proposal.json"
+    path = state / relative
+    if not path.exists():
+        return None
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReturnError("proposal_unreadable", f"{relative} cannot be read: {exc}",
+                          "Restore the proposal from the durable record; do not hand-edit it.") from exc
+    raw = str(body.get("raw_stdout") or "")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    invocation = body.get("invocation") if isinstance(body.get("invocation"), Mapping) else {}
+    recorded = str(invocation.get("stdout_sha256") or "")
+    if recorded and recorded != digest:
+        raise ReturnError("proposal_tampered",
+                          f"{relative} does not hash to the stdout digest recorded at invocation",
+                          "A changed proposal cannot be presented as original evidence.")
+    return {
+        "path": relative,
+        "raw_sha256": digest,
+        "model": str(invocation.get("model") or ""),
+        "provider": str(invocation.get("provider") or ""),
+        "elapsed_ms": int(invocation.get("elapsed_ms") or 0),
+        "exit_code": invocation.get("exit_code"),
+        "parse_error": body.get("parse_error"),
+    }
+
+
+def _work_view(state: Path, job_id: str, request_id: str) -> dict[str, Any] | None:
+    """The durable agent-work item, if the request went through a consumer."""
+    from . import agent_work
+
+    for item in agent_work.list(state, job_id=job_id):
+        if str(item.get("request_id") or "") != request_id:
+            continue
+        result = item.get("result") if isinstance(item.get("result"), Mapping) else {}
+        decision = result.get("decision") if isinstance(result.get("decision"), Mapping) else {}
+        return {
+            "work_id": str(item.get("work_id") or ""),
+            "state": str(item.get("state") or ""),
+            "claims": int(item.get("claims") or 0),
+            "decision_digest": str(result.get("decision_digest") or recovery.decision_digest(decision)) if decision else None,
+        }
+    return None
 
 
 def _supersession_view(

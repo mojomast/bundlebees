@@ -99,7 +99,16 @@ class _WakeupFixture(unittest.TestCase):
         manifests = json.loads(
             (self.fx.state / "jobs" / JOB / "return.json").read_text())
         self.assertEqual(manifests["receiver_decision"]["status"], "pending")
-        self.assertTrue(manifests.get("recovery"), "RETURN must carry the recovery history")
+        recovery_rows = manifests.get("recovery") or []
+        self.assertTrue(recovery_rows, "RETURN must carry the recovery history")
+        row = recovery_rows[0]
+        self.assertIsNotNone(row.get("work"), "RETURN must name the agent-work item")
+        self.assertEqual(row["work"]["state"], "completed")
+        self.assertTrue(row["work"]["work_id"].startswith("aw_"))
+        adapter = str((row.get("decision") or {}).get("adapter") or "")
+        if adapter.startswith("hermes"):
+            self.assertIsNotNone(row.get("proposal"), "a model decision must name its raw proposal")
+            self.assertEqual(len(row["proposal"]["raw_sha256"]), 64)
         return job
 
 
