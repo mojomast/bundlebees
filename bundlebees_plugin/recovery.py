@@ -19,9 +19,27 @@ The protocol is owned by the pinned workflow checkout, not by this module:
   codes (``test_unresolved`` and its synonyms become ``test_not_found``). The
   original observation is preserved verbatim in the evidence artefact and is
   named in the rationale.
-* the envelope is derived from the sealed authorization plus the job and task
-  ``recovery_policy`` (which may only narrow it), and is always an integer
-  budget: ``contract_corrections_allowed`` is ``0`` or ``1``, never a boolean.
+* the envelope comes from the sealed authorization alone: attempts, corrections,
+  the exact replacement selectors, the file and test scope a correction may
+  touch, and the human gates that stay in force are all named there. A job or
+  task ``recovery_policy`` may restate one of those to *narrow* it — ``min`` for
+  attempts and corrections, intersection for selectors and scopes, union for
+  gates — and can never add an attempt, a correction, a selector, a file, a
+  test file or a gate. ``contract_corrections_allowed`` is always the integer
+  ``0`` or ``1``, never a boolean.
+* an authorization with **no** recovery block is the empty ceiling: one attempt
+  (the one that already failed), no correction and no replacement tests. A retry
+  or supersede decision against it is refused by the decision checks, so it can
+  only escalate. A mutable job document cannot manufacture supersession
+  authority, because no job or task field is consulted for a permission.
+* the recovery block is sealed inside the authorization and digested
+  (``job.recovery_digest``), and that digest is pinned into the job document at
+  admission. A block rewritten after the approval no longer matches. This is
+  tamper *evidence*, not OS isolation: the state key is readable by the OS
+  principal that runs the coordinator, so a principal with that access can mint
+  a wholly new authorization. The interactive path stops the coordinator from
+  minting authority for itself; it does not pretend to separate two processes
+  running as the same user.
 * a request carries exactly the protocol's fields. Nothing volatile is in the
   document, so the digest is stable and a re-read can prove it.
 * a decision carries exactly the protocol's fields. It has no digest of its
@@ -51,6 +69,7 @@ load, decision and dispatch path refuses them with ``recovery_record_legacy``.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -118,10 +137,11 @@ MAX_CORRECTIONS = 1
 GATE_AWAITING_APPROVAL = "awaiting_approval"
 GATE_WAITING = "waiting"
 
-#: Default ceiling for worker attempts per task (the first attempt plus one
-#: corrective retry). An authorization may lower or raise the ceiling; a job or
-#: task policy may only lower it, and v1 caps it at five.
-DEFAULT_MAX_ATTEMPTS_PER_TASK = 2
+#: The ceiling an authorization that carries no recovery block implies: the one
+#: attempt that already failed, and no permission to retry or correct. A larger
+#: ceiling exists only because an approver named it in the sealed authorization;
+#: a job or task policy can lower it and never raise it.
+DEFAULT_MAX_ATTEMPTS_PER_TASK = 1
 
 #: The class that can never dispatch, and the class that can never retry.
 _NO_DISPATCH = frozenset({"environment", "infrastructure"})
@@ -926,19 +946,60 @@ def _normalise_failure(failure: Any, contract: Mapping[str, Any] | None) -> dict
 # ---------------------------------------------------------------------------
 
 
-def _explicit_envelope(authorization: Mapping[str, Any] | None) -> dict[str, Any]:
+def _sealed_ceiling(authorization: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The recovery ceiling the approval actually sealed, or the empty ceiling.
+
+    Only ``authorization["recovery"]`` is authority. The older spellings
+    (``recovery_envelope``, ``budget.max_attempts_per_task``, a top-level
+    ``max_attempts_per_task``) are deliberately not read: a second spelling is
+    a second place for a mutable document to look like an approval. An
+    authorization without the block — or without the digest that proves it —
+    grants nothing at all.
+    """
+
     if not isinstance(authorization, Mapping):
         return {}
-    for key in ("recovery", "recovery_envelope"):
-        block = authorization.get(key)
-        if isinstance(block, Mapping):
-            return dict(block)
-    budget = authorization.get("budget")
-    if isinstance(budget, Mapping) and "max_attempts_per_task" in budget:
-        return {"max_attempts_per_task": budget.get("max_attempts_per_task")}
-    if "max_attempts_per_task" in authorization:
-        return {"max_attempts_per_task": authorization.get("max_attempts_per_task")}
-    return {}
+    block = authorization.get("recovery")
+    block = dict(block) if isinstance(block, Mapping) else {}
+    stored = str(authorization.get("recovery_digest") or "")
+    if stored or block:
+        if stored != jobs.recovery_digest(block):
+            raise RecoveryError(
+                "authorization_recovery_altered",
+                "the authorization's recovery block does not match the digest sealed with it",
+                "Re-authorize the job interactively; recovery permission is never repaired in place.",
+            )
+    return block
+
+
+#: The keys a job or task ``recovery_policy`` may restate. Each restatement can
+#: only narrow the authorization's ceiling. An unknown key is refused rather
+#: than ignored, so a policy cannot smuggle a permission in under a new name.
+_POLICY_FIELDS = frozenset({
+    "max_attempts_per_task",
+    "contract_corrections_allowed",
+    "corrected_tests_allowed",
+    "file_scope",
+    "test_scope",
+    "gates",
+})
+
+
+def _policy(source: Any, where: str) -> dict[str, Any]:
+    """Read one narrowing policy; refuse anything that is not a narrowing."""
+
+    if source is None:
+        return {}
+    if not isinstance(source, Mapping):
+        raise RecoveryError("envelope_invalid", f"{where} must be a mapping, not {type(source).__name__}")
+    unknown = sorted(set(source) - _POLICY_FIELDS)
+    if unknown:
+        raise RecoveryError(
+            "envelope_invalid",
+            f"{where} names field(s) that are not part of a recovery policy: " + ", ".join(unknown),
+            "A policy may only restate the authorization's ceiling fields to narrow them.",
+        )
+    return dict(source)
 
 
 def _positive_int(value: Any, what: str) -> int:
@@ -962,50 +1023,49 @@ def _correction_budget(value: Any, where: str) -> int | None:
     )
 
 
-def _authorized_tests(contract: Mapping[str, Any] | None, task: Mapping[str, Any]) -> list[str]:
-    """The exact test ids a correction may name, derived only from approvals.
+def _strings(value: Any, where: str) -> list[str]:
+    """A sorted, de-duplicated list of non-empty strings, or a refusal."""
 
-    The protocol requires every corrected test to be *identical* to an entry of
-    ``corrected_tests_allowed``: a decision selects from the pre-authorized
-    replacements, it does not invent acceptance. Without an explicit list, the
-    only selections an approval already names are the contract's declared test
-    ids and the task's own acceptance tests — which is why a correction normally
-    needs the approver to enumerate its replacements.
-    """
-
-    allowed: set[str] = set()
-    ids, _files = contract_tests(contract)
-    allowed.update(ids)
-    acceptance = task.get("acceptance")
-    if isinstance(acceptance, Mapping):
-        for item in acceptance.get("tests") or []:
-            if isinstance(item, str) and item.strip():
-                allowed.add(item.strip())
-    return sorted(allowed)
-
-
-def _policy_tests(source: Any, where: str) -> list[str] | None:
-    if not isinstance(source, Mapping) or "corrected_tests_allowed" not in source:
-        return None
-    value = source.get("corrected_tests_allowed")
     if not isinstance(value, (list, tuple)) or not all(
         isinstance(item, str) and item.strip() for item in value
     ):
-        raise RecoveryError(
-            "envelope_invalid", f"{where}.corrected_tests_allowed must be a list of test selections"
-        )
+        raise RecoveryError("envelope_invalid", f"{where} must be a list of non-empty strings")
     return sorted({item.strip() for item in value})
 
 
+def _within(path: str, scope: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatch(str(path), str(pattern)) for pattern in scope)
 
-def _narrow_tests(base: list[str] | None, narrower: list[str] | None) -> list[str] | None:
-    """A policy may only narrow the tests an authorization already allows."""
 
-    if base is None:
-        return narrower
-    if narrower is None:
-        return base
-    return sorted(set(base) & set(narrower))
+def _tests_in_scope(tests: Sequence[str], test_scope: Sequence[str]) -> list[str]:
+    """The selectors whose *file* sits inside the authorized test scope."""
+
+    if not test_scope:
+        return []
+    return sorted({str(item) for item in tests if _within(str(item).split("::", 1)[0], test_scope)})
+
+
+def _correction_in_scope(task: Mapping[str, Any], ceiling: Mapping[str, Any]) -> bool:
+    """True when this task's contract files all sit inside the authorized scopes.
+
+    A supersession revises only the acceptance selection, so the contract's
+    reviewed file scope is the scope the correction will run under. If the
+    authorization did not name every file that contract touches — and the test
+    files a corrected selector may live in — the correction is outside its
+    ceiling and no supersession is permitted.
+    """
+
+    contract = task.get("contract") if isinstance(task.get("contract"), Mapping) else {}
+    scope = contract.get("scope") if isinstance(contract.get("scope"), Mapping) else {}
+    files = [str(path) for path in scope.get("assigned_files") or []]
+    test_files = [str(path) for path in scope.get("test_files") or []]
+    file_scope = [str(item) for item in ceiling.get("file_scope") or []]
+    test_scope = [str(item) for item in ceiling.get("test_scope") or []]
+    if not file_scope or not test_scope:
+        return False
+    if any(not _within(path, file_scope) for path in files + test_files):
+        return False
+    return all(_within(path, test_scope) for path in test_files)
 
 
 def envelope_for(
@@ -1013,59 +1073,129 @@ def envelope_for(
 ) -> dict[str, Any]:
     """The bounded envelope this job may act inside.
 
-    The authorization sets the ceiling; the job and the task may only narrow it.
-    The result is already in the protocol's types: an integer attempt ceiling
-    and an integer 0/1 correction budget. The final narrowing to "this failure
-    may actually use a correction" happens in :func:`_final_envelope`.
+    Authority flows one way. The sealed authorization names every permission —
+    attempts, corrections, the exact replacement selectors, the file scope and
+    test scope a correction may touch, and the human gates that stay in force —
+    and a job or task ``recovery_policy`` may only restate one of them to narrow
+    it. Nothing a job document says can add an attempt, a correction, a
+    selector, a file, a test file or a gate.
+
+    An authorization with no recovery block is the empty ceiling: one attempt
+    (the one that already failed), no correction, no replacement tests. The only
+    reachable decision from such a request is escalation, which is exactly the
+    point — a mutable job document cannot manufacture supersession authority.
+
+    The returned dict is the internal ceiling: the protocol's three envelope
+    fields plus the scopes and gates the ceiling carries. ``_final_envelope``
+    projects it onto the fields ``rizzstack.recovery/1`` defines, so the durable
+    request never carries an extra key.
     """
 
-    explicit = _explicit_envelope(authorization)
-    ceiling = DEFAULT_MAX_ATTEMPTS_PER_TASK
-    if "max_attempts_per_task" in explicit:
-        ceiling = _positive_int(explicit.get("max_attempts_per_task"), "max_attempts_per_task")
-    policies = (job.get("recovery_policy"), task.get("recovery_policy"))
-    for source in policies:
-        if isinstance(source, Mapping) and "max_attempts_per_task" in source:
-            narrow = _positive_int(source.get("max_attempts_per_task"), "max_attempts_per_task")
-            ceiling = min(ceiling, narrow)
+    ceiling = _sealed_ceiling(authorization)
+    pinned = ""
+    reference = job.get("authorization") if isinstance(job.get("authorization"), Mapping) else {}
+    if isinstance(reference, Mapping):
+        pinned = str(reference.get("recovery_digest") or "")
+    if ceiling and not pinned:
+        # This job was admitted without a recovery ceiling. A ceiling added to
+        # the authorization afterwards is a new approval, not a permission this
+        # job may use: fail closed and make the approver re-admit the work.
+        raise RecoveryError(
+            "authorization_recovery_unpinned",
+            "the job was admitted without a recovery ceiling, so a ceiling cannot be added to it afterwards",
+            "Re-authorize and re-create the job; recovery permission is admitted with the job.",
+        )
+    if pinned and pinned != jobs.recovery_digest(ceiling):
+        raise RecoveryError(
+            "authorization_recovery_altered",
+            "the authorization's recovery block is not the one this job was admitted under",
+            "Restore the sealed authorization; a rewritten recovery ceiling is not authority.",
+        )
+    attempts = int(ceiling.get("max_attempts_per_task") or DEFAULT_MAX_ATTEMPTS_PER_TASK)
+    corrections = int(ceiling.get("contract_corrections_allowed") or 0)
+    tests = _strings(ceiling.get("corrected_tests_allowed") or [], "authorization.recovery.corrected_tests_allowed")
+    file_scope = _strings(ceiling.get("file_scope") or [], "authorization.recovery.file_scope")
+    test_scope = _strings(ceiling.get("test_scope") or [], "authorization.recovery.test_scope")
+    gates = _strings(ceiling.get("gates") or [], "authorization.recovery.gates")
+    authorized_gates = _strings(
+        (authorization or {}).get("gates") or [], "authorization.gates"
+    ) if isinstance(authorization, Mapping) else []
+    if not gates:
+        # The authorization always names its gates; the ceiling restates them,
+        # and a ceiling that omits them may not shorten that list.
+        gates = list(authorized_gates)
+    if corrections < 1:
+        tests = []
+
+    for label, source in (
+        ("job.recovery_policy", job.get("recovery_policy")),
+        ("task.recovery_policy", task.get("recovery_policy")),
+    ):
+        policy = _policy(source, label)
+        if "max_attempts_per_task" in policy:
+            attempts = min(
+                attempts,
+                _positive_int(policy.get("max_attempts_per_task"), f"{label}.max_attempts_per_task"),
+            )
+        budget = _correction_budget(policy.get("contract_corrections_allowed"),
+                                    f"{label}.contract_corrections_allowed")
+        if budget is not None:
+            corrections = min(corrections, budget)
+        if "corrected_tests_allowed" in policy:
+            # Intersection: a policy selects from the approver's list, it never
+            # extends it. An empty policy list allows nothing.
+            tests = sorted(
+                set(tests) & set(_strings(policy.get("corrected_tests_allowed"),
+                                          f"{label}.corrected_tests_allowed"))
+            )
+        for name in ("file_scope", "test_scope"):
+            if name in policy:
+                narrowed = set(_strings(policy.get(name), f"{label}.{name}"))
+                current = file_scope if name == "file_scope" else test_scope
+                narrowed &= set(current)
+                if name == "file_scope":
+                    file_scope = sorted(narrowed)
+                else:
+                    test_scope = sorted(narrowed)
+        if "gates" in policy:
+            # Union: a policy may add a human gate, never remove one.
+            added = {gate.strip().lower() for gate in _strings(policy.get("gates"), f"{label}.gates")}
+            gates = sorted(set(gates) | added)
+
+    # ``max_attempts`` on the job or task is the older, narrower spelling of the
+    # attempt policy; it can still only lower the authorization's ceiling.
     for source in (job, task):
         value = source.get("max_attempts")
         if value is not None:
-            ceiling = min(ceiling, _positive_int(value, "max_attempts"))
-    ceiling = max(1, min(int(ceiling), MAX_ATTEMPTS_CAP))
+            attempts = min(attempts, _positive_int(value, "max_attempts"))
 
-    # The authorization is a hard ceiling; an explicit deny there cannot be
-    # overridden. When it says nothing, the job/task policy may grant, because
-    # those were approved as part of admitting the job — never an adapter, and
-    # never an implicit default.
-    authorized = _correction_budget(explicit.get("contract_corrections_allowed"), "authorization.recovery")
-    policy_values = [
-        _correction_budget(source.get("contract_corrections_allowed"), "recovery_policy")
-        for source in policies
-        if isinstance(source, Mapping) and "contract_corrections_allowed" in source
-    ]
-    if authorized == 0:
-        corrections = 0
-    elif authorized == 1:
-        corrections = 0 if any(value == 0 for value in policy_values) else 1
-    else:
-        if any(value == 0 for value in policy_values):
-            corrections = 0
-        else:
-            corrections = 1 if any(value == 1 for value in policy_values) else 0
+    attempts = max(1, min(int(attempts), MAX_ATTEMPTS_CAP))
+    tests = _tests_in_scope(tests, test_scope)
+    corrections = 1 if (corrections >= 1 and tests) else 0
+    if corrections == 0:
+        tests = []
 
-    allowed = _policy_tests(explicit, "authorization.recovery")
-    allowed = _narrow_tests(allowed, _policy_tests(job.get("recovery_policy"), "recovery_policy"))
-    allowed = _narrow_tests(allowed, _policy_tests(task.get("recovery_policy"), "recovery_policy"))
-    contract = task.get("contract") if isinstance(task.get("contract"), Mapping) else None
-    if allowed is None:
-        tests = _authorized_tests(contract, task)
-    else:
-        tests = list(allowed)
+    # The job document is mutable; the authorization is not. A job that has
+    # dropped a gate the approver kept may not run a corrective attempt: the
+    # recovery ceiling restates the authorization's human gates, and a gate the
+    # job removed is a permission the recovery would silently widen.
+    declared = (job.get("approval_gate") or {}).get("gates") if isinstance(job.get("approval_gate"), Mapping) else None
+    if isinstance(declared, (list, tuple)):
+        missing = sorted(set(authorized_gates) - {str(gate).strip().lower() for gate in declared})
+        if missing:
+            raise RecoveryError(
+                "gate_removed",
+                "the job document no longer carries the authorized human gate(s): " + ", ".join(missing),
+                "Restore the gate from the sealed authorization before any recovery is dispatched.",
+            )
+
     return {
-        "max_attempts_per_task": int(ceiling),
+        "max_attempts_per_task": int(attempts),
         "contract_corrections_allowed": int(corrections),
         "corrected_tests_allowed": list(tests),
+        "file_scope": list(file_scope),
+        "test_scope": list(test_scope),
+        "gates": list(gates),
     }
 
 
@@ -1593,6 +1723,12 @@ def build_request(
     classified = _normalise_failure(failure, contract)
     envelope = envelope_for(job, task, authorization)
     permitted = supersession_permitted(job, task, classified, envelope)
+    if permitted and not _correction_in_scope(task, envelope):
+        # The permission is real but this contract is not inside the file/test
+        # scope the approver named. A supersession revises only the acceptance
+        # selection, so the reviewed scope is the scope it would run under: no
+        # supersession is permitted outside the ceiling.
+        permitted = False
     final_envelope = _final_envelope(envelope, permitted=permitted, failure_class=classified["class"])
 
     canonical, legacy = _scan_requests(state, job_id, task_id)
@@ -1811,6 +1947,58 @@ def _ledger(job: Mapping[str, Any], task: Mapping[str, Any]) -> tuple[int, int]:
     return attempts, corrections
 
 
+def _recheck_authority(
+    state_dir: Path, job: Mapping[str, Any], task: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
+    """Re-derive the ceiling from the sealed authorization before dispatching.
+
+    A request is durable, but it is not authority. If the authorization no
+    longer grants what the recorded envelope claims — a forged request document,
+    or a job whose pinned ceiling disagrees with the sealed block — the
+    corrective attempt is refused rather than dispatched.
+    """
+
+    job_id = str(job.get("job_id") or "")
+    try:
+        authorization = jobs.load_authorization(Path(state_dir), job_id)
+    except jobs.JobError as exc:
+        raise RecoveryError(
+            "authorization_missing",
+            f"the sealed authorization for job {job_id!r} cannot be read: {exc}",
+            "Re-authorize the job; a recovery decision never stands in for an authorization.",
+        ) from exc
+    ceiling = envelope_for(job, task, authorization)
+    envelope = request.get("envelope")
+    recorded: dict[str, Any] = dict(envelope) if isinstance(envelope, Mapping) else {}
+    if int(recorded.get("max_attempts_per_task") or 0) > int(ceiling["max_attempts_per_task"]):
+        raise RecoveryError(
+            "recovery_authority_widened",
+            f"the request allows {recorded.get('max_attempts_per_task')} attempt(s); the sealed "
+            f"authorization allows {ceiling['max_attempts_per_task']}",
+            "Re-authorize a larger ceiling; a request may never exceed it.",
+        )
+    if int(recorded.get("contract_corrections_allowed") or 0) > int(
+        ceiling["contract_corrections_allowed"]
+    ):
+        raise RecoveryError(
+            "recovery_authority_widened",
+            "the request budgets a contract correction the sealed authorization does not",
+            "A correction needs the approver's explicit budget.",
+        )
+    outside = [
+        str(item)
+        for item in recorded.get("corrected_tests_allowed") or []
+        if not test_authorized(item, ceiling["corrected_tests_allowed"])
+    ]
+    if outside:
+        raise RecoveryError(
+            "recovery_authority_widened",
+            "the request names corrected test(s) the sealed authorization does not: "
+            + ", ".join(sorted(outside)),
+            "A request may only carry the approver's exact replacement selectors.",
+        )
+
+
 def _check_decision(state_dir: Path, request: Mapping[str, Any], decision: Mapping[str, Any],
                     *, job: Mapping[str, Any] | None = None,
                     task: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1829,6 +2017,11 @@ def _check_decision(state_dir: Path, request: Mapping[str, Any], decision: Mappi
     if job is None or task is None:
         job, task = _load_task(state_dir, request)
     assert job is not None and task is not None
+
+    if name in {"retry", "supersede"}:
+        # Permission is re-derived from the sealed authorization, not trusted
+        # from the durable request, on every admission that could dispatch.
+        _recheck_authority(state_dir, job, task, request)
 
     if failure_class in _NO_DISPATCH and name != "escalate":
         raise RecoveryError(

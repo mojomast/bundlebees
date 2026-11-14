@@ -146,7 +146,7 @@ def new_state(
         statement="Add contract source-rev validation to acdd-lint, nothing else.",
         repo="mojomast/workflow",
         base_rev=SHA,
-        scope=["tools/**"],
+        scope=["tools/**", "tests/**"],
         bees=3,
         wall_clock_s=3600,
         interactive=True,
@@ -154,6 +154,8 @@ def new_state(
             "max_attempts_per_task": max_attempts,
             "contract_corrections_allowed": corrections,
             "corrected_tests_allowed": list(allowed),
+            "file_scope": ["tools/t.py", TEST_FILE],
+            "test_scope": [TEST_FILE],
         },
     )
     contract = frozen_contract()

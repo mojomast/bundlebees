@@ -5,6 +5,21 @@ lives in a separate document written through an interactive path, and a job may
 only narrow it. Everything here is plain JSON on disk, signed with the same key
 the lease records use, written atomically and readable after a crash.
 
+Recovery permission is not implicit either. An authorization may carry a sealed
+``recovery`` block — attempts, corrections, the exact replacement selectors, the
+file and test scope a correction may touch, and the human gates that stay in
+force — and that block is part of the signed body, digested, and pinned into the
+job document when the job is admitted. A job or task ``recovery_policy`` may
+only restate a permission to narrow it (``min`` for attempts and corrections,
+intersection for selectors and scopes, union for gates). An authorization with
+no block grants no retry and no correction at all.
+
+The seal is an HMAC over canonical JSON with a key file in the state directory.
+It is tamper *evidence* for a reader of that directory, not OS isolation: any
+principal that can read the key can seal a new authorization. The separate
+interactive path exists so a coordinator cannot mint authority for itself, not
+to defend against a principal that already owns the state directory.
+
 Refusal codes are stable strings, because a coordinator that cannot tell "the
 file was edited" from "the scope was widened" cannot respond correctly.
 """
@@ -16,6 +31,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 
@@ -250,6 +266,188 @@ def _unseal(path: Path, key: bytes, what: str) -> dict[str, Any]:
 # Authorizations — written only through an interactive path
 # ---------------------------------------------------------------------------
 
+#: The exact fields a sealed authorization's ``recovery`` block may carry.
+#: Every one of them is a permission: a job or task ``recovery_policy`` may
+#: restate a subset to *narrow* the ceiling, and can never add a field or a
+#: value the approver did not name.
+RECOVERY_FIELDS: tuple[str, ...] = (
+    "max_attempts_per_task",
+    "contract_corrections_allowed",
+    "corrected_tests_allowed",
+    "file_scope",
+    "test_scope",
+    "gates",
+)
+
+#: v1 caps the attempt ceiling at five total attempts and one correction.
+RECOVERY_MAX_ATTEMPTS = 5
+
+#: A selector is a test path with an optional ``::node`` suffix: the path part
+#: carries no whitespace, and the node part carries no newline.
+_SELECTOR_RE = re.compile(r"^[^:\s]+(::[^\n]+)?$")
+
+
+def recovery_digest(recovery: Mapping[str, Any] | None) -> str:
+    """SHA-256 over one canonical recovery block.
+
+    The digest is stored *inside* the sealed authorization body and pinned in
+    the job's authorization reference, so a recovery block that is rewritten
+    after the approval — even by re-sealing the authorization with the state
+    key — no longer matches what the job was admitted under.
+
+    This is tamper *evidence*, not isolation: the state key is a file readable
+    by the OS principal that runs the coordinator, so a principal with that
+    access can mint a whole new authorization. Nothing here claims OS-level
+    separation between the approver and the coordinator.
+    """
+
+    return hashlib.sha256(_canonical(dict(recovery or {}))).hexdigest()
+
+
+def _selector(value: Any, where: str) -> str:
+    text = str(value or "").strip()
+    if not text or not _SELECTOR_RE.fullmatch(text) or text.startswith("/") or ".." in Path(text).parts:
+        raise JobError(
+            "authorization_incomplete",
+            f"{where} must be one test selector (path or path::node), not {value!r}",
+            _FIX_AUTH,
+        )
+    return text
+
+
+def _recovery_envelope(
+    value: Mapping[str, Any] | None, *, gates: Sequence[str], scope: Sequence[str]
+) -> dict[str, Any]:
+    """Validate and normalise the recovery ceiling an approver types in.
+
+    Nothing is inferred. Every permission an envelope can carry — attempts,
+    corrections, the exact replacement selectors, the file and test scope a
+    correction may touch, and the human gates that stay in force — must be
+    named by the approver. A block that budgets a correction without naming its
+    selectors, its file scope and its test scope is refused rather than filled
+    in from the job or the contract: those documents are the thing this ceiling
+    exists to bound.
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise JobError("authorization_incomplete", "recovery must be a mapping", _FIX_AUTH)
+    unknown = sorted(set(value) - set(RECOVERY_FIELDS))
+    if unknown:
+        raise JobError(
+            "authorization_incomplete",
+            "unknown recovery field(s): " + ", ".join(unknown),
+            "Enroll only the documented recovery ceiling fields; an unknown field is never a permission.",
+        )
+    out: dict[str, Any] = {}
+    attempts = value.get("max_attempts_per_task")
+    if attempts is not None:
+        if (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or not 1 <= attempts <= RECOVERY_MAX_ATTEMPTS
+        ):
+            raise JobError(
+                "authorization_incomplete",
+                f"recovery.max_attempts_per_task must be an integer from 1 to {RECOVERY_MAX_ATTEMPTS}",
+                _FIX_AUTH,
+            )
+        out["max_attempts_per_task"] = int(attempts)
+    corrections = value.get("contract_corrections_allowed")
+    if corrections is not None:
+        if isinstance(corrections, bool):
+            corrections = int(corrections)
+        if not isinstance(corrections, int) or corrections not in (0, 1):
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.contract_corrections_allowed must be the integer 0 or 1",
+                _FIX_AUTH,
+            )
+        out["contract_corrections_allowed"] = int(corrections)
+    allowed = value.get("corrected_tests_allowed")
+    if allowed is not None:
+        if not isinstance(allowed, (list, tuple)):
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.corrected_tests_allowed must be a list of test selections",
+                _FIX_AUTH,
+            )
+        out["corrected_tests_allowed"] = sorted(
+            {_selector(item, "recovery.corrected_tests_allowed[]") for item in allowed}
+        )
+    for name in ("file_scope", "test_scope"):
+        entries = value.get(name)
+        if entries is None:
+            continue
+        if not isinstance(entries, (list, tuple)):
+            raise JobError("authorization_incomplete", f"recovery.{name} must be a list of paths", _FIX_AUTH)
+        out[name] = _normalize_scope(entries)
+        if not out[name]:
+            raise JobError(
+                "authorization_incomplete",
+                f"recovery.{name} names no path, so it permits nothing",
+                _FIX_AUTH,
+            )
+    named_gates = value.get("gates")
+    if named_gates is not None:
+        if not isinstance(named_gates, (list, tuple)) or not all(
+            isinstance(gate, str) and gate.strip() for gate in named_gates
+        ):
+            raise JobError("authorization_incomplete", "recovery.gates must be a list of gate names", _FIX_AUTH)
+        normalized = sorted({_slug(gate) for gate in named_gates})
+        missing = sorted(set(gates) - set(normalized))
+        if missing:
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.gates removes the authorization gate(s): " + ", ".join(missing),
+                "A recovery block may add a human gate, never remove one.",
+            )
+        out["gates"] = normalized
+
+    budget = int(out.get("contract_corrections_allowed") or 0)
+    outside = [path for path in out.get("file_scope") or [] if not _covered(path, scope)]
+    if outside:
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.file_scope names path(s) outside the authorized scope: " + ", ".join(outside),
+            "A recovery ceiling may narrow the authorization, never reach past it.",
+        )
+    outside = [path for path in out.get("test_scope") or [] if not _covered(path, out.get("file_scope") or [])]
+    if outside:
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.test_scope names path(s) outside recovery.file_scope: " + ", ".join(outside),
+            "A corrected test must live in a file the recovery may already touch.",
+        )
+    if budget == 1:
+        for name in ("corrected_tests_allowed", "file_scope", "test_scope"):
+            if not out.get(name):
+                raise JobError(
+                    "authorization_incomplete",
+                    f"a contract correction needs an explicit recovery.{name}",
+                    "Name the replacement selectors and the files they may touch; nothing is inferred.",
+                )
+        outside = [
+            selector
+            for selector in out["corrected_tests_allowed"]
+            if not _covered(selector.split("::", 1)[0], out["test_scope"])
+        ]
+        if outside:
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.corrected_tests_allowed names test(s) outside recovery.test_scope: "
+                + ", ".join(sorted(outside)),
+                _FIX_AUTH,
+            )
+    elif out.get("corrected_tests_allowed"):
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.corrected_tests_allowed names replacements but no correction is budgeted",
+            "Grant both or neither; a test list with no budget authorises nothing.",
+        )
+    return out
+
 
 def record_authorization(
     state_dir: Path,
@@ -302,7 +500,8 @@ def record_authorization(
 
     path = authorization_path(state_dir, job_id)
     key = _ensure_key(state_dir)
-    envelope = _recovery_envelope(recovery)
+    authorized_gates = sorted({_slug(gate) for gate in gates}) or ["merge"]
+    envelope = _recovery_envelope(recovery, gates=authorized_gates, scope=globs)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "authorization",
@@ -313,13 +512,17 @@ def record_authorization(
         "base_rev": str(base_rev).strip().lower(),
         "scope": globs,
         "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
-        "gates": sorted({_slug(gate) for gate in gates}) or ["merge"],
+        "gates": authorized_gates,
         "by": by or _current_user(),
         "at": _utc_now(),
+        # Always sealed, even when the block is empty: the digest is the pin a
+        # job is admitted under, and an empty ceiling is a fact worth proving.
+        "recovery_digest": recovery_digest(envelope),
     }
     if envelope:
-        # The approver's recovery envelope is part of the authorization;
-        # a job may narrow it further and may never widen it.
+        # The approver's recovery ceiling is part of the sealed authorization.
+        # A job or task policy may restate it to narrow it, never to widen it,
+        # and no job document is consulted for a permission.
         body["recovery"] = envelope
     if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
         raise JobError(
@@ -328,42 +531,6 @@ def record_authorization(
             "Authorize a new job id; recorded authorizations are immutable.",
         )
     return body
-
-
-def _recovery_envelope(value: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Validate the recovery block an approver types into an authorization."""
-
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise JobError("authorization_incomplete", "recovery must be a mapping", _FIX_AUTH)
-    out: dict[str, Any] = {}
-    attempts = value.get("max_attempts_per_task")
-    if attempts is not None:
-        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
-            raise JobError("authorization_incomplete",
-                           "recovery.max_attempts_per_task must be a positive integer", _FIX_AUTH)
-        out["max_attempts_per_task"] = attempts
-    corrections = value.get("contract_corrections_allowed")
-    if corrections is not None:
-        if not isinstance(corrections, bool):
-            raise JobError("authorization_incomplete",
-                           "recovery.contract_corrections_allowed must be a boolean", _FIX_AUTH)
-        out["contract_corrections_allowed"] = corrections
-    allowed = value.get("corrected_tests_allowed")
-    if allowed is not None:
-        if not isinstance(allowed, (list, tuple)) or not all(
-            isinstance(item, str) and item.strip() for item in allowed
-        ):
-            raise JobError("authorization_incomplete",
-                           "recovery.corrected_tests_allowed must be a list of test selections", _FIX_AUTH)
-        out["corrected_tests_allowed"] = [item.strip() for item in allowed]
-    unknown = sorted(set(value) - {"max_attempts_per_task", "contract_corrections_allowed", "corrected_tests_allowed"})
-    if unknown:
-        raise JobError("authorization_incomplete",
-                       "unknown recovery field(s): " + ", ".join(unknown),
-                       "Enroll only the documented recovery envelope fields.")
-    return out
 
 
 def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
@@ -377,7 +544,23 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
             f"no authorization exists for job {job_id!r}",
             _FIX_AUTH,
         ) from exc
-    return _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    body = _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    block = body.get("recovery")
+    block = dict(block) if isinstance(block, Mapping) else {}
+    if "recovery" in body or "recovery_digest" in body:
+        stored = str(body.get("recovery_digest") or "")
+        if stored != recovery_digest(block):
+            # A block that was rewritten after the seal — with or without the
+            # state key — is not the ceiling the approver wrote. A recovery
+            # block without a digest is refused too: nothing can prove it.
+            raise JobError(
+                "authorization_recovery_altered",
+                f"the recovery block in authorization {body.get('auth_id')!r} does not match its sealed digest",
+                "Re-authorize the job interactively; a recovery ceiling is never repaired in place.",
+            )
+    # An authorization sealed before the digest existed carries neither key and
+    # therefore no recovery permission at all: it reads as the empty ceiling.
+    return body
 
 
 def _load_enrolled_policy(state_dir: Path, policy_id: str) -> tuple[dict[str, Any], str]:
@@ -396,7 +579,7 @@ def _load_enrolled_policy(state_dir: Path, policy_id: str) -> tuple[dict[str, An
 
 _DERIVED_IDENTITY = (
     "kind", "job_id", "statement", "repo", "base_rev", "scope", "budget", "gates",
-    "policy", "derived_from", "dependency_evidence", "descendant",
+    "policy", "derived_from", "dependency_evidence", "descendant", "recovery_digest",
 )
 
 
@@ -528,6 +711,11 @@ def record_derived_authorization(
                        "dependent_feature": str(policy.get("dependent_feature") or ""),
                        "dependent_job": str(policy.get("dependent_job") or ""),
                        "scope": ceiling},
+        # A derived authorization is not a human authorization: it cannot mint a
+        # recovery ceiling. Descendant jobs run without retry or correction and
+        # escalate instead, which is the fail-closed reading of "recovery
+        # permission originates in the sealed human authorization".
+        "recovery_digest": recovery_digest({}),
     }
     key = _ensure_key(state_dir)
     path = authorization_path(state_dir, job_id)
@@ -639,6 +827,11 @@ def create_job(
         "authorization": {
             "ref": f"{AUTH_DIR}/{_job_id(job_id)}.json",
             "auth_id": authorization["auth_id"],
+            # The recovery ceiling this job was admitted under, pinned by the
+            # digest sealed inside the authorization. A job is a mutable
+            # document; this pin is what makes a recovery block rewritten after
+            # admission visible instead of authoritative.
+            "recovery_digest": str(authorization.get("recovery_digest") or ""),
         },
         "goal": {
             "summary": str(summary or authorization["statement"]),
