@@ -279,7 +279,7 @@ def test_bee_landing_end_to_end(tmp_path, monkeypatch, capsys):
 
     def handler(payload):
         handled.append(payload)
-        return {"accepted": True, "event_id": payload["event_id"]}
+        return {"accepted": True, "event_id": payload.get("id") or payload["event_id"]}
 
     real_ack = event_consumer._ack
 
@@ -324,7 +324,7 @@ def test_bee_landing_end_to_end(tmp_path, monkeypatch, capsys):
     assert duplicate_handle["state"] == "duplicate"
     assert duplicate_handle["duplicate"] is True
     assert len(handled) == 2
-    assert [call["event_id"] for call in handled] == [event["id"], event["id"]]
+    assert [(call.get("id") or call.get("event_id")) for call in handled] == [event["id"], event["id"]]
 
     assert len(_json_files(state / "events" / "outbox")) == 1
     assert len(_json_files(state / "events" / "inbox" / SUBSCRIBER)) == 1
