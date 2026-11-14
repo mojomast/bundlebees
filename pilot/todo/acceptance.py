@@ -77,6 +77,11 @@ def run(db_path: Path | str) -> dict[str, Any]:
         status, body = _request(base, "GET", "/api/todos/not-a-real-id")
         assert status == 404 and body.get("error"), (status, body)
         checks.append("not-found")
+
+        with urllib.request.urlopen(base + "/", timeout=5) as response:
+            html = response.read().decode()
+        assert response.status == 200 and 'id="todo-list"' in html, "UI was not served"
+        checks.append("ui")
     finally:
         server.shutdown()
         server.server_close()

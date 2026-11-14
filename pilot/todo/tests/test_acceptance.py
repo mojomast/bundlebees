@@ -13,7 +13,7 @@ class AcceptanceTest(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(
             report["checks"],
-            ["create", "list", "search", "edit", "complete", "validation", "not-found", "persist"],
+            ["create", "list", "search", "edit", "complete", "validation", "not-found", "ui", "persist"],
         )
 
 
