@@ -364,6 +364,31 @@ class TwoFeaturesPacketNative(unittest.TestCase):
         self.assertEqual(log[-1].get("feature"), fx.FEATURE_B, json.dumps(log, indent=1, default=str))
         self.assertEqual(self.queue.get(fx.FEATURE_A).status, "ready_for_review")
         self.assertEqual(self.queue.get(fx.FEATURE_B).status, "ready_for_review")
+
+        # P4: RETURN packets are built from durable evidence, deterministically.
+        from bundlebees_plugin import job_cli as _jc
+
+        manifests = {}
+        for job_id in (fx.JOB_A, fx.JOB_B):
+            first = _jc.report(self.state, job_id, repo=self.work)
+            manifest = json.loads((self.state / "jobs" / job_id / "return.json").read_text())
+            manifests[job_id] = manifest
+            self.assertEqual(manifest["schema"], "rizzstack.return/1")
+            self.assertEqual(manifest["receiver_decision"]["status"], "pending")
+            self.assertIsNone(manifest["receiver_decision"]["decided_by"])
+            self.assertTrue((self.state / "jobs" / job_id / "RETURN.md").read_text().strip())
+            statuses = {a["id"]: a["status"] for a in manifest["acceptance"]}
+            self.assertTrue(statuses and all(v == "PASS" for v in statuses.values()), statuses)
+            again = _jc.report(self.state, job_id, repo=self.work)
+            self.assertEqual(again["return"]["evidence_digest"], first["return"]["evidence_digest"],
+                             "regenerating a RETURN from the same evidence changed its identity")
+
+        accepted_a = jobs.load_job(self.state, fx.JOB_A)["integration"]["last_commit"]
+        self.assertEqual(manifests[fx.JOB_B]["descendant"]["accepted_commit"], accepted_a)
+        self.assertEqual(manifests[fx.JOB_B]["repository"]["source_rev"], accepted_a)
+        self.assertEqual(manifests[fx.JOB_B]["descendant"]["dependency_feature"], "feature-a")
+        self.assertEqual(manifests[fx.JOB_A]["contract"]["id"], "SMOKE-A")
+        self.assertEqual(manifests[fx.JOB_B]["contract"]["id"], "SMOKE-B")
         self.assert_the_proof()
 
     def assert_the_proof(self):

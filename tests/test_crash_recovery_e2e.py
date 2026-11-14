@@ -578,6 +578,20 @@ class CrashRecoveryTwoFeatures(unittest.TestCase):
             self.assertIsNotNone(item, f"{feature} vanished from the queue")
             self.assertEqual(item.status, "ready_for_review")
 
+        # P4 restart proof: reports are rebuilt from durable state only, and a
+        # second rebuild of the same snapshot is byte-identical.
+        from bundlebees_plugin import job_cli as _jc
+
+        for job_id in (fx.JOB_A, fx.JOB_B):
+            first = _jc.report(self.state, job_id, repo=self.work)
+            manifest = json.loads((self.state / "jobs" / job_id / "return.json").read_text())
+            self.assertEqual(manifest["receiver_decision"]["status"], "pending")
+            statuses = {a["id"]: a["status"] for a in manifest["acceptance"]}
+            self.assertTrue(statuses and all(v == "PASS" for v in statuses.values()), statuses)
+            second = _jc.report(self.state, job_id, repo=self.work)
+            self.assertEqual(second["return"]["evidence_digest"], first["return"]["evidence_digest"],
+                             "a rebuilt RETURN after restart changed its evidence identity")
+
     def assert_intent_untouched(self):
         self.assertEqual(fx.file_sha256(self.intent_path), self.intent_file_sha,
                          "the immutable intent packet was rewritten")
