@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -35,6 +36,9 @@ from .leases import LeaseError, load_lease
 __all__ = [
     "ACK_SCHEMA",
     "ACK_DIR",
+    "EXPORT_SCHEMA",
+    "EXPORT_CURSOR_SCHEMA",
+    "DEFAULT_EXPORT_LIMIT",
     "BridgeError",
     "consume_once",
     "consume",
@@ -43,12 +47,26 @@ __all__ = [
     "scan_pending",
     "verify_event_identity",
     "lease_sha256",
+    "export_cursor_path",
+    "ingest_remote",
+    "consume_remote",
+    "remote_ingest",
+    "ingest_export",
+    "consume_export",
+    "ingest_remote_export",
+    "consume_remote_export",
+    "ingest_launcher_export",
     "run",
     "main",
 ]
 
 ACK_SCHEMA = "rizzstack.bee-landing-ack/1"
 ACK_DIR = "acked"
+EXPORT_SCHEMA = "rizzstack.bee-landed-export/1"
+EXPORT_CURSOR_SCHEMA = "rizzstack.bee-landing-export-cursor/1"
+DEFAULT_EXPORT_LIMIT = 100
+_EXPORT_CURSOR_DIR = "landing"
+_EXPORT_CURSOR_FILE = "export-cursor.json"
 _ACK_META_DIR = ".acks"
 _ACK_SUFFIX = ".ack.json"
 _MAX_SOURCE_BYTES = bee_events.MAX_EVENT_BYTES * 8
@@ -754,6 +772,70 @@ def scan_pending(state_dir: Any, launcher_outbox: Any) -> list[str]:
     return pending
 
 
+def _ingest_event_batch(
+    state_dir: Path,
+    events: list[dict[str, Any]],
+    name: str,
+) -> dict[str, Any]:
+    """Validate, correlate and durably record one ordered batch of events.
+
+    The batch is preflighted before the first write so a later conflict cannot
+    leave earlier events from the same source recorded but unacknowledged.
+    Delivery must also be durable before the caller advances any cursor.
+    """
+
+    for event in events:
+        bee_events.validate_event(event)
+
+    # Validate and correlate the whole batch before writing or acking any of it.
+    identities: list[dict[str, Any]] = []
+    for event in events:
+        identities.append(verify_event_identity(state_dir, event))
+
+    # Preflight the whole batch so a later conflict never leaves an earlier
+    # event from the same source recorded but unacknowledged.
+    seen: dict[str, bytes] = {}
+    for event in events:
+        event_id = event["id"]
+        canonical = _canonical(event)
+        if event_id in seen and seen[event_id] != canonical:
+            raise BridgeError(
+                "event_conflict",
+                f"source {name} contains conflicting bytes for {event_id}",
+                "Keep one event per event id; do not rewrite a landing.",
+            )
+        seen[event_id] = canonical
+        path = bee_events._outbox_path(state_dir, event_id)
+        existing = bee_events._read_regular(path)
+        if existing is not None and existing != canonical:
+            raise BridgeError(
+                "event_conflict",
+                f"source {name} conflicts with the durable event {event_id}",
+                "Keep the original landing bytes; do not rewrite a landing.",
+            )
+
+    created: list[bool] = []
+    for event in events:
+        result = bee_events.record_landing(state_dir, event)
+        created.append(bool(result.get("created")))
+
+    delivery = bee_events.deliver_pending(state_dir)
+    pending_ids = {item["event_id"] for item in bee_events.pending_deliveries(state_dir)}
+    blocked = [event["id"] for event in events if event["id"] in pending_ids]
+    if blocked:
+        raise BridgeError(
+            "delivery_pending",
+            f"delivery is not durable for event(s): {', '.join(blocked)}",
+            "Keep the source file; retry delivery before acknowledging it.",
+        )
+
+    return {
+        "identities": identities,
+        "delivery": delivery,
+        "created": created,
+    }
+
+
 def _process_file(
     state_dir: Path,
     source: Path,
@@ -785,50 +867,8 @@ def _process_file(
             "event_ids": [event["id"] for event in events],
         }
 
-    for event in events:
-        bee_events.validate_event(event)
-
-    # Validate and correlate the whole file before writing or acking any of it.
-    identities: list[dict[str, Any]] = []
-    for event in events:
-        identities.append(verify_event_identity(state_dir, event))
-
-    # Preflight the whole file so a later conflict never leaves an earlier
-    # event from the same source recorded but unacknowledged.
-    seen: dict[str, bytes] = {}
-    for event in events:
-        event_id = event["id"]
-        canonical = _canonical(event)
-        if event_id in seen and seen[event_id] != canonical:
-            raise BridgeError(
-                "event_conflict",
-                f"source {source.name} contains conflicting bytes for {event_id}",
-                "Keep one event per event id; do not rewrite a landing.",
-            )
-        seen[event_id] = canonical
-        path = bee_events._outbox_path(state_dir, event_id)
-        existing = bee_events._read_regular(path)
-        if existing is not None and existing != canonical:
-            raise BridgeError(
-                "event_conflict",
-                f"source {source.name} conflicts with the durable event {event_id}",
-                "Keep the original landing bytes; do not rewrite a landing.",
-            )
-
-    for event in events:
-        bee_events.record_landing(state_dir, event)
-
-    delivery = bee_events.deliver_pending(state_dir)
-    pending_ids = {item["event_id"] for item in bee_events.pending_deliveries(state_dir)}
-    blocked = [event["id"] for event in events if event["id"] in pending_ids]
-    if blocked:
-        raise BridgeError(
-            "delivery_pending",
-            f"delivery is not durable for event(s): {', '.join(blocked)}",
-            "Keep the source file; retry delivery before acknowledging it.",
-        )
-
-    record = _ack_record(source.name, raw, events, delivery, now)
+    batch = _ingest_event_batch(state_dir, events, source.name)
+    record = _ack_record(source.name, raw, events, batch["delivery"], now)
     stored = _write_ack(_ack_meta_path(source.parent, source.name), record)
     _move_source(source, raw)
     return {
@@ -836,7 +876,7 @@ def _process_file(
         "state": "acked",
         "event_ids": stored["event_ids"],
         "delivery": stored["delivery"],
-        "identities": identities,
+        "identities": batch["identities"],
     }
 
 
@@ -898,6 +938,360 @@ def process_pending(state_dir: Any, launcher_outbox: Any, *, now: Any = None) ->
     """Compatibility alias for :func:`consume_once`."""
 
     return consume_once(state_dir, launcher_outbox, now=now)
+
+
+# ---------------------------------------------------------------------------
+# Authenticated remote export
+# ---------------------------------------------------------------------------
+
+_EXPORT_HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def export_cursor_path(state_dir: Any) -> Path:
+    """Return the durable remote-export cursor path for ``state_dir``."""
+
+    return Path(state_dir) / _EXPORT_CURSOR_DIR / _EXPORT_CURSOR_FILE
+
+
+def _read_export_cursor(path: Path) -> Any:
+    raw = _read_regular(path)
+    if raw is None:
+        return None
+    value = _decode_json(raw, path.name)
+    if not isinstance(value, Mapping):
+        raise BridgeError(
+            "cursor_invalid",
+            f"{path.name} is not a JSON object",
+            "Remove the corrupt export cursor; ingestion replays from the start.",
+        )
+    if value.get("schema") not in (None, EXPORT_CURSOR_SCHEMA):
+        raise BridgeError(
+            "cursor_invalid",
+            f"{path.name} has an unsupported cursor schema",
+            "Remove the corrupt export cursor; ingestion replays from the start.",
+        )
+    return value.get("cursor")
+
+
+def _write_export_cursor(path: Path, cursor: Any, *, now: Any = None) -> None:
+    if cursor is None:
+        return
+    if isinstance(cursor, bool) or not isinstance(cursor, (str, int)):
+        raise BridgeError(
+            "cursor_invalid",
+            "the export cursor is not a string or integer",
+            "Emit a stable scalar cursor from the launcher export.",
+        )
+    record = {
+        "schema": EXPORT_CURSOR_SCHEMA,
+        "cursor": cursor,
+        "updated_at": bee_events._iso(bee_events._clock(now), microseconds=True),
+    }
+    payload = _canonical(record)
+    _ensure_private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        raise BridgeError(
+            "cursor_write_failed",
+            f"export cursor write failed: {type(exc).__name__}",
+            "Check the state directory is writable and retry.",
+        ) from exc
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _export_reader(client: Any) -> Any:
+    for name in (
+        "landing_events",
+        "landing_export",
+        "export_landing_events",
+        "export_events",
+    ):
+        reader = getattr(client, name, None)
+        if callable(reader):
+            return reader
+    if callable(client):
+        return client
+    return None
+
+
+def _read_export_page(client: Any, after: Any, limit: int) -> Any:
+    reader = _export_reader(client)
+    if reader is None:
+        raise BridgeError(
+            "export_client_invalid",
+            "the launcher client has no landing export reader",
+            "Use LauncherClient with the authenticated landing export endpoint.",
+        )
+    try:
+        return reader(after=after, limit=limit)
+    except TypeError:
+        return reader(after, limit)
+
+
+def _export_entries(page: Any) -> list[tuple[Any, dict[str, Any]]]:
+    """Validate one export page and return ``(cursor, event)`` pairs."""
+
+    if not isinstance(page, Mapping):
+        raise BridgeError(
+            "export_invalid",
+            "the landing export page is not an object",
+            "Return the documented landing export page.",
+        )
+    if page.get("schema") != EXPORT_SCHEMA:
+        raise BridgeError(
+            "export_schema_invalid",
+            f"landing export schema is not {EXPORT_SCHEMA}",
+            "Point the launcher client at a compatible landing export.",
+        )
+    entries = page.get("events")
+    if not isinstance(entries, (list, tuple)):
+        raise BridgeError(
+            "export_invalid",
+            "landing export events is not a list",
+            "Return the documented landing export page.",
+        )
+
+    parsed: list[tuple[Any, dict[str, Any]]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise BridgeError(
+                "export_invalid",
+                f"landing export event {index} is not an object",
+                "Return the documented landing export page.",
+            )
+        cursor = entry.get("cursor")
+        if cursor is None:
+            raise BridgeError(
+                "cursor_invalid",
+                f"landing export event {index} has no cursor",
+                "Emit a cursor for every exported event.",
+            )
+        event = entry.get("event")
+        if not isinstance(event, Mapping):
+            raise BridgeError(
+                "export_invalid",
+                f"landing export event {index} has no event object",
+                "Return the documented landing export page.",
+            )
+        event = dict(event)
+        event_id = entry.get("event_id")
+        if event_id is None:
+            raise BridgeError(
+                "event_id_mismatch",
+                f"landing export event {index} has no event_id",
+                "Emit the event id exactly as the canonical envelope carries it.",
+            )
+        if str(event_id) != str(event.get("id")):
+            raise BridgeError(
+                "event_id_mismatch",
+                f"landing export event {index} id does not match its envelope",
+                "Emit the event id exactly as the canonical envelope carries it.",
+            )
+        if event.get("id") is None:
+            raise BridgeError(
+                "event_invalid",
+                f"landing export event {index} has no id",
+                "Emit a canonical landed event.",
+            )
+
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or not _EXPORT_HEX64.match(digest.strip()):
+            raise BridgeError(
+                "event_sha256_invalid",
+                f"landing export event {index} has no valid sha256",
+                "Emit the SHA-256 of the raw event bytes.",
+            )
+        raw = entry.get("event_raw")
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, (bytes, bytearray)):
+            raw = _canonical(event)
+        raw_digest = hashlib.sha256(bytes(raw)).hexdigest()
+        canonical_digest = hashlib.sha256(_canonical(event)).hexdigest()
+        if digest.strip().lower() not in {raw_digest, canonical_digest}:
+            raise BridgeError(
+                "event_sha256_mismatch",
+                f"landing export event {index} bytes do not match their sha256",
+                "Keep the producer bytes and digest unchanged.",
+            )
+        parsed.append((cursor, event))
+    return parsed
+
+
+def ingest_remote(
+    state_dir: Any,
+    client: Any = None,
+    *,
+    after: Any = None,
+    cursor: Any = None,
+    limit: int = DEFAULT_EXPORT_LIMIT,
+    max_pages: int | None = None,
+    cursor_path: Any = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Ingest the authenticated landing export into the durable bridge path.
+
+    Events are validated with the pinned workflow schema and correlated with
+    the coordinator lease/job records before anything is recorded.  A page is
+    recorded and delivered durably before its cursor is persisted, so a
+    disconnect or restart replays from the last durable page without duplicate
+    outbox, inbox or consumer effects.
+    """
+
+    if client is None:
+        raise TypeError("ingest_remote() requires a launcher client")
+    # Accept either argument order; both are common for a bridge helper.
+    if _export_reader(state_dir) is not None and _export_reader(client) is None:
+        state_dir, client = client, state_dir
+    state = Path(state_dir)
+    path = Path(cursor_path) if cursor_path is not None else export_cursor_path(state)
+
+    if after is None:
+        after = cursor
+    cursor = after if after is not None else _read_export_cursor(path)
+    start_cursor = cursor
+    pages = 0
+    processed = 0
+    duplicates = 0
+    outcomes: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    while True:
+        if max_pages is not None and pages >= max_pages:
+            break
+        try:
+            page = _read_export_page(client, cursor, int(limit))
+        except Exception as exc:  # noqa: BLE001 - a disconnected export is retryable
+            failures.append(
+                {
+                    "stage": "fetch",
+                    "error": str(getattr(exc, "code", "launcher_unavailable")),
+                    "message": bee_events.scrub(
+                        str(getattr(exc, "error", "") or exc)
+                    ),
+                }
+            )
+            break
+        pages += 1
+        try:
+            entries = _export_entries(page)
+        except (BridgeError, bee_events.EventError) as exc:
+            failures.append(
+                {
+                    "stage": "export",
+                    "page": pages,
+                    "error": getattr(exc, "code", "export_invalid"),
+                    "message": getattr(exc, "error", str(exc)),
+                }
+            )
+            break
+
+        if not entries:
+            # An empty page carries no durable work; do not advance the cursor
+            # on the strength of a response that ingested nothing.
+            break
+
+        events = [event for _entry_cursor, event in entries]
+        try:
+            batch = _ingest_event_batch(
+                state, events, f"landing export page {pages}"
+            )
+        except (BridgeError, bee_events.EventError) as exc:
+            failures.append(
+                {
+                    "stage": "ingest",
+                    "page": pages,
+                    "error": getattr(exc, "code", "ingest_failed"),
+                    "message": getattr(exc, "error", str(exc)),
+                }
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 - one page must not lose its cursor
+            failures.append(
+                {
+                    "stage": "ingest",
+                    "page": pages,
+                    "error": "ingest_failed",
+                    "message": bee_events.scrub(f"{type(exc).__name__}: {exc}"),
+                }
+            )
+            break
+
+        previous = cursor
+        next_cursor = page.get("next_cursor")
+        if next_cursor is None:
+            next_cursor = entries[-1][0]
+        try:
+            _write_export_cursor(path, next_cursor, now=now)
+        except BridgeError as exc:
+            failures.append(
+                {
+                    "stage": "cursor",
+                    "page": pages,
+                    "error": exc.code,
+                    "message": exc.error,
+                }
+            )
+            break
+        cursor = next_cursor
+        for (entry_cursor, event), created in zip(entries, batch["created"]):
+            outcomes.append(
+                {
+                    "cursor": entry_cursor,
+                    "event_id": event.get("id"),
+                    "created": bool(created),
+                    "delivery": batch["delivery"],
+                }
+            )
+            if created:
+                processed += 1
+            else:
+                duplicates += 1
+
+        if not bool(page.get("has_more")):
+            break
+        if cursor == previous:
+            # The export repeated its cursor; stop instead of spinning.
+            break
+
+    try:
+        pending = len(bee_events.pending_deliveries(state))
+    except Exception:  # noqa: BLE001 - a pending scan is informational
+        pending = 0
+
+    return {
+        "processed": processed,
+        "duplicates": duplicates,
+        "failed": len(failures),
+        "pending": pending,
+        "pages": pages,
+        "start_cursor": start_cursor,
+        "cursor": cursor,
+        "events": outcomes,
+        "sources": outcomes,
+        "failures": failures,
+    }
+
+
+consume_remote = ingest_remote
+remote_ingest = ingest_remote
+ingest_export = ingest_remote
+consume_export = ingest_remote
+ingest_remote_export = ingest_remote
+consume_remote_export = ingest_remote
+ingest_launcher_export = ingest_remote
 
 
 def run(

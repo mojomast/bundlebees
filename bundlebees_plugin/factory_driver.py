@@ -984,6 +984,9 @@ class FactoryDriver:
         *,
         tick: Any = None,
         launcher_outbox: Any = None,
+        landing_client: Any = None,
+        launcher_client: Any = None,
+        landing_export_limit: int = landing_bridge.DEFAULT_EXPORT_LIMIT,
         subscribers: Sequence[str] | None = None,
         now: Any = None,
         wake_ttl_s: float = DEFAULT_WAKE_TTL_S,
@@ -996,6 +999,8 @@ class FactoryDriver:
         self._tick = tick if tick is not None else mechanical_tick(self.state)
         self.tick = self._serialized_tick(self._tick)
         self.launcher_outbox = Path(launcher_outbox) if launcher_outbox is not None else None
+        self.landing_client = landing_client if landing_client is not None else launcher_client
+        self.landing_export_limit = max(1, int(landing_export_limit))
         self.subscribers = list(subscribers) if subscribers is not None else None
         self.now = now
         self.wake = WakeCoalescer(self.state, ttl_s=wake_ttl_s)
@@ -1692,7 +1697,19 @@ class FactoryDriver:
             errors.append({"stage": "queue", "error": type(exc).__name__})
 
         landing_result: dict[str, Any] | None = None
-        if self.launcher_outbox is not None:
+        if self.landing_client is not None:
+            try:
+                landing_result = landing_bridge.ingest_remote(
+                    self.state,
+                    self.landing_client,
+                    limit=self.landing_export_limit,
+                    now=self.now,
+                )
+            except Exception as exc:  # noqa: BLE001
+                landing_result = {"processed": 0, "duplicates": 0, "failed": 1, "pending": 0,
+                                  "sources": [], "failures": [{"error": type(exc).__name__}]}
+                errors.append({"stage": "landing", "error": type(exc).__name__})
+        elif self.launcher_outbox is not None:
             try:
                 landing_result = landing_bridge.consume_once(self.state, self.launcher_outbox, now=self.now)
             except Exception as exc:  # noqa: BLE001
@@ -1807,6 +1824,9 @@ def run_pass(
     *,
     tick: Any = None,
     launcher_outbox: Any = None,
+    landing_client: Any = None,
+    launcher_client: Any = None,
+    landing_export_limit: int = landing_bridge.DEFAULT_EXPORT_LIMIT,
     subscribers: Sequence[str] | None = None,
     now: Any = None,
     startup: bool = True,
@@ -1817,6 +1837,9 @@ def run_pass(
         queue,
         tick=tick,
         launcher_outbox=launcher_outbox,
+        landing_client=landing_client,
+        launcher_client=launcher_client,
+        landing_export_limit=landing_export_limit,
         subscribers=subscribers,
         now=now,
         startup=startup,
@@ -1921,15 +1944,17 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
     tick = load_tick(args.tick)
-    if tick is None and args.launcher_url and args.repo:
+    client = None
+    if args.launcher_url:
         from .client import LauncherClient
 
         token = os.environ.get("BUNDLEBEES_LAUNCHER_TOKEN", "")
         if not token:
             raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
+        client = LauncherClient(args.launcher_url, token=token)
+    if tick is None and client is not None and args.repo:
         if not args.gitleaks:
             raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
-        client = LauncherClient(args.launcher_url, token=token)
         provisioner = None
         if args.provisioning:
             from . import provisioning as provisioning_mod
@@ -1949,12 +1974,19 @@ def main(argv: list[str] | None = None) -> int:
     if tick is None:
         tick = mechanical_tick(state)
     subscribers = args.subscribers or None
+    driver_options: dict[str, Any] = {
+        "tick": tick,
+        # Production lands from the authenticated export. The worker-local
+        # outbox directory is a test/legacy transport, never the live driver's.
+        "launcher_outbox": args.launcher_outbox if client is None else None,
+        "subscribers": subscribers,
+    }
+    if client is not None:
+        driver_options["landing_client"] = client
     driver = FactoryDriver(
         state,
         queue_mod.JsonQueue(queue_path),
-        tick=tick,
-        launcher_outbox=args.launcher_outbox,
-        subscribers=subscribers,
+        **driver_options,
     )
 
     if args.once:

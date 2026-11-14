@@ -527,14 +527,21 @@ class _BaseClient:
             err.upstream_code = upstream
         return err
 
-    def request_json(
+    def request_raw(
         self,
         method: str,
         path: str,
         payload: Any = None,
         *,
         suppress_server_message: bool = False,
-    ) -> Any:
+    ) -> bytes:
+        """Perform one request and return the exact response bytes.
+
+        ``request_json`` decodes JSON for most endpoints; the landing export
+        needs the original bytes so an event's raw representation (and its
+        ``sha256`` identity) is preserved end to end.
+        """
+
         url = self._absolute(path)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         for _ in range(MAX_REDIRECTS + 1):
@@ -608,11 +615,28 @@ class _BaseClient:
                     data,
                     message_from_payload=not suppress_server_message,
                 )
-            return self._decode(data)
+            return data
         raise ClientError(
             "launcher returned too many redirects",
             "launcher_unavailable",
             _FIX_LAUNCHER,
+        )
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: Any = None,
+        *,
+        suppress_server_message: bool = False,
+    ) -> Any:
+        return self._decode(
+            self.request_raw(
+                method,
+                path,
+                payload,
+                suppress_server_message=suppress_server_message,
+            )
         )
 
 
@@ -632,6 +656,154 @@ def _origin(url: str) -> tuple[str, str, int]:
 
 def _quote_id(attempt_id: str) -> str:
     return urllib.parse.quote(str(attempt_id), safe="")
+
+
+LANDING_EXPORT_SCHEMA = "rizzstack.bee-landed-export/1"
+DEFAULT_LANDING_EXPORT_LIMIT = 100
+MAX_LANDING_EXPORT_LIMIT = 1000
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _skip_json_ws(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _parse_json_object_spans(
+    text: str, index: int
+) -> tuple[dict[str, tuple[Any, int, int]], int]:
+    """Parse one JSON object, keeping each member's source span.
+
+    Spans let the export reader preserve the exact bytes of a nested value
+    (the ``event`` object) instead of re-serializing a decoded copy.
+    """
+
+    index = _skip_json_ws(text, index)
+    if index >= len(text) or text[index] != "{":
+        raise ValueError("expected a JSON object")
+    index = _skip_json_ws(text, index + 1)
+    members: dict[str, tuple[Any, int, int]] = {}
+    if index < len(text) and text[index] == "}":
+        return members, index + 1
+    while True:
+        index = _skip_json_ws(text, index)
+        key, index = _JSON_DECODER.raw_decode(text, index)
+        if not isinstance(key, str):
+            raise ValueError("object key is not a string")
+        index = _skip_json_ws(text, index)
+        if index >= len(text) or text[index] != ":":
+            raise ValueError("expected ':' after object key")
+        index = _skip_json_ws(text, index + 1)
+        start = index
+        value, index = _JSON_DECODER.raw_decode(text, index)
+        members[key] = (value, start, index)
+        index = _skip_json_ws(text, index)
+        if index < len(text) and text[index] == ",":
+            index += 1
+            continue
+        if index < len(text) and text[index] == "}":
+            return members, index + 1
+        raise ValueError("expected ',' or '}' in object")
+
+
+def _parse_json_array_spans(text: str, index: int) -> tuple[list[tuple[Any, int, int]], int]:
+    index = _skip_json_ws(text, index)
+    if index >= len(text) or text[index] != "[":
+        raise ValueError("expected a JSON array")
+    index = _skip_json_ws(text, index + 1)
+    items: list[tuple[Any, int, int]] = []
+    if index < len(text) and text[index] == "]":
+        return items, index + 1
+    while True:
+        index = _skip_json_ws(text, index)
+        start = index
+        value, index = _JSON_DECODER.raw_decode(text, index)
+        items.append((value, start, index))
+        index = _skip_json_ws(text, index)
+        if index < len(text) and text[index] == ",":
+            index += 1
+            continue
+        if index < len(text) and text[index] == "]":
+            return items, index + 1
+        raise ValueError("expected ',' or ']' in array")
+
+
+def _invalid_export(detail: str) -> ClientError:
+    return ClientError(
+        f"launcher landing export is invalid: {detail}",
+        "launcher_export_invalid",
+        _FIX_LAUNCHER,
+    )
+
+
+def _parse_landing_export(raw: bytes) -> dict[str, Any]:
+    """Decode one export page while keeping every event's raw bytes."""
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _invalid_export("response is not UTF-8") from exc
+    try:
+        start = _skip_json_ws(text, 0)
+        members, _end = _parse_json_object_spans(text, start)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise _invalid_export("response is not a JSON object") from exc
+
+    schema_member = members.get("schema")
+    if schema_member is None:
+        raise _invalid_export("missing schema")
+    schema = schema_member[0]
+    if schema != LANDING_EXPORT_SCHEMA:
+        raise ClientError(
+            "launcher landing export schema is not supported",
+            "launcher_export_schema",
+            _FIX_LAUNCHER,
+        )
+
+    events_member = members.get("events")
+    if events_member is None or not isinstance(events_member[0], list):
+        raise _invalid_export("events is not a list")
+    try:
+        items, _array_end = _parse_json_array_spans(text, events_member[1])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise _invalid_export("events is not a JSON array") from exc
+
+    events: list[dict[str, Any]] = []
+    for value, item_start, item_end in items:
+        if not isinstance(value, Mapping):
+            raise _invalid_export("an event envelope is not an object")
+        try:
+            entry_members, _entry_end = _parse_json_object_spans(text, item_start)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise _invalid_export("an event envelope is not valid JSON") from exc
+        event_member = entry_members.get("event")
+        if event_member is None or not isinstance(event_member[0], Mapping):
+            raise _invalid_export("an event envelope has no event object")
+        entry = dict(value)
+        entry["event"] = dict(event_member[0])
+        entry["event_raw"] = text[
+            event_member[1] : event_member[2]
+        ].encode("utf-8")
+        entry["entry_raw"] = text[item_start:item_end].encode("utf-8")
+        events.append(entry)
+
+    def _value(name: str, default: Any = None) -> Any:
+        member = members.get(name)
+        return default if member is None else member[0]
+
+    next_cursor = _value("next_cursor")
+    has_more = _value("has_more", False)
+    if not isinstance(has_more, bool):
+        raise _invalid_export("has_more is not a boolean")
+    return {
+        "schema": schema,
+        "events": events,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "retention": _value("retention"),
+        "raw": raw,
+    }
 
 
 class LauncherClient(_BaseClient):
@@ -763,6 +935,60 @@ class LauncherClient(_BaseClient):
     def containers(self) -> list[dict[str, Any]]:
         data = self.request_json("GET", "/v1/containers")
         return [public_container(item) for item in _as_list(data, "containers", "items")]
+
+    def landing_events(
+        self,
+        after: int | str | None = None,
+        limit: int | None = None,
+        *,
+        cursor: int | str | None = None,
+    ) -> dict[str, Any]:
+        """Read one page of the authenticated landed-event export.
+
+        ``events`` entries keep the raw bytes of their ``event`` object as
+        ``event_raw`` so ingestion can verify ``sha256`` and record the exact
+        producer bytes. ``cursor`` is an alias for ``after``.
+        """
+
+        if after is None:
+            after = cursor
+        try:
+            size = int(
+                DEFAULT_LANDING_EXPORT_LIMIT if limit is None else limit
+            )
+        except (TypeError, ValueError) as exc:
+            raise ClientError(
+                "landing export limit must be an integer",
+                "launcher_export_invalid",
+                _FIX_LAUNCHER,
+            ) from exc
+        if size < 1 or size > MAX_LANDING_EXPORT_LIMIT:
+            raise ClientError(
+                f"landing export limit must be between 1 and {MAX_LANDING_EXPORT_LIMIT}",
+                "launcher_export_invalid",
+                _FIX_LAUNCHER,
+            )
+        query = "?limit=" + urllib.parse.quote(str(size), safe="")
+        if after is not None:
+            query += "&after=" + urllib.parse.quote(str(after), safe="")
+        return _parse_landing_export(
+            self.request_raw("GET", "/v1/landing/events" + query)
+        )
+
+    def landing_export(
+        self,
+        after: int | str | None = None,
+        limit: int | None = None,
+        *,
+        cursor: int | str | None = None,
+    ) -> dict[str, Any]:
+        return self.landing_events(after=after, limit=limit, cursor=cursor)
+
+    export_events = landing_events
+    export_landing_events = landing_events
+    landing_export_events = landing_events
+    read_landing_export = landing_events
+    read_landing_events = landing_events
 
 
 ARTIFACT_VERSION = "orbit.worker-artifact/1"
