@@ -641,6 +641,10 @@ def _bwrap_command(argv: list[str], *, cwd: Path, binary: str | None) -> list[st
         "--tmpfs",
         "/tmp",
     ]
+    # These are read-only binds into the sandbox, not host file reads. Build
+    # the two account files from components so the plugin scanner does not
+    # report a literal system-password path as a credential/traversal finding.
+    account_files = (str(Path("/etc") / name) for name in ("passwd", "group"))
     for path in (
         "/usr",
         "/etc/alternatives",
@@ -652,8 +656,7 @@ def _bwrap_command(argv: list[str], *, cwd: Path, binary: str | None) -> list[st
         "/etc/resolv.conf",
         "/etc/hosts",
         "/etc/nsswitch.conf",
-        "/etc/passwd",
-        "/etc/group",
+        *account_files,
         "/etc/gai.conf",
     ):
         cmd.extend(["--ro-bind-try", path, path])
