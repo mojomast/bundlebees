@@ -42,6 +42,33 @@ jobs:
       - name: Report sandbox backend
         run: |
           python -c "from bundlebees_plugin import sandbox; print('auto backend:', sandbox.detect_backend())"
+      - name: Install gitleaks (verification requires a real scanner)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          "$RUNNER_TEMP/bin/gitleaks" version
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "GITLEAKS=$RUNNER_TEMP/bin/gitleaks" >> "$GITHUB_ENV"
+      - name: Check out workflow protocol (pinned)
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/mojomast/workflow.git "$RUNNER_TEMP/workflow"
+          git -C "$RUNNER_TEMP/workflow" fetch --quiet origin refs/pull/33/head
+          git -C "$RUNNER_TEMP/workflow" checkout --quiet 070b6c10bdfa3e9d31b84cc83a2d9d701222082f
+          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "070b6c10bdfa3e9d31b84cc83a2d9d701222082f"
+          echo "WORKFLOW_SRC=$RUNNER_TEMP/workflow" >> "$GITHUB_ENV"
+          echo "REQUIRE_WORKFLOW=1" >> "$GITHUB_ENV"
+      - name: Check out hyvv provisioning contract (pinned)
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/mojomast/hyvv.git "$RUNNER_TEMP/hyvv-contract"
+          git -C "$RUNNER_TEMP/hyvv-contract" fetch --quiet origin refs/pull/4/head
+          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet 5bee1a870ffe32ee91c6a70b7be807eaa8400801
+          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "5bee1a870ffe32ee91c6a70b7be807eaa8400801"
+          echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
+          echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
       - name: Run test suite
         run: python -m pytest -rs
       - name: Measure tool-schema tokens

@@ -14,11 +14,28 @@ has always enforced. Nothing here weakens it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import revision, verify_local
+
+
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault checkpoint for the crash harness, if one is armed.
+
+    Imported lazily and tolerated when absent, exactly like the other lanes'
+    checkpoints: the shipped path has no hooks and this is a no-op.
+    """
+
+    try:  # noqa: SIM105 - a missing optional module is the normal no-op case
+        from . import faults  # noqa: PLC0415
+    except ImportError:
+        return
+    fire = getattr(faults, "checkpoint", None)
+    if callable(fire):
+        fire(name, **payload)
 
 
 class IntegrateError(Exception):
@@ -53,6 +70,70 @@ def _wave_number(job: Mapping[str, Any]) -> int:
         return max(1, int(text))
     except ValueError:
         return 1
+
+
+import hashlib as _hashlib
+
+
+def job_wave_id(job: Mapping[str, Any]) -> str:
+    """Wave records are per job and always within the 64-char record limit.
+
+    M1 allows job ids up to 96 characters while wave ids allow 64, so long ids are
+    shortened with a digest of the *full* id: unique, deterministic, and stable
+    across restarts.
+    """
+    job_id = str(job.get("job_id") or "").strip()
+    if not job_id:
+        raise IntegrateError("bad_job_id", "the job has no id", "Fix the job document.")
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in job_id)
+    suffix = f".w{_wave_number(job)}"
+    if len(safe) + len(suffix) > 64:
+        digest = _hashlib.sha256(job_id.encode()).hexdigest()[:16]
+        safe = f"{safe[:44]}.{digest}"
+    return f"{safe}{suffix}"
+
+
+def _legacy_names(job: Mapping[str, Any]) -> list[str]:
+    job_id = str(job.get("job_id") or "").strip()
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in job_id)
+    return [f"w{_wave_number(job)}", f"{safe}.w{_wave_number(job)}"]
+
+
+def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> dict[str, Any] | None:
+    """Copy an old ``wN`` record to its per-job name, only on exact proof.
+
+    Existing evidence is preserved (the legacy file is left in place); adoption
+    happens only when the legacy record lists exactly this job's attempts.
+    """
+    if wave == legacy:
+        return None
+    target = Path(state_dir) / "waves" / f"{wave}.json"
+    source = Path(state_dir) / "waves" / f"{legacy}.json"
+    if target.exists() or not source.exists():
+        return None
+    try:
+        record = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    recorded = record.get("attempts") if isinstance(record, dict) else None
+    if not isinstance(recorded, list) or sorted(str(a) for a in recorded) != sorted(str(a) for a in attempts):
+        return None
+    body = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)          # atomic: two recoverers see one result
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return record
 
 
 def integration_ref(job_id: str) -> str:
@@ -95,11 +176,15 @@ def integrate(
     if len(base_rev) != 40:
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
-    wave = wave_id or f"w{_wave_number(job)}"
+    wave = wave_id or job_wave_id(job)
 
     # Crash recovery: an accepted wave record already on disk is the result.
     # Restore the durable ref if the crash happened before it was updated, and
     # report recovery so the caller does not count it as a new attempt.
+    for legacy in _legacy_names(job):
+        adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
+        if adopted is not None:
+            break
     existing = _accepted_wave_record(state_dir, wave)
     if existing is not None:
         head = str(existing.get("head_sha") or "")
@@ -178,6 +263,12 @@ def integrate(
             head = str(record.get("head_sha") or "")
             if len(head) != 40:
                 raise IntegrateError("bad_wave_record", "the accepted wave has no head sha", "Inspect the wave record.")
+            # Fault boundary: the accepted wave record is durable, but neither the
+            # integration ref nor the job document names it yet. A crash here must
+            # be recovered from the record, never by integrating the wave again.
+            _checkpoint("wave.after_persist", job_id=str(job.get("job_id") or ""),
+                        wave_id=str(record.get("wave_id") or wave), head_sha=head,
+                        attempts=list(attempts))
             # Durable ref: the next wave starts here, not at the original base.
             _git(["update-ref", ref, head], repo)
     finally:

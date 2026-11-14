@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import integrate_job, job as jobs, leases, reconcile, verify_local
+from . import agent_work, integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
+from . import hermes_adapter
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -26,6 +28,218 @@ class JobCliError(Exception):
         self.code = code
         self.message = message
         self.fix = fix
+
+
+def _checkpoint(name: str, **payload: Any) -> None:
+    """Fire a fault-injection checkpoint if the faults lane installed one.
+
+    The import is lazy because ``bundlebees_plugin.faults`` is owned by another
+    lane and may be absent; its absence is a no-op, never an import failure. A
+    hook that raises propagates — that raise is the simulated crash.
+    """
+    try:
+        import importlib
+
+        faults = importlib.import_module(f"{__package__}.faults")
+    except ImportError:
+        return
+    fire = getattr(faults, "checkpoint", None)
+    if callable(fire):
+        fire(name, **payload)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery at the integration boundary
+# ---------------------------------------------------------------------------
+
+
+def _last_accepted_head(job: Mapping[str, Any]) -> str:
+    integration = job.get("integration")
+    if not isinstance(integration, Mapping):
+        return ""
+    waves = [wave for wave in (integration.get("accepted_waves") or []) if isinstance(wave, Mapping)]
+    head = str(waves[-1].get("commit") or "") if waves else ""
+    return head or str(integration.get("last_commit") or "")
+
+
+def _restore_ref(repo: Path, ref: str, head: str) -> str:
+    """Point the durable integration ref at the accepted head, or report why not.
+
+    A repository that does not exist here has no ref to repair; a repository
+    that refuses the update is a refusal, because the next wave would otherwise
+    build on the wrong base.
+    """
+    inside = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-dir"],
+                            capture_output=True, text=True)
+    if inside.returncode != 0:
+        return ""
+    current = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+                             capture_output=True, text=True)
+    if current.returncode == 0 and current.stdout.strip() == head:
+        return head
+    updated = subprocess.run(["git", "-C", str(repo), "update-ref", ref, head],
+                             capture_output=True, text=True)
+    if updated.returncode != 0:
+        raise JobCliError(
+            "integration_ref_unrestored",
+            f"could not restore {ref} to {head[:12]}: {updated.stderr.strip()[:200]}",
+            "Repair the repository refs; the next wave must build on the accepted commit.",
+        )
+    return head
+
+
+def recover(
+    state_dir: Path,
+    job_id: str,
+    repo: Path | None = None,
+    *,
+    decision_file: Any = None,
+    adapter: Any = None,
+    hermes: bool = False,
+    hermes_adopt: bool = False,
+    hermes_timeout: int = 300,
+    hermes_model: str | None = None,
+    hermes_provider: str | None = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Crash-adopt an accepted wave and handle the recovery request.
+
+    Two different recoveries live here because both are the coordinator's
+    business and neither may be automatic:
+
+    * the integration boundary — a wave record published before the job was
+      saved is adopted and the durable ``refs/bb/integrated/<job>`` ref is
+      restored from it. Corrupt evidence raises its own code
+      (``wave_malformed``/``wave_unreadable``); it is never read as permission to
+      integrate again;
+    * a rejected task — the durable request is printed, or a decision file
+      (``decision_file``) / the deterministic adapter (``adapter="deterministic"``)
+      is *recorded*. Recording never applies the decision: the next ``job tick``
+      does that, exactly once.
+    """
+    job = jobs.load_job(state_dir, job_id, recover=False)
+    adopted = jobs.recover_integration(state_dir, job)
+    if adopted:
+        jobs.save_job(state_dir, job)
+    head = _last_accepted_head(job)
+    restored = ""
+    if head and repo is not None:
+        restored = _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+    recovered = (job.get("integration") or {}).get("recovered") or {}
+
+    requests = recovery.list_requests(state_dir, job_id)
+    # Publish the queue item *before* a decision can be recorded: a request that
+    # is decided by this command still gets exactly one durable work record
+    # (pending), which the consumer closes idempotently.
+    work_items: list[dict[str, Any]] = []
+    work_error = ""
+    try:
+        work_items = agent_work.publish_outstanding(state_dir, job, now=now)
+    except (agent_work.WorkError, recovery.RecoveryError, jobs.JobError, OSError) as exc:
+        work_error = str(getattr(exc, "code", None) or type(exc).__name__)
+    recorded: list[dict[str, Any]] = []
+    proposals: list[str] = []
+    if decision_file is not None:
+        try:
+            payload = json.loads(Path(str(decision_file)).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise JobCliError("decision_file_invalid", f"the decision file cannot be read: {exc}",
+                              "Pass a JSON decision document written by the decider.") from exc
+        if not isinstance(payload, dict):
+            raise JobCliError("decision_file_invalid", "a decision file must contain one JSON object",
+                              "Write the decision as an object.")
+        target = str(payload.get("request_id") or (requests[-1].get("request_id") if requests else "") or "")
+        if not target:
+            raise JobCliError("no_recovery_request", f"job {job_id} has no recovery request to decide",
+                              "A decision is only recorded against an outstanding request.")
+        recorded.append(recovery.record_decision(
+            state_dir, target, payload, adapter=str(payload.get("adapter") or "file"), now=now,
+        ))
+    elif hermes_adopt:
+        if repo is None:
+            raise JobCliError(
+                "repo_required",
+                "--hermes-adopt needs --repo: the proposal was recorded against a pinned revision",
+                "Pass the repository the job targets; adoption never asks the model again.",
+            )
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            outcome = hermes_adapter.adopt_proposal(
+                state_dir,
+                str(request["request_id"]),
+                repo=Path(repo),
+                now=now,
+            )
+            proposals.append(str(outcome["proposal"]))
+            recorded.append(outcome["decision"])
+    elif hermes:
+        if repo is None:
+            raise JobCliError(
+                "repo_required",
+                "--hermes needs --repo: the evidence package quotes the contract's files at the pinned revision",
+                "Pass the repository the job targets; no model is asked without its evidence.",
+            )
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            if hermes_adapter.proposal_path(state_dir, request).exists():
+                # A crash after the raw answer was persisted is recovered from
+                # that durable proposal: never re-roll the model.
+                outcome = hermes_adapter.adopt_proposal(
+                    state_dir,
+                    str(request["request_id"]),
+                    repo=Path(repo),
+                    now=now,
+                )
+            else:
+                outcome = hermes_adapter.decide_with_hermes(
+                    state_dir,
+                    str(request["request_id"]),
+                    repo=Path(repo),
+                    timeout_s=hermes_timeout,
+                    model=hermes_model,
+                    provider=hermes_provider,
+                    now=now,
+                )
+            proposals.append(str(outcome["proposal"]))
+            recorded.append(outcome["decision"])
+    elif adapter is not None:
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            if adapter == "deterministic":
+                task = next(
+                    (item for item in job.get("tasks") or []
+                     if str(item.get("task_id") or "") == str(request.get("task_id") or "")),
+                    None,
+                )
+                decision = recovery.deterministic_adapter(request, task=task)
+                name = "deterministic"
+            elif callable(adapter):
+                decision = adapter(request)
+                name = str(getattr(adapter, "__name__", "adapter"))
+            else:
+                raise JobCliError("adapter_unknown", f"unknown recovery adapter {adapter!r}",
+                                  "Use --deterministic, or pass a decision file.")
+            recorded.append(recovery.record_decision(state_dir, str(request["request_id"]), decision,
+                                                     adapter=name, now=now))
+
+    outstanding = recovery.outstanding(state_dir, job)
+    summary = recovery.summarize(state_dir, job_id)
+    return {
+        "adopted": adopted,
+        "wave_id": str(recovered.get("wave_id") or ""),
+        "head_sha": head,
+        "ref_restored": restored,
+        "request": outstanding,
+        "requests": summary["requests"],
+        "decisions_recorded": recorded,
+        "proposals": proposals,
+        "work": work_items,
+        "work_error": work_error,
+        "supersessions": summary["supersessions"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +389,26 @@ def acknowledge(state_dir: Path, job_id: str, note: str, *, now: Any = None) -> 
 # ---------------------------------------------------------------------------
 
 
+def _after_dispatch(state_dir: Path, job_id: str, result: reconcile.TickResult) -> None:
+    """Fire ``tick.after_dispatch`` once a dispatch is durable.
+
+    ``reconcile.tick`` saves the job before returning, so a hook raising here
+    simulates a crash after the dispatch was persisted and before the caller saw
+    the tick return: a restart must adopt that attempt, not dispatch a second
+    one. Nothing is fired for a tick that recorded no attempt.
+    """
+    if result.action not in {"dispatch", "adopt"}:
+        return
+    try:
+        job = jobs.load_job(state_dir, job_id, recover=False)
+    except jobs.JobError:
+        return
+    attempts = [str(attempt) for task in job.get("tasks") or [] for attempt in (task.get("attempts") or [])]
+    if not attempts:
+        return
+    _checkpoint("tick.after_dispatch", job_id=str(job_id), attempts=attempts)
+
+
 def tick(
     state_dir: Path,
     job_id: str,
@@ -186,13 +420,72 @@ def tick(
     require_gitleaks: bool = True,
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     now: Any = None,
+    provisioner: Any = None,
+    expect_host: str | None = None,
 ) -> dict[str, Any]:
-    """One mechanical tick, wired to the production adapter, verifier and integrator."""
+    """One mechanical tick: provisioning phase, then ordinary reconcile."""
+
+    binder = LeaseBinder(state_dir)
+    job = jobs.load_job(state_dir, job_id, recover=False)
+    # The crash window between "wave accepted and published" and "job saved" is
+    # closed before anything else: adopt the accepted record, persist it, and
+    # point the durable ref back at the accepted head so a restart can neither
+    # integrate the same work twice nor build the next wave on the wrong base.
+    if jobs.recover_integration(state_dir, job):
+        jobs.save_job(state_dir, job)
+    head = _last_accepted_head(job)
+    if head and Path(repo).exists():
+        _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+    job = _hydrate_contracts(state_dir, job, repo)
+
+    from . import provision_bind
+
+    required = [task for task in job.get("tasks") or [] if isinstance(task.get("provision"), Mapping)]
+    if required and provisioner is None:
+        # A provisioning-required task must never fall back to the legacy path.
+        return {"status": "blocked", "action": "provision", "transitions": [],
+                "detail": "this job requires provisioning but no provisioner was supplied; refusing to dispatch",
+                "evidence": {"tasks": [str(task["task_id"]) for task in required]},
+                "exactly_once": False, "handoff": None}
+
+    if provisioner is not None:
+        outcome = provision_bind.advance(state_dir, job, provisioner=provisioner, expect_host=expect_host)
+        job = jobs.load_job(state_dir, job_id)
+        if outcome.get("blocked"):
+            return {"status": "uncertain", "action": "provision", "transitions": [],
+                    "detail": "provisioning outcome is uncertain; reconciled by receipt lookup, not re-POSTed",
+                    "evidence": outcome, "exactly_once": False, "handoff": None}
+        unbound = [task["task_id"] for task in job.get("tasks") or []
+                   if isinstance(task.get("provision"), Mapping) and not (task.get("binding") or {}).get("receipt_digest")]
+        if unbound:
+            return {"status": "blocked", "action": "provision", "transitions": [],
+                    "detail": f"tasks {unbound} are not bound to a verified receipt; refusing to dispatch",
+                    "evidence": outcome, "exactly_once": False, "handoff": None}
 
     adapter = LauncherAdapter(client)
-    binder = LeaseBinder(state_dir)
-    job = jobs.load_job(state_dir, job_id)
-    job = _hydrate_contracts(state_dir, job, repo)
+    bindings = provision_bind.bindings_for(job)
+    validators = {}
+    if provisioner is not None:
+        for task in job.get("tasks") or []:
+            binding_doc = task.get("binding")
+            if not isinstance(binding_doc, Mapping) or not binding_doc.get("receipt_digest"):
+                continue
+            key = provision_bind.stable_key(str(job_id), str(task["task_id"]))
+
+            def _check(binding_doc=binding_doc, key=key):
+                receipt = provisioner.authoritative_receipt(
+                    key, expect_repo=str(binding_doc["repo"]), expect_rev=str(binding_doc["source_rev"]),
+                    expect_profile=str(binding_doc["profile"]), expect_project=str(binding_doc["project"]),
+                    expect_host=str(binding_doc["host"]),
+                )
+                from . import provisioning as _P
+
+                _P.Binding(**{k: binding_doc[k] for k in ("repo", "source_rev", "host", "profile", "project", "receipt_digest", "contract_sha256")},
+                           workspace=binding_doc.get("workspace") or "").validate(receipt, contract_sha256=str(binding_doc["contract_sha256"]))
+
+            validators[str(task["task_id"])] = _check
+    if bindings:
+        adapter = provision_bind.BoundLauncher(adapter, bindings, validators)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
         from . import acdd_cli
@@ -259,7 +552,7 @@ def tick(
                 contract_declared=declared,
             )
         except verify_local.VerifyError as exc:
-            return {"ok": False, "evidence": f"{exc.code}: {exc.message}"}
+            return {"ok": False, "evidence": _failure_evidence(exc, tests)}
         return {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}
 
     def integrator(job_doc: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -272,7 +565,14 @@ def tick(
             )
         except (integrate_job.IntegrateError, Exception) as exc:  # noqa: BLE001 - reported as a failed wave
             return {"ok": False, "evidence": f"integration error: {exc}"}
-        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or "")}
+        commit = ""
+        ref = result.get("integration_ref")
+        if ref:
+            import subprocess as _sp
+
+            head = _sp.run(["git", "-C", str(repo), "rev-parse", str(ref)], capture_output=True, text=True)
+            commit = head.stdout.strip() if head.returncode == 0 else ""
+        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or ""), "commit": commit}
 
     result = reconcile.tick(
         state_dir,
@@ -284,6 +584,7 @@ def tick(
         now=now,
     )
     handoff = record_handoff(state_dir, job_id, result)
+    _after_dispatch(state_dir, job_id, result)
     payload = {
         "status": result.status,
         "action": result.action,
@@ -291,9 +592,31 @@ def tick(
         "detail": result.detail,
         "evidence": result.evidence,
         "exactly_once": result.exactly_once,
+        "work_state": result.work_state,
+        "work_id": result.work_id,
         "handoff": handoff,
     }
     return payload
+
+
+def _failure_evidence(exc: Any, tests: Sequence[str]) -> str:
+    """The verifier's own evidence, with an unusable selector named as such.
+
+    A named test run that collects nothing is not a failed implementation: no
+    patch can make a selector that does not exist pass. The verifier is the only
+    component that knows which selection it ran, so it records that fact as the
+    leading evidence code instead of leaving a bare ``tests_failed`` for the
+    coordinator to guess about.
+    """
+
+    message = f"{exc.code}: {exc.message}"
+    tail = str(getattr(exc, "message", "") or "").lower()
+    if getattr(exc, "code", "") == "tests_failed" and (
+        "no tests ran" in tail or "collected 0 items" in tail or "no tests collected" in tail
+    ):
+        named = ", ".join(str(item) for item in tests) or "(no test selection)"
+        return f"test_unresolved: no test was collected for {named}; {message}"
+    return message
 
 
 def _patch_text(envelope: Mapping[str, Any]) -> str | None:
@@ -341,7 +664,23 @@ def status(state_dir: Path, job_id: str) -> dict[str, Any]:
     }
 
 
-def report(state_dir: Path, job_id: str) -> dict[str, Any]:
+def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False) -> dict[str, Any]:
+    """Write and print the job acceptance report, bound to a RETURN packet.
+
+    The shallow report at ``jobs/<job>.report.json`` keeps its keys and gains a
+    ``return`` block naming the durable ``jobs/<job>/return.json`` manifest, its
+    ``RETURN.md`` rendering and the ``evidence_digest`` that binds them to the
+    evidence. Building the RETURN validates every durable relationship first, so
+    a corrupt or contradictory job is refused instead of reported as accepted.
+
+    With ``verify``, nothing is written: the durable state is rebuilt and
+    compared against the on-disk RETURN, and a mismatch raises
+    ``report_tampered``.
+    """
+
+    if verify:
+        return return_report.verify(state_dir, job_id, repo=repo)
+
     job = jobs.load_job(state_dir, job_id)
     rows = []
     for task in job.get("tasks", []):
@@ -356,6 +695,7 @@ def report(state_dir: Path, job_id: str) -> dict[str, Any]:
                 "verified": bool((record or {}).get("ok")),
             }
         )
+    manifest = return_report.build(state_dir, job_id, repo=repo)
     payload = {
         "job_id": job_id,
         "goal": job.get("goal", {}),
@@ -363,9 +703,25 @@ def report(state_dir: Path, job_id: str) -> dict[str, Any]:
         "integration": job.get("integration", {}),
         "escalations": job.get("escalations", []),
         "measurements": {"tokens": "UNKNOWN", "cost": "UNKNOWN"},
+        "return": {
+            "schema": manifest["schema"],
+            "evidence_digest": manifest["evidence_digest"],
+            "path": f"{jobs.JOBS_DIR}/{job_id}/{return_report.RETURN_FILE}",
+            "markdown": f"{jobs.JOBS_DIR}/{job_id}/{return_report.RENDER_FILE}",
+            "acceptance": {
+                item["id"] or item["statement"]: item["status"] for item in manifest["acceptance"]
+            },
+        },
+        # Local-only checks, kept out of the RETURN so the digest stays a pure
+        # function of the durable state: a receiver re-runs them from the commit
+        # ids the manifest names.
+        "checks": {
+            "repository": str(repo) if repo is not None else None,
+            "commit_presence": "verified" if repo is not None else "skipped: no --repo supplied",
+        },
     }
-    target = Path(state_dir) / "jobs" / f"{job_id}.report.json"
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    target = Path(state_dir) / jobs.JOBS_DIR / f"{job_id}.report.json"
+    return_report.write_document(target, json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n")
     return payload
 
 
@@ -409,6 +765,20 @@ def add_parsers(subparsers: Any) -> None:
     tick.add_argument("--gitleaks", default=None)
     tick.add_argument("--state-dir", default=None)
     tick.set_defaults(command="job", job_handler="tick")
+    queue = sub.add_parser("queue", help="Feature queue: status, run --once, inspect, doctor.")
+    qsub = queue.add_subparsers(dest="queue_handler")
+    qsub.add_parser("status")
+    run = qsub.add_parser("run")
+    run.add_argument("--once", action="store_true", help="One deterministic pass (required for now).")
+    run.add_argument("--repo", required=True, help="Repository worktree used by verification/integration.")
+    run.add_argument("--state-dir", default=None)
+    run.add_argument("--gitleaks", default=None, help="Scanner executable; defaults to PATH or queue.gitleaks in config.")
+    run.add_argument("--backend", choices=["json", "kanban"], default="json",
+                     help="Queue backend. json is the deterministic local/test store; kanban uses the configured CLI.")
+    inspect = qsub.add_parser("inspect")
+    inspect.add_argument("feature_id")
+    qsub.add_parser("doctor")
+    queue.set_defaults(command="queue")
 
     note = sub.add_parser("note", help="Record a decision for the pending handoff.")
     note.add_argument("--job-id", required=True)
@@ -421,15 +791,118 @@ def add_parsers(subparsers: Any) -> None:
     pending.add_argument("--state-dir", default=None)
     pending.set_defaults(command="job", job_handler="agent-pending")
 
-    rep = sub.add_parser("report", help="Write and print the job acceptance report.")
+    rec = sub.add_parser("recover", help="Print or record the recovery request for a rejected task.")
+    rec.add_argument("--job-id", required=True)
+    rec.add_argument("--state-dir", default=None)
+    rec.add_argument("--repo", default=None, help="Repository whose integration ref should be restored.")
+    choice = rec.add_mutually_exclusive_group()
+    choice.add_argument("--decision-file", default=None,
+                        help="JSON decision to validate and record against its request.")
+    choice.add_argument("--deterministic", action="store_true",
+                        help="Record the deterministic adapter's decision for every outstanding request.")
+    choice.add_argument("--hermes", action="store_true",
+                        help="Ask the configured Hermes model for one strict JSON proposal per outstanding "
+                             "request; the pinned validator still decides whether it may be recorded.")
+    choice.add_argument("--hermes-adopt", action="store_true",
+                        help="Adopt an already-recorded Hermes proposal after a crash: re-hash, reparse and "
+                             "validate it, without asking the model again.")
+    rec.add_argument("--hermes-timeout", type=int, default=300,
+                     help="Seconds one Hermes proposal turn may take (default 300); a timeout decides nothing.")
+    rec.add_argument("--hermes-model", default=None, help="Model for --hermes (default: the configured one).")
+    rec.add_argument("--hermes-provider", default=None,
+                     help="Provider for --hermes (default: the configured one).")
+    rec.set_defaults(command="job", job_handler="recover")
+
+    rep = sub.add_parser("report", help="Write and print the job acceptance report plus its RETURN packet.")
     rep.add_argument("--job-id", required=True)
     rep.add_argument("--state-dir", default=None)
+    rep.add_argument("--repo", default=None,
+                     help="Repository used to prove every recorded verification commit exists.")
+    rep.add_argument("--verify", action="store_true",
+                     help="Rebuild the RETURN from durable state and compare evidence_digest; writes nothing.")
     rep.set_defaults(command="job", job_handler="report")
 
 
-def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
+def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
+    from . import queue as queue_mod
+
+    config = {}
+    getter = getattr(ctx, "config", None)
+    if isinstance(getter, Mapping):
+        config = dict(getter)
+    queue_file = Path((config.get("queue") or {}).get("file") or (Path(state_dir) / "queue.json"))
+    backend_name = getattr(args, "backend", "json")
+    if backend_name == "kanban":
+        import shutil
+        import subprocess
+
+        hermes = shutil.which("hermes")
+        if hermes is None:
+            print(json.dumps({"error": "kanban_unavailable", "detail": "the hermes CLI is not on PATH"}, indent=2))
+            return 2
+        backend = queue_mod.KanbanQueue(lambda argv: subprocess.run([hermes, *argv], capture_output=True, text=True))
+    else:
+        backend = queue_mod.JsonQueue(queue_file)
+    handler = getattr(args, "queue_handler", None)
+
+    if handler == "status":
+        items = backend.list_items()
+        print(json.dumps({"queue": str(queue_file), "items": [
+            {"feature_id": item.feature_id, "status": item.status, "job_id": item.job_id,
+             "repo": item.repo, "depends_on": list(item.depends_on)} for item in items]}, indent=2))
+        return 0
+
+    if handler == "inspect":
+        record = queue_mod.QueueStore(state_dir).read(args.feature_id)
+        if record is None:
+            print(json.dumps({"error": "not_claimed", "feature_id": args.feature_id}, indent=2))
+            return 1
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return 0
+
+    if handler == "doctor":
+        enabled = bool((config.get("provisioning") or {}).get("enabled"))
+        print(json.dumps({"state_dir": str(state_dir), "queue": str(queue_file),
+                          "queue_exists": queue_file.exists(), "provisioning_enabled": enabled,
+                          "items": len(backend.list_items())}, indent=2))
+        return 0
+
+    if handler == "run":
+        if not args.once:
+            print(json.dumps({"error": "loop_not_enabled", "detail": "--once is required; no daemon or cron is installed"}, indent=2))
+            return 2
+        client = client_factory()
+        provisioner = provisioner_factory() if provisioner_factory is not None else None
+        scanner = getattr(args, "gitleaks", None) or (config.get("queue") or {}).get("gitleaks")
+        if not scanner:
+            import shutil
+
+            scanner = shutil.which("gitleaks")
+        if not scanner:
+            # Verification requires the scanner; refuse before claiming anything.
+            print(json.dumps({"error": "gitleaks_unavailable",
+                              "detail": "queue run requires gitleaks; install it or set --gitleaks"}, indent=2))
+            return 2
+
+        def one_tick(job_id: str):
+            return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner,
+                        gitleaks=scanner)
+
+        handoff_context = None
+        mirror = (config.get("transport") or {}).get("mirror")
+        if mirror:
+            handoff_context = {"worktree": str(Path(args.repo)), "mirror": str(mirror),
+                               "repo_identity": str((config.get("queue") or {}).get("repo") or "")}
+        result = queue_mod.run_once(state_dir, backend, tick=one_tick, handoff_context=handoff_context)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print(json.dumps({"error": "queue_handler_required"}, indent=2))
+    return 2
+
+
+def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     handler = getattr(args, "job_handler", None)
-    job_id = getattr(args, "job_id", None)
+    job_id = str(getattr(args, "job_id", None) or "")
     try:
         if handler == "authorize":
             record = jobs.record_authorization(
@@ -457,7 +930,9 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
 
         if handler == "tick":
             client = client_factory()
-            result = tick(state_dir, job_id, client=client, repo=Path(args.repo), gitleaks=args.gitleaks)
+            provisioner = provisioner_factory() if provisioner_factory is not None else None
+            result = tick(state_dir, job_id, client=client, repo=Path(args.repo), gitleaks=args.gitleaks,
+                          provisioner=provisioner)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
@@ -472,12 +947,34 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory) -> int:
                 print(prompt)
             return 0
 
+        if handler == "recover":
+            result = recover(
+                state_dir,
+                job_id,
+                Path(args.repo) if getattr(args, "repo", None) else None,
+                decision_file=getattr(args, "decision_file", None),
+                adapter="deterministic" if getattr(args, "deterministic", False) else None,
+                hermes=bool(getattr(args, "hermes", False)),
+                hermes_adopt=bool(getattr(args, "hermes_adopt", False)),
+                hermes_timeout=int(getattr(args, "hermes_timeout", 300) or 300),
+                hermes_model=getattr(args, "hermes_model", None),
+                hermes_provider=getattr(args, "hermes_provider", None),
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+
         if handler == "report":
-            print(json.dumps(report(state_dir, job_id), indent=2, sort_keys=True))
+            repo = Path(args.repo) if getattr(args, "repo", None) else None
+            if getattr(args, "verify", False):
+                result = report(state_dir, job_id, repo=repo, verify=True)
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 0 if result.get("ok") else 1
+            print(json.dumps(report(state_dir, job_id, repo=repo), indent=2, sort_keys=True))
             return 0
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")
-    except (JobCliError, jobs.JobError, reconcile.ReconcileError, verify_local.VerifyError) as exc:
+    except (JobCliError, jobs.JobError, reconcile.ReconcileError, recovery.RecoveryError,
+            verify_local.VerifyError, return_report.ReturnError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
         return 1
 

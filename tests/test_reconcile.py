@@ -230,7 +230,8 @@ class Contract:
     def test_tickresult_is_the_frozen_dataclass_from_the_contract(self):
         assert dataclasses.is_dataclass(rec.TickResult)
         names = [field.name for field in dataclasses.fields(rec.TickResult)]
-        assert names == ["status", "transitions", "action", "detail", "exactly_once", "evidence"]
+        assert names == ["status", "transitions", "action", "detail", "exactly_once", "evidence",
+                         "work_state", "work_id"]
 
         result = rec.TickResult(status="idle")
         with pytest.raises(dataclasses.FrozenInstanceError):

@@ -30,12 +30,14 @@ try:  # POSIX advisory locks; bundlebees targets Linux and CI is ubuntu
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback keeps O_EXCL
     fcntl = None  # type: ignore[assignment]
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from . import agent_work as work_queue
 from . import job as jobs
+from . import recovery as recoveries
 from .brief import BriefError, validate_brief
 
 DEFAULT_GRACE_S = 60.0
@@ -104,6 +106,9 @@ class TickResult:
     detail: str = ""
     exactly_once: bool = False
     evidence: str = ""
+    #: The durable agent-work state for this job's outstanding request, if any.
+    work_state: str = ""
+    work_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -513,9 +518,32 @@ def tick(
         return TickResult(status="locked", detail="another live tick holds the job lock")
     try:
         job = jobs.load_job(Path(state_dir), job_id)
+        # Durable work publication is an observer of the mechanical tick, never a
+        # gate on it: a broken queue must not stop reconciliation from running.
+        work_item: dict[str, Any] | None = None
+        work_error = ""
+        try:
+            published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
+            work_item = _work_item_for(Path(state_dir), job, published)
+        except Exception as exc:  # noqa: BLE001 - publication must not block the tick
+            work_error = str(getattr(exc, "code", None) or type(exc).__name__)
         result = _run(
             Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder
         )
+        try:
+            published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
+            work_item = _work_item_for(Path(state_dir), job, published) or work_item
+        except Exception as exc:  # noqa: BLE001 - a request created this tick may be unpublishable
+            work_error = work_error or str(getattr(exc, "code", None) or type(exc).__name__)
+        work_state = str((work_item or {}).get("state") or "")
+        if not work_state and work_error:
+            work_state = "publish_failed"
+        if work_state or work_item:
+            result = replace(
+                result,
+                work_state=work_state,
+                work_id=str((work_item or {}).get("work_id") or ""),
+            )
         if lock.stolen:
             result = TickResult(
                 status=result.status,
@@ -524,6 +552,8 @@ def tick(
                 detail=(result.detail + f" [{lock.stolen}]").strip(),
                 exactly_once=result.exactly_once,
                 evidence=result.evidence,
+                work_state=result.work_state,
+                work_id=result.work_id,
             )
         return result
     finally:
@@ -562,10 +592,16 @@ def _run(
         if outcome is not None:
             return outcome
 
-    # 2. Reap terminal attempts.
-    changed = _reap(job, attempts, transitions)
+    # 2. Recovery: a rejected task advances only under a validated decision.
+    outcome, applied = _apply_recovery(state_dir, job, clock, transitions)
+    if outcome is not None:
+        jobs.save_job(state_dir, job)
+        return outcome
 
-    # 3. One heavy operation at most: integrate, else verify.
+    # 3. Reap terminal attempts.
+    changed = _reap(state_dir, job, attempts, transitions, clock)
+
+    # 4. One heavy operation at most: integrate, else verify.
     integration = job.setdefault("integration", {"wave": 1, "state": "pending"})
     in_flight = {"dispatching", "dispatched", "running", "verifying"}
     wave_ready = (
@@ -590,11 +626,11 @@ def _run(
 
     verifying = next((t for t in job["tasks"] if t.get("state") == "verifying"), None)
     if verifying is not None and verifier is not None:
-        result = _verify(state_dir, job, verifying, verifier, transitions)
+        result = _verify(state_dir, job, verifying, verifier, transitions, clock)
         jobs.save_job(state_dir, job)
         return result
 
-    # 4. Dispatch ready tasks (a batch; the heavy-operation rule is about verify).
+    # 5. Dispatch ready tasks (a batch; the heavy-operation rule is about verify).
     if verifying is None:
         dispatched_before = len(transitions)
         outcome = _dispatch_ready(state_dir, job, adapter, clock, transitions, binder)
@@ -607,7 +643,22 @@ def _run(
 
     if changed or transitions:
         jobs.save_job(state_dir, job)
-        return TickResult(status="ok", transitions=tuple(transitions), action="reap")
+        action = "recovery" if applied and not changed else "reap"
+        return TickResult(status="ok", transitions=tuple(transitions), action=action)
+    # Nothing else to do: say plainly that a rejection is waiting on a decision
+    # rather than reporting a bare idle. No corrective attempt is dispatched.
+    pending = _pending_recovery(state_dir, job)
+    if pending is not None:
+        failure = pending.get("failure") if isinstance(pending.get("failure"), Mapping) else {}
+        return TickResult(
+            status="awaiting_decision",
+            action="recovery",
+            detail=(
+                f"{pending.get('task_id')}: {failure.get('class')}/{failure.get('code')} rejection is waiting "
+                f"for a validated decision ({pending.get('request_id')}); no corrective attempt is dispatched"
+            ),
+            evidence=str(pending.get("request_id") or ""),
+        )
     return TickResult(status="idle", detail="nothing to do")
 
 
@@ -727,6 +778,120 @@ def _reconcile_uncertain(
     )
 
 
+# --- recovery --------------------------------------------------------------
+
+
+def _work_item_for(
+    state_dir: Path,
+    job: Mapping[str, Any],
+    published: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """The item whose state this tick reports: active first, else the newest.
+
+    A decision recorded outside the queue does not erase its work item; the
+    consumer still has to close it. Reading the durable items keeps the tick
+    honest about that instead of reporting "no work" once a decision exists.
+    """
+
+    if published:
+        return dict(published[0])
+    try:
+        items = work_queue.list(Path(state_dir), job_id=str(job.get("job_id") or ""))
+    except work_queue.WorkError:
+        return None
+    if not items:
+        return None
+    active = [item for item in items if str(item.get("state") or "") in {"pending", "claimed"}]
+    return active[0] if active else items[-1]
+
+
+def _authorization_for(state_dir: Path, job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The sealed authorization that bounds recovery, or ``None`` if absent.
+
+    A missing authorization is not permission: the envelope then falls back to
+    its documented default rather than to anything the task asked for.
+    """
+
+    try:
+        return jobs.load_authorization(Path(state_dir), str(job.get("job_id") or ""))
+    except jobs.JobError:
+        return None
+
+
+def _record_failure(
+    state_dir: Path,
+    job: Mapping[str, Any],
+    task: Mapping[str, Any],
+    record: Mapping[str, Any],
+    clock: float,
+) -> dict[str, Any] | None:
+    """Persist the durable recovery request for a rejection, exactly once.
+
+    The request is written *before* the rejection is committed, so a task can
+    never be left rejected with no recorded path forward. Calling this again for
+    the same attempt and evidence code returns the request already on disk.
+    """
+
+    try:
+        return recoveries.build_request(
+            Path(state_dir),
+            job,
+            task,
+            failure=dict(record),
+            authorization=_authorization_for(state_dir, job),
+            now=clock,
+        )
+    except recoveries.RecoveryError as exc:
+        raise ReconcileError(exc.code, exc.message, exc.fix) from exc
+
+
+def _apply_recovery(
+    state_dir: Path,
+    job: dict[str, Any],
+    clock: float,
+    transitions: list[str],
+) -> tuple[TickResult | None, list[dict[str, Any]]]:
+    """Apply every validated decision; escalate what cannot dispatch.
+
+    A retry or supersede appends the task's return to ``dispatching`` so the
+    dispatch step below can issue exactly one corrective attempt in this tick.
+    """
+
+    try:
+        applied = recoveries.apply_ready_decisions(state_dir, job, now=clock)
+    except recoveries.RecoveryError as exc:
+        raise ReconcileError(exc.code, exc.message, exc.fix) from exc
+    except jobs.JobError as exc:
+        raise ReconcileError(exc.code, exc.message, exc.fix) from exc
+
+    escalations = [item for item in applied if item.get("decision") == "escalate"]
+    if escalations:
+        item = escalations[0]
+        return (
+            TickResult(
+                status="escalated",
+                transitions=tuple(transitions),
+                action="needs_approval",
+                detail=f"{item['task_id']}: {item.get('detail') or 'recovery escalated'}",
+                evidence="recovery_escalated",
+            ),
+            applied,
+        )
+    for item in applied:
+        if item.get("transition"):
+            transitions.append(str(item["transition"]))
+    return None, applied
+
+
+def _pending_recovery(state_dir: Path, job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The newest request still waiting for a decision, if any."""
+
+    try:
+        return recoveries.outstanding(state_dir, job)
+    except recoveries.RecoveryError as exc:
+        raise ReconcileError(exc.code, exc.message, exc.fix) from exc
+
+
 def _escalate(
     state_dir: Path,
     job: dict[str, Any],
@@ -790,7 +955,13 @@ def _to_dispatched(job: dict[str, Any], task: dict[str, Any], reason: str) -> No
 # --- reap / verify / integrate --------------------------------------------
 
 
-def _reap(job: dict[str, Any], attempts: Sequence[Mapping[str, Any]], transitions: list[str]) -> bool:
+def _reap(
+    state_dir: Path,
+    job: dict[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+    transitions: list[str],
+    clock: float,
+) -> bool:
     by_id: dict[str, Mapping[str, Any]] = {}
     for entry in attempts:
         attempt_id = _attempt_id(entry)
@@ -811,6 +982,15 @@ def _reap(job: dict[str, Any], attempts: Sequence[Mapping[str, Any]], transition
             transitions.append(f"{task['task_id']}->verifying")
             changed = True
         elif state in {"failed", "cancelled", "canceled", "error"} and current in {"dispatched", "running"}:
+            # A dead worker is recorded as a rejection too: without a durable
+            # request the task would sit rejected with nothing able to move it.
+            _record_failure(
+                state_dir,
+                job,
+                task,
+                {"code": "worker_failed", "evidence": f"worker ended {state}"},
+                clock,
+            )
             jobs.transition(job, str(task["task_id"]), "rejected", actor="reconciler", reason=f"worker ended {state}")
             transitions.append(f"{task['task_id']}->rejected")
             changed = True
@@ -847,6 +1027,7 @@ def _verify(
     task: dict[str, Any],
     verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     transitions: list[str],
+    clock: float,
 ) -> TickResult:
     task_id = str(task["task_id"])
     attempt_id = (task.get("attempts") or [None])[-1]
@@ -856,6 +1037,15 @@ def _verify(
         jobs.transition(job, task_id, "verified", actor="reconciler", reason=evidence, evidence=evidence)
         transitions.append(f"{task_id}->verified")
         return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} verified")
+    # The rejection is only durable once its reason is: the recovery request is
+    # written first, and a rejection with no recorded path forward never happens.
+    # A legacy job that never froze a contract cannot carry a canonical request;
+    # it rejects exactly as it did before M4 and never dispatches a correction.
+    try:
+        _record_failure(state_dir, job, task, {"ok": False, "evidence": evidence, "attempt_id": attempt_id}, clock)
+    except ReconcileError as exc:
+        if exc.code != "recovery_not_applicable":
+            raise
     jobs.transition(job, task_id, "rejected", actor="reconciler", reason=evidence or "verifier rejected", evidence=evidence)
     transitions.append(f"{task_id}->rejected")
     return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} rejected")
@@ -903,6 +1093,8 @@ def _integrate(
     integration["attempts"] = int(integration.get("attempts") or 0) + 1
     integration["evidence"] = evidence
     integration["state"] = "accepted" if ok else "failed"
+    if ok and isinstance(verdict.get("commit"), str) and verdict["commit"]:
+        integration["last_commit"] = verdict["commit"]
 
     if ok:
         # Accept the wave, then open the next one so dependants can complete.
@@ -914,7 +1106,8 @@ def _integrate(
                 transitions.append(f"{task_id}->accepted")
         wave = _wave_number(integration)
         accepted = list(integration.get("accepted_waves") or [])
-        accepted.append({"wave": wave, "at": _iso(clock), "evidence": evidence})
+        accepted.append({"wave": wave, "at": _iso(clock), "evidence": evidence,
+                         "commit": integration.get("last_commit") or ""})
         integration.update(
             accepted_waves=accepted,
             wave=wave + 1,
@@ -965,6 +1158,13 @@ def _dispatch_ready(
     states = {t.get("task_id"): t.get("state") for t in job["tasks"]}
     for task in job["tasks"]:
         state = task.get("state")
+        if isinstance(task.get("provision"), Mapping) and not str(
+            (task.get("binding") or {}).get("receipt_digest") or ""
+        ):
+            # Provisioning runs before reconcile. A task whose binding was dropped
+            # by a contract supersession must be re-provisioned under the corrected
+            # contract before it may dispatch again.
+            continue
         if state in {"pending", "dispatching"}:
             intent = _intent_for(state_dir, job, task)
             if intent is not None and intent.get("status") == INTENT_ESCALATED:
@@ -1006,6 +1206,11 @@ def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any
     }
     if isinstance(contract, Mapping):
         brief["contract"] = dict(contract)
+    binding = task.get("binding")
+    if isinstance(binding, Mapping) and binding.get("project"):
+        # The launcher dispatches into this project; without it the worker falls
+        # back to a default, which is exactly the failure this binding prevents.
+        brief["project"] = str(binding["project"])
     try:
         validate_brief(brief)
     except BriefError as exc:

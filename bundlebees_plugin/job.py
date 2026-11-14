@@ -5,6 +5,21 @@ lives in a separate document written through an interactive path, and a job may
 only narrow it. Everything here is plain JSON on disk, signed with the same key
 the lease records use, written atomically and readable after a crash.
 
+Recovery permission is not implicit either. An authorization may carry a sealed
+``recovery`` block — attempts, corrections, the exact replacement selectors, the
+file and test scope a correction may touch, and the human gates that stay in
+force — and that block is part of the signed body, digested, and pinned into the
+job document when the job is admitted. A job or task ``recovery_policy`` may
+only restate a permission to narrow it (``min`` for attempts and corrections,
+intersection for selectors and scopes, union for gates). An authorization with
+no block grants no retry and no correction at all.
+
+The seal is an HMAC over canonical JSON with a key file in the state directory.
+It is tamper *evidence* for a reader of that directory, not OS isolation: any
+principal that can read the key can seal a new authorization. The separate
+interactive path exists so a coordinator cannot mint authority for itself, not
+to defend against a principal that already owns the state directory.
+
 Refusal codes are stable strings, because a coordinator that cannot tell "the
 file was edited" from "the scope was widened" cannot respond correctly.
 """
@@ -16,8 +31,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
+
+from . import packets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -151,9 +169,74 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
         raise
 
 
+def _without_seal(body: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in body.items() if k != "seal"}
+
+
+def _create_only(path: Path, payload: bytes, mode: int = 0o400) -> bool:
+    """Publish a document only if it does not exist yet.
+
+    The bytes are written in full to a private temporary file and then linked
+    into place, which fails atomically when the target exists. Two concurrent
+    writers therefore cannot both believe they created the document, and a
+    crash mid-write can never leave a half-written document where a reader
+    would take it for authority.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        except OSError:
+            # Filesystems without hard links: exclusive create is still atomic.
+            try:
+                direct = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            except FileExistsError:
+                return False
+            with os.fdopen(direct, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return True
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _seal(body: Mapping[str, Any], key: bytes) -> dict[str, Any]:
     document = dict(body)
     return {"body": document, "mac": _sign(document, key)}
+
+
+def verify_seal(body: Mapping[str, Any], key: bytes, what: str) -> dict[str, Any]:
+    """Verify a sealed object already in memory (used by sealed policy files)."""
+    provided = body.get("seal")
+    expected = hmac.new(key, _canonical(_without_seal(body)), hashlib.sha256).hexdigest()
+    if not isinstance(provided, str) or not hmac.compare_digest(provided, expected):
+        raise JobError("seal_invalid", f"the {what} seal does not verify", "Refuse it; re-enroll from a trusted copy.")
+    return _without_seal(body)
+
+
+def open_sealed(envelope: Mapping[str, Any], key: bytes, what: str) -> dict[str, Any]:
+    """Open the on-disk ``{"body", "mac"}`` envelope and verify it."""
+    body, mac = envelope.get("body"), envelope.get("mac")
+    if not isinstance(body, Mapping) or not isinstance(mac, str):
+        raise JobError("seal_invalid", f"the {what} envelope is malformed", "Refuse it.")
+    expected = hmac.new(key, _canonical(body), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        raise JobError("seal_invalid", f"the {what} seal does not verify", "Refuse it; re-enroll from a trusted copy.")
+    return dict(body)
 
 
 def _unseal(path: Path, key: bytes, what: str) -> dict[str, Any]:
@@ -183,6 +266,188 @@ def _unseal(path: Path, key: bytes, what: str) -> dict[str, Any]:
 # Authorizations — written only through an interactive path
 # ---------------------------------------------------------------------------
 
+#: The exact fields a sealed authorization's ``recovery`` block may carry.
+#: Every one of them is a permission: a job or task ``recovery_policy`` may
+#: restate a subset to *narrow* the ceiling, and can never add a field or a
+#: value the approver did not name.
+RECOVERY_FIELDS: tuple[str, ...] = (
+    "max_attempts_per_task",
+    "contract_corrections_allowed",
+    "corrected_tests_allowed",
+    "file_scope",
+    "test_scope",
+    "gates",
+)
+
+#: v1 caps the attempt ceiling at five total attempts and one correction.
+RECOVERY_MAX_ATTEMPTS = 5
+
+#: A selector is a test path with an optional ``::node`` suffix: the path part
+#: carries no whitespace, and the node part carries no newline.
+_SELECTOR_RE = re.compile(r"^[^:\s]+(::[^\n]+)?$")
+
+
+def recovery_digest(recovery: Mapping[str, Any] | None) -> str:
+    """SHA-256 over one canonical recovery block.
+
+    The digest is stored *inside* the sealed authorization body and pinned in
+    the job's authorization reference, so a recovery block that is rewritten
+    after the approval — even by re-sealing the authorization with the state
+    key — no longer matches what the job was admitted under.
+
+    This is tamper *evidence*, not isolation: the state key is a file readable
+    by the OS principal that runs the coordinator, so a principal with that
+    access can mint a whole new authorization. Nothing here claims OS-level
+    separation between the approver and the coordinator.
+    """
+
+    return hashlib.sha256(_canonical(dict(recovery or {}))).hexdigest()
+
+
+def _selector(value: Any, where: str) -> str:
+    text = str(value or "").strip()
+    if not text or not _SELECTOR_RE.fullmatch(text) or text.startswith("/") or ".." in Path(text).parts:
+        raise JobError(
+            "authorization_incomplete",
+            f"{where} must be one test selector (path or path::node), not {value!r}",
+            _FIX_AUTH,
+        )
+    return text
+
+
+def _recovery_envelope(
+    value: Mapping[str, Any] | None, *, gates: Sequence[str], scope: Sequence[str]
+) -> dict[str, Any]:
+    """Validate and normalise the recovery ceiling an approver types in.
+
+    Nothing is inferred. Every permission an envelope can carry — attempts,
+    corrections, the exact replacement selectors, the file and test scope a
+    correction may touch, and the human gates that stay in force — must be
+    named by the approver. A block that budgets a correction without naming its
+    selectors, its file scope and its test scope is refused rather than filled
+    in from the job or the contract: those documents are the thing this ceiling
+    exists to bound.
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise JobError("authorization_incomplete", "recovery must be a mapping", _FIX_AUTH)
+    unknown = sorted(set(value) - set(RECOVERY_FIELDS))
+    if unknown:
+        raise JobError(
+            "authorization_incomplete",
+            "unknown recovery field(s): " + ", ".join(unknown),
+            "Enroll only the documented recovery ceiling fields; an unknown field is never a permission.",
+        )
+    out: dict[str, Any] = {}
+    attempts = value.get("max_attempts_per_task")
+    if attempts is not None:
+        if (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or not 1 <= attempts <= RECOVERY_MAX_ATTEMPTS
+        ):
+            raise JobError(
+                "authorization_incomplete",
+                f"recovery.max_attempts_per_task must be an integer from 1 to {RECOVERY_MAX_ATTEMPTS}",
+                _FIX_AUTH,
+            )
+        out["max_attempts_per_task"] = int(attempts)
+    corrections = value.get("contract_corrections_allowed")
+    if corrections is not None:
+        if isinstance(corrections, bool):
+            corrections = int(corrections)
+        if not isinstance(corrections, int) or corrections not in (0, 1):
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.contract_corrections_allowed must be the integer 0 or 1",
+                _FIX_AUTH,
+            )
+        out["contract_corrections_allowed"] = int(corrections)
+    allowed = value.get("corrected_tests_allowed")
+    if allowed is not None:
+        if not isinstance(allowed, (list, tuple)):
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.corrected_tests_allowed must be a list of test selections",
+                _FIX_AUTH,
+            )
+        out["corrected_tests_allowed"] = sorted(
+            {_selector(item, "recovery.corrected_tests_allowed[]") for item in allowed}
+        )
+    for name in ("file_scope", "test_scope"):
+        entries = value.get(name)
+        if entries is None:
+            continue
+        if not isinstance(entries, (list, tuple)):
+            raise JobError("authorization_incomplete", f"recovery.{name} must be a list of paths", _FIX_AUTH)
+        out[name] = _normalize_scope(entries)
+        if not out[name]:
+            raise JobError(
+                "authorization_incomplete",
+                f"recovery.{name} names no path, so it permits nothing",
+                _FIX_AUTH,
+            )
+    named_gates = value.get("gates")
+    if named_gates is not None:
+        if not isinstance(named_gates, (list, tuple)) or not all(
+            isinstance(gate, str) and gate.strip() for gate in named_gates
+        ):
+            raise JobError("authorization_incomplete", "recovery.gates must be a list of gate names", _FIX_AUTH)
+        normalized = sorted({_slug(gate) for gate in named_gates})
+        missing = sorted(set(gates) - set(normalized))
+        if missing:
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.gates removes the authorization gate(s): " + ", ".join(missing),
+                "A recovery block may add a human gate, never remove one.",
+            )
+        out["gates"] = normalized
+
+    budget = int(out.get("contract_corrections_allowed") or 0)
+    outside = [path for path in out.get("file_scope") or [] if not _covered(path, scope)]
+    if outside:
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.file_scope names path(s) outside the authorized scope: " + ", ".join(outside),
+            "A recovery ceiling may narrow the authorization, never reach past it.",
+        )
+    outside = [path for path in out.get("test_scope") or [] if not _covered(path, out.get("file_scope") or [])]
+    if outside:
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.test_scope names path(s) outside recovery.file_scope: " + ", ".join(outside),
+            "A corrected test must live in a file the recovery may already touch.",
+        )
+    if budget == 1:
+        for name in ("corrected_tests_allowed", "file_scope", "test_scope"):
+            if not out.get(name):
+                raise JobError(
+                    "authorization_incomplete",
+                    f"a contract correction needs an explicit recovery.{name}",
+                    "Name the replacement selectors and the files they may touch; nothing is inferred.",
+                )
+        outside = [
+            selector
+            for selector in out["corrected_tests_allowed"]
+            if not _covered(selector.split("::", 1)[0], out["test_scope"])
+        ]
+        if outside:
+            raise JobError(
+                "authorization_incomplete",
+                "recovery.corrected_tests_allowed names test(s) outside recovery.test_scope: "
+                + ", ".join(sorted(outside)),
+                _FIX_AUTH,
+            )
+    elif out.get("corrected_tests_allowed"):
+        raise JobError(
+            "authorization_incomplete",
+            "recovery.corrected_tests_allowed names replacements but no correction is budgeted",
+            "Grant both or neither; a test list with no budget authorises nothing.",
+        )
+    return out
+
 
 def record_authorization(
     state_dir: Path,
@@ -198,6 +463,7 @@ def record_authorization(
     require_tty: bool = True,
     interactive: bool | None = None,
     by: str | None = None,
+    recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Record one human authorization. Immutable once written.
 
@@ -233,14 +499,9 @@ def record_authorization(
         raise JobError("authorization_incomplete", "the wall-clock budget must be at least 60 s", _FIX_AUTH)
 
     path = authorization_path(state_dir, job_id)
-    if path.exists():
-        raise JobError(
-            "authorization_exists",
-            "an authorization already exists for this job id",
-            "Authorize a new job id; recorded authorizations are immutable.",
-        )
-
     key = _ensure_key(state_dir)
+    authorized_gates = sorted({_slug(gate) for gate in gates}) or ["merge"]
+    envelope = _recovery_envelope(recovery, gates=authorized_gates, scope=globs)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "authorization",
@@ -251,11 +512,24 @@ def record_authorization(
         "base_rev": str(base_rev).strip().lower(),
         "scope": globs,
         "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
-        "gates": sorted({_slug(gate) for gate in gates}) or ["merge"],
+        "gates": authorized_gates,
         "by": by or _current_user(),
         "at": _utc_now(),
+        # Always sealed, even when the block is empty: the digest is the pin a
+        # job is admitted under, and an empty ceiling is a fact worth proving.
+        "recovery_digest": recovery_digest(envelope),
     }
-    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
+    if envelope:
+        # The approver's recovery ceiling is part of the sealed authorization.
+        # A job or task policy may restate it to narrow it, never to widen it,
+        # and no job document is consulted for a permission.
+        body["recovery"] = envelope
+    if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        raise JobError(
+            "authorization_exists",
+            "an authorization already exists for this job id",
+            "Authorize a new job id; recorded authorizations are immutable.",
+        )
     return body
 
 
@@ -270,7 +544,188 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
             f"no authorization exists for job {job_id!r}",
             _FIX_AUTH,
         ) from exc
-    return _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    body = _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    block = body.get("recovery")
+    block = dict(block) if isinstance(block, Mapping) else {}
+    if "recovery" in body or "recovery_digest" in body:
+        stored = str(body.get("recovery_digest") or "")
+        if stored != recovery_digest(block):
+            # A block that was rewritten after the seal — with or without the
+            # state key — is not the ceiling the approver wrote. A recovery
+            # block without a digest is refused too: nothing can prove it.
+            raise JobError(
+                "authorization_recovery_altered",
+                f"the recovery block in authorization {body.get('auth_id')!r} does not match its sealed digest",
+                "Re-authorize the job interactively; a recovery ceiling is never repaired in place.",
+            )
+    # An authorization sealed before the digest existed carries neither key and
+    # therefore no recovery permission at all: it reads as the empty ceiling.
+    return body
+
+
+def _load_enrolled_policy(state_dir: Path, policy_id: str) -> tuple[dict[str, Any], str]:
+    """Load and verify the human-enrolled policy that is the root of this authority.
+
+    Imported lazily because the handoff module depends on this one at import time.
+    The policy is verified with the enrollment (approval) key, never with the
+    coordinator's job key, so a job-sealing key cannot mint authority here.
+    """
+
+    from . import handoff  # noqa: PLC0415 - breaks the import cycle by design
+
+    policy = handoff.load_policy(Path(state_dir), str(policy_id))
+    return policy, handoff.policy_digest(policy)
+
+
+_DERIVED_IDENTITY = (
+    "kind", "job_id", "statement", "repo", "base_rev", "scope", "budget", "gates",
+    "policy", "derived_from", "dependency_evidence", "descendant", "recovery_digest",
+)
+
+
+def _derived_identity(body: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: body.get(key) for key in _DERIVED_IDENTITY}
+
+
+def record_derived_authorization(
+    state_dir: Path,
+    *,
+    job_id: str,
+    parent_job_id: str,
+    statement: str,
+    repo: str,
+    candidate_rev: str,
+    scope: Sequence[str],
+    bees: int,
+    wall_clock_s: int,
+    policy_id: str,
+    dependency_feature: str = "",
+    dependent_feature: str = "",
+    dependency_evidence: Mapping[str, Any] | None = None,
+    gates: Sequence[str] = ("merge",),
+    by: str = "coordinator(derived)",
+) -> dict[str, Any]:
+    """Seal a narrow, derived authority for one dependent job.
+
+    This does not create authority: it records that an already-approved descendant
+    policy was resolved to a concrete commit by validated evidence. The ceiling is
+    the *sealed, enrolled* policy read back from disk — never a caller-supplied
+    scope — and every dimension (repository, dependency, scope, budget, gates,
+    dependency evidence, resolved revision) is compared against it.
+    """
+
+    policy, policy_digest = _load_enrolled_policy(state_dir, policy_id)
+    parent = load_authorization(state_dir, parent_job_id)
+
+    dependency_jobs = [str(item) for item in policy.get("dependencies") or []]
+    dependency_features = [str(item) for item in policy.get("dependency_features") or []]
+    if len(dependency_jobs) != 1 or len(dependency_features) != 1:
+        raise JobError("policy_ambiguous", f"policy {policy.get('policy_id')} does not name exactly one dependency",
+                       "Enroll one bounded policy per dependent job.")
+    if str(parent_job_id) != dependency_jobs[0]:
+        raise JobError("derived_dependency_mismatch",
+                       f"policy {policy.get('policy_id')} is not bound to dependency job {parent_job_id!r}",
+                       "Enroll the policy against this dependency.")
+    feature = str(dependency_feature or dependency_features[0])
+    if feature != dependency_features[0]:
+        raise JobError("derived_dependency_mismatch", f"{feature!r} is not the policy's dependency feature",
+                       "Name the feature the policy was enrolled for.")
+    if str(repo) != str(policy.get("repo") or ""):
+        raise JobError("derived_repo_mismatch", f"{repo!r} is not the policy's repository",
+                       "A derived authority may not change repository.")
+    dependent = str(dependent_feature or policy.get("dependent_feature") or "")
+    if dependent and dependent != str(policy.get("dependent_feature") or ""):
+        raise JobError("derived_feature_mismatch", f"{dependent!r} is not the policy's dependent feature",
+                       "Enroll a policy bound to this feature.")
+    if str(policy.get("dependent_job") or "") != _job_id(job_id):
+        raise JobError("derived_job_mismatch", f"policy is bound to dependent job {policy.get('dependent_job')!r}",
+                       "Enroll a policy bound to this job id.")
+
+    revision = str(candidate_rev or "").strip().lower()
+    if not _is_sha(revision):
+        raise JobError("derived_revision_invalid", "the derived source revision must be a full 40-hex commit",
+                       "Resolve the dependency's accepted commit first.")
+    from . import descendants  # noqa: PLC0415 - descendants imports this module at import time
+
+    try:
+        accepted = descendants.accepted_commit(Path(state_dir), str(parent_job_id))
+    except descendants.DescendantError as exc:
+        raise JobError(exc.code, exc.message, exc.fix) from exc
+    if accepted != revision:
+        raise JobError("derived_revision_mismatch",
+                       f"{revision} is not dependency {parent_job_id}'s accepted commit {accepted}",
+                       "Use the exact accepted integration commit, or ask the human for a new policy.")
+
+    scope_globs = _normalize_scope(scope)
+    if not scope_globs:
+        raise JobError("derived_scope_missing", "a derived authorization needs a file scope", _FIX_SCOPE)
+    ceiling = _normalize_scope(policy.get("scope") or [])
+    outside = [p for p in scope_globs if not _covered(p, ceiling)]
+    if outside:
+        raise JobError("derived_scope_widened", f"outside the enrolled policy scope: {', '.join(outside)}",
+                       "A derived authority may only narrow the enrolled policy.")
+
+    budget = policy.get("budget") or {}
+    if int(bees) < 1 or int(bees) > int(budget.get("bees") or 0):
+        raise JobError("derived_budget_exceeded", f"bees={bees} exceeds the enrolled policy budget",
+                       "Stay inside the enrolled envelope.")
+    if int(wall_clock_s) < 1 or int(wall_clock_s) > int(budget.get("wall_clock_s") or 0):
+        raise JobError("derived_budget_exceeded", f"wall_clock_s={wall_clock_s} exceeds the enrolled policy budget",
+                       "Stay inside the enrolled envelope.")
+
+    policy_gates = sorted({_slug(gate) for gate in policy.get("gates") or []}) or ["merge"]
+    wanted_gates = sorted({_slug(gate) for gate in gates}) or ["merge"]
+    if not set(wanted_gates).issubset(policy_gates):
+        raise JobError("derived_gate_widened", f"gates {wanted_gates} are not all enrolled in the policy {policy_gates}",
+                       "A derived authority may not add a gate.")
+
+    evidence = dict(dependency_evidence or {})
+    if not evidence:
+        evidence = {"job_id": str(parent_job_id), "accepted_commit": revision, "attempts": []}
+    if str(evidence.get("job_id")) != str(parent_job_id) or str(evidence.get("accepted_commit")) != revision:
+        raise JobError("derived_evidence_mismatch",
+                       "the dependency evidence does not name this dependency and its accepted commit",
+                       "Re-read the dependency's accepted wave.")
+
+    body = {
+        "kind": "authorization",
+        "job_id": _job_id(job_id),
+        "auth_id": secrets.token_hex(8),
+        "statement": str(statement),
+        "repo": str(repo),
+        "base_rev": revision,
+        "scope": scope_globs,
+        "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
+        "gates": wanted_gates,
+        "by": by,
+        "at": _utc_now(),
+        "authority": "derived",
+        "policy": {"policy_id": str(policy.get("policy_id")), "policy_digest": policy_digest},
+        "derived_from": {"job_id": str(parent_job_id), "auth_id": parent.get("auth_id"),
+                         "base_rev": parent.get("base_rev")},
+        "dependency_evidence": evidence,
+        "descendant": {"policy": "rizzstack.descendant-authorization/1",
+                       "root_rev": str(policy.get("root_rev")),
+                       "dependencies": dependency_jobs,
+                       "dependency_features": dependency_features,
+                       "dependent_feature": str(policy.get("dependent_feature") or ""),
+                       "dependent_job": str(policy.get("dependent_job") or ""),
+                       "scope": ceiling},
+        # A derived authorization is not a human authorization: it cannot mint a
+        # recovery ceiling. Descendant jobs run without retry or correction and
+        # escalate instead, which is the fail-closed reading of "recovery
+        # permission originates in the sealed human authorization".
+        "recovery_digest": recovery_digest({}),
+    }
+    key = _ensure_key(state_dir)
+    path = authorization_path(state_dir, job_id)
+    if _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        return body
+    existing = _unseal(path, key, "authorization")
+    if _derived_identity(existing) == _derived_identity(body):
+        return existing
+    raise JobError("derived_authorization_exists", f"a different authorization already exists for {job_id}",
+                   "Refuse: derived authority is create-only.")
 
 
 def record_approval(
@@ -298,13 +753,6 @@ def record_approval(
         raise JobError("approval_invalid", "decision must be 'granted' or 'refused'", _FIX_AUTH)
 
     path = approval_path(state_dir, job_id, gate)
-    if path.exists():
-        raise JobError(
-            "approval_exists",
-            "this gate already has a recorded decision",
-            "A gate is decided once; start a new job for new work.",
-        )
-
     key = _ensure_key(state_dir)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
@@ -316,7 +764,12 @@ def record_approval(
         "by": by or _current_user(),
         "at": _utc_now(),
     }
-    _atomic_write(path, _canonical(_seal(body, key)) + b"\n", mode=0o400)
+    if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        raise JobError(
+            "approval_exists",
+            "this gate already has a recorded decision",
+            "A gate is decided once; start a new job for new work.",
+        )
     return body
 
 
@@ -331,10 +784,42 @@ def create_job(
     job_id: str,
     tasks: Sequence[Mapping[str, Any]],
     summary: str = "",
+    workflow_ref: str | None = None,
+    packet: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a job that narrows an existing authorization."""
+    """Create a job that narrows an existing authorization.
+
+    A workflow-native job carries its validated intent packet: the packet's
+    ``job_id`` and repository must be this job's, its ``workflow_ref`` must equal
+    the argument exactly (an omitted argument inherits the packet's pin), and the
+    packet bytes are persisted once at ``packets/<job_id>.json`` with their digest
+    sealed into the job. Legacy packet-free jobs keep working unchanged.
+    """
 
     authorization = load_authorization(state_dir, job_id)
+    packet_digest = ""
+    if packet is not None:
+        packet_digest = packets.validate(packet)
+        if str(packet.get("job_id")) != str(job_id):
+            raise JobError("packet_job_mismatch", "the packet names another job", "Refuse: packet and job identity must match.")
+        if str((packet.get("repository") or {}).get("identity")) != str(authorization.get("repo")):
+            raise JobError("packet_repo_mismatch", "the packet names another repository", "Refuse.")
+        pinned = str(packet.get("workflow_ref") or "")
+        if workflow_ref is None:
+            workflow_ref = pinned
+        elif str(workflow_ref) != pinned:
+            raise JobError("workflow_ref_mismatch",
+                           f"workflow_ref {workflow_ref!r} is not the packet's pinned {pinned!r}",
+                           "Refuse: a job runs under exactly the protocol it was admitted with.")
+
+    path = job_path(state_dir, job_id)
+    if path.exists():
+        raise JobError(
+            "job_exists",
+            "a job already exists for this id",
+            "Pick a new job id; the recorded job is the record.",
+        )
+
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "job",
@@ -342,14 +827,31 @@ def create_job(
         "authorization": {
             "ref": f"{AUTH_DIR}/{_job_id(job_id)}.json",
             "auth_id": authorization["auth_id"],
+            # The recovery ceiling this job was admitted under, pinned by the
+            # digest sealed inside the authorization. A job is a mutable
+            # document; this pin is what makes a recovery block rewritten after
+            # admission visible instead of authoritative.
+            "recovery_digest": str(authorization.get("recovery_digest") or ""),
         },
         "goal": {
             "summary": str(summary or authorization["statement"]),
             "repo": authorization["repo"],
             "base_rev": authorization["base_rev"],
+            # The protocol commit the feature is executed under. Pinned at creation;
+            # a resumed job never reinterprets itself under a different workflow.
+            "workflow_ref": str(workflow_ref or ""),
+            "packet_digest": packet_digest,
         },
-        "tasks": [_normalize_task(task) for task in tasks],
-        "integration": {"wave": "w1", "state": "pending", "evidence": None},
+        "tasks": [_normalize_task(task, for_create=True) for task in tasks],
+        "integration": {
+            "wave": "w1",
+            "state": "pending",
+            "evidence": None,
+            # The durable name of the wave record this job is working on. It is
+            # derived from the job id alone, so a crashed tick can find the
+            # record it wrote without trusting an in-memory copy.
+            "wave_id": _wave_id(_job_id(job_id), "w1"),
+        },
         "approval_gate": {
             "required": True,
             "gates": list(authorization["gates"]),
@@ -360,32 +862,231 @@ def create_job(
     }
     _enforce_narrowing(body, authorization)
 
-    path = job_path(state_dir, job_id)
-    if path.exists():
-        raise JobError(
-            "job_exists",
-            "a job already exists for this id",
-            "Pick a new job id; the recorded job is the record.",
-        )
+    if packet is not None:
+        packets.store_packet(state_dir, job_id, packet)
     save_job(state_dir, body)
     return body
 
 
-def load_job(state_dir: Path, job_id: str) -> dict[str, Any]:
+def _wave_index(value: Any) -> int:
+    """The raw integer a schema wave value names (``"w2"`` -> 2); 0 if unusable."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower().lstrip("w")
     try:
-        key = _load_key(state_dir)
-    except LeaseError as exc:
+        return int(text)
+    except ValueError:
+        return 0
+
+
+def _wave_number(value: Any) -> int:
+    """Accept the schema's ``"w1"`` as well as a plain integer wave number."""
+    return max(1, _wave_index(value))
+
+
+def _wave_id(job_id: Any, wave: Any) -> str:
+    from . import revision  # noqa: PLC0415 - wave names are revision's business
+
+    return revision.wave_id_for(str(job_id or ""), wave)
+
+
+def _wave_record(state_dir: Path, wave_id: str) -> dict[str, Any] | None:
+    """Read one wave record: absent is ``None``, damaged is a named refusal."""
+    from . import revision  # noqa: PLC0415
+
+    try:
+        return revision.read_wave(Path(state_dir), wave_id)
+    except revision.RevisionError as exc:
+        if exc.code == revision.WAVE_MISSING:
+            return None
+        raise JobError(exc.code, exc.error, exc.fix) from exc
+
+
+def recover_integration(state_dir: Path, job: dict[str, Any]) -> bool:
+    """Adopt an accepted wave that a crash left out of this job document.
+
+    A wave record is published before the job is saved, so a crash between the
+    two leaves durable proof that the wave was accepted next to a job that does
+    not say so. Re-running integration from that state would commit the same
+    work twice, so the accepted record is adopted instead: the tasks it
+    integrated move to ``accepted``, the wave counter advances, and the record's
+    head commit becomes ``last_commit``. Evidence that exists but cannot be read
+    raises with its own code; it is never read as "no accepted wave".
+    """
+    job_id = str(job.get("job_id") or "").strip()
+    integration = job.get("integration")
+    if not job_id or not isinstance(integration, dict):
+        return False
+    wave = _wave_number(integration.get("wave", 1))
+    settled = [entry for entry in (integration.get("accepted_waves") or []) if isinstance(entry, Mapping)]
+    if any(_wave_index(entry.get("wave", 0)) >= wave for entry in settled):
+        return False
+    wave_id = _wave_id(job_id, wave)
+    record = _wave_record(state_dir, wave_id)
+    if record is None or record.get("accepted") is not True:
+        return False
+
+    named = str(record.get("wave_id") or wave_id)
+    if named != wave_id:
+        raise JobError(
+            "wave_evidence_mismatch",
+            f"wave record {wave_id} names itself {named!r}",
+            "Inspect the waves directory by hand; do not integrate again.",
+        )
+    head = str(record.get("head_sha") or "")
+    if not _is_sha(head):
+        raise JobError(
+            "wave_evidence_invalid",
+            f"accepted wave {wave_id} does not name a full commit",
+            "Inspect the wave record; an incomplete acceptance is not evidence.",
+        )
+    listed = record.get("attempts")
+    if not isinstance(listed, (list, tuple)) or not listed:
+        raise JobError(
+            "wave_evidence_invalid",
+            f"accepted wave {wave_id} lists no attempts",
+            "Inspect the wave record; an acceptance with no attempts is not evidence.",
+        )
+    pending = [task for task in job.get("tasks") or [] if task.get("state") in {"verified", "integrating"}]
+    integrated = sorted(str((task.get("attempts") or [None])[-1]) for task in pending)
+    if sorted(str(item) for item in listed) != integrated:
+        raise JobError(
+            "wave_evidence_mismatch",
+            f"accepted wave {wave_id} integrates {sorted(str(item) for item in listed)}, "
+            f"which is not this job's pending verification {integrated}",
+            "Inspect the wave record and the job; do not integrate again.",
+        )
+
+    for task in pending:
+        task_id = str(task.get("task_id") or "")
+        if task.get("state") == "verified":
+            transition(job, task_id, "integrating", actor="recovery",
+                       reason=f"wave {wave_id} was already accepted")
+        transition(job, task_id, "accepted", actor="recovery",
+                   reason=f"adopted accepted wave {wave_id} after a crash",
+                   evidence=f"recovered wave {wave_id} at {head[:12]}")
+
+    integration.update(
+        accepted_waves=[
+            *settled,
+            {
+                "wave": wave,
+                "at": str(record.get("at") or ""),
+                "evidence": f"recovered accepted wave {wave_id} at {head}",
+                "commit": head,
+                "recovered": True,
+            },
+        ],
+        wave=wave + 1,
+        wave_id=_wave_id(job_id, wave + 1),
+        attempts=0,
+        state="pending",
+        last_commit=head,
+        recovered={"wave": wave, "wave_id": wave_id, "head_sha": head,
+                   "at": str(record.get("at") or "")},
+    )
+    return True
+
+
+def load_job(state_dir: Path, job_id: str, *, recover: bool = True) -> dict[str, Any]:
+    """Load a sealed job. Absent, unreadable and unsealed are different answers.
+
+    With ``recover`` (the default) an accepted wave record that the crash window
+    left out of the document is adopted in memory, so every reader — the queue's
+    completion check included — sees the evidence that exists on disk. Nothing is
+    written here; ``save_job`` persists the adoption, and a caller that wants to
+    be explicit about it passes ``recover=False`` and calls
+    :func:`recover_integration` itself.
+    """
+
+    path = job_path(state_dir, job_id)
+    if not path.exists():
         raise JobError(
             "job_missing",
             f"no job exists for id {job_id!r}",
             _FIX_AUTH,
+        )
+    try:
+        key = _load_key(state_dir)
+    except LeaseError as exc:
+        raise JobError(
+            "job_unsealed",
+            f"job {job_id!r} exists but its signing key is missing; it is not absent",
+            _FIX_TAMPERED,
         ) from exc
-    return _unseal(job_path(state_dir, job_id), key, "job")
+    body = _unseal(path, key, "job")
+    if recover:
+        recover_integration(Path(state_dir), body)
+    return body
+
+
+def _refuse_lost_evidence(previous: Mapping[str, Any], job: Mapping[str, Any]) -> None:
+    """A save may add accepted-wave evidence; it may never drop or rewind it."""
+    before = previous.get("integration")
+    after = job.get("integration")
+    before = before if isinstance(before, Mapping) else {}
+    after = after if isinstance(after, Mapping) else {}
+    prior = list(before.get("accepted_waves") or [])
+    current = list(after.get("accepted_waves") or [])
+    if len(current) < len(prior) or any(left != right for left, right in zip(prior, current)):
+        raise JobError(
+            "accepted_wave_dropped",
+            "this save would drop or rewrite an accepted wave record",
+            "Reload the job; accepted integration evidence is append-only.",
+        )
+    if _wave_number(before.get("wave", 1)) > _wave_number(after.get("wave", 1)):
+        raise JobError(
+            "integration_wave_regressed",
+            "this save would move the job back to an earlier wave",
+            "Reload the job; the wave counter only moves forward.",
+        )
 
 
 def save_job(state_dir: Path, job: Mapping[str, Any]) -> None:
+    """Persist a job, refusing to overwrite an unreadable one or lose evidence."""
+
+    job_id = _job_id(str(job.get("job_id") or ""))
+    path = job_path(state_dir, job_id)
+    goal = job.get("goal") or {}
+    digest = str(goal.get("packet_digest") or "")
+    previous = None
+    if path.exists():
+        try:
+            key = _load_key(state_dir)
+        except LeaseError as exc:
+            raise JobError(
+                "job_unsealed",
+                f"job {job_id!r} exists but its signing key is missing; refusing to overwrite it",
+                _FIX_TAMPERED,
+            ) from exc
+        # An unreadable, unsealed or tampered document raises here: it is never
+        # treated as "no previous job" and never replaced.
+        previous = _unseal(path, key, "job")
+    if previous is not None:
+        before = str((previous.get("goal") or {}).get("packet_digest") or "")
+        if before and not digest:
+            raise JobError("packet_digest_missing",
+                           "the sealed job carries a packet digest and this save would drop it",
+                           "Refuse: a job keeps the packet it was admitted under.")
+        if before != digest:
+            raise JobError("packet_identity_changed", "the job would resume under a different packet identity",
+                           "Refuse: a sealed job keeps the protocol and packet it started with.")
+        _refuse_lost_evidence(previous, job)
+    if digest:
+        try:
+            packets.verify_stored(state_dir, job_id, digest)
+        except packets.PacketError as exc:
+            raise JobError(exc.code, exc.message, exc.fix) from exc
+    document = dict(job)
+    integration = document.get("integration")
+    if isinstance(integration, Mapping):
+        # Keep the durable wave name truthful: it is derived from the job id and
+        # the wave counter, and a stale pin is worse than no pin at all.
+        refreshed = dict(integration)
+        refreshed["wave_id"] = _wave_id(job_id, refreshed.get("wave", 1))
+        document["integration"] = refreshed
     key = _ensure_key(state_dir)
-    _atomic_write(job_path(state_dir, job["job_id"]), _canonical(_seal(job, key)) + b"\n")
+    _atomic_write(path, _canonical(_seal(document, key)) + b"\n")
 
 
 def transition(
@@ -448,7 +1149,7 @@ def _require_dependencies_accepted(job: Mapping[str, Any], task: Mapping[str, An
 # ---------------------------------------------------------------------------
 
 
-def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_task(task: Mapping[str, Any], *, for_create: bool = False) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
     if not task_id:
         raise JobError("job_invalid", "every task needs a task_id", _FIX_TRANSITION)
@@ -458,7 +1159,8 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
     depends_on = task.get("depends_on") or []
     if not isinstance(depends_on, (list, tuple)):
         raise JobError("job_invalid", f"task {task_id} depends_on must be a list", _FIX_TRANSITION)
-    return {
+    provision = task.get("provision")
+    body = {
         "task_id": task_id,
         "objective": str(task.get("objective") or ""),
         "lease": lease,
@@ -467,11 +1169,21 @@ def _normalize_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "contract_sha256": task.get("contract_sha256"),
         "acceptance": task.get("acceptance"),
         "contract": task.get("contract"),
-        "state": "pending",
-        "attempts": [],
-        "verify": None,
-        "intent": None,
+        "provision": dict(provision) if isinstance(provision, Mapping) else None,
     }
+    if for_create:
+        # A new job always starts at the beginning: an author-supplied state,
+        # attempt list, binding or verification is never trusted as history.
+        body.update(binding=None, provisioning=None, state="pending", attempts=[], verify=None, intent=None)
+    else:
+        # Restoring a persisted document: these fields are written by the
+        # coordinator, not by the caller of create_job().
+        body.update(
+            binding=task.get("binding"), provisioning=task.get("provisioning"),
+            state=str(task.get("state") or "pending"), attempts=list(task.get("attempts") or []),
+            verify=task.get("verify"), intent=task.get("intent"),
+        )
+    return body
 
 
 def _normalize_scope(scope: Iterable[Any]) -> list[str]:

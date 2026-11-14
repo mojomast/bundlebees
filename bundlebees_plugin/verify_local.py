@@ -226,7 +226,12 @@ def verify_and_commit(
         if applied.returncode != 0:
             raise VerifyError("patch_conflict", f"the patch failed to apply: {applied.stderr.strip()[:300]}", "Re-dispatch against the pinned base.")
 
-        touched = [line[3:] for line in _run(["git", "status", "--porcelain"], worktree).stdout.splitlines()]
+        # -uall lists every new file instead of collapsing a new directory to
+        # ``smoke/``, which would fail the declared-file comparison.
+        touched = [line[3:] for line in _run(["git", "status", "--porcelain", "-uall"], worktree).stdout.splitlines()]
+        # Test runs create bytecode/caches; they are not part of the worker's patch.
+        touched = [path for path in touched
+                   if not (path.endswith(".pyc") or "__pycache__" in path.split("/") or ".pytest_cache" in path.split("/"))]
         touched = sorted({path.split(" -> ")[-1] for path in touched if path})
         if touched != declared:
             raise VerifyError(

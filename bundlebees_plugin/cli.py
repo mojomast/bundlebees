@@ -268,11 +268,17 @@ def _dispatch(ctx: Any, args: Any) -> int:
         if command == "tdd":
             return acdd_cli.cmd_tdd(ctx, args)
         if command == "job":
+            if getattr(args, "command", "") == "queue":
+                return job_cli.cmd_queue(ctx, args, state_dir=state_dir, client_factory=lambda: _client_for(ctx),
+                                         provisioner_factory=lambda: __import__("bundlebees_plugin.provisioning", fromlist=["from_client"]).from_client(_config(ctx), _client_for(ctx)))
             return job_cli.cmd_job(
                 ctx,
                 args,
                 state_dir=_state_dir(ctx, args),
                 client_factory=lambda: _client_for(ctx),
+                provisioner_factory=lambda: __import__("bundlebees_plugin.provisioning", fromlist=["from_client"]).from_client(
+                    _config(ctx), _client_for(ctx)
+                ),
             )
         raise CliError(
             "invalid_argument",
