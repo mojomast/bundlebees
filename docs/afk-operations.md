@@ -48,17 +48,17 @@ python -m bundlebees_plugin.factory_driver \
   --repo "$REPO" \
   --gitleaks "$GITLEAKS" \
   --launcher-url "$BUNDLEBEES_LAUNCHER_URL" \
-  --suite-command pytest tests \
   --provisioning --provisioning-host HOST_LABEL \
-  --once
+  --once --suite-command python -m pytest -q
 ```
 
 `--provisioning` binds the existing hyvv provisioning client over the same
 authenticated launcher connection; `--provisioning-host` is the expected host
 policy label, never a host address. The launcher token comes from
 `BUNDLEBEES_LAUNCHER_TOKEN`. Every token after
-`--suite-command` is forwarded unchanged as the tick's `suite_command`; when
-omitted, the tick uses `python -m pytest -q`. `--once` prints the pass result as
+`--suite-command` captures the remaining command line, including dash-prefixed
+arguments, and is forwarded unchanged as the tick's `suite_command`. Put it last;
+when omitted, the tick uses `python -m pytest -q`. `--once` prints the pass result as
 JSON and exits 0.
 
 ## Status

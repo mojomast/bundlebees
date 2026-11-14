@@ -102,8 +102,8 @@ def test_main_passes_suite_command_to_the_real_tick(monkeypatch, tmp_path):
         "--launcher-url", "http://127.0.0.1:1",
         "--repo", str(tmp_path),
         "--gitleaks", "/bin/true",
-        "--suite-command", *suite,
         "--once",
+        "--suite-command", *suite,
     ])
 
     assert code == 0

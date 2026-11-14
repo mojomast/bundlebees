@@ -1483,8 +1483,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=None, help="local repository for the real job tick")
     parser.add_argument("--gitleaks", default=os.environ.get("GITLEAKS", ""),
                         help="gitleaks binary; required for a real tick")
-    parser.add_argument("--suite-command", nargs="+", default=None,
-                        help="integration suite command (default: python -m pytest -q)")
+    parser.add_argument("--suite-command", nargs=argparse.REMAINDER, default=None,
+                        help="integration suite command, last option (default: python -m pytest -q)")
     parser.add_argument("--provisioning", action="store_true",
                         help="bind the configured hyvv provisioning client")
     parser.add_argument("--provisioning-host", default=None,
