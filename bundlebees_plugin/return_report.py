@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import contract as contracts
-from . import handoff, job as jobs, leases, packets, revision, tdd, transport, verify_local
+from . import handoff, job as jobs, leases, packets, recovery, revision, tdd, transport, verify_local
 
 RETURN_SCHEMA = "rizzstack.return/1"
 RETURN_FILE = "return.json"
@@ -1004,6 +1004,132 @@ def _acceptance(
 
 
 # ---------------------------------------------------------------------------
+# Recovery evidence (M4)
+# ---------------------------------------------------------------------------
+
+
+def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One row per durable recovery request, with its validated decision.
+
+    Only durable files are read. A request or decision that no longer hashes to
+    its recorded digest refuses the RETURN instead of being summarised away: a
+    recovery decision is evidence, and evidence that cannot be re-proved is not
+    evidence.
+    """
+
+    state = Path(state_dir)
+    job_id = str(job.get("job_id") or "")
+    try:
+        requests = recovery.list_requests(state, job_id)
+    except recovery.RecoveryError as exc:
+        raise ReturnError(exc.code, exc.message, exc.fix) from exc
+    if not requests:
+        return []
+
+    by_task: dict[str, Mapping[str, Any]] = {}
+    for task in job.get("tasks") or []:
+        if isinstance(task, Mapping):
+            by_task[str(task.get("task_id") or "")] = task
+
+    rows: list[dict[str, Any]] = []
+    for request in requests:
+        request_id = str(request.get("request_id") or "")
+        task_id = str(request.get("task_id") or "")
+        task = by_task.get(task_id) or {}
+        number = request.get("number")
+        try:
+            decision = recovery.read_decision(state, request)
+        except recovery.RecoveryError as exc:
+            raise ReturnError(exc.code, exc.message, exc.fix) from exc
+        recorded = task.get("recovery") if isinstance(task.get("recovery"), Mapping) else {}
+        applied_entry = next(
+            (
+                entry
+                for entry in task.get("recovery_applied") or []
+                if isinstance(entry, Mapping) and str(entry.get("request_id") or "") == request_id
+            ),
+            None,
+        )
+        applied = applied_entry is not None or str(recorded.get("request_id") or "") == request_id
+        applied_at = (
+            str(applied_entry.get("at") or "")
+            if isinstance(applied_entry, Mapping)
+            else str(recorded.get("applied_at") or "")
+        )
+        escalated = str(recorded.get("request_id") or "") == request_id and bool(recorded.get("escalated"))
+        supersession = task.get("contract_supersession") if isinstance(task.get("contract_supersession"), Mapping) else None
+        if supersession is not None and str(supersession.get("request_id") or "") != request_id:
+            supersession = None
+        relative = f"{recovery.RECOVERY_DIR}/{job_id}/{task_id}.{number}.request.json"
+        failure = request.get("failure") if isinstance(request.get("failure"), Mapping) else {}
+        decision_block = None
+        if decision is not None:
+            supersedes = decision.get("supersedes")
+            decision_block = {
+                "decision": str(decision.get("decision") or ""),
+                "adapter": str(decision.get("adapter") or ""),
+                "decided_at": str(decision.get("decided_at") or ""),
+                "rationale": str(decision.get("rationale") or ""),
+                "corrected_tests": [str(item) for item in decision.get("corrected_tests") or []],
+                "supersedes": dict(supersedes) if isinstance(supersedes, Mapping) else None,
+                "digest": str(decision.get("decision_digest") or ""),
+                "path": f"{recovery.RECOVERY_DIR}/{job_id}/{task_id}.{number}.decision.json",
+            }
+        rows.append(
+            {
+                "request_id": request_id,
+                "task_id": task_id,
+                "attempt_id": str(request.get("attempt_id") or ""),
+                "failure": {
+                    "class": str(failure.get("class") or ""),
+                    "code": str(failure.get("code") or ""),
+                    "evidence": str(failure.get("evidence") or ""),
+                    "rationale": str(failure.get("rationale") or ""),
+                },
+                "contract": dict(request.get("contract") or {}),
+                "supersession_permitted": bool(request.get("supersession_permitted")),
+                "envelope": dict(request.get("envelope") or {}),
+                "outstanding_question": str(request.get("outstanding_question") or ""),
+                "request_path": relative,
+                "request_digest": str(request.get("request_digest") or ""),
+                "decision": decision_block,
+                "applied": bool(applied),
+                "applied_at": applied_at if applied else "",
+                "escalated": bool(escalated),
+                "supersedes": _supersession_view(decision_block, supersession),
+            }
+        )
+    return rows
+
+
+def _supersession_view(
+    decision: Mapping[str, Any] | None, supersession: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """The old -> new contract pair, exactly as the receiver re-checks it.
+
+    ``contract_id``/``contract_sha256`` name the frozen contract that was
+    replaced; ``new_contract_id``/``new_contract_sha256`` and
+    ``supersedes_sha256`` name the contract now in force on the task.
+    """
+
+    if not isinstance(supersession, Mapping):
+        return None
+    declared = decision.get("supersedes") if isinstance(decision, Mapping) else None
+    declared = dict(declared) if isinstance(declared, Mapping) else {}
+    new_sha = str(supersession.get("contract_sha256") or "")
+    view = {
+        "contract_id": str(supersession.get("supersedes") or declared.get("contract_id") or ""),
+        "contract_sha256": str(supersession.get("supersedes_sha256") or declared.get("contract_sha256") or ""),
+        "new_contract_id": str(supersession.get("contract_id") or ""),
+        "new_contract_sha256": new_sha,
+        "supersedes_sha256": new_sha,
+        "path": str(supersession.get("path") or ""),
+        "reprovisioned": bool(supersession.get("reprovisioned")),
+    }
+    return view
+
+
+# ---------------------------------------------------------------------------
 # Manifest assembly
 # ---------------------------------------------------------------------------
 
@@ -1215,6 +1341,16 @@ def _manifest(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict
         "pending_approvals": sorted(dict.fromkeys(pending)),
         "receiver_decision": {"status": "pending", "decided_by": None, "decided_at": None, "note": None},
     }
+    recovery_rows = _recovery_rows(state, job)
+    if recovery_rows:
+        # Optional by design: a job with no recovery has no key at all, so the
+        # legacy manifest keeps its exact shape.
+        manifest["recovery"] = recovery_rows
+        if not any(row["decision"] for row in recovery_rows):
+            limitations.append(
+                "a task is rejected and its recovery request has no validated decision yet; "
+                "no corrective attempt is dispatched until one is recorded"
+            )
     manifest["evidence_digest"] = evidence_digest(manifest)
 
     _refuse_uncovered(job, waves, criteria, task_rows)
@@ -1364,6 +1500,47 @@ def render(manifest: Mapping[str, Any]) -> str:
             )
         )
     lines.append("")
+
+    recovery_rows = manifest.get("recovery") or []
+    if recovery_rows:
+        lines += [
+            "## Recovery",
+            "",
+            "| Request | Task | Failure | Decision | Applied |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for row in recovery_rows:
+            failure = row.get("failure") or {}
+            decision = row.get("decision") or {}
+            lines.append(
+                "| `{request}` | {task} | {cls}/{code} | {decided} | {applied} |".format(
+                    request=_cell(row.get("request_id")),
+                    task=_cell(row.get("task_id")),
+                    cls=_cell(failure.get("class")),
+                    code=_cell(failure.get("code")),
+                    decided=_cell(decision.get("decision") or "awaiting decision"),
+                    applied="yes" if row.get("applied") else "no",
+                )
+            )
+        lines.append("")
+        for row in recovery_rows:
+            decision = row.get("decision") or {}
+            if decision:
+                lines.append(
+                    f"- `{_cell(row.get('request_id'))}`: {_cell(decision.get('decision'))} by "
+                    f"`{_cell(decision.get('adapter'))}` — {_cell(decision.get('rationale') or '(no rationale given)')}"
+                )
+            supersession = row.get("supersedes")
+            if isinstance(supersession, Mapping):
+                lines.append(
+                    f"  - contract `{_cell(supersession.get('new_contract_id'))}` "
+                    f"(`{str(supersession.get('new_contract_sha256') or '')[:12]}`) supersedes "
+                    f"`{_cell(supersession.get('contract_id'))}` "
+                    f"(`{str(supersession.get('contract_sha256') or '')[:12]}`)"
+                )
+            if row.get("escalated"):
+                lines.append("  - escalated: this task requires approval and will not dispatch again")
+        lines.append("")
 
     for title, key in (("Unrun", "unrun"), ("Pending approvals", "pending_approvals"), ("Limitations", "limitations")):
         lines += [f"## {title}", ""]

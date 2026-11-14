@@ -265,6 +265,7 @@ def record_authorization(
     require_tty: bool = True,
     interactive: bool | None = None,
     by: str | None = None,
+    recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Record one human authorization. Immutable once written.
 
@@ -301,6 +302,7 @@ def record_authorization(
 
     path = authorization_path(state_dir, job_id)
     key = _ensure_key(state_dir)
+    envelope = _recovery_envelope(recovery)
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "authorization",
@@ -315,6 +317,10 @@ def record_authorization(
         "by": by or _current_user(),
         "at": _utc_now(),
     }
+    if envelope:
+        # The approver's recovery envelope is part of the authorization;
+        # a job may narrow it further and may never widen it.
+        body["recovery"] = envelope
     if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
         raise JobError(
             "authorization_exists",
@@ -322,6 +328,42 @@ def record_authorization(
             "Authorize a new job id; recorded authorizations are immutable.",
         )
     return body
+
+
+def _recovery_envelope(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate the recovery block an approver types into an authorization."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise JobError("authorization_incomplete", "recovery must be a mapping", _FIX_AUTH)
+    out: dict[str, Any] = {}
+    attempts = value.get("max_attempts_per_task")
+    if attempts is not None:
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+            raise JobError("authorization_incomplete",
+                           "recovery.max_attempts_per_task must be a positive integer", _FIX_AUTH)
+        out["max_attempts_per_task"] = attempts
+    corrections = value.get("contract_corrections_allowed")
+    if corrections is not None:
+        if not isinstance(corrections, bool):
+            raise JobError("authorization_incomplete",
+                           "recovery.contract_corrections_allowed must be a boolean", _FIX_AUTH)
+        out["contract_corrections_allowed"] = corrections
+    allowed = value.get("corrected_tests_allowed")
+    if allowed is not None:
+        if not isinstance(allowed, (list, tuple)) or not all(
+            isinstance(item, str) and item.strip() for item in allowed
+        ):
+            raise JobError("authorization_incomplete",
+                           "recovery.corrected_tests_allowed must be a list of test selections", _FIX_AUTH)
+        out["corrected_tests_allowed"] = [item.strip() for item in allowed]
+    unknown = sorted(set(value) - {"max_attempts_per_task", "contract_corrections_allowed", "corrected_tests_allowed"})
+    if unknown:
+        raise JobError("authorization_incomplete",
+                       "unknown recovery field(s): " + ", ".join(unknown),
+                       "Enroll only the documented recovery envelope fields.")
+    return out
 
 
 def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:

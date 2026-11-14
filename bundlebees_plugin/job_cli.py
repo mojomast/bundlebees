@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import integrate_job, job as jobs, leases, reconcile, return_report, verify_local
+from . import integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -87,15 +87,29 @@ def _restore_ref(repo: Path, ref: str, head: str) -> str:
     return head
 
 
-def recover(state_dir: Path, job_id: str, repo: Path | None = None) -> dict[str, Any]:
-    """Adopt an accepted wave that a crash left out of the job document.
+def recover(
+    state_dir: Path,
+    job_id: str,
+    repo: Path | None = None,
+    *,
+    decision_file: Any = None,
+    adapter: Any = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Crash-adopt an accepted wave and handle the recovery request.
 
-    The wave record is published before the job is saved, so a crash between the
-    two leaves proof of an accepted wave beside a job that could otherwise
-    integrate the same work again. The accepted record is adopted and persisted
-    first, then the durable ``refs/bb/integrated/<job>`` ref is restored from it.
-    Corrupt evidence raises its own code (``wave_malformed``/``wave_unreadable``);
-    it is never read as permission to integrate again.
+    Two different recoveries live here because both are the coordinator's
+    business and neither may be automatic:
+
+    * the integration boundary — a wave record published before the job was
+      saved is adopted and the durable ``refs/bb/integrated/<job>`` ref is
+      restored from it. Corrupt evidence raises its own code
+      (``wave_malformed``/``wave_unreadable``); it is never read as permission to
+      integrate again;
+    * a rejected task — the durable request is printed, or a decision file
+      (``decision_file``) / the deterministic adapter (``adapter="deterministic"``)
+      is *recorded*. Recording never applies the decision: the next ``job tick``
+      does that, exactly once.
     """
     job = jobs.load_job(state_dir, job_id, recover=False)
     adopted = jobs.recover_integration(state_dir, job)
@@ -106,11 +120,52 @@ def recover(state_dir: Path, job_id: str, repo: Path | None = None) -> dict[str,
     if head and repo is not None:
         restored = _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     recovered = (job.get("integration") or {}).get("recovered") or {}
+
+    requests = recovery.list_requests(state_dir, job_id)
+    recorded: list[dict[str, Any]] = []
+    if decision_file is not None:
+        try:
+            payload = json.loads(Path(str(decision_file)).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise JobCliError("decision_file_invalid", f"the decision file cannot be read: {exc}",
+                              "Pass a JSON decision document written by the decider.") from exc
+        if not isinstance(payload, dict):
+            raise JobCliError("decision_file_invalid", "a decision file must contain one JSON object",
+                              "Write the decision as an object.")
+        target = str(payload.get("request_id") or (requests[-1].get("request_id") if requests else "") or "")
+        if not target:
+            raise JobCliError("no_recovery_request", f"job {job_id} has no recovery request to decide",
+                              "A decision is only recorded against an outstanding request.")
+        recorded.append(recovery.record_decision(
+            state_dir, target, payload, adapter=str(payload.get("adapter") or "file"), now=now,
+        ))
+    elif adapter is not None:
+        for request in requests:
+            if recovery.read_decision(state_dir, request) is not None:
+                continue
+            if adapter == "deterministic":
+                decision = recovery.deterministic_adapter(request)
+                name = "deterministic"
+            elif callable(adapter):
+                decision = adapter(request)
+                name = str(getattr(adapter, "__name__", "adapter"))
+            else:
+                raise JobCliError("adapter_unknown", f"unknown recovery adapter {adapter!r}",
+                                  "Use --deterministic, or pass a decision file.")
+            recorded.append(recovery.record_decision(state_dir, str(request["request_id"]), decision,
+                                                     adapter=name, now=now))
+
+    outstanding = recovery.outstanding(state_dir, job)
+    summary = recovery.summarize(state_dir, job_id)
     return {
         "adopted": adopted,
         "wave_id": str(recovered.get("wave_id") or ""),
         "head_sha": head,
         "ref_restored": restored,
+        "request": outstanding,
+        "requests": summary["requests"],
+        "decisions_recorded": recorded,
+        "supersessions": summary["supersessions"],
     }
 
 
@@ -424,7 +479,7 @@ def tick(
                 contract_declared=declared,
             )
         except verify_local.VerifyError as exc:
-            return {"ok": False, "evidence": f"{exc.code}: {exc.message}"}
+            return {"ok": False, "evidence": _failure_evidence(exc, tests)}
         return {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}
 
     def integrator(job_doc: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -467,6 +522,26 @@ def tick(
         "handoff": handoff,
     }
     return payload
+
+
+def _failure_evidence(exc: Any, tests: Sequence[str]) -> str:
+    """The verifier's own evidence, with an unusable selector named as such.
+
+    A named test run that collects nothing is not a failed implementation: no
+    patch can make a selector that does not exist pass. The verifier is the only
+    component that knows which selection it ran, so it records that fact as the
+    leading evidence code instead of leaving a bare ``tests_failed`` for the
+    coordinator to guess about.
+    """
+
+    message = f"{exc.code}: {exc.message}"
+    tail = str(getattr(exc, "message", "") or "").lower()
+    if getattr(exc, "code", "") == "tests_failed" and (
+        "no tests ran" in tail or "collected 0 items" in tail or "no tests collected" in tail
+    ):
+        named = ", ".join(str(item) for item in tests) or "(no test selection)"
+        return f"test_unresolved: no test was collected for {named}; {message}"
+    return message
 
 
 def _patch_text(envelope: Mapping[str, Any]) -> str | None:
@@ -641,6 +716,17 @@ def add_parsers(subparsers: Any) -> None:
     pending.add_argument("--state-dir", default=None)
     pending.set_defaults(command="job", job_handler="agent-pending")
 
+    rec = sub.add_parser("recover", help="Print or record the recovery request for a rejected task.")
+    rec.add_argument("--job-id", required=True)
+    rec.add_argument("--state-dir", default=None)
+    rec.add_argument("--repo", default=None, help="Repository whose integration ref should be restored.")
+    choice = rec.add_mutually_exclusive_group()
+    choice.add_argument("--decision-file", default=None,
+                        help="JSON decision to validate and record against its request.")
+    choice.add_argument("--deterministic", action="store_true",
+                        help="Record the deterministic adapter's decision for every outstanding request.")
+    rec.set_defaults(command="job", job_handler="recover")
+
     rep = sub.add_parser("report", help="Write and print the job acceptance report plus its RETURN packet.")
     rep.add_argument("--job-id", required=True)
     rep.add_argument("--state-dir", default=None)
@@ -775,6 +861,17 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                 print(prompt)
             return 0
 
+        if handler == "recover":
+            result = recover(
+                state_dir,
+                job_id,
+                Path(args.repo) if getattr(args, "repo", None) else None,
+                decision_file=getattr(args, "decision_file", None),
+                adapter="deterministic" if getattr(args, "deterministic", False) else None,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+
         if handler == "report":
             repo = Path(args.repo) if getattr(args, "repo", None) else None
             if getattr(args, "verify", False):
@@ -785,7 +882,8 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
             return 0
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")
-    except (JobCliError, jobs.JobError, reconcile.ReconcileError, verify_local.VerifyError, return_report.ReturnError) as exc:
+    except (JobCliError, jobs.JobError, reconcile.ReconcileError, recovery.RecoveryError,
+            verify_local.VerifyError, return_report.ReturnError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
         return 1
 
