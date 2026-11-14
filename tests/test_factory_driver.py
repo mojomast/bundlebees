@@ -167,7 +167,9 @@ class FakeWorker:
             )
             self.outbox.mkdir(parents=True, exist_ok=True)
             (self.outbox / "attempt.json").write_bytes(_canonical(self.event))
-        return {"status": "running", "transitions": ["T1->dispatched"]}
+        if len(self.calls) == 1:
+            return {"status": "running", "transitions": ["T1->dispatched"]}
+        return {"status": "ok", "action": "ready_for_review", "transitions": ["T1->verified"]}
 
 
 def _files(directory: Path) -> list[Path]:
@@ -193,7 +195,7 @@ def test_enqueue_dispatch_landing_inbox_verification_and_next_eligible_work(tmp_
     first = driver.run_pass()
 
     assert first["queue"]["action"] == "running"
-    assert worker.calls == [JOB]
+    assert worker.calls == [JOB, JOB]
     assert first["landing"]["processed"] == 1
     assert len(_files(state / "events" / "outbox")) == 1
     assert len(_files(state / "events" / "inbox" / "coordinator")) == 1
@@ -201,23 +203,29 @@ def test_enqueue_dispatch_landing_inbox_verification_and_next_eligible_work(tmp_
     assert first["events"][0]["state"] == "acked"
     verify_id = first["events"][0]["work_id"]
     assert verify_id.startswith("ws_verify_")
-    assert verify_id in first["ready"]
     assert first["inference"] == 0
 
     work_scheduler.add_item(
         state, work_id="ws_next", title="next delivery", kind="feature",
         priority=1, depends_on=[verify_id],
     )
-    assert "ws_next" not in [item["work_id"] for item in work_scheduler.ready_items(state)]
+    work_scheduler.add_item(
+        state, work_id="ws_blocked", title="waits on next", kind="docs",
+        priority=2, depends_on=["ws_next"],
+    )
+    ready_ids = [item["work_id"] for item in work_scheduler.ready_items(state)]
+    assert "ws_next" in ready_ids
+    assert "ws_blocked" not in ready_ids
 
-    work_scheduler.claim(state, verify_id, "verifier", "wt")
-    work_scheduler.complete(state, verify_id, owner="verifier")
+    # The driver, not the test, claims/completes the verification item.
+    assert next(item for item in work_scheduler.list_items(state)
+                if item["work_id"] == verify_id)["status"] == "done"
 
     second = driver.run_pass()
 
     assert "ws_next" in second["ready"]
-    assert worker.calls == [JOB, JOB]
-    assert len(work_scheduler.list_items(state)) == 2
+    assert worker.calls == [JOB, JOB, JOB]
+    assert len(work_scheduler.list_items(state)) == 3
 
 
 def test_restart_is_idempotent_and_repairs_an_abandoned_claim(tmp_path: Path):

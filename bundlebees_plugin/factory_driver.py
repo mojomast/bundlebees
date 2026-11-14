@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
     fcntl = None  # type: ignore[assignment]
 
 from . import bee_events
+from . import job_cli
 from . import event_consumer
 from . import job as jobs
 from . import landing_bridge
@@ -441,11 +442,26 @@ def deterministic_handler(
             (entry for entry in work_scheduler.list_items(state) if entry["work_id"] == work_id),
             {"work_id": work_id},
         )
+    mapping = state / "factory" / "work-jobs"
+    mapping.mkdir(parents=True, exist_ok=True)
+    map_path = mapping / f"{work_id}.json"
+    map_body = {
+        "work_id": work_id,
+        "job_id": str(_event_data(event).get("job_id") or ""),
+        "attempt_id": str(_event_data(event).get("attempt_id") or ""),
+        "event_id": _event_id(event),
+    }
+    tmp = map_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(map_body, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, map_path)
+
     ready = [entry["work_id"] for entry in work_scheduler.ready_items(state)]
     return {
         "accepted": True,
         "event_id": _event_id(event),
         "work_id": work_id,
+        "job_id": str(_event_data(event).get("job_id") or ""),
+        "attempt_id": str(_event_data(event).get("attempt_id") or ""),
         "created": item.get("status") == "pending",
         "eligible": ready,
     }
@@ -713,28 +729,83 @@ class FactoryDriver:
 
     def _event_handler(self, subscriber: str) -> Any:
         def handler(event: Mapping[str, Any]) -> dict[str, Any]:
+            # Inbox handling is short and must not hold a model turn open. A
+            # busy session is deferred, not turned into a handler failure: the
+            # event is acknowledged as durable work and the wake coalescer keeps
+            # the pending generation until a safe boundary.
             session = _session_of(event, subscriber)
-            self.wake.request_wake(session, now=self.now)
-            turn = self.wake.begin_turn(session, now=self.now)
-            if not turn.get("started"):
-                raise FactoryError(
-                    "turn_active",
-                    f"session {session} already has an active turn",
-                    "Leave the event in the inbox; the next pass handles it.",
-                )
-            result: dict[str, Any] | None = None
-            try:
-                result = deterministic_handler(self.state, event, now=self.now)
-                result["session"] = session
-                result["generation"] = int(turn.get("generation") or 0)
-                return result
-            finally:
-                finished = self.wake.finish_turn(session, turn.get("turn"), now=self.now)
-                if result is not None and finished.get("pending"):
-                    result_pending = self.wake.status(session)
-                    result_pending.pop("session", None)
-                    result["wake"] = result_pending
+            wake = self.wake.request_wake(session, now=self.now)
+            result = deterministic_handler(self.state, event, now=self.now)
+            result["session"] = session
+            result["generation"] = int(wake.get("generation") or 0)
+            result["deferred"] = bool(wake.get("active"))
+            return result
         return handler
+
+    def _advance_ready_work(self) -> None:
+        """Advance every scheduler item whose job is durable, without manual claims."""
+        mapping = self.state / "factory" / "work-jobs"
+        if not mapping.is_dir():
+            return
+        for item in work_scheduler.list_items(self.state):
+            work_id = str(item.get("work_id") or "")
+            if str(item.get("status") or "") not in {"pending", "claimed"}:
+                continue
+            map_path = mapping / f"{work_id}.json"
+            try:
+                body = json.loads(map_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            job_id = str(body.get("job_id") or "")
+            if not job_id:
+                continue
+            try:
+                tick_result = self.tick(job_id)
+            except Exception:  # noqa: BLE001 - independent work must continue
+                continue
+            try:
+                job = jobs.load_job(self.state, job_id, recover=False)
+                tasks = job.get("tasks") or []
+                done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
+            except Exception:  # noqa: BLE001
+                done = False
+            if not done and str(tick_result.get("action") or "") not in {"ready_for_review", "accepted"}:
+                continue
+            try:
+                work_scheduler.claim(self.state, work_id, "factory-driver", str(self.state))
+                work_scheduler.complete(self.state, work_id, owner="factory-driver")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _advance_event_work(self, event_results: list[dict[str, Any]]) -> None:
+        """Drive authoritative job progress for landed work, then sync scheduler."""
+        for entry in event_results:
+            job_id = str(entry.get("job_id") or "")
+            work_id = str(entry.get("work_id") or "")
+            if not job_id:
+                continue
+            try:
+                tick_result = self.tick(job_id)
+            except Exception as exc:  # noqa: BLE001 - one job must not stop the pass
+                entry["tick"] = {"status": "error", "error": type(exc).__name__}
+                continue
+            entry["tick"] = tick_result
+            if not work_id:
+                continue
+            try:
+                job = jobs.load_job(self.state, job_id, recover=False)
+                tasks = job.get("tasks") or []
+                done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
+            except Exception:  # noqa: BLE001
+                done = False
+            if not done and str(tick_result.get("action") or "") not in {"ready_for_review", "accepted"}:
+                continue
+            try:
+                work_scheduler.claim(self.state, work_id, "factory-driver", str(self.state))
+                work_scheduler.complete(self.state, work_id, owner="factory-driver")
+                entry["work_state"] = "done"
+            except Exception as exc:  # noqa: BLE001
+                entry["work_state"] = f"sync_error:{type(exc).__name__}"
 
     def run_pass(self) -> dict[str, Any]:
         startup = self._ensure_startup()
@@ -783,6 +854,9 @@ class FactoryDriver:
                 if key in result:
                     entry[key] = result[key]
             event_results.append(entry)
+
+        self._advance_event_work(event_results)
+        self._advance_ready_work()
 
         try:
             ready = work_scheduler.ready_items(self.state)
@@ -858,6 +932,39 @@ def mechanical_tick(state_dir: Any) -> Any:
     return tick
 
 
+def make_job_tick(
+    state_dir: Any,
+    *,
+    client: Any,
+    repo: Any,
+    gitleaks: str | None = None,
+    suite_command: Sequence[str] | None = None,
+    provisioner: Any = None,
+    expect_host: str | None = None,
+) -> Any:
+    """Bind the real ``job_cli.tick`` signature to the driver's ``tick(job_id)``."""
+    from pathlib import Path as _Path
+
+    state = _Path(state_dir)
+    repo_path = _Path(repo)
+    suite = tuple(suite_command or ("python", "-m", "pytest", "-q"))
+
+    def tick(job_id: str) -> dict[str, Any]:
+        return job_cli.tick(
+            state,
+            str(job_id),
+            client=client,
+            repo=repo_path,
+            gitleaks=gitleaks,
+            require_gitleaks=gitleaks is not None,
+            suite_command=suite,
+            provisioner=provisioner,
+            expect_host=expect_host,
+        )
+
+    return tick
+
+
 def load_tick(spec: str | None) -> Any:
     if not spec:
         return None
@@ -877,6 +984,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--subscriber", action="append", dest="subscribers", default=[],
                         help="event subscriber to drain (repeatable)")
     parser.add_argument("--tick", default=None, help="mechanical worker tick as module:callable")
+    parser.add_argument("--launcher-url", default=os.environ.get("BUNDLEBEES_LAUNCHER_URL", ""),
+                        help="real launcher base URL (token from BUNDLEBEES_LAUNCHER_TOKEN)")
+    parser.add_argument("--repo", default=None, help="local repository for the real job tick")
+    parser.add_argument("--gitleaks", default=os.environ.get("GITLEAKS", ""),
+                        help="gitleaks binary; required for a real tick")
+    parser.add_argument("--suite-command", nargs="+", default=None,
+                        help="integration suite command (default: python -m pytest -q)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="run one pass and exit")
     mode.add_argument("--interval", nargs="?", const=1.0, type=float, default=None,
@@ -889,7 +1003,24 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
-    tick = load_tick(args.tick) or mechanical_tick(state)
+    tick = load_tick(args.tick)
+    if tick is None and args.launcher_url and args.repo:
+        from .client import LauncherClient
+
+        token = os.environ.get("BUNDLEBEES_LAUNCHER_TOKEN", "")
+        if not token:
+            raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
+        if not args.gitleaks:
+            raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
+        tick = make_job_tick(
+            state,
+            client=LauncherClient(args.launcher_url, token=token),
+            repo=Path(args.repo),
+            gitleaks=args.gitleaks,
+            suite_command=args.suite_command,
+        )
+    if tick is None:
+        tick = mechanical_tick(state)
     subscribers = args.subscribers or None
     driver = FactoryDriver(
         state,
