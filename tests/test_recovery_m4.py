@@ -11,6 +11,7 @@ an accepted job.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,20 @@ T0 = 1_800_000_000.0
 TEST_FILE = "tests/test_t.py"
 WRONG_TEST = f"{TEST_FILE}::test_missing"
 RIGHT_TEST = f"{TEST_FILE}::test_real"
+
+#: Recovery is refused while the pinned protocol validator cannot be loaded, so
+#: these tests run against the real checkout rather than a local stub.
+WORKFLOW_SRC = os.environ.get("WORKFLOW_SRC", "")
+REQUIRE_WORKFLOW = os.environ.get("REQUIRE_WORKFLOW") == "1"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _pinned_protocol():
+    if not WORKFLOW_SRC:
+        if REQUIRE_WORKFLOW:
+            pytest.fail("REQUIRE_WORKFLOW=1 but WORKFLOW_SRC does not name the pinned workflow checkout")
+        pytest.skip("set WORKFLOW_SRC to the pinned workflow checkout; recovery refuses without its validator")
+
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +104,13 @@ def frozen_contract(
 def make_job(tmp_path: Path, *, max_attempts: int = 2, frozen: dict | None = None) -> tuple[dict, dict, str]:
     """An authorized job whose one task pins a frozen contract."""
 
-    envelope = {"max_attempts_per_task": max_attempts}
+    envelope = {
+        "max_attempts_per_task": max_attempts,
+        "contract_corrections_allowed": True,
+        # The approver pre-authorizes the exact replacement selection; the
+        # protocol refuses a corrected test that is not named here.
+        "corrected_tests_allowed": [RIGHT_TEST],
+    }
     jobs.record_authorization(
         tmp_path,
         job_id="job_a",
@@ -166,25 +187,28 @@ class Classification:
     __test__ = True
 
     @pytest.mark.parametrize(
-        "evidence,name",
+        "evidence,name,code",
         [
-            (f"test_unresolved: AC-001 test {WRONG_TEST!r} matches no collected test id", "specification"),
-            ("tests_failed: named tests failed after the patch", "implementation"),
-            ("suite_failed: the regression suite exited 1", "implementation"),
-            ("security_tool_missing: gitleaks is not on PATH", "environment"),
-            ("sandbox_unavailable: no usable isolation backend", "environment"),
-            ("launcher_unavailable: the launcher refused the connection", "infrastructure"),
-            ("worker_failed: worker ended failed", "infrastructure"),
-            ("integration_failed: the wave merge conflicted", "integration"),
+            (f"test_unresolved: AC-001 test {WRONG_TEST!r} matches no collected test id",
+             "specification", "test_not_found"),
+            ("tests_failed: named tests failed after the patch", "implementation", "test_failed"),
+            ("suite_failed: the regression suite exited 1", "implementation", "suite_failed"),
+            ("security_tool_missing: gitleaks is not on PATH", "environment", "toolchain_missing"),
+            ("sandbox_unavailable: no usable isolation backend", "environment", "dependency_unavailable"),
+            ("launcher_unavailable: the launcher refused the connection", "infrastructure", "launcher_unavailable"),
+            ("worker_failed: worker ended failed", "infrastructure", "launcher_unavailable"),
+            ("integration_failed: the wave merge conflicted", "integration", "merge_conflict"),
         ],
     )
-    def test_every_class_is_derived_from_its_evidence_code(self, evidence, name):
+    def test_every_class_is_derived_from_its_evidence_code(self, evidence, name, code):
         failure = recovery.classify_failure({"ok": False, "evidence": evidence}, contract=None)
 
         assert failure["class"] == name, failure
-        assert failure["code"] == evidence.split(":", 1)[0]
+        assert failure["code"] == code, failure
         assert failure["evidence"] == evidence
-        assert failure["rationale"]
+        # The protocol code is canonical; the observation that produced it is
+        # still named, so normalisation hides nothing.
+        assert evidence.split(":", 1)[0] in failure["rationale"], failure
 
     def test_the_five_classes_are_the_documented_ones(self):
         assert recovery.CLASSES == (
@@ -204,17 +228,19 @@ class Classification:
                    )}
         assert covered == set(recovery.CLASSES)
 
-    def test_an_unattributable_record_fails_closed_and_cannot_escalate_itself(self):
+    def test_an_unattributable_record_fails_closed_to_a_non_dispatching_class(self):
         failure = recovery.classify_failure({"ok": False, "evidence": "something odd happened"}, contract=None)
 
+        # The protocol has no "unclassified" code. A stalled scheduler is the
+        # honest description of "no next step could be scheduled", and the class
+        # keeps the record non-dispatching.
         assert failure["class"] == "infrastructure"
-        assert failure["code"] == "unclassified_failure"
-
-        state = Path(recovery.__file__).parent
-        assert state  # keep the import used
+        assert failure["code"] == "scheduler_stalled"
 
         request = {"failure": failure, "envelope": {"max_attempts_per_task": 2}}
-        assert recovery.attributed(request) is False
+        assert recovery.attributed(request) is True
+        assert recovery.exhausted(request) is True
+        assert recovery.deterministic_adapter(request)["decision"] == "escalate"
 
     def test_a_declared_class_must_agree_with_its_code(self):
         with pytest.raises(recovery.RecoveryError) as caught:
@@ -259,7 +285,10 @@ class RetryBudget:
         request = recovery.outstanding(tmp_path, jobs.load_job(tmp_path, "job_a"))
         assert request["failure"]["class"] == "implementation"
         assert request["envelope"]["max_attempts_per_task"] == 2
-        assert request["attempts_used"] == 1
+        # A canonical request carries no attempts_used field: the ledger is the
+        # task's attempt list, which is what every budget check reads.
+        assert "attempts_used" not in request
+        assert recovery.remaining_attempts(request, task_of(tmp_path)) == 1
 
         decision = recovery.deterministic_adapter(request)
         assert decision["decision"] == "retry"
@@ -282,7 +311,7 @@ class RetryBudget:
                                       {"decision": "retry", "rationale": "one more attempt inside the budget"})
         assert caught.value.code == "retry_budget_exhausted"
 
-        exhausted = recovery.deterministic_adapter(second)
+        exhausted = recovery.deterministic_adapter(second, task=task_of(tmp_path))
         assert exhausted["decision"] == "escalate"
         recovery.record_decision(tmp_path, second["request_id"], exhausted)
 
@@ -399,41 +428,51 @@ class Supersession:
         request = recovery.outstanding(tmp_path, jobs.load_job(tmp_path, "job_a"))
         return launcher, request
 
+    def _supersede(self, tmp_path, request, *, adapter="agent", decided_at="2026-11-13T10:00:00Z"):
+        """The canonical supersede decision: same contract id, changed hash."""
+
+        derived = recovery.derive_superseding_contract(
+            task_of(tmp_path), [RIGHT_TEST], adapter=adapter, decided_at=decided_at,
+            contract_id=request["contract"]["id"],
+        )
+        return {
+            "adapter": adapter,
+            "decision": "supersede",
+            "corrected_tests": [RIGHT_TEST],
+            "supersedes": {
+                "contract_id": request["contract"]["id"],
+                "contract_sha256": request["contract"]["sha256"],
+                "new_contract_id": request["contract"]["id"],
+                "new_contract_sha256": contracts.check_frozen(derived),
+            },
+            "rationale": "the contract named a test that does not exist at source_rev",
+            "decided_at": decided_at,
+        }
+
     def test_supersede_once_repoints_the_task_and_touches_no_packet(self, tmp_path):
         launcher, request = self._specification_rejection(tmp_path)
         old_sha = request["contract"]["sha256"]
         assert request["failure"]["class"] == "specification"
+        assert request["failure"]["code"] == "test_not_found"
         assert request["supersession_permitted"] is True
 
-        recovery.record_decision(
-            tmp_path,
-            request["request_id"],
-            {
-                "adapter": "agent",
-                "decision": "supersede",
-                "corrected_tests": [RIGHT_TEST],
-                "supersedes": {
-                    "contract_id": "SPEC-1",
-                    "contract_sha256": old_sha,
-                    "new_contract_id": "SPEC-1-r1",
-                    "new_contract_sha256": "",
-                },
-                "rationale": "the contract named a test that does not exist at source_rev",
-                "decided_at": "2026-11-13T10:00:00Z",
-            },
-        )
+        recovery.record_decision(tmp_path, request["request_id"], self._supersede(tmp_path, request))
 
         result = rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 3)
         assert result.action == "dispatch"
         assert len(launcher.posts) == 2
 
         brief_contract = launcher.posts[-1]["contract"]
+        # A correction revises the same contract; only the selection (and
+        # therefore the reviewed hash) moves.
+        assert brief_contract["id"] == "SPEC-1"
         assert brief_contract["supersedes"] == "SPEC-1"
         assert brief_contract["supersedes_sha256"] == old_sha
         assert brief_contract["acceptance_criteria"][0]["tests"] == [RIGHT_TEST]
 
         task = task_of(tmp_path)
         assert task["contract_sha256"] != old_sha
+        assert task["contract"]["id"] == "SPEC-1"
         assert task["contract_supersession"]["supersedes"] == "SPEC-1"
         assert task["contract_supersession"]["supersedes_sha256"] == old_sha
         stored = tmp_path / "recovery" / "job_a" / "T1.1.contract.json"
@@ -455,18 +494,7 @@ class Supersession:
 
     def test_only_one_supersession_is_ever_permitted(self, tmp_path):
         launcher, request = self._specification_rejection(tmp_path)
-        old_sha = request["contract"]["sha256"]
-        recovery.record_decision(
-            tmp_path,
-            request["request_id"],
-            {
-                "adapter": "agent",
-                "decision": "supersede",
-                "corrected_tests": [RIGHT_TEST],
-                "supersedes": {"contract_id": "SPEC-1", "contract_sha256": old_sha},
-                "rationale": "first correction",
-            },
-        )
+        recovery.record_decision(tmp_path, request["request_id"], self._supersede(tmp_path, request))
         rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 3)  # dispatch the correction
         rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 4)  # reap
         reject(tmp_path, launcher, f"test_unresolved: AC-001 test {WRONG_TEST!r} matches no collected test id",
@@ -475,6 +503,7 @@ class Supersession:
         second = recovery.outstanding(tmp_path, jobs.load_job(tmp_path, "job_a"))
         assert second["request_id"] != request["request_id"]
         assert second["supersession_permitted"] is False
+        assert second["envelope"]["contract_corrections_allowed"] == 0
 
         with pytest.raises(recovery.RecoveryError) as caught:
             recovery.record_decision(
@@ -487,6 +516,8 @@ class Supersession:
                     "supersedes": {
                         "contract_id": second["contract"]["id"],
                         "contract_sha256": second["contract"]["sha256"],
+                        "new_contract_id": second["contract"]["id"],
+                        "new_contract_sha256": "0" * 64,
                     },
                     "rationale": "second correction",
                 },
@@ -760,7 +791,8 @@ class ReturnEvidence:
         rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 4)
         reject(tmp_path, launcher, "tests_failed: still failing", now=T0 + 5)
         second = recovery.outstanding(tmp_path, jobs.load_job(tmp_path, "job_a"))
-        recovery.record_decision(tmp_path, second["request_id"], recovery.deterministic_adapter(second))
+        recovery.record_decision(tmp_path, second["request_id"],
+                                 recovery.deterministic_adapter(second, task=task_of(tmp_path)))
         rec.tick(tmp_path, "job_a", launcher=launcher, now=T0 + 6)
 
         manifest = return_report.build(tmp_path, "job_a")
@@ -891,19 +923,33 @@ class JobRecoverCommand:
 class IntegrationAndSelection:
     __test__ = True
 
-    def _request(self, tmp_path, failure):
+    def _request(self, tmp_path, failure, *, corrections: bool = True):
         job, authorization, _sha = make_job(tmp_path, max_attempts=2)
         launcher = FakeLauncher()
         drive_to_verification(tmp_path, launcher)
         job = jobs.load_job(tmp_path, "job_a")
         task = job["tasks"][0]
         task["attempts"] = ["att_0"]
+        task["recovery_policy"] = {
+            "max_attempts_per_task": 2,
+            "contract_corrections_allowed": corrections,
+        }
         job["tasks"][0] = task
         return recovery.build_request(tmp_path, job, task, failure=failure, authorization=authorization)
 
     def test_an_integration_failure_gets_bounded_repair(self, tmp_path):
-        request = self._request(tmp_path, {"code": "integration_failed", "evidence": "integration_failed: wave conflicted"})
+        request = self._request(
+            tmp_path,
+            {
+                "code": "integration_failed",
+                "evidence": "integration_failed: wave conflicted",
+                # Distinct repair evidence: a conflict record must name the paths.
+                "paths": ["tools/t.py"],
+            },
+        )
         assert request["failure"]["class"] == "integration"
+        assert request["failure"]["evidence"][0]["kind"] == "conflict"
+        assert request["failure"]["evidence"][0]["paths"] == ["tools/t.py"]
         assert recovery.deterministic_adapter(request)["decision"] == "retry"
 
         recovery.record_decision(tmp_path, request["request_id"],
@@ -916,21 +962,34 @@ class IntegrationAndSelection:
         task["attempts"] = ["att_0", "att_1"]
         jobs.save_job(tmp_path, job)
         second = recovery.build_request(tmp_path, job, task,
-                                        failure={"code": "integration_failed", "evidence": "integration_failed: again"},
+                                        failure={"code": "integration_failed",
+                                                 "evidence": "integration_failed: again",
+                                                 "paths": ["tools/t.py"]},
                                         authorization=jobs.load_authorization(tmp_path, "job_a"))
         with pytest.raises(recovery.RecoveryError) as caught:
             recovery.record_decision(tmp_path, second["request_id"],
                                      {"decision": "retry", "rationale": "repair it once more anyway"})
         assert caught.value.code == "retry_budget_exhausted"
-        assert recovery.deterministic_adapter(second)["decision"] == "escalate"
+        assert recovery.deterministic_adapter(second, task=task)["decision"] == "escalate"
 
-    def test_a_specification_failure_without_an_unusable_selection_cannot_supersede(self, tmp_path):
+    def test_an_integration_failure_without_conflicted_paths_is_refused(self, tmp_path):
+        with pytest.raises(recovery.RecoveryError) as caught:
+            self._request(
+                tmp_path,
+                {"code": "integration_failed", "evidence": "integration_failed: wave conflicted"},
+            )
+        assert caught.value.code == "recovery_evidence_incomplete"
+        assert requests_of(tmp_path) == []
+
+    def test_a_specification_failure_without_a_correction_budget_cannot_supersede(self, tmp_path):
         request = self._request(
             tmp_path,
-            {"code": "red_missing", "evidence": "red_missing: the named tests pass before the patch"},
+            {"code": "missing_test", "evidence": "missing_test: the approved file is missing at source_rev"},
+            corrections=False,
         )
         assert request["failure"]["class"] == "specification"
-        assert request["failure"]["code"] not in recovery.SELECTION_CODES
+        assert request["failure"]["code"] in recovery.SELECTION_CODES
+        assert request["envelope"]["contract_corrections_allowed"] == 0
         assert request["supersession_permitted"] is False
 
         with pytest.raises(recovery.RecoveryError) as caught:
@@ -944,8 +1003,11 @@ class IntegrationAndSelection:
                     "supersedes": {
                         "contract_id": request["contract"]["id"],
                         "contract_sha256": request["contract"]["sha256"],
+                        "new_contract_id": request["contract"]["id"],
+                        "new_contract_sha256": "0" * 64,
                     },
-                    "rationale": "supersede a contract that is not the problem",
+                    "rationale": "supersede a contract without a correction budget",
                 },
             )
         assert caught.value.code == "supersede_forbidden"
+

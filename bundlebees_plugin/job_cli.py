@@ -144,7 +144,12 @@ def recover(
             if recovery.read_decision(state_dir, request) is not None:
                 continue
             if adapter == "deterministic":
-                decision = recovery.deterministic_adapter(request)
+                task = next(
+                    (item for item in job.get("tasks") or []
+                     if str(item.get("task_id") or "") == str(request.get("task_id") or "")),
+                    None,
+                )
+                decision = recovery.deterministic_adapter(request, task=task)
                 name = "deterministic"
             elif callable(adapter):
                 decision = adapter(request)

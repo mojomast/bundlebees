@@ -986,7 +986,13 @@ def _verify(
         return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} verified")
     # The rejection is only durable once its reason is: the recovery request is
     # written first, and a rejection with no recorded path forward never happens.
-    _record_failure(state_dir, job, task, {"ok": False, "evidence": evidence, "attempt_id": attempt_id}, clock)
+    # A legacy job that never froze a contract cannot carry a canonical request;
+    # it rejects exactly as it did before M4 and never dispatches a correction.
+    try:
+        _record_failure(state_dir, job, task, {"ok": False, "evidence": evidence, "attempt_id": attempt_id}, clock)
+    except ReconcileError as exc:
+        if exc.code != "recovery_not_applicable":
+            raise
     jobs.transition(job, task_id, "rejected", actor="reconciler", reason=evidence or "verifier rejected", evidence=evidence)
     transitions.append(f"{task_id}->rejected")
     return TickResult(status="ok", transitions=tuple(transitions), action="verify", detail=f"{task_id} rejected")

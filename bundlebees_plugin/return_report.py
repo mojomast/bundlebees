@@ -1036,7 +1036,9 @@ def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, An
         request_id = str(request.get("request_id") or "")
         task_id = str(request.get("task_id") or "")
         task = by_task.get(task_id) or {}
-        number = request.get("number")
+        # The ordinal lives in the durable filename, not in the document: a
+        # canonical request has no volatile field.
+        number = recovery.request_ordinal(state, request_id)
         try:
             decision = recovery.read_decision(state, request)
         except recovery.RecoveryError as exc:
@@ -1072,7 +1074,9 @@ def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, An
                 "rationale": str(decision.get("rationale") or ""),
                 "corrected_tests": [str(item) for item in decision.get("corrected_tests") or []],
                 "supersedes": dict(supersedes) if isinstance(supersedes, Mapping) else None,
-                "digest": str(decision.get("decision_digest") or ""),
+                # A journal value recomputed from the canonical decision; the
+                # document itself has no digest field.
+                "digest": recovery.decision_digest(decision),
                 "path": f"{recovery.RECOVERY_DIR}/{job_id}/{task_id}.{number}.decision.json",
             }
         rows.append(
@@ -1083,7 +1087,9 @@ def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, An
                 "failure": {
                     "class": str(failure.get("class") or ""),
                     "code": str(failure.get("code") or ""),
-                    "evidence": str(failure.get("evidence") or ""),
+                    "evidence": [
+                        dict(entry) for entry in failure.get("evidence") or [] if isinstance(entry, Mapping)
+                    ],
                     "rationale": str(failure.get("rationale") or ""),
                 },
                 "contract": dict(request.get("contract") or {}),
