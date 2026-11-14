@@ -69,8 +69,8 @@ jobs:
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/hyvv.git "$RUNNER_TEMP/hyvv-contract"
           git -C "$RUNNER_TEMP/hyvv-contract" fetch --quiet origin refs/heads/feat/bee-landed-events
-          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet e991c757103a61b9ab76eaf01dd1b7b51818273d
-          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "e991c757103a61b9ab76eaf01dd1b7b51818273d"
+          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet 8ffaf73000974e0ba273c72fca42e07b79c38106
+          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "8ffaf73000974e0ba273c72fca42e07b79c38106"
           echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
           echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
       - name: Run test suite
