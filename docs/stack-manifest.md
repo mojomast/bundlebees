@@ -7,8 +7,8 @@ paths; a branch tip is not a substitute.
 | Component | Pin | Role |
 |---|---|---|
 | workflow | `9c69d3a` | canonical packets, landing events, recovery and RETURN validators |
-| bundlebees | `ff44852` | queue, landing bridge, event inbox, work scheduler and this driver |
-| hyvv | `e991c75` | governed provisioning contract and launcher outbox |
+| bundlebees | `ec37c24` | queue, landing bridge, event inbox, work scheduler and this driver |
+| hyvv | `8ffaf73` | governed provisioning contract and launcher outbox |
 | Hermes | `0.23.0` | plugin host API floor (`requires_hermes`) |
 | launcher | `0.1.16` | local worker launcher result envelope |
 | python | `3.12.3` | runtime and test interpreter |

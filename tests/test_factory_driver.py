@@ -346,7 +346,7 @@ def test_stack_manifest_records_the_pinned_versions():
     doc = Path(__file__).resolve().parents[1] / "docs" / "stack-manifest.md"
     text = doc.read_text(encoding="utf-8")
 
-    for token in ("9c69d3a", "389dca2", "e991c75", "0.23.0", "0.1.16", "3.12.3"):
+    for token in ("9c69d3a", "ec37c24", "8ffaf73", "0.23.0", "0.1.16", "3.12.3"):
         assert token in text
     assert 'git -C "$WORKFLOW_SRC" rev-parse HEAD' in text
     assert 'git -C "$HYVV_SRC" rev-parse HEAD' in text
