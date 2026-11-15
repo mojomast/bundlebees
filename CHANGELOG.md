@@ -22,6 +22,20 @@ one pull request.
   missing, expired, revoked, malformed or tampered state, while merges,
   protected pushes, releases, deploys, worker changes and secret access remain
   explicit human gates. See `docs/repo-grants.md`.
+- **One-time owner approval:** `bundlebees_plugin/approval.py` and
+  `job authorize --approval-receipt`. The owner reviews a plain-language
+  preview in the trusted application and clicks once; the application signs an
+  HMAC-SHA256 receipt with `BUNDLEBEES_APPROVAL_SECRET` from Hermes
+  `agent.secret_scope.get_secret`. The receipt binds the exact job id,
+  repository/base revision, statement, scope, normalised task specs, budgets,
+  worker project/profile, Bundlebees code revision, planned coordinator
+  stop/restart, gates and recovery ceiling, and expires (900 s default). A
+  non-TTY authorization accepts it only after signature, expiry,
+  one-time-consumption and exact-binding checks; the sealed authorization
+  records `authority: owner-approval` and the receipt identity/digest. A
+  decision without the per-request owner capability fails closed with
+  `approval_owner_required`. The bridge authorises one trial run only: no
+  acceptance, merge, release or deploy. See `docs/job-approval.md`.
 - **ACDD contracts and TDD evidence** ([docs/ACDD.md](docs/ACDD.md), the
   protocol from workflow chapter 16). `bundlebees_plugin/contract.py` validates
   `acdd/1` contracts (the bundled schema plus the eight code checks), hashes
@@ -56,6 +70,14 @@ one pull request.
 
 ### Fixed
 
+- `return_report.pending_approvals` treated the mere presence of
+  `approvals/<job>.<gate>.json` as an approval. A hand-written `{}` cleared a
+  gate, and so did a recorded `refused` verdict. Gate decisions are now loaded
+  through `job.load_approval()`/`job.gate_decision()`, which verify the sealed
+  envelope, the job id, the gate name and the `granted` verdict. Only a valid
+  granted record clears a gate; a forged, copied, refused or unreadable record
+  stays pending and is reported as a limitation. Existing terminal approval
+  behavior is unchanged.
 - Concurrent first dispatches on a fresh state directory could fail with
   `lease_invalid: the lease key is not 32 bytes`: one thread opened the key
   file after another created it but before the bytes were written (seen in

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import agent_work, integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
+from . import agent_work, approval, integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
 from . import hermes_adapter
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
@@ -738,14 +738,20 @@ def add_parsers(subparsers: Any) -> None:
     )
     sub = job.add_subparsers(dest="job_command", required=True)
 
-    auth = sub.add_parser("authorize", help="Record a human authorization (interactive).")
+    auth = sub.add_parser("authorize", help="Record a human authorization (interactive or owner receipt).")
     auth.add_argument("--job-id", required=True)
-    auth.add_argument("--repo", required=True)
-    auth.add_argument("--base-rev", required=True)
-    auth.add_argument("--scope", action="append", required=True)
-    auth.add_argument("--bees", type=int, default=3)
-    auth.add_argument("--wall-clock", type=int, default=3600)
-    auth.add_argument("--statement", required=True)
+    auth.add_argument("--repo", default=None, help="Repository as owner/name (default: the receipt's).")
+    auth.add_argument("--base-rev", default=None, help="Pinned 40-hex base revision (default: the receipt's).")
+    auth.add_argument("--scope", action="append", default=None,
+                      help="Authorized scope glob, repeatable (default: the receipt's).")
+    auth.add_argument("--bees", type=int, default=None, help="Bee budget (default: 3, or the receipt's).")
+    auth.add_argument("--wall-clock", type=int, default=None,
+                      help="Wall-clock budget in seconds (default: 3600, or the receipt's).")
+    auth.add_argument("--statement", default=None, help="The approver's own words (default: the receipt's).")
+    auth.add_argument("--approval-receipt", default=None,
+                      help="A signed owner-approval receipt; enables the non-TTY path after verification.")
+    auth.add_argument("--tasks", default=None,
+                      help="Optional task-list JSON to prove it is the exact set the owner approved.")
     auth.add_argument("--state-dir", default=None)
     auth.set_defaults(command="job", job_handler="authorize")
 
@@ -1083,6 +1089,67 @@ def cmd_repo(ctx: Any, args: Any, *, state_dir: Path) -> int:
         return 1
 
 
+def _authorize_from_receipt(state_dir: Path, job_id: str, args: Any) -> dict[str, Any]:
+    """Turn a signed owner receipt into a sealed authorization without a TTY.
+
+    This is the step an agent may run after the owner has clicked: it proves
+    the receipt and the exact binding, but it cannot create the decision. Any
+    explicit flag that disagrees with the receipt is refused inside
+    ``record_authorization`` because the rebuilt binding no longer matches.
+    """
+
+    path = Path(str(getattr(args, "approval_receipt", "") or ""))
+    try:
+        receipt = approval.read_receipt_file(path)
+    except approval.ApprovalError as exc:
+        raise JobCliError(exc.code, exc.message, exc.fix) from exc
+    binding = receipt.get("binding")
+    if not isinstance(binding, Mapping):
+        raise JobCliError(
+            "approval_receipt_invalid",
+            "the receipt at the given path has no binding object",
+            "Pass the signed receipt written by the trusted approval application.",
+        )
+    bound_job = str(binding.get("job_id") or "")
+    if bound_job != job_id:
+        raise JobCliError(
+            "approval_job_mismatch",
+            f"the receipt is for job {bound_job!r}, not {job_id!r}",
+            "Authorize the job the owner approved; a receipt never carries to another job.",
+        )
+    budgets = binding.get("budgets")
+    budgets = dict(budgets) if isinstance(budgets, Mapping) else {}
+    tasks: Any = None
+    if getattr(args, "tasks", None):
+        try:
+            tasks = json.loads(Path(str(args.tasks)).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise JobCliError(
+                "tasks_invalid", f"the task list cannot be read: {exc}", "Pass a JSON task list."
+            ) from exc
+        if not isinstance(tasks, list):
+            raise JobCliError("tasks_invalid", "the task list must be a JSON array", "Pass a JSON task list.")
+    gates = binding.get("gates")
+    return jobs.record_authorization(
+        state_dir,
+        job_id=job_id,
+        statement=str(getattr(args, "statement", None) or binding.get("statement") or ""),
+        repo=str(getattr(args, "repo", None) or binding.get("repo") or ""),
+        base_rev=str(getattr(args, "base_rev", None) or binding.get("base_rev") or ""),
+        scope=list(getattr(args, "scope", None) or binding.get("scope") or []),
+        bees=int(args.bees) if getattr(args, "bees", None) is not None else int(budgets.get("bees") or 0),
+        wall_clock_s=(
+            int(args.wall_clock) if getattr(args, "wall_clock", None) is not None
+            else int(budgets.get("wall_clock_s") or 0)
+        ),
+        gates=list(gates or ("merge",)),
+        require_tty=False,
+        interactive=False,
+        approval_receipt=receipt,
+        tasks=tasks,
+    )
+
+
 def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     handler = getattr(args, "job_handler", None)
     if handler == "project":
@@ -1090,6 +1157,34 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
     job_id = str(getattr(args, "job_id", None) or "")
     try:
         if handler == "authorize":
+            if getattr(args, "approval_receipt", None):
+                record = _authorize_from_receipt(state_dir, job_id, args)
+                print(json.dumps({
+                    "authorized": record["job_id"],
+                    "auth_id": record["auth_id"],
+                    "authority": record.get("authority"),
+                    "approval": {
+                        "request_id": (record.get("approval") or {}).get("request_id"),
+                        "receipt_id": (record.get("approval") or {}).get("receipt_id"),
+                        "receipt_digest": (record.get("approval") or {}).get("receipt_digest"),
+                    },
+                }, indent=2, sort_keys=True))
+                return 0
+            missing = [
+                flag for flag, value in (
+                    ("--statement", getattr(args, "statement", None)),
+                    ("--repo", getattr(args, "repo", None)),
+                    ("--base-rev", getattr(args, "base_rev", None)),
+                    ("--scope", getattr(args, "scope", None)),
+                ) if not value
+            ]
+            if missing:
+                raise JobCliError(
+                    "authorization_incomplete",
+                    "job authorize needs " + ", ".join(missing),
+                    "Pass the authorization fields and run it at a terminal, or use "
+                    "--approval-receipt with an owner decision.",
+                )
             record = jobs.record_authorization(
                 state_dir,
                 job_id=job_id,
@@ -1097,8 +1192,8 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                 repo=args.repo,
                 base_rev=args.base_rev,
                 scope=args.scope,
-                bees=args.bees,
-                wall_clock_s=args.wall_clock,
+                bees=args.bees if args.bees is not None else 3,
+                wall_clock_s=args.wall_clock if args.wall_clock is not None else 3600,
             )
             print(json.dumps({"authorized": record["job_id"], "auth_id": record["auth_id"]}, indent=2))
             return 0
