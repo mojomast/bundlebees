@@ -239,6 +239,32 @@ class ProcessControl:
             )
         assert caught.value.code == "driver_argv_not_the_driver"
 
+    def test_a_failed_wait_stops_the_driver_it_started(self, tmp_path):
+        pid_file = tmp_path / "pid"
+        script = write_script(tmp_path, "cleanup-sleeper.py", CHILD_SLEEPER)
+        clock = th.SystemClock()
+        record = th.start_driver(
+            (PY, str(script), str(pid_file)),
+            run=1,
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            log_path=tmp_path / "log",
+            clock=clock,
+            validate_argv=False,
+        )
+        trial = object.__new__(th.RestartTrial)
+        trial.plan = type("Plan", (), {"term_grace_s": 0.25, "kill_grace_s": 0.25})()
+        trial.clock = clock
+        trial.deadline = None
+        trial._drivers = [record]
+        trial._stops = []
+        trial._timeline = []
+        trial._limitations = []
+        trial._cleanup_leftover_drivers()
+        assert record.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(record.pid, 0)
+
     def test_a_shell_pipeline_is_refused_before_any_process_is_started(self, tmp_path):
         with pytest.raises(th.TrialRefused) as shell:
             th.validate_driver_argv(["bash", "-c", "python -m bundlebees_plugin.factory_driver"])
