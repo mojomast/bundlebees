@@ -6,6 +6,7 @@ import sys
 import unittest
 
 from bundlebees_plugin import client as client_mod
+from bundlebees_plugin import campaign
 from bundlebees_plugin import factory_driver
 from bundlebees_plugin import job as jobs
 from bundlebees_plugin import provisioning as provisioning_mod
@@ -21,6 +22,43 @@ class FactoryDriverCliReturn(unittest.TestCase):
         )
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+
+    def test_a_campaign_advances_across_driver_restart_without_duplicate_dispatch(self):
+        fx = self.fixture
+        campaign.create_campaign(
+            fx.state,
+            campaign_id="campaign-c",
+            job_id="job_c",
+            objective="Carry the smoke feature to a reviewable campaign",
+            branch="main",
+        )
+
+        first = factory_driver.FactoryDriver(
+            fx.state, fx.queue, tick=fx.tick, campaign_id="campaign-c"
+        ).run_pass()
+        self.assertNotEqual(first["queue"].get("action"), "idle")
+        self.assertIn(first["campaign"]["phase"], {"ready_to_advance", "running", "job_complete"})
+
+        # A fresh driver is the restart boundary: it must adopt the durable claim
+        # and continue; it must not dispatch the feature a second time.
+        for _ in range(8):
+            result = factory_driver.FactoryDriver(
+                fx.state, fx.queue, tick=fx.tick, campaign_id="campaign-c"
+            ).run_pass()
+            item = queue.QueueStore(fx.state).read("f1")
+            if item and item.get("state") == "ready_for_review":
+                break
+
+        item = queue.QueueStore(fx.state).read("f1")
+        self.assertEqual(item.get("state"), "ready_for_review")
+        self.assertEqual(len(fx.launcher.posts), 1)
+        job = jobs.load_job(fx.state, "job_c")
+        integration = job.get("integration") or {}
+        self.assertEqual(len(integration.get("accepted_waves") or []), 1)
+        plan = campaign.resume_plan(fx.state, "campaign-c")
+        self.assertEqual(plan["phase"], "job_complete")
+        self.assertTrue(plan["requires_campaign_closeout"])
+        self.assertFalse(plan["should_continue"])
 
     def test_cli_binds_real_tick_and_provisioning(self):
         fx = self.fixture

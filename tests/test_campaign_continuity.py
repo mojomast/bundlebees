@@ -56,6 +56,36 @@ def _set_task(state: Path, task_id: str, task_state: str) -> None:
     jobs.save_job(state, job)
 
 
+def _mark_job_accepted(state: Path, job_id: str = JOB) -> None:
+    """Attach the minimum real verify/integration evidence the queue accepts."""
+    job = jobs.load_job(state, job_id)
+    attempts = []
+    for task in job["tasks"]:
+        task["state"] = "accepted"
+        attempt_id = f"att-{task['task_id']}"
+        task["attempts"] = [attempt_id]
+        attempts.append(attempt_id)
+        record = {
+            "ok": True,
+            "sha": "b" * 40,
+            "base_rev": SHA,
+            "gitleaks": {"exit_code": 0},
+            "suite": {"exit_code": 0},
+        }
+        path = state / "verify-results" / f"{attempt_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+    job["integration"] = {
+        "wave": "w1",
+        "state": "accepted",
+        "last_commit": "b" * 40,
+        "accepted_waves": [
+            {"wave": 1, "commit": "b" * 40, "attempts": attempts}
+        ],
+    }
+    jobs.save_job(state, job)
+
+
 def test_reconcile_exposes_ready_work_without_dispatch(tmp_path: Path):
     record = _setup(tmp_path)
 
@@ -94,19 +124,38 @@ def test_reconcile_adopts_in_flight_work_without_a_second_action(tmp_path: Path)
     assert "T1" in result["wait_condition"]
 
 
-def test_all_accepted_is_ready_for_review_not_campaign_acceptance(tmp_path: Path):
+def test_all_tasks_accepted_without_job_evidence_is_not_campaign_complete(tmp_path: Path):
     record = _setup(tmp_path)
     _set_task(tmp_path, "T1", "accepted")
     _set_task(tmp_path, "T2", "accepted")
 
     result = campaign.reconcile(tmp_path, record["campaign_id"])
 
-    assert result["phase"] == "ready_for_review"
-    assert result["next_action"] == "await_receiver_review"
-    assert "human receiver decision" in result["wait_condition"]
+    assert result["phase"] == "blocked"
+    assert result["next_action"] == "repair_job_evidence"
+    assert result["job_accepted"] is False
+    assert result["job_acceptance_reasons"]
     plan = campaign.resume_plan(tmp_path, record["campaign_id"])
     assert plan["should_continue"] is False
     assert plan["requires_human"] is True
+    assert plan["requires_campaign_closeout"] is False
+
+
+def test_all_tasks_accepted_with_job_evidence_is_job_complete(tmp_path: Path):
+    record = _setup(tmp_path)
+    _mark_job_accepted(tmp_path)
+
+    result = campaign.reconcile(tmp_path, record["campaign_id"])
+
+    assert result["phase"] == "job_complete"
+    assert result["next_action"] == "prepare_campaign_closeout"
+    assert "product evidence" in result["wait_condition"]
+    assert result["job_accepted"] is True
+    assert result["job_acceptance_reasons"] == []
+    plan = campaign.resume_plan(tmp_path, record["campaign_id"])
+    assert plan["should_continue"] is False
+    assert plan["requires_human"] is False
+    assert plan["requires_campaign_closeout"] is True
 
 
 def test_failed_work_is_a_blocker_not_a_retry(tmp_path: Path):
@@ -204,3 +253,101 @@ def test_a_job_with_no_tasks_is_a_blocker_not_an_idle_loop(tmp_path: Path):
     assert result["phase"] == "blocked"
     assert result["blocker"]["code"] == "no_tasks"
     assert campaign.resume_plan(tmp_path, record["campaign_id"])["should_continue"] is False
+
+
+def test_a_queued_campaign_advances_through_driver_restart(tmp_path: Path):
+    """Deterministic driver/queue trial: no real worker is involved.
+
+    The CI-only GateC test exercises the same driver with the real job tick and
+    a simulated worker patch. This one keeps the queue and driver real while
+    making task transitions deterministic, so it can catch a wiring regression
+    without a sandbox or a worker host.
+    """
+    record = _setup(tmp_path)
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(json.dumps({
+        "f1": {"repo": "mojomast/campaign-fixture", "job_id": JOB, "status": "queued"}
+    }), encoding="utf-8")
+    queue = queue_mod.JsonQueue(queue_path)
+    calls: list[str] = []
+
+    def tick(job_id: str):
+        calls.append(job_id)
+        job = jobs.load_job(tmp_path, job_id)
+        states = {task["task_id"]: task["state"] for task in job["tasks"]}
+        if states["T1"] == "pending":
+            _set_task(tmp_path, "T1", "dispatched")
+            return {"status": "running"}
+        if states["T1"] == "dispatched":
+            _set_task(tmp_path, "T1", "accepted")
+            return {"status": "running"}
+        if states["T2"] == "pending":
+            _set_task(tmp_path, "T2", "dispatched")
+            return {"status": "running"}
+        if states["T2"] == "dispatched":
+            _set_task(tmp_path, "T2", "accepted")
+            _mark_job_accepted(tmp_path)
+            return {"status": "running"}
+        return {"status": "idle"}
+
+    for _ in range(6):
+        result = factory_driver.FactoryDriver(
+            tmp_path, queue, tick=tick, startup=False, campaign_id=record["campaign_id"]
+        ).run_pass()
+        item = queue_mod.QueueStore(tmp_path).read("f1")
+        if item and item.get("state") == "ready_for_review":
+            break
+
+    item = queue_mod.QueueStore(tmp_path).read("f1")
+    assert item and item.get("state") == "ready_for_review"
+    assert len(calls) == 4
+    plan = campaign.resume_plan(tmp_path, record["campaign_id"])
+    assert plan["phase"] == "job_complete"
+    assert plan["requires_campaign_closeout"] is True
+
+
+def test_campaign_can_be_created_without_a_branch(tmp_path: Path):
+    _setup(tmp_path)
+    record = campaign.create_campaign(
+        tmp_path,
+        campaign_id="campaign-no-branch",
+        job_id=JOB,
+        objective="Optional branch",
+    )
+    assert record["branch"] == ""
+    assert record["phase"] == "authorized"
+
+
+def test_terminal_integration_is_a_blocker_not_a_worker_wait(tmp_path: Path):
+    record = _setup(tmp_path)
+    _set_task(tmp_path, "T1", "verified")
+    _set_task(tmp_path, "T2", "pending")
+    job = jobs.load_job(tmp_path, JOB)
+    job["integration"] = {
+        "wave": "w1",
+        "terminal": True,
+        "state": "stopped",
+        "stopped": "integration_failed",
+        "evidence": "two integration attempts failed",
+    }
+    jobs.save_job(tmp_path, job)
+
+    result = campaign.reconcile(tmp_path, record["campaign_id"])
+
+    assert result["phase"] == "blocked"
+    assert result["blocker"]["code"] == "integration_terminal"
+    assert result["next_action"] == "resolve_integration"
+    assert campaign.resume_plan(tmp_path, record["campaign_id"])["should_continue"] is False
+
+
+def test_verified_work_waits_for_integration_not_a_worker(tmp_path: Path):
+    record = _setup(tmp_path)
+    _set_task(tmp_path, "T1", "verified")
+    _set_task(tmp_path, "T2", "pending")
+
+    result = campaign.reconcile(tmp_path, record["campaign_id"])
+
+    assert result["phase"] == "running"
+    assert result["next_action"] == "integrate:T1"
+    assert "integration step pending" in result["wait_condition"]
+    assert "wait_for_worker" != result["next_action"]

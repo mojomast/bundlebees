@@ -946,11 +946,9 @@ def startup_reconcile(
     abandoned = [str(record.get("feature_id")) for record in active if not _pid_alive(record.get("pid"))]
     report["abandoned_claims"] = abandoned
 
-    if abandoned:
-        try:
-            report["repair"] = queue_mod.run_once(state, queue, tick=tick or mechanical_tick(state))
-        except Exception as exc:  # noqa: BLE001 - the regular pass still runs
-            report["errors"].append({"repair": type(exc).__name__})
+    # Adoption is the regular queue pass's job. Running run_once here as well
+    # would tick the same claim twice on every restart.
+    report["repair"] = None
 
     return report
 
@@ -1237,9 +1235,7 @@ class FactoryDriver:
                 "tick": {"status": "error", "error": type(exc).__name__},
             }
         try:
-            job = jobs.load_job(self.state, job_id, recover=False)
-            tasks = job.get("tasks") or []
-            done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
+            done = queue_mod.job_accepted(self.state, job_id)
         except Exception:  # noqa: BLE001
             done = False
         completed = done or str(tick_result.get("action") or "") in {

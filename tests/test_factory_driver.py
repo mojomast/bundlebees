@@ -256,13 +256,17 @@ def test_restart_is_idempotent_and_repairs_an_abandoned_claim(tmp_path: Path):
     record["pid"] = 10 ** 9
     claim_path.write_text(json.dumps(record), encoding="utf-8")
 
+    before_restart_calls = len(worker.calls)
     restarted = factory_driver.run_pass(
         state, queue_path, tick=worker, launcher_outbox=outbox,
         subscribers=["coordinator"], startup=True,
     )
 
     assert restarted["startup"]["abandoned_claims"] == ["f1"]
-    assert restarted["startup"]["repair"] is not None
+    assert restarted["startup"]["repair"] is None
+    assert len(worker.calls) == before_restart_calls + 1
+    adopted = json.loads(claim_path.read_text(encoding="utf-8"))
+    assert int(adopted["pid"]) == os.getpid()
     assert len(_files(state / "events" / "outbox")) == 1
     assert len(_files(state / "events" / "inbox" / "coordinator")) == 1
     assert len(_files(state / "events" / "acks" / "coordinator")) == 1

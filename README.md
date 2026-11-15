@@ -242,8 +242,11 @@ hermes bundlebees campaign reconcile  --campaign-id campaign-a
 hermes bundlebees campaign resume-plan --campaign-id campaign-a
 ```
 
-`resume-plan` says `should_continue: true` only while there is actionable or in-flight work. At
-`ready_for_review` it requires a human; at `blocked` it returns the named blocker. See
+`resume-plan` says `should_continue: true` only while there is actionable or in-flight work. The
+campaign itself never enqueues or dispatches; its authorized job must have a queue item for the
+driver to advance it. At `job_complete` it requires a campaign closeout (product evidence and audit
+triage), not just task acceptance; at `ready_for_review` it requires a human; at `blocked` it returns
+the named blocker. See
 [campaign continuity](docs/CAMPAIGN-CONTINUITY.md) for the state fields and the host-run scheduler.
 
 ### The feature queue

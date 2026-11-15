@@ -10,7 +10,7 @@ workflow-owned report contract.
 | Level | What bundlebees can prove | What it cannot prove |
 |---|---|---|
 | **Task** | The leased patch applies at the pinned revision, the approved tests run, the scope is intact, and the verifier records GREEN/REFACTOR/integration | That the feature is usable, visually correct or performant |
-| **Project** | Every task in the project plan is `accepted` and the job's RETURN has evidence | That every product acceptance criterion has been run; the pilot todo's `pilot/todo/acceptance.py` is an application test, not a runner |
+| **Project** | Every task in the project plan is `accepted`; a separate job review gate and RETURN determine whether the integrated job is reviewable | That every product acceptance criterion has been run; the pilot todo's `pilot/todo/acceptance.py` is an application test, not a runner |
 | **Campaign** | Nothing by itself; the coordinator/reviewer assembles the closeout | A human receiver's decision |
 
 `project_completion()` in `bundlebees_plugin/project.py` reads task states. It is

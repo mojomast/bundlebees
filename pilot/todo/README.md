@@ -31,4 +31,4 @@ Python standard library and no external assets.
 The executable plan is `pilot/todo/project.json`; the project planner turns it
 into a dependent task list and the factory driver advances it. `acceptance.py`
 is application-level evidence for the served product, not a claim that the
-project or a campaign is accepted; see [campaign acceptance](../CAMPAIGN-ACCEPTANCE.md).
+project or a campaign is accepted; see [campaign acceptance](../../docs/CAMPAIGN-ACCEPTANCE.md).

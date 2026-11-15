@@ -22,11 +22,12 @@ Git/PR observer is still required for full external reconciliation.
 | `job_id` | The one authorized job that executes it; the job is authoritative |
 | `authorization` | A snapshot of the sealed auth id, statement, repo, base revision, scope, budget and human gates; never a new grant |
 | `limits` | The same budget and gates in a compact form for reporting |
-| `phase` | `authorized`, `ready_to_advance`, `running`, `ready_for_review` or `blocked` |
+| `phase` | `authorized`, `ready_to_advance`, `running`, `job_complete`, `ready_for_review` or `blocked` |
+| `job_accepted` / `job_acceptance_reasons` | The queue/job completion check: verified attempts, gitleaks, suite and an accepted integration wave, not merely task state strings |
 | `active_workers` | Task ids, job states and attempt ids currently in flight |
 | `dependencies` | Each task's declared dependencies |
 | `last_completed_action` | The latest durable job event |
-| `next_action` | What the coordinator should do next, such as `dispatch:T2`, `wait_for_worker` or `await_receiver_review` |
+| `next_action` | What the coordinator should do next, such as `dispatch:T2`, `wait_for_worker` or `prepare_campaign_closeout` |
 | `wait_condition` | Why the next action is waiting |
 | `blocker` | The named failure or dependency problem, when blocked |
 | `task_counts` | total, accepted, active, ready and failed counts |
@@ -34,7 +35,9 @@ Git/PR observer is still required for full external reconciliation.
 
 The record is written atomically and mode `0600`. Repeating a reconcile against
 unchanged job state returns the same record and does not rewrite it. A restart
-therefore adopts the checkpoint, not a remembered plan.
+therefore adopts the checkpoint, not a remembered plan. A `verified` task is
+waiting for integration, not for a worker; a terminal integration failure is a
+named blocker.
 
 ## What reconcile does and does not do
 
@@ -74,14 +77,22 @@ hermes bundlebees campaign resume-plan --campaign-id jackpot-2026-11
 ```
 
 `resume-plan` sets `should_continue: true` only for `authorized`,
-`ready_to_advance` or `running`. At `ready_for_review` it returns
-`requires_human: true`; at `blocked` it returns the named blocker and does not
-retry.
+`ready_to_advance` or `running`. At `job_complete` the job evidence is accepted but campaign
+product evidence and audit triage are not verified, so it returns
+`requires_campaign_closeout: true` and does not claim ready-for-review. At
+`ready_for_review` it returns `requires_human: true`; at `blocked` it returns the
+named blocker and does not retry.
+
+The queue card's `ready_for_review` status is a **job-level** status emitted when
+the job document is accepted. It is not campaign review: the campaign checkpoint
+stays at `job_complete` until the closeout report and its evidence are reviewed.
 
 ## Scheduler
 
 `factory_driver --interval` is the implemented resident loop. It can reconcile a
-campaign on every pass:
+campaign on every pass, but it advances work through the feature queue: the
+authorized job must already have a queue item. A campaign checkpoint never
+enqueues, dispatches or claims work on its own.
 
 ```bash
 python -m bundlebees_plugin.factory_driver \
@@ -98,9 +109,12 @@ A prompt instruction is not a scheduler. The process must be started by the
 host. The supported shape is a user service with restart-on-failure (values are
 placeholders; this repository does not install it):
 
+Name the template `bundlebees-campaign@.service`; `%i` is the campaign id.
+`bundlebees-campaign@jackpot-2026-11.service` starts one instance.
+
 ```ini
 [Unit]
-Description=bundlebees campaign driver
+Description=bundlebees campaign driver (%i)
 After=network-online.target
 
 [Service]
@@ -110,7 +124,11 @@ EnvironmentFile=%h/.config/bundlebees/driver.env
 ExecStart=%h/rizzstack/.venv/bin/python -m bundlebees_plugin.factory_driver \
   --state %h/.hermes/plugin-data/bundlebees \
   --queue %h/.hermes/plugin-data/bundlebees/queue.json \
-  --campaign-id %i --interval 5
+  --campaign-id %i \
+  --repo %h/rizzstack/work \
+  --gitleaks %h/.local/bin/gitleaks \
+  --launcher-url ${BUNDLEBEES_LAUNCHER_URL} \
+  --interval 5
 Restart=on-failure
 RestartSec=10
 Nice=10
@@ -118,6 +136,13 @@ Nice=10
 [Install]
 WantedBy=default.target
 ```
+
+`BUNDLEBEES_LAUNCHER_TOKEN` and `BUNDLEBEES_LAUNCHER_URL` belong in the
+mode-`0600` environment file. Do not launch this unit without `--repo`,
+`--gitleaks` and a launcher URL for a dispatch-capable campaign: without them
+the driver silently falls back to `mechanical_tick`, claims queue cards and
+cannot dispatch or verify. That fallback is useful only for observation and is
+not a work-conserving scheduler.
 
 The unit and its environment file are host changes. Installing, enabling or
 restarting them needs the approver's yes and is **not** done by this change. If
@@ -151,11 +176,23 @@ failure of the job/queue seam, not something the checkpoint should hide.
 `tests/test_campaign_continuity.py` runs a bounded deterministic trial:
 
 - a two-task job is authorized and checkpointed;
-- dispatch and integration are simulated by changing the durable task state;
-- the checkpoint is reconciled, the file is read fresh, and reconcile is run
-  again as a restart would;
-- the test asserts the revision is unchanged, no task is redispatched, and the
-  `ready_for_review` state requires a human rather than auto-acceptance.
+- a real `JsonQueue` + `QueueStore` and the production `FactoryDriver` are used,
+  with a deterministic tick that advances the job through verification and
+  integration;
+- the checkpoint is reconciled, the file is read fresh, and the driver is
+  reconstructed as a restart;
+- the test asserts one queue claim, no duplicate dispatch, the queue card reaches
+  its job-level `ready_for_review` status, and the campaign reaches
+  `job_complete` only when the job's own acceptance evidence passes;
+- task rows marked `accepted` without verification/integration evidence are
+  `blocked` at `repair_job_evidence`;
+- a `ready_for_review` campaign phase is reserved for a future verified closeout
+  gate and is never set solely by task acceptance.
+
+`tests/test_factory_cli_e2e.py` adds the CI-only production-path trial: an
+authorized job in the real queue, the real `job_cli.tick`, and a fresh
+`FactoryDriver` per restart pass. It uses a simulated worker patch, not a real
+worker host.
 
 This is **not** a live-host trial. It does not prove that a real systemd unit
 restarts, that the launcher survives a reboot, or that a real model continues

@@ -322,7 +322,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             continue
         job = _load_job_or_none(state_dir, item.job_id)
         if job is None:
-            store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist"))
+            store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist", pid=os.getpid()))
             queue.set_status(feature_id, "needs_approval", {"detail": "claimed but no job; authorization or packet must be re-registered"})
             return {"action": "blocked", "feature": feature_id, "job": item.job_id,
                     "detail": "a claim exists but its job does not; recreate the authorized job, then re-run"}
@@ -336,14 +336,14 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             _checkpoint("queue.before_ack", feature_id=feature_id, job_id=item.job_id,
                        state="ready_for_review")
             queue.set_status(feature_id, "ready_for_review", {"job_id": item.job_id})
-            store.write(feature_id, dict(record, state="ready_for_review", evidence=result))
+            store.write(feature_id, dict(record, state="ready_for_review", evidence=result, pid=os.getpid()))
             return {"action": "ready_for_review", "feature": feature_id, "job": item.job_id, "status": status}
         if status in ("blocked", "failed", "error"):
-            store.write(feature_id, dict(record, state="blocked" if status == "blocked" else "failed", evidence=result))
+            store.write(feature_id, dict(record, state="blocked" if status == "blocked" else "failed", evidence=result, pid=os.getpid()))
             queue.set_status(feature_id, "blocked" if status == "blocked" else "failed",
                              {"detail": str(result.get("detail") or "")[:400]})
             return {"action": status, "feature": feature_id, "job": item.job_id, "status": status}
-        store.write(feature_id, dict(record, state="running", evidence=result))
+        store.write(feature_id, dict(record, state="running", evidence=result, pid=os.getpid()))
         queue.set_status(feature_id, "running", {"job_id": item.job_id})
         return {"action": "advanced", "feature": feature_id, "job": item.job_id, "status": status}
 
@@ -355,7 +355,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     record = store.claim(item.feature_id, job_id=item.job_id)
     queue.set_status(item.feature_id, "claimed", {"job_id": item.job_id})
     if _load_job_or_none(state_dir, item.job_id) is None:
-        store.write(item.feature_id, dict(record, state="needs_approval", detail="job missing at claim time"))
+        store.write(item.feature_id, dict(record, state="needs_approval", detail="job missing at claim time", pid=os.getpid()))
         queue.set_status(item.feature_id, "needs_approval", {"detail": "no authorized job for this feature"})
         return {"action": "blocked", "feature": item.feature_id, "job": item.job_id,
                 "detail": "claimed, but the authorized job does not exist"}
@@ -366,14 +366,14 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         _checkpoint("queue.before_ack", feature_id=item.feature_id, job_id=item.job_id,
                    state="ready_for_review")
         queue.set_status(item.feature_id, "ready_for_review", {"job_id": item.job_id})
-        store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result))
+        store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result, pid=os.getpid()))
         action = "ready_for_review"
     elif status in ("blocked", "failed", "error"):
-        store.write(item.feature_id, dict(record, state="blocked", evidence=result))
+        store.write(item.feature_id, dict(record, state="blocked", evidence=result, pid=os.getpid()))
         queue.set_status(item.feature_id, "blocked", {"detail": str(result.get("detail") or "")[:400]})
         action = "blocked"
     else:
-        store.write(item.feature_id, dict(record, state="running", evidence=result))
+        store.write(item.feature_id, dict(record, state="running", evidence=result, pid=os.getpid()))
         queue.set_status(item.feature_id, "running", {"job_id": item.job_id})
         action = "running"
 
@@ -433,6 +433,16 @@ def _job_accepted_reasons(state_dir: Path, job_id: str) -> list[str]:
 def _job_accepted(state_dir: Path, job_id: str) -> bool:
     """Completion requires real verification records, not status strings."""
     return not _job_accepted_reasons(state_dir, job_id)
+
+
+def job_accepted(state_dir: Path | str, job_id: str) -> bool:
+    """Public read-only job-completion check for campaign/continuity callers."""
+    return _job_accepted(Path(state_dir), job_id)
+
+
+def job_accepted_reasons(state_dir: Path | str, job_id: str) -> list[str]:
+    """Public read-only list of missing job evidence; empty means accepted."""
+    return _job_accepted_reasons(Path(state_dir), job_id)
 
 
 def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:

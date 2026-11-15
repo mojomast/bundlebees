@@ -62,7 +62,7 @@
       }
     },
     "phase": {
-      "enum": ["authorized", "ready_to_advance", "running", "ready_for_review", "blocked"]
+      "enum": ["authorized", "ready_to_advance", "running", "job_complete", "ready_for_review", "blocked"]
     },
     "active_workers": {
       "type": "array",
@@ -100,6 +100,8 @@
         "task_ids": {"type": "array", "items": {"type": "string"}}
       }
     },
+    "job_accepted": {"type": "boolean"},
+    "job_acceptance_reasons": {"type": "array", "items": {"type": "string"}},
     "task_counts": {
       "type": "object",
       "required": ["total", "accepted", "active", "ready", "failed"],

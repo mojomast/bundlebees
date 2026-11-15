@@ -7,8 +7,9 @@ action, the next action and the current wait/blocker. It never grants authority:
 the job's signed authorization remains the only source of permission.
 
 Reconciliation is deliberately read-only with respect to the job tree. It reads
-the durable job document and writes a new campaign checkpoint; dispatch,
-verification, integration and recovery stay in ``job_cli.tick``/the queue.
+the durable job document and the queue's job-acceptance evidence, then writes a
+new campaign checkpoint; dispatch, verification, integration and recovery stay
+in ``job_cli.tick``/the queue.
 Repeating a reconcile against unchanged job state does not advance the revision
 or rewrite the file, so a restart can adopt the checkpoint without side effects.
 """
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import job as jobs
+from . import queue as queue_mod
 
 SCHEMA = "rizzstack.campaign-state/1"
 CAMPAIGN_DIR = "campaigns"
@@ -44,7 +46,9 @@ ALLOWED_TASK_STATES = (
 ACTIVE_TASK_STATES = frozenset(
     {"dispatching", "dispatched", "running", "verifying", "verified", "integrating"}
 )
-BAD_TASK_STATES = frozenset({"rejected", "failed"})
+WORKER_TASK_STATES = frozenset({"dispatching", "dispatched", "running", "verifying"})
+INTEGRATION_TASK_STATES = frozenset({"verified", "integrating"})
+BAD_TASK_STATES = frozenset({"rejected", "failed", "superseded"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
@@ -85,6 +89,8 @@ def _text(value: Any, field: str) -> str:
 
 def _optional_text(value: Any, field: str) -> str:
     if value is None:
+        return ""
+    if isinstance(value, str) and not value.strip():
         return ""
     return _text(value, field)
 
@@ -216,6 +222,8 @@ def create_campaign(
         "next_action": "reconcile",
         "wait_condition": "not reconciled against the job yet",
         "blocker": None,
+        "job_accepted": False,
+        "job_acceptance_reasons": [],
         "task_counts": {"total": 0, "accepted": 0, "active": 0, "ready": 0, "failed": 0},
         "revision": 1,
         "created_at": _now(),
@@ -229,7 +237,14 @@ def load_campaign(state_dir: Path | str, campaign_id: str) -> dict[str, Any]:
     return _read(_path(state_dir, _id(campaign_id, "campaign_id")))
 
 
-def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+def _derive(
+    record: Mapping[str, Any],
+    job: Mapping[str, Any],
+    *,
+    now: str,
+    job_accepted: bool,
+    job_acceptance_reasons: list[str],
+) -> dict[str, Any]:
     auth_value = record.get("authorization")
     auth: Mapping[str, Any] = auth_value if isinstance(auth_value, Mapping) else {}
     goal_value = job.get("goal")
@@ -262,11 +277,17 @@ def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> d
     active = sorted(
         task_id for task_id, state in states.items() if state in ACTIVE_TASK_STATES
     )
+    worker_active = sorted(
+        task_id for task_id, state in states.items() if state in WORKER_TASK_STATES
+    )
+    integration_active = sorted(
+        task_id for task_id, state in states.items() if state in INTEGRATION_TASK_STATES
+    )
     ready: list[str] = []
     for task_id, task in task_map.items():
         if task_id in accepted or task_id in failed or task_id in active:
             continue
-        if states.get(task_id) not in {"pending", "dispatching"}:
+        if states.get(task_id) != "pending":
             continue
         if all(states.get(dep) == "accepted" for dep in dependencies.get(task_id, [])):
             ready.append(task_id)
@@ -292,20 +313,51 @@ def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> d
                 "reason": str(last.get("reason") or ""),
             }
 
-    if failed:
+    integration_value = job.get("integration")
+    integration: Mapping[str, Any] = (
+        integration_value if isinstance(integration_value, Mapping) else {}
+    )
+    if integration.get("terminal"):
+        phase = "blocked"
+        blocker = {
+            "code": "integration_terminal",
+            "detail": str(integration.get("evidence") or "integration stopped after its bounded attempts"),
+        }
+        next_action = "resolve_integration"
+        wait_condition = "integration is terminal; a recovery or human decision is required"
+    elif failed:
         phase = "blocked"
         blocker = {
             "code": "task_failed",
             "task_ids": failed,
-            "detail": "a task is rejected or failed; recovery or a human decision is required",
+            "detail": "a task is rejected, failed or superseded; recovery or a human decision is required",
         }
         next_action = "resolve:" + ",".join(failed)
         wait_condition = "failure requires recovery or an explicit decision"
-    elif tasks and len(accepted) == len(states):
-        phase = "ready_for_review"
+    elif tasks and len(accepted) == len(states) and job_accepted:
+        phase = "job_complete"
         blocker = None
-        next_action = "await_receiver_review"
-        wait_condition = "human receiver decision; merge, release, deploy and publish remain gated"
+        next_action = "prepare_campaign_closeout"
+        wait_condition = (
+            "job tasks are accepted; campaign-level product evidence, audit triage "
+            "and the closeout report have not been verified"
+        )
+    elif tasks and len(accepted) == len(states):
+        phase = "blocked"
+        blocker = {
+            "code": "job_evidence_incomplete",
+            "detail": "; ".join(job_acceptance_reasons[:8]) or "job acceptance evidence is incomplete",
+        }
+        next_action = "repair_job_evidence"
+        wait_condition = "task rows are accepted but the job is not reviewable"
+    elif integration_active and not worker_active:
+        phase = "running"
+        blocker = None
+        next_action = "integrate:" + integration_active[0]
+        wait_condition = (
+            "integration step pending for "
+            + ", ".join(f"{task_id} ({states[task_id]})" for task_id in integration_active)
+        )
     elif active:
         phase = "running"
         blocker = None
@@ -322,7 +374,7 @@ def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> d
         phase = "blocked"
         blocker = {
             "code": "no_ready_task",
-            "task_ids": sorted(task_id for task_id in states if states[task_id] not in accepted),
+            "task_ids": sorted(task_id for task_id in states if task_id not in accepted),
             "detail": "no pending task has all dependencies accepted",
         }
         next_action = "inspect_dependencies"
@@ -345,6 +397,8 @@ def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> d
         "next_action": next_action,
         "wait_condition": wait_condition,
         "blocker": blocker,
+        "job_accepted": bool(job_accepted),
+        "job_acceptance_reasons": list(job_acceptance_reasons),
         "task_counts": {
             "total": len(states),
             "accepted": len(accepted),
@@ -376,7 +430,14 @@ def reconcile(
     if not job_id:
         raise CampaignError("campaign_corrupt", "campaign checkpoint has no job_id")
     job = jobs.load_job(Path(state_dir), job_id)
-    observed = _derive(record, job, now=now or _now())
+    reasons = queue_mod.job_accepted_reasons(Path(state_dir), job_id)
+    observed = _derive(
+        record,
+        job,
+        now=now or _now(),
+        job_accepted=not reasons,
+        job_acceptance_reasons=reasons,
+    )
     changed = any(record.get(key) != observed[key] for key in observed if key != "reconciled_at")
     if not changed:
         return record
@@ -409,4 +470,5 @@ def resume_plan(state_dir: Path | str, campaign_id: str, *, now: str | None = No
         "blocker": record.get("blocker"),
         "should_continue": phase in {"authorized", "ready_to_advance", "running"},
         "requires_human": phase in {"ready_for_review", "blocked"},
+        "requires_campaign_closeout": phase == "job_complete",
     }
