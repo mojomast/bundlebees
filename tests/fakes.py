@@ -136,6 +136,10 @@ def require_sandbox_interpreter(preferred: str = "auto") -> None:
 
     from bundlebees_plugin import sandbox
 
+    # A configured interpreter is staged into the copy by run_in_sandbox, so reachability of the
+    # coordinator's own interpreter no longer decides whether a sandboxed python child can start.
+    if sandbox.resolve_sandbox_python(""):
+        return
     backend = sandbox.detect_backend(preferred)
     if backend is None:
         pytest.skip("no strong sandbox backend is usable on this host")
