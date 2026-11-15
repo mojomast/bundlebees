@@ -29,4 +29,6 @@ Python standard library and no external assets.
 | Application acceptance | `pilot/todo/acceptance.py` | real server + HTTP + API contract checks |
 
 The executable plan is `pilot/todo/project.json`; the project planner turns it
-into a dependent task list and the factory driver advances it.
+into a dependent task list and the factory driver advances it. `acceptance.py`
+is application-level evidence for the served product, not a claim that the
+project or a campaign is accepted; see [campaign acceptance](../CAMPAIGN-ACCEPTANCE.md).

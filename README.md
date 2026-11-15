@@ -22,7 +22,7 @@ A coordinator can already run cheap, parallel coding workers — bees — in dis
 
 bundlebees turns that workflow into a Hermes plugin so the agent does not have to invent an HTTP client, touch a token, or apply a patch itself.
 
-The unit of progress is an **accepted artifact with evidence**, not a worker's claim that it finished. From v0.2.0 that is enforced in code: a strict brief, a signed coordinator lease, an exact-revision check, tests in a disposable no-network sandbox, and a full-suite integration gate before a wave counts. None of it depends on which agent did the work: DeepSeek bees through the Orbit/Hermes launcher are the default [worker backend](docs/ADAPTERS.md), and any runtime that returns a patch can plug in.
+The unit of progress is an **accepted artifact with evidence**, not a worker's claim that it finished. From v0.2.0 that is enforced in code: a strict brief, a signed coordinator lease, an exact-revision check, tests in a disposable no-network sandbox, and a full-suite integration gate before a wave counts. None of it depends on which agent did the work: DeepSeek bees through the Orbit/Hermes launcher are the default [worker backend](docs/ADAPTERS.md), and any runtime that returns a patch can plug in. A task or project being `accepted` is still not campaign acceptance; see [campaign acceptance](docs/CAMPAIGN-ACCEPTANCE.md) for the closeout boundary.
 
 What the agent gets:
 

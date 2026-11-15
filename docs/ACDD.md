@@ -171,3 +171,7 @@ In progress: a read-only model and panel renderer are built (orbitdesktop `serve
 | Orbit | Read-only contract and evidence view | Model and panel built on a branch under review; wiring into the board, routes and activity feed is planned |
 
 The ACDD + TDD work itself was built this way; the RED/GREEN evidence for all three repositories is in [`evidence/2026-11-12-acdd-build/`](https://github.com/mojomast/workflow/blob/main/evidence/2026-11-12-acdd-build/README.md).
+
+## Campaign acceptance
+
+A job's ACDD evidence and a project's task states are not a campaign closeout. The workflow-owned [`rizzstack.campaign-report/1`](https://github.com/mojomast/workflow/blob/main/docs/30-campaign-closeout.md) record separates implementation, integration and accepted evidence, requires evidence for PASS and reasons for unrun checks, and keeps the receiver decision pending. bundlebees' boundary and the pilot application acceptance pattern are in [CAMPAIGN-ACCEPTANCE.md](CAMPAIGN-ACCEPTANCE.md).
