@@ -3054,7 +3054,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.get("verdict") == "pass" else 2
 
     if args.command == "prepare":
-        plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        try:
+            plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"plan_invalid: cannot read trial plan: {exc}", file=sys.stderr)
+            return 2
         try:
             result = prepare_request(
                 args.state,
