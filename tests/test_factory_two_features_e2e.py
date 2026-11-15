@@ -23,6 +23,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+
+import pytest
 from pathlib import Path
 from unittest import mock
 
@@ -219,9 +221,19 @@ def validate_pair(request, decision, **kwargs):
 '''
 
 
+# Values this module found in the environment before it injected its doubles. Without the restore in
+# `_restore_gatec_dependencies` these fakes leak into every later test module in the same process: the
+# M4/adaptor suites then run against a fake protocol instead of skipping, and fail for reasons that have
+# nothing to do with the code under test.
+_PRE_INSTALL: dict[str, str | None] = {}
+_INJECTED: dict[str, str] = {}
+
+
 def _install_gatec_dependencies() -> None:
     """Supply local doubles only when the pinned external tools are absent."""
 
+    for name in ("WORKFLOW_SRC", "HYVV_SRC", "GITLEAKS"):
+        _PRE_INSTALL.setdefault(name, os.environ.get(name))
     workflow = os.environ.get("WORKFLOW_SRC", "")
     if not (workflow and (Path(workflow) / "tools" / "recovery.py").is_file()):
         root = Path(tempfile.mkdtemp(prefix="bb-fake-workflow-"))
@@ -237,6 +249,7 @@ def _install_gatec_dependencies() -> None:
         subprocess.run(["git", "commit", "-q", "-m", "pinned recovery protocol"],
                        cwd=str(root), check=True, env=env)
         os.environ["WORKFLOW_SRC"] = str(root)
+        _INJECTED["WORKFLOW_SRC"] = str(root)
 
     hyvv = os.environ.get("HYVV_SRC", "")
     if not (hyvv and (Path(hyvv) / "provisioning.py").exists()):
@@ -244,6 +257,7 @@ def _install_gatec_dependencies() -> None:
         atexit.register(shutil.rmtree, root, True)
         (root / "provisioning.py").write_text(_FAKE_HYVV, encoding="utf-8")
         os.environ["HYVV_SRC"] = str(root)
+        _INJECTED["HYVV_SRC"] = str(root)
 
     gitleaks = os.environ.get("GITLEAKS") or shutil.which("gitleaks") or "/home/clanker01/.local/bin/gitleaks"
     if not Path(gitleaks).exists():
@@ -253,9 +267,36 @@ def _install_gatec_dependencies() -> None:
         gitleaks.write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n", encoding="utf-8")
         gitleaks.chmod(0o755)
         os.environ["GITLEAKS"] = str(gitleaks)
+        _INJECTED["GITLEAKS"] = str(gitleaks)
+
+
+def _restore_gatec_environment() -> None:
+    """Put the process environment back the way this module found it."""
+    for name, original in _PRE_INSTALL.items():
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
+
+
+def _apply_gatec_environment() -> None:
+    os.environ.update(_INJECTED)
 
 
 _install_gatec_dependencies()
+# pytest imports every test module during collection, before any test runs. Leaving the doubles in
+# os.environ here made later modules capture a fake WORKFLOW_SRC/HYVV_SRC at import and then fail for
+# reasons unrelated to their subject instead of taking their documented skip. Restore immediately and
+# re-apply only while this module's own tests execute.
+_restore_gatec_environment()
+
+
+@pytest.fixture(autouse=True)
+def _gatec_environment():
+    _apply_gatec_environment()
+    yield
+    _restore_gatec_environment()
+
 
 from bundlebees_plugin import contract as contract_mod
 from bundlebees_plugin import factory_driver, job as jobs, queue, return_report, sandbox
