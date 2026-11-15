@@ -110,6 +110,8 @@ def client(tmp_path, monkeypatch):
     module.load_receipt = fake.load_receipt
     module.record_decision = fake.record_decision
     monkeypatch.setitem(sys.modules, "bundlebees_plugin.approval", module)
+    import bundlebees_plugin
+    monkeypatch.setattr(bundlebees_plugin, "approval", module, raising=False)
     API.reset_state()
     API.set_data_dir(tmp_path)
     app = FastAPI()
