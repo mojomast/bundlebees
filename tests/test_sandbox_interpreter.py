@@ -13,6 +13,7 @@ Offline only: ``subprocess.run`` is faked here, so no backend executes.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -169,6 +170,27 @@ class TestRunInSandbox:
         assert len(self.calls) == 1
         assert "/bin/true" in self.calls[0]
         assert self.outer not in self.calls[0]
+
+
+class TestStageInterpreter:
+    def test_a_regular_interpreter_gains_the_execute_bit(self, tmp_path):
+        host = Path(_exe(tmp_path / "venv" / "bin" / "python3"))
+        host.chmod(0o644)  # as if copied without the execute bit
+        staged = Path(sandbox.stage_interpreter(tmp_path / "work", str(host)))
+        assert staged.is_file() and not staged.is_symlink()
+        assert staged.stat().st_mode & 0o500 == 0o500
+        assert str(staged).startswith(str(tmp_path / "work" / sandbox._SANDBOX_PYTHON_DIR))
+
+    def test_a_venv_symlink_is_staged_without_following_it(self, tmp_path):
+        # Every normal venv links bin/python at its base interpreter; chmod would EPERM there.
+        venv = tmp_path / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        (venv / "bin" / "python").symlink_to("/usr/bin/python3.12")
+        staged = Path(sandbox.stage_interpreter(tmp_path / "work", str(venv / "bin" / "python")))
+        assert staged.is_symlink()
+        assert os.readlink(staged) == "/usr/bin/python3.12"
+        assert (tmp_path / "work" / sandbox._SANDBOX_PYTHON_DIR / "pyvenv.cfg").is_file()
 
 
 class TestDeclaration:
