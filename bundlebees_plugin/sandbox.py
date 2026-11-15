@@ -516,8 +516,10 @@ def stage_interpreter(copy_dir: Path, host_python: str) -> str:
         shutil.rmtree(destination)
     shutil.copytree(root, destination, symlinks=True)
     staged = destination / host.relative_to(root)
-    mode = staged.stat().st_mode
-    staged.chmod(mode | 0o500)  # copy2 keeps the mode; make sure it is executable
+    if not staged.is_symlink():
+        # A venv's bin/python is usually a symlink to the base interpreter; chmod would follow it
+        # and fail with EPERM on a root-owned target. Only a regular file needs the execute bit.
+        staged.chmod(staged.stat().st_mode | 0o500)
     return str(staged)
 
 
