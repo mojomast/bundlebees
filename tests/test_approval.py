@@ -213,6 +213,17 @@ def test_an_edited_expiry_is_refused_even_when_the_binding_is_unchanged(tmp_path
 # ---------------------------------------------------------------------------
 
 
+def test_interactive_true_is_not_a_tty_bypass(tmp_path, monkeypatch):
+    import sys
+
+    request = make_request(tmp_path)
+    receipt = decide(tmp_path, request)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(jobs.JobError) as caught:
+        authorize(tmp_path, receipt, require_tty=True, interactive=True)
+    assert caught.value.code == "authorization_receipt_requires_nontty"
+
+
 def test_an_unprefixed_agent_call_is_refused_and_cannot_mint_a_receipt(tmp_path):
     request = make_request(tmp_path)
 

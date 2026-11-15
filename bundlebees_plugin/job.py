@@ -647,7 +647,12 @@ def record_authorization(
             "Call the receipt path with require_tty=False; a receipt never substitutes for a typed authorization.",
         )
 
-    is_tty = sys.stdin.isatty() if interactive is None else bool(interactive)
+    is_tty = sys.stdin.isatty()
+    if interactive is False:
+        is_tty = False
+    # ``interactive=True`` is deliberately not a bypass: a caller that cannot
+    # show a real terminal cannot mint authority by asserting one. Tests set a
+    # fake isatty() instead of lying through this argument.
     if require_tty and not is_tty:
         raise JobError(
             "authorization_not_interactive",
@@ -1098,7 +1103,12 @@ def record_approval(
 ) -> dict[str, Any]:
     """Record a gate decision. Only a TTY can write one."""
 
-    is_tty = sys.stdin.isatty() if interactive is None else bool(interactive)
+    is_tty = sys.stdin.isatty()
+    if interactive is False:
+        is_tty = False
+    # ``interactive=True`` is deliberately not a bypass: a caller that cannot
+    # show a real terminal cannot mint authority by asserting one. Tests set a
+    # fake isatty() instead of lying through this argument.
     if require_tty and not is_tty:
         raise JobError(
             "approval_not_interactive",
