@@ -1131,7 +1131,10 @@ class _ModuleApproval:
         return self._verify(receipt)
 
     def consume_receipt(self, receipt: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self._consume(receipt)
+        # The approval lane keys consumption to a stable consumer. A trial is
+        # exactly one consumer; a second trial with the same receipt is a
+        # replay and must be refused by the approval module.
+        return self._consume(receipt, consumer="bundlebees-restart-trial")
 
 
 def _verified_receipt(result: Any) -> dict[str, Any]:
@@ -1143,8 +1146,20 @@ def _verified_receipt(result: Any) -> dict[str, Any]:
             f"verify_receipt returned {type(result).__name__}, not a mapping",
             "Use the approval lane's receipt verifier; the harness will not guess a verdict.",
         )
-    positive = any(result.get(key) is True for key in ("ok", "valid", "verified", "approved"))
-    if not positive:
+    decision_value = str(result.get("decision") or "").strip().lower()
+    if decision_value == "declined":
+        raise TrialRefused(
+            "approval_receipt_declined",
+            "the owner declined this trial",
+            "Do not dispatch; ask for a fresh request if the work changes.",
+        )
+    positive = decision_value == "approved" or any(
+        result.get(key) is True for key in ("ok", "valid", "verified", "approved")
+    )
+    identity = str(
+        result.get("receipt_id") or result.get("request_id") or result.get("id") or ""
+    ).strip()
+    if not positive or not identity:
         raise TrialRefused(
             "approval_receipt_rejected",
             f"the approval receipt was not accepted: {dict(result)!r}"[:500],
@@ -2229,9 +2244,16 @@ class RestartTrial:
             "source": "configured" if self.plan.code_rev else ("git-head" if detected_rev else "unavailable"),
         }
         if not self.code_rev:
-            self._limitations.append(
-                "code_rev_unavailable: the checkout has no readable git HEAD; the trial is not bound to a code revision"
-            )
+            if self.plan.rehearsal:
+                self._limitations.append(
+                    "code_rev_unavailable: the checkout has no readable git HEAD; the trial is not bound to a code revision"
+                )
+            else:
+                raise TrialRefused(
+                    "code_rev_unverifiable",
+                    "the live checkout cannot name its git HEAD, so the trial cannot bind to a code revision",
+                    "Run from the pinned Bundlebees checkout or pass an exact --code-rev.",
+                )
         self._step("code_rev_recorded", code_rev=self.code_rev)
         argv = validate_driver_argv(self.plan.driver_argv, allowed_modules=self._driver_modules())
         restart_argv = validate_driver_argv(self.plan.restart_argv, allowed_modules=self._driver_modules())
