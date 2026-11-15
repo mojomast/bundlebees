@@ -98,6 +98,17 @@ config_schema:
       (bwrap, then firejail; never unshare), or one of bwrap, firejail,
       unshare. unshare also needs verify_allow_weak_unshare. Verify fails
       closed when none is usable.
+  verify_python:
+    type: str
+    default: ""
+    description: >-
+      Absolute interpreter path the sandbox starts for pytest and the ACDD
+      collector, for hosts where the Hermes interpreter lives inside the
+      coordinator home (firejail --private hides that home, so the jail
+      cannot exec it). It must exist OUTSIDE the home and have pytest
+      installed. Empty uses the coordinator's own interpreter, which is
+      right for bwrap and refused with sandbox_interpreter_hidden when a
+      home-hiding backend is chosen. BUNDLEBEES_VERIFY_PYTHON does the same.
   integrate_suite:
     type: str
     default: ""

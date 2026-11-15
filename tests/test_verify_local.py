@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.fakes import require_sandbox_interpreter
 from bundlebees_plugin import leases, sandbox, verify_local
 
 PY = sys.executable
@@ -165,6 +166,7 @@ class Refusals:
         assert exc.value.code == "red_missing"
 
     def test_failing_tests_after_the_patch_are_refused(self, tmp_path):
+        require_sandbox_interpreter()
         repo, base = make_repo(tmp_path)
         state = tmp_path / "state"
         bad = {

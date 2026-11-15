@@ -56,6 +56,16 @@ one pull request.
 
 ### Fixed
 
+- **Verify can start pytest on a host whose Hermes interpreter lives under `$HOME`.**
+  `firejail --private=<copy>` masks the coordinator home, so an interpreter at
+  `~/.hermes/tools/python-*/bin/python3` (or a `uv run --with` shim under
+  `~/.cache/uv/builds-v0/`) does not exist inside the jail; the wrapper reported only
+  `no suitable <path> executable found` and the run failed with `tests_failed`. Reachability is
+  now **probed through the chosen backend** before the worker's command starts (a path heuristic
+  is wrong: this host masks `~/.hermes` while a separate mount under `~/.cache/uv` stays
+  visible), a hidden interpreter refuses with `sandbox_interpreter_hidden` and a fix, and the new
+  `verify_python` setting (or `BUNDLEBEES_VERIFY_PYTHON`) names an interpreter the jail can exec.
+  `auto` still prefers bubblewrap, where the coordinator interpreter is already visible.
 - Concurrent first dispatches on a fresh state directory could fail with
   `lease_invalid: the lease key is not 32 bytes`: one thread opened the key
   file after another created it but before the bytes were written (seen in
