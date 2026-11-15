@@ -907,6 +907,15 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
             _FIX_AUTH,
         ) from exc
     body = _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    if str(body.get("job_id") or "") != _job_id(job_id):
+        raise JobError(
+            "authorization_job_mismatch",
+            (
+                f"the authorization at {authorization_path(state_dir, job_id)} names job "
+                f"{body.get('job_id')!r}, not {job_id!r}"
+            ),
+            "Refuse it; an authorization is never valid for a different job id.",
+        )
     block = body.get("recovery")
     block = dict(block) if isinstance(block, Mapping) else {}
     if "recovery" in body or "recovery_digest" in body:
