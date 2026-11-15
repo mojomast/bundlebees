@@ -729,7 +729,10 @@ def run_in_sandbox(
                 extra_ro.append((str(cache), _TIKTOKEN_CACHE_INSIDE))
                 env["TIKTOKEN_CACHE_DIR"] = _TIKTOKEN_CACHE_INSIDE
         elif chosen == "firejail":
-            evidence_inside = str(evidence_host)
+            # firejail --private=<copy> mounts the copy OVER $HOME, so the copy's host path does not
+            # exist inside the jail even though the same directory is the child's cwd. Evidence must be
+            # addressed relatively, exactly like a staged interpreter.
+            evidence_inside = f"./{_EVIDENCE_NAME}"
             env = sandbox_env(copy_dir, Path("/tmp"))
             if cache is not None:
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
