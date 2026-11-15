@@ -8,6 +8,7 @@ collection failure that looked like a bad patch.
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -28,6 +29,7 @@ class TestEvidencePath:
     @pytest.fixture(autouse=True)
     def _fake_jail(self, monkeypatch):
         self.calls: list[list[str]] = []
+        self.envs: list[dict] = []
 
         class Done:
             returncode = 0
@@ -36,6 +38,7 @@ class TestEvidencePath:
 
         def fake_run(command, **kwargs):
             self.calls.append([str(part) for part in command])
+            self.envs.append(dict(kwargs.get("env") or {}))
             return Done()
 
         monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
@@ -60,12 +63,30 @@ class TestEvidencePath:
         assert runs, self.calls
         flat = " ".join(runs[0])
         assert f"./{sandbox._EVIDENCE_NAME}/collected.json" in flat, flat
-        assert str(self.work / sandbox._EVIDENCE_NAME) not in flat, "host evidence path leaked into the jail"
+        # Any absolute evidence path is invisible in the jail (the copy is mounted over $HOME), so the
+        # command must contain none — not merely "not this one directory".
+        prefixes = [m.group(1) for m in re.finditer(r"(\S*)" + re.escape(sandbox._EVIDENCE_NAME), flat)]
+        assert prefixes == ["./"], prefixes
+
+    def test_firejail_gets_a_home_that_exists_inside_the_jail(self):
+        self._run("firejail")
+        runs = [i for i, c in enumerate(self.calls) if "test -x" not in " ".join(c)]
+        assert runs, self.calls
+        env = self.envs[runs[0]]
+        assert env["HOME"] == str(Path.home()), env["HOME"]
+        assert env["HOME"] != str(self.work), "HOME still points at the copy's host path"
 
     def test_bubblewrap_keeps_its_mounted_evidence_path(self):
         # bwrap mounts the copy at /work, so absolute-inside paths stay valid there.
-        result = self._run("bwrap")
-        assert result.get("backend") in (None, "bwrap")
+        self._run("bwrap")
+        runs = [c for c in self.calls if "test -x" not in " ".join(c)]
+        assert runs, self.calls
+        flat = " ".join(runs[0])
+        assert f"/work/{sandbox._EVIDENCE_NAME}/collected.json" in flat, flat
+        # The copy's host path legitimately appears as the --bind source, so check the prefix that
+        # each occurrence of the evidence name was addressed with: it must be the mount point.
+        prefixes = [m.group(1) for m in re.finditer(r"(\S*)" + re.escape(sandbox._EVIDENCE_NAME), flat)]
+        assert prefixes == ["/work/"], prefixes
 
 
 class TestRealFirejailWritesTheManifest:

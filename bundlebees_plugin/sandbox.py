@@ -733,7 +733,9 @@ def run_in_sandbox(
             # exist inside the jail even though the same directory is the child's cwd. Evidence must be
             # addressed relatively, exactly like a staged interpreter.
             evidence_inside = f"./{_EVIDENCE_NAME}"
-            env = sandbox_env(copy_dir, Path("/tmp"))
+            # The copy is mounted OVER the coordinator's home, so the jail-visible home is the real
+            # home path, not the copy's host path (which does not exist inside).
+            env = sandbox_env(Path.home(), Path("/tmp"))
             if cache is not None:
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
         else:
