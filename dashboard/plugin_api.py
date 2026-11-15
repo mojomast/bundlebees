@@ -809,6 +809,13 @@ def _approval_error(exc: Exception) -> DashboardError:
     return DashboardError(message, code, fix, status)
 
 
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _approval_public(row: Mapping[str, Any]) -> dict[str, Any]:
     """Only the owner-facing card projection; no internal paths or credentials."""
     binding = row.get("binding") if isinstance(row.get("binding"), Mapping) else {}
@@ -839,10 +846,10 @@ def _approval_public(row: Mapping[str, Any]) -> dict[str, Any]:
         "worker_project": str(worker.get("project") or ""),
         "worker_profile": str(worker.get("profile") or ""),
         "code_rev": str(binding.get("code_rev") or ""),
-        "bees": int(budgets.get("bees") or 0),
-        "wall_clock_s": int(budgets.get("wall_clock_s") or 0),
-        "attempts": int(budgets.get("attempts") or 0),
-        "accepted_waves": int(budgets.get("accepted_waves") or 0),
+        "bees": _int_or_zero(budgets.get("bees")),
+        "wall_clock_s": _int_or_zero(budgets.get("wall_clock_s")),
+        "attempts": _int_or_zero(budgets.get("attempts")),
+        "accepted_waves": _int_or_zero(budgets.get("accepted_waves")),
         "coordinator_stop": dict(stop) if isinstance(stop, Mapping) else {"planned": stop},
         "restart": dict(restart) if isinstance(restart, Mapping) else {"planned": restart},
         "created_at": row.get("created_at"),
