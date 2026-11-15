@@ -191,3 +191,16 @@ def test_the_checkpoint_matches_its_published_schema(tmp_path: Path):
     Draft202012Validator.check_schema(schema)
     Draft202012Validator(schema).validate(record)
     Draft202012Validator(schema).validate(reconciled)
+
+
+def test_a_job_with_no_tasks_is_a_blocker_not_an_idle_loop(tmp_path: Path):
+    record = _setup(tmp_path)
+    job = jobs.load_job(tmp_path, JOB)
+    job["tasks"] = []
+    jobs.save_job(tmp_path, job)
+
+    result = campaign.reconcile(tmp_path, record["campaign_id"])
+
+    assert result["phase"] == "blocked"
+    assert result["blocker"]["code"] == "no_tasks"
+    assert campaign.resume_plan(tmp_path, record["campaign_id"])["should_continue"] is False

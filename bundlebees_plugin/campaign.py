@@ -328,10 +328,14 @@ def _derive(record: Mapping[str, Any], job: Mapping[str, Any], *, now: str) -> d
         next_action = "inspect_dependencies"
         wait_condition = "dependency graph has no dispatchable task"
     else:
-        phase = "authorized"
-        blocker = None
+        phase = "blocked"
+        blocker = {
+            "code": "no_tasks",
+            "task_ids": [],
+            "detail": "the job has no tasks; a campaign has nothing to advance",
+        }
         next_action = "add_tasks"
-        wait_condition = "the job has no tasks"
+        wait_condition = "add tasks to the authorized job before continuing"
 
     return {
         "phase": phase,
