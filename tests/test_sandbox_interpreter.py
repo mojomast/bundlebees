@@ -176,10 +176,11 @@ class TestStageInterpreter:
     def test_a_regular_interpreter_gains_the_execute_bit(self, tmp_path):
         host = Path(_exe(tmp_path / "venv" / "bin" / "python3"))
         host.chmod(0o644)  # as if copied without the execute bit
-        staged = Path(sandbox.stage_interpreter(tmp_path / "work", str(host)))
-        assert staged.is_file() and not staged.is_symlink()
-        assert staged.stat().st_mode & 0o500 == 0o500
-        assert str(staged).startswith(str(tmp_path / "work" / sandbox._SANDBOX_PYTHON_DIR))
+        staged = sandbox.stage_interpreter(tmp_path / "work", str(host))
+        assert staged == f"./{sandbox._SANDBOX_PYTHON_DIR}/bin/python3"  # cwd-relative by design
+        target = tmp_path / "work" / staged[2:]
+        assert target.is_file() and not target.is_symlink()
+        assert target.stat().st_mode & 0o500 == 0o500
 
     def test_a_venv_symlink_is_staged_without_following_it(self, tmp_path):
         # Every normal venv links bin/python at its base interpreter; chmod would EPERM there.
@@ -187,9 +188,11 @@ class TestStageInterpreter:
         (venv / "bin").mkdir(parents=True)
         (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
         (venv / "bin" / "python").symlink_to("/usr/bin/python3.12")
-        staged = Path(sandbox.stage_interpreter(tmp_path / "work", str(venv / "bin" / "python")))
-        assert staged.is_symlink()
-        assert os.readlink(staged) == "/usr/bin/python3.12"
+        staged = sandbox.stage_interpreter(tmp_path / "work", str(venv / "bin" / "python"))
+        assert staged == f"./{sandbox._SANDBOX_PYTHON_DIR}/bin/python"
+        target = tmp_path / "work" / staged[2:]
+        assert target.is_symlink()
+        assert os.readlink(target) == "/usr/bin/python3.12"
         assert (tmp_path / "work" / sandbox._SANDBOX_PYTHON_DIR / "pyvenv.cfg").is_file()
 
 

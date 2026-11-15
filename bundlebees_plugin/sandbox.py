@@ -502,12 +502,16 @@ def interpreter_visible_in_sandbox(
 
 
 def stage_interpreter(copy_dir: Path, host_python: str) -> str:
-    """Copy *host_python*'s install tree into the sandbox copy and return its path there.
+    """Copy *host_python*'s install tree into the sandbox copy; return the sandbox-visible path.
 
-    A sandbox that masks every writable location outside its own copy leaves no read-only bind
-    available to an unprivileged user, so the interpreter is staged instead: the copy is
-    disposable, its ``bin/python`` symlink still resolves to the visible base interpreter, and
-    ``python -m pytest`` never depends on installed console-script shebangs.
+    The returned path is **relative** (``./.bundlebees-python/bin/python``): a wrapper that remaps
+    the home mounts the copy over ``$HOME`` and may not expose the copy's host path at all, while
+    the child's cwd is always the copy. ``firejail --private=<copy>`` behaves exactly that way
+    (a host path under the copy answers ENOENT inside the jail, the same file answers fine as
+    ``./…`` or ``$HOME/…``).
+
+    The copy is disposable, a venv's ``bin/python`` symlink still resolves to the visible base
+    interpreter, and ``python -m pytest`` never depends on installed console-script shebangs.
     """
     host = Path(host_python).expanduser()
     root = host.parent.parent  # <venv>/bin/python -> <venv>
@@ -520,7 +524,7 @@ def stage_interpreter(copy_dir: Path, host_python: str) -> str:
         # A venv's bin/python is usually a symlink to the base interpreter; chmod would follow it
         # and fail with EPERM on a root-owned target. Only a regular file needs the execute bit.
         staged.chmod(staged.stat().st_mode | 0o500)
-    return str(staged)
+    return f"./{_SANDBOX_PYTHON_DIR}/{host.relative_to(root).as_posix()}"
 
 
 def swap_interpreter(argv: list[str], interpreter: str | None) -> list[str]:
