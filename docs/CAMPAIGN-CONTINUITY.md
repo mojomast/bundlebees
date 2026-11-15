@@ -24,20 +24,23 @@ Git/PR observer is still required for full external reconciliation.
 | `limits` | The same budget and gates in a compact form for reporting |
 | `phase` | `authorized`, `ready_to_advance`, `running`, `job_complete`, `ready_for_review` or `blocked` |
 | `job_accepted` / `job_acceptance_reasons` | The queue/job completion check: verified attempts, gitleaks, suite and an accepted integration wave, not merely task state strings |
-| `active_workers` | Task ids, job states and attempt ids currently in flight |
+| `active_workers` | Task ids, job states and attempt ids a worker is currently running; a `verified` row is never listed here |
+| `integration_queue` | Task ids, job states and attempt ids whose patch is verified and which await integration |
 | `dependencies` | Each task's declared dependencies |
 | `last_completed_action` | The latest durable job event |
-| `next_action` | What the coordinator should do next, such as `dispatch:T2`, `wait_for_worker` or `prepare_campaign_closeout` |
+| `next_action` | What the coordinator should do next, such as `dispatch:T2`, `wait_for_worker`, `integrate:T1`, `replan:T2` or `prepare_campaign_closeout` |
 | `wait_condition` | Why the next action is waiting |
-| `blocker` | The named failure or dependency problem, when blocked |
-| `task_counts` | total, accepted, active, ready and failed counts |
+| `blocker` | The named failure or dependency problem, when blocked: `integration_terminal`, `task_failed`, `task_superseded`, `job_evidence_incomplete`, `no_ready_task` or `no_tasks` |
+| `task_counts` | total, accepted, active (worker plus integration), integrating, ready, failed and superseded counts; `failed` means rejected or failed, and a superseded row is counted separately |
 | `revision` | Incremented only when the reconciled view changes |
 
 The record is written atomically and mode `0600`. Repeating a reconcile against
 unchanged job state returns the same record and does not rewrite it. A restart
 therefore adopts the checkpoint, not a remembered plan. A `verified` task is
-waiting for integration, not for a worker; a terminal integration failure is a
-named blocker.
+waiting for integration, not for a worker: it appears in `integration_queue`, not
+`active_workers`. A terminal integration failure is a named blocker, and a
+`superseded` row is reported as `task_superseded`/`replan:<ids>` rather than as a
+retryable failure.
 
 ## What reconcile does and does not do
 
@@ -138,11 +141,29 @@ WantedBy=default.target
 ```
 
 `BUNDLEBEES_LAUNCHER_TOKEN` and `BUNDLEBEES_LAUNCHER_URL` belong in the
-mode-`0600` environment file. Do not launch this unit without `--repo`,
-`--gitleaks` and a launcher URL for a dispatch-capable campaign: without them
-the driver silently falls back to `mechanical_tick`, claims queue cards and
-cannot dispatch or verify. That fallback is useful only for observation and is
-not a work-conserving scheduler.
+mode-`0600` environment file. The driver refuses a partial production
+configuration instead of falling back silently: `--repo` without a launcher URL
+exits with the missing option named, so a unit with an unset
+`BUNDLEBEES_LAUNCHER_URL` fails and restarts loudly rather than claiming cards it
+cannot dispatch. A launcher URL without `--repo` is allowed only for landing
+authenticated export events; it has no dispatch-capable tick and runs
+`observation_only`.
+
+With no launcher URL at all the driver runs the **mechanical observation tick**.
+That tick cannot dispatch, verify, integrate or adopt a worker result, so a queue
+pass in that mode is `observation_only`: it reports the queued and active cards
+and moves nothing. The pass JSON carries `observation_only: true` and a
+one-line warning goes to stderr. Observation is useful for watching state; it is
+not a work-conserving scheduler, and no card is marked `running` by it.
+
+A production pass never treats a tick's own status as acceptance. A tick
+that escalates (a terminal integration stop) or awaits a recovery decision
+blocks the queue card; a known progress status (`ok`, `running`,
+`reconcile_wait`) can keep an active card `running`, but it is not completion
+evidence. A tick that could not run because another live process holds the job
+lock is reported as `deferred` and rewrites nothing. The card is `blocked` with
+the tick's detail, so the campaign checkpoint and the card agree about a job
+that needs a human.
 
 The unit and its environment file are host changes. Installing, enabling or
 restarting them needs the approver's yes and is **not** done by this change. If
@@ -168,6 +189,13 @@ lives: the job's dispatch intent, idempotency key, signed lease and the queue's
 - adopts a terminal attempt instead of dispatching another;
 - records a campaign revision only if the observed view changed.
 
+Two claim-level states are named refusals rather than silent progress: a claim
+whose card now names a different job is not ticked for either job, and a card
+moved back to `queued` while its previous claim record is still on disk is
+reported as `blocked` (with the record's state) instead of raising the same
+`already_claimed` error on every pass. Releasing that record stays a human act;
+the driver never re-claims or deletes it.
+
 A campaign restart that produces a second dispatch or a second accepted wave is a
 failure of the job/queue seam, not something the checkpoint should hide.
 
@@ -187,7 +215,10 @@ failure of the job/queue seam, not something the checkpoint should hide.
 - task rows marked `accepted` without verification/integration evidence are
   `blocked` at `repair_job_evidence`;
 - a `ready_for_review` campaign phase is reserved for a future verified closeout
-  gate and is never set solely by task acceptance.
+  gate and is never set solely by task acceptance;
+- a `verified` row is reported in `integration_queue` with `active_workers`
+  empty, a `superseded` row blocks as `task_superseded`, and a tick that
+  escalates blocks the queue card instead of leaving it `running`.
 
 `tests/test_factory_cli_e2e.py` adds the CI-only production-path trial: an
 authorized job in the real queue, the real `job_cli.tick`, and a fresh

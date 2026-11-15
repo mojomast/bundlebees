@@ -48,7 +48,11 @@ ACTIVE_TASK_STATES = frozenset(
 )
 WORKER_TASK_STATES = frozenset({"dispatching", "dispatched", "running", "verifying"})
 INTEGRATION_TASK_STATES = frozenset({"verified", "integrating"})
-BAD_TASK_STATES = frozenset({"rejected", "failed", "superseded"})
+#: A rejected or failed row needs a recovery decision or a human; a superseded
+#: row is terminal by replacement and can never be retried.
+FAILED_TASK_STATES = frozenset({"rejected", "failed"})
+SUPERSEDED_TASK_STATE = "superseded"
+BAD_TASK_STATES = FAILED_TASK_STATES | {SUPERSEDED_TASK_STATE}
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
@@ -217,6 +221,7 @@ def create_campaign(
         },
         "phase": "authorized",
         "active_workers": [],
+        "integration_queue": [],
         "dependencies": {},
         "last_completed_action": None,
         "next_action": "reconcile",
@@ -224,7 +229,10 @@ def create_campaign(
         "blocker": None,
         "job_accepted": False,
         "job_acceptance_reasons": [],
-        "task_counts": {"total": 0, "accepted": 0, "active": 0, "ready": 0, "failed": 0},
+        "task_counts": {
+            "total": 0, "accepted": 0, "active": 0, "integrating": 0,
+            "ready": 0, "failed": 0, "superseded": 0,
+        },
         "revision": 1,
         "created_at": _now(),
         "updated_at": _now(),
@@ -273,7 +281,10 @@ def _derive(
         for task_id, task in task_map.items()
     }
     accepted = sorted(task_id for task_id, state in states.items() if state == "accepted")
-    failed = sorted(task_id for task_id, state in states.items() if state in BAD_TASK_STATES)
+    failed = sorted(task_id for task_id, state in states.items() if state in FAILED_TASK_STATES)
+    superseded = sorted(
+        task_id for task_id, state in states.items() if state == SUPERSEDED_TASK_STATE
+    )
     active = sorted(
         task_id for task_id, state in states.items() if state in ACTIVE_TASK_STATES
     )
@@ -293,13 +304,15 @@ def _derive(
             ready.append(task_id)
     ready.sort()
 
-    active_records = []
+    worker_records = []
+    integration_records = []
     for task_id in active:
         task = task_map[task_id]
         attempts = [
             str(item) for item in task.get("attempts") or [] if item
         ] if isinstance(task.get("attempts"), list) else []
-        active_records.append({"task_id": task_id, "state": states[task_id], "attempts": attempts})
+        bucket = worker_records if states[task_id] in WORKER_TASK_STATES else integration_records
+        bucket.append({"task_id": task_id, "state": states[task_id], "attempts": attempts})
 
     events = job.get("events") if isinstance(job.get("events"), list) else []
     last_action = None
@@ -330,10 +343,22 @@ def _derive(
         blocker = {
             "code": "task_failed",
             "task_ids": failed,
-            "detail": "a task is rejected, failed or superseded; recovery or a human decision is required",
+            "detail": "a task is rejected or failed; recovery or a human decision is required",
         }
         next_action = "resolve:" + ",".join(failed)
         wait_condition = "failure requires recovery or an explicit decision"
+    elif superseded:
+        phase = "blocked"
+        blocker = {
+            "code": "task_superseded",
+            "task_ids": superseded,
+            "detail": (
+                "a task row was superseded and cannot be retried; the job needs a re-plan "
+                "or a new authorization"
+            ),
+        }
+        next_action = "replan:" + ",".join(superseded)
+        wait_condition = "a superseded task can never be accepted; re-plan before continuing"
     elif tasks and len(accepted) == len(states) and job_accepted:
         phase = "job_complete"
         blocker = None
@@ -363,8 +388,12 @@ def _derive(
         blocker = None
         next_action = "wait_for_worker"
         wait_condition = "worker/job progress for " + ", ".join(
-            f"{item['task_id']} ({item['state']})" for item in active_records
+            f"{item['task_id']} ({item['state']})" for item in worker_records
         )
+        if integration_records:
+            wait_condition += "; integration pending for " + ", ".join(
+                f"{item['task_id']} ({item['state']})" for item in integration_records
+            )
     elif ready:
         phase = "ready_to_advance"
         blocker = None
@@ -391,7 +420,9 @@ def _derive(
 
     return {
         "phase": phase,
-        "active_workers": active_records,
+        # Only a live worker belongs here; a verified row is integration work.
+        "active_workers": worker_records,
+        "integration_queue": integration_records,
         "dependencies": dependencies,
         "last_completed_action": last_action,
         "next_action": next_action,
@@ -403,8 +434,10 @@ def _derive(
             "total": len(states),
             "accepted": len(accepted),
             "active": len(active),
+            "integrating": len(integration_active),
             "ready": len(ready),
             "failed": len(failed),
+            "superseded": len(superseded),
         },
         "reconciled_at": now,
     }
@@ -465,6 +498,7 @@ def resume_plan(state_dir: Path | str, campaign_id: str, *, now: str | None = No
         "phase": phase,
         "revision": record["revision"],
         "active_workers": list(record.get("active_workers") or []),
+        "integration_queue": list(record.get("integration_queue") or []),
         "next_action": record.get("next_action"),
         "wait_condition": record.get("wait_condition"),
         "blocker": record.get("blocker"),

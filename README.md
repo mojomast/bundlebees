@@ -246,8 +246,9 @@ hermes bundlebees campaign resume-plan --campaign-id campaign-a
 campaign itself never enqueues or dispatches; its authorized job must have a queue item for the
 driver to advance it. At `job_complete` it requires a campaign closeout (product evidence and audit
 triage), not just task acceptance; at `ready_for_review` it requires a human; at `blocked` it returns
-the named blocker. See
-[campaign continuity](docs/CAMPAIGN-CONTINUITY.md) for the state fields and the host-run scheduler.
+the named blocker. A `verified` task waits in `integration_queue` (no worker is in flight for it), a
+terminal integration failure is `integration_terminal`, and a superseded row is `task_superseded`.
+See [campaign continuity](docs/CAMPAIGN-CONTINUITY.md) for the state fields and the host-run scheduler.
 
 ### The feature queue
 
@@ -265,6 +266,14 @@ There is no daemon in the feature queue itself; `factory_driver --interval` is t
 described in [campaign continuity](docs/CAMPAIGN-CONTINUITY.md). `--backend kanban` uses the configured Hermes kanban, but a Kanban
 status is never evidence that work completed — completion is derived from the job document being accepted.
 A queue run needs gitleaks and refuses before claiming anything if it is missing.
+
+A pass never treats the tick's own status string as acceptance. A tick that escalates (a terminal
+integration stop) or waits on a recovery decision sets the card to `blocked` with the tick's detail;
+a known progress status (`ok`, `running`, `reconcile_wait`) can keep an active card `running`, but it
+is not completion evidence. A tick that could not run because another live process holds the job lock
+is reported as `deferred` and rewrites nothing. A card moved back to `queued` while its previous claim
+record still exists is reported as a named `blocked` refusal rather than an `already_claimed` error on
+every pass — releasing that record is a human act.
 
 ### Protocol pinning
 
@@ -484,7 +493,7 @@ Secret (Hermes secrets, not config):
 
 ## Roadmap
 
-- **Unreleased on `main`** (`875025b`): the autonomy layer — durable jobs and authorizations, feature queue, crash-safe reconciler, local-only verification, integration, bounded recovery, RETURN packets, and the agent wake-up — merged in #16–#19. CI-proven in the deterministic harness; the supervised real-model runs are recorded separately. The workflow protocol chapters 25–27 and the hyvv provisioning endpoints are still on their PR branches (see *What is blocked*).
+- **Unreleased on `main`** (`875025b`): the autonomy layer — durable jobs and authorizations, feature queue, crash-safe reconciler, local-only verification, integration, bounded recovery, RETURN packets, and the agent wake-up — merged in #16–#19. CI-proven in the deterministic harness; the supervised real-model runs are recorded separately. The workflow protocol chapters 25–27 and the hyvv provisioning endpoints are merged on their respective `main` branches.
 - **v0.2.0** (in review, not tagged): ACDD contracts and signed TDD evidence ([docs/ACDD.md](docs/ACDD.md)), sandboxed verification, strict brief contract, signed coordinator leases, `source_rev` checks, wave integration gate, outcome metrics, and an agent-agnostic worker-backend interface.
 - **v0.1.1** is the latest release: catalog review fixes (secret scope, per-key settings, Desktop default export, dashboard `api` mount, `plugin_data_dir`, cross-origin redirect refusal, approval for attempt cancel/review).
 - **v0.1.0**: tools, user-run CLI, Desktop pane, and the operator skill.

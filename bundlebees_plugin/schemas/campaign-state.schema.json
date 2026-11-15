@@ -14,6 +14,7 @@
     "limits",
     "phase",
     "active_workers",
+    "integration_queue",
     "dependencies",
     "last_completed_action",
     "next_action",
@@ -66,6 +67,20 @@
     },
     "active_workers": {
       "type": "array",
+      "description": "Tasks a worker is currently running. A verified row is integration work, reported in integration_queue.",
+      "items": {
+        "type": "object",
+        "required": ["task_id", "state", "attempts"],
+        "properties": {
+          "task_id": {"type": "string"},
+          "state": {"type": "string"},
+          "attempts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "integration_queue": {
+      "type": "array",
+      "description": "Tasks whose patch is verified and which await integration; no worker is in flight for them.",
       "items": {
         "type": "object",
         "required": ["task_id", "state", "attempts"],
@@ -105,6 +120,15 @@
     "task_counts": {
       "type": "object",
       "required": ["total", "accepted", "active", "ready", "failed"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "accepted": {"type": "integer", "minimum": 0},
+        "active": {"type": "integer", "minimum": 0},
+        "ready": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0, "description": "Tasks rejected or failed; a superseded row is counted separately."},
+        "superseded": {"type": "integer", "minimum": 0},
+        "integrating": {"type": "integer", "minimum": 0}
+      },
       "additionalProperties": {"type": "integer", "minimum": 0}
     },
     "revision": {"type": "integer", "minimum": 1},

@@ -359,6 +359,60 @@ def test_cli_once_emits_an_idle_pass(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert payload["landing"] is None
 
 
+def test_cli_refuses_a_repo_without_a_launcher_url(tmp_path: Path):
+    # A partial production configuration used to fall through to the mechanical
+    # tick: the pass claimed queue cards it could never dispatch or verify.
+    state = tmp_path / "state"
+    queue_path = _queue_file(tmp_path, {})
+
+    with pytest.raises(SystemExit) as caught:
+        factory_driver.main(["--state", str(state), "--queue", str(queue_path),
+                             "--repo", str(tmp_path), "--gitleaks", "/bin/true", "--once"])
+
+    assert "--launcher-url" in str(caught.value)
+
+
+def test_cli_allows_a_landing_only_launcher_without_a_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    # A launcher URL without a worktree can still land authenticated export
+    # events. It has no dispatch-capable tick, so the pass must be observation
+    # only and must not claim queued cards.
+    state = tmp_path / "state"
+    queue_path = _queue_file(tmp_path, {})
+    monkeypatch.setenv("BUNDLEBEES_LAUNCHER_TOKEN", "test-token")
+
+    code = factory_driver.main(["--state", str(state), "--queue", str(queue_path),
+                                "--launcher-url", "http://127.0.0.1:9", "--once"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["observation_only"] is True
+    assert payload["queue"]["action"] == "idle"
+
+
+def test_the_mechanical_tick_is_observation_only_and_claims_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    state = tmp_path / "state"
+    queue_path = _queue_file(tmp_path, {
+        "f1": {"repo": "mojomast/smoke-real", "job_id": JOB, "title": "queued", "status": "queued"},
+    })
+    _job(state)
+
+    code = factory_driver.main(["--state", str(state), "--queue", str(queue_path), "--once"])
+
+    assert code == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["queue"]["action"] == "observation_only"
+    assert payload["observation_only"] is True
+    assert "observation tick" in captured.err
+    # No claim, no card status change: a mechanical pass cannot dispatch.
+    assert queue_mod.QueueStore(state).read("f1") is None
+    assert queue_mod.JsonQueue(queue_path).get("f1").status == "queued"
+
+
 def test_stack_manifest_records_relationships_not_frozen_builds():
     root = Path(__file__).resolve().parents[1]
     text = (root / "docs" / "stack-manifest.md").read_text(encoding="utf-8")

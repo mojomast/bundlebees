@@ -22,6 +22,7 @@ import importlib
 import inspect
 import json
 import os
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -897,11 +898,16 @@ def startup_reconcile(
     state_dir: Any,
     queue: Any,
     *,
-    tick: Any = None,
     launcher_outbox: Any = None,
     now: Any = None,
+    tick: Any = None,
 ) -> dict[str, Any]:
-    """Repair crash residue through the durable modules, before the first pass."""
+    """Repair crash residue through the durable modules, before the first pass.
+
+    It never ticks a job: adoption belongs to the regular queue pass, and ticking
+    here as well would drive the same claim twice on every restart. The ``tick``
+    keyword is accepted for compatibility with older callers and ignored.
+    """
 
     state = _state_path(state_dir)
     report: dict[str, Any] = {
@@ -997,6 +1003,8 @@ class FactoryDriver:
         self.state.mkdir(parents=True, exist_ok=True)
         self.queue = queue if hasattr(queue, "list_items") else queue_mod.JsonQueue(Path(queue))
         self._tick = tick if tick is not None else mechanical_tick(self.state)
+        # A tick that cannot dispatch or verify must never claim queue work.
+        self.observation_only = bool(getattr(self._tick, "observation_only", False))
         self.tick = self._serialized_tick(self._tick)
         self.campaign_id = str(campaign_id).strip() if campaign_id else ""
         if self.campaign_id:
@@ -1040,6 +1048,7 @@ class FactoryDriver:
                 result = core(job_id)
                 return result if isinstance(result, dict) else {"status": str(result)}
 
+        tick.observation_only = bool(getattr(core, "observation_only", False))  # type: ignore[attr-defined]
         return tick
 
     def _live_queue_owner(self, job_id: str) -> int | None:
@@ -1148,7 +1157,6 @@ class FactoryDriver:
         self.startup_report = startup_reconcile(
             self.state,
             self.queue,
-            tick=self.tick,
             launcher_outbox=self.launcher_outbox,
             now=self.now,
         )
@@ -1693,7 +1701,9 @@ class FactoryDriver:
 
         queue_result: dict[str, Any]
         try:
-            queue_result = queue_mod.run_once(self.state, self.queue, tick=self.tick)
+            queue_result = queue_mod.run_once(
+                self.state, self.queue, tick=self.tick, admit=not self.observation_only
+            )
         except Exception as exc:  # noqa: BLE001 - landing and events still run
             queue_result = {"action": "error", "detail": f"{type(exc).__name__}: {exc}"}
             errors.append({"stage": "queue", "error": type(exc).__name__})
@@ -1824,6 +1834,7 @@ class FactoryDriver:
             "campaign": campaign_result,
             "failures": failures,
             "idle": idle,
+            "observation_only": self.observation_only,
             "inference": 0,
             "model_calls": 0,
             "errors": errors,
@@ -1872,7 +1883,13 @@ run_once = run_pass
 
 
 def mechanical_tick(state_dir: Any) -> Any:
-    """A no-inference tick that persists crash-adopted integration waves."""
+    """A no-inference tick that persists crash-adopted integration waves.
+
+    The returned tick is marked ``observation_only``: it cannot dispatch, verify,
+    integrate or adopt a worker result, so the driver must not let it claim a
+    queue feature. A claim here would only mark a card running with nothing able
+    to advance it.
+    """
 
     state = _state_path(state_dir)
 
@@ -1885,6 +1902,7 @@ def mechanical_tick(state_dir: Any) -> Any:
             jobs.save_job(state, job)
         return {"status": "idle", "detail": "no worker configured; mechanical reconcile only"}
 
+    tick.observation_only = True  # type: ignore[attr-defined]
     return tick
 
 
@@ -1966,15 +1984,26 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
     tick = load_tick(args.tick)
+    launcher_url = str(args.launcher_url or "").strip()
+    repo_arg = str(args.repo or "").strip()
+    if tick is None:
+        # Production selection is explicit. A partial launcher/worktree
+        # configuration used to fall through to the mechanical tick, which then
+        # claimed queue cards it could never dispatch or verify.
+        if repo_arg and not launcher_url:
+            raise SystemExit(
+                "--repo requires --launcher-url or BUNDLEBEES_LAUNCHER_URL: without a launcher "
+                "the driver would only run a mechanical tick and could not dispatch or verify"
+            )
     client = None
-    if args.launcher_url:
+    if launcher_url:
         from .client import LauncherClient
 
         token = os.environ.get("BUNDLEBEES_LAUNCHER_TOKEN", "")
         if not token:
             raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
-        client = LauncherClient(args.launcher_url, token=token)
-    if tick is None and client is not None and args.repo:
+        client = LauncherClient(launcher_url, token=token)
+    if tick is None and client is not None and repo_arg:
         if not args.gitleaks:
             raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
         provisioner = None
@@ -1988,13 +2017,18 @@ def main(argv: list[str] | None = None) -> int:
         tick = make_job_tick(
             state,
             client=client,
-            repo=Path(args.repo),
+            repo=Path(repo_arg),
             gitleaks=args.gitleaks,
             suite_command=args.suite_command,
             provisioner=provisioner,
         )
     if tick is None:
         tick = mechanical_tick(state)
+        print(
+            "bundlebees factory-driver: no launcher URL configured; running the mechanical "
+            "observation tick, which cannot claim, dispatch, verify or integrate",
+            file=sys.stderr,
+        )
     subscribers = args.subscribers or None
     driver_options: dict[str, Any] = {
         "tick": tick,

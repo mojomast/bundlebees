@@ -351,3 +351,59 @@ def test_verified_work_waits_for_integration_not_a_worker(tmp_path: Path):
     assert result["next_action"] == "integrate:T1"
     assert "integration step pending" in result["wait_condition"]
     assert "wait_for_worker" != result["next_action"]
+    # A verified row is waiting for integration; no worker is in flight for it.
+    assert result["active_workers"] == []
+    assert result["integration_queue"] == [
+        {"task_id": "T1", "state": "verified", "attempts": []}
+    ]
+    assert result["task_counts"]["integrating"] == 1
+    assert result["task_counts"]["active"] == 1
+
+
+def test_a_superseded_task_is_a_replan_blocker_not_a_task_failure(tmp_path: Path):
+    record = _setup(tmp_path)
+    _set_task(tmp_path, "T1", "accepted")
+    _set_task(tmp_path, "T2", "superseded")
+
+    result = campaign.reconcile(tmp_path, record["campaign_id"])
+
+    assert result["phase"] == "blocked"
+    assert result["blocker"]["code"] == "task_superseded"
+    assert result["blocker"]["task_ids"] == ["T2"]
+    assert result["next_action"] == "replan:T2"
+    # A cancelled row is not a failed row: it can never be retried.
+    assert result["task_counts"]["failed"] == 0
+    assert result["task_counts"]["superseded"] == 1
+    assert campaign.resume_plan(tmp_path, record["campaign_id"])["should_continue"] is False
+
+
+def test_a_terminal_integration_escalation_blocks_the_queue_card(tmp_path: Path):
+    record = _setup(tmp_path)
+    job = jobs.load_job(tmp_path, JOB)
+    job["tasks"][0]["state"] = "verified"
+    job["integration"] = {
+        "wave": "w1",
+        "terminal": True,
+        "state": "stopped",
+        "stopped": "integration_failed",
+        "evidence": "two integration attempts failed",
+    }
+    jobs.save_job(tmp_path, job)
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(json.dumps({
+        "f1": {"repo": "mojomast/campaign-fixture", "job_id": JOB, "status": "queued"}
+    }), encoding="utf-8")
+
+    result = queue_mod.run_once(
+        tmp_path,
+        queue_mod.JsonQueue(queue_path),
+        tick=lambda job_id: {"status": "escalated", "action": "integrate",
+                             "detail": "two integration attempts failed"},
+    )
+
+    assert result["action"] == "blocked"
+    assert queue_mod.JsonQueue(queue_path).get("f1").status == "blocked"
+    assert queue_mod.QueueStore(tmp_path).read("f1")["state"] == "blocked"
+    reconcile = campaign.reconcile(tmp_path, record["campaign_id"])
+    assert reconcile["phase"] == "blocked"
+    assert reconcile["blocker"]["code"] == "integration_terminal"
