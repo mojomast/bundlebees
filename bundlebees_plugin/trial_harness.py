@@ -2761,6 +2761,87 @@ def run_rehearsal(
 # ---------------------------------------------------------------------------
 
 
+def prepare_request(
+    state_dir: Path | str,
+    plan: Mapping[str, Any],
+    *,
+    source_root: Path | str | None = None,
+    code_rev: str | None = None,
+    ttl_s: int = 900,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Create the inert owner-approval request for a trial plan.
+
+    This is the only step before the owner card: it writes no job and grants no
+    authority. The trusted application records the signed decision; the
+    coordinator consumes that receipt only after the owner clicked.
+    """
+
+    try:
+        from . import approval  # noqa: PLC0415 - approval lane may not be installed
+    except Exception as exc:  # pragma: no cover - deployment fault
+        raise TrialRefused(
+            "approval_unavailable",
+            f"bundlebees_plugin.approval is unavailable: {exc}",
+            "Install the approval bridge before preparing a live trial.",
+        ) from exc
+    if not isinstance(plan, Mapping):
+        raise TrialRefused("plan_invalid", "the trial plan must be a JSON object", "Pass --plan.")
+    schema = str(plan.get("schema") or "")
+    if schema != "bundlebees.restart-trial-plan/1":
+        raise TrialRefused(
+            "plan_invalid",
+            f"unexpected trial plan schema {schema!r}",
+            "Use a trial/restart-trial-*.json plan.",
+        )
+    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[1]
+    revision = str(code_rev or plan.get("code_rev") or approval.code_revision(root)).strip().lower()
+    if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
+        raise TrialRefused(
+            "code_rev_unverifiable",
+            "the approval request needs the exact 40-hex Bundlebees revision",
+            "Run from the pinned checkout or pass --code-rev.",
+        )
+    budgets = plan.get("budgets") if isinstance(plan.get("budgets"), Mapping) else {}
+    worker = plan.get("worker") if isinstance(plan.get("worker"), Mapping) else {}
+    coordinator = plan.get("coordinator") if isinstance(plan.get("coordinator"), Mapping) else {}
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise TrialRefused("plan_invalid", "the plan needs a non-empty tasks list", "Pass --plan.")
+    request = approval.create_request(
+        Path(state_dir),
+        job_id=str(plan.get("job_id") or ""),
+        statement=str(plan.get("statement") or ""),
+        repo=str(plan.get("repository") or plan.get("repo") or ""),
+        base_rev=str(plan.get("base_rev") or ""),
+        scope=list(plan.get("scope") or []),
+        tasks=tasks,
+        bees=int(budgets.get("bees") or 0),
+        wall_clock_s=int(budgets.get("wall_clock_s") or 0),
+        worker_project=str(worker.get("project") or ""),
+        worker_profile=str(worker.get("profile") or ""),
+        code_rev=revision,
+        coordinator_stop=coordinator.get("stop"),
+        restart=coordinator.get("restart"),
+        budgets={
+            key: budgets[key]
+            for key in ("attempts", "accepted_waves", "verifications")
+            if key in budgets
+        },
+        ttl_s=int(ttl_s),
+        now=now,
+    )
+    return {
+        "schema": "bundlebees.restart-trial-approval/1",
+        "request_id": request["request_id"],
+        "request_digest": request["request_digest"],
+        "card_path": f"/api/plugins/bundlebees/approval/{request['request_id']}",
+        "code_rev": revision,
+        "state_dir": str(Path(state_dir)),
+        "request": request,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bundlebees-trial-harness",
@@ -2780,6 +2861,7 @@ def _parser() -> argparse.ArgumentParser:
     rehearse.add_argument("--report", default=None, help="also copy the trial report to this path")
 
     run = sub.add_parser("run", help="coordinate a real restart trial (never starts the launcher)")
+    prepare = sub.add_parser("prepare", help="create the inert one-time owner approval request for a plan")
     run.add_argument("--state", required=True)
     run.add_argument("--job", required=True)
     run.add_argument("--campaign", default="")
@@ -2821,6 +2903,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--report", default=None)
 
+    prepare.add_argument("--state", required=True, help="coordinator state directory")
+    prepare.add_argument("--plan", required=True, help="trial/restart-trial-*.json")
+    prepare.add_argument("--source-root", default=None, help="pinned Bundlebees checkout")
+    prepare.add_argument("--code-rev", default="", help="approved 40-hex revision; defaults to checkout HEAD")
+    prepare.add_argument("--ttl-seconds", type=int, default=900)
+    prepare.add_argument("--report", default=None)
+
     return parser
 
 
@@ -2852,6 +2941,26 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
         return 0 if report.get("verdict") == "pass" else 2
+
+    if args.command == "prepare":
+        plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        try:
+            result = prepare_request(
+                args.state,
+                plan,
+                source_root=args.source_root,
+                code_rev=args.code_rev or None,
+                ttl_s=args.ttl_seconds,
+            )
+        except (TrialError, OSError, ValueError) as exc:
+            code = getattr(exc, "code", "plan_invalid")
+            print(f"{code}: {exc}", file=sys.stderr)
+            return 2
+        if args.report:
+            Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.report).write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0
 
     if not os.environ.get("BUNDLEBEES_TRIAL_LIVE"):
         print(

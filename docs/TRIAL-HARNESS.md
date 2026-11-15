@@ -129,6 +129,12 @@ are consumed before run 1: one receipt admits one trial.
 python -m bundlebees_plugin.trial_harness rehearse \
   --source-root "$PWD" --deadline-seconds 60
 
+# Create the inert one-time owner approval request from the plan. The owner
+# then reviews the card in the Bundlebees pane; no terminal authorization.
+python -m bundlebees_plugin.trial_harness prepare \
+  --state "$BUNDLEBEES_STATE" --plan trial/restart-trial-20261115.json \
+  --source-root "$PWD" --code-rev "$MERGED_BUNDLEBEES_REV"
+
 # A live trial (only after the owner approved it and the job is queued).
 BUNDLEBEES_TRIAL_LIVE=1 python -m bundlebees_plugin.trial_harness run \
   --state "$BUNDLEBEES_STATE" --job job_x --campaign camp_x \
