@@ -574,6 +574,7 @@ def binding_for(
     budgets: Mapping[str, Any] | None = None,
     gates: Sequence[str] = ("merge",),
     recovery: Mapping[str, Any] | None = None,
+    expires_at: str | None = None,
 ) -> dict[str, Any]:
     """The immutable set of facts one owner decision covers.
 
@@ -600,7 +601,7 @@ def binding_for(
     authorized_gates = _gates(gates)
     budget = _budgets(bees, wall_clock_s, budgets)
     envelope = _recovery(recovery, gates=authorized_gates, scope=scope_globs)
-    return {
+    result = {
         "job_id": _job_id(job_id),
         "statement": text,
         "repo": _repo(repo),
@@ -622,12 +623,26 @@ def binding_for(
         "recovery": envelope,
         "recovery_digest": _digest(envelope),
     }
+    if expires_at is not None:
+        result["expires_at"] = _iso(_clock(expires_at))
+    return result
 
 
 def binding_digest(binding: Mapping[str, Any]) -> str:
-    """The request digest: SHA-256 over the canonical binding."""
+    """SHA-256 over the canonical binding."""
 
     return _digest(dict(binding))
+
+
+def request_digest(binding: Mapping[str, Any], expires_at: Any) -> str:
+    """The exact digest the owner card displays.
+
+    The expiry is part of the preview identity, not merely metadata: editing
+    the request's expiry must invalidate the digest rather than silently
+    extending how long the same approval can be used.
+    """
+
+    return _digest({"binding": dict(binding), "expires_at": _iso(_clock(expires_at))})
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +686,7 @@ def create_request(
         raise ApprovalError(
             "approval_invalid", f"ttl_s must be an integer from 1 to {MAX_TTL_S}", _FIX_REQUEST
         )
+    expires_at = _iso(clock + timedelta(seconds=int(ttl_s)))
     binding = binding_for(
         job_id=job_id,
         statement=statement,
@@ -688,8 +704,9 @@ def create_request(
         budgets=budgets,
         gates=gates,
         recovery=recovery,
+        expires_at=expires_at,
     )
-    digest = binding_digest(binding)
+    digest = request_digest(binding, expires_at)
     for existing in _all_requests(state, job_id=binding["job_id"]):
         if _request_spent(state, existing, now=clock):
             continue
@@ -707,7 +724,7 @@ def create_request(
         "schema": REQUEST_SCHEMA,
         "request_id": f"apr_{secrets.token_hex(12)}",
         "created_at": _iso(clock),
-        "expires_at": _iso(clock + timedelta(seconds=int(ttl_s))),
+        "expires_at": expires_at,
         "request_digest": digest,
         "binding": binding,
     }
@@ -740,10 +757,10 @@ def _verify_request(document: Mapping[str, Any], *, request_id: str | None = Non
         raise ApprovalError(
             "approval_request_invalid", "the request has no binding object", _FIX_REQUEST
         )
-    if str(document.get("request_digest") or "") != binding_digest(binding):
+    if str(document.get("request_digest") or "") != request_digest(binding, document.get("expires_at")):
         raise ApprovalError(
             "approval_request_tampered",
-            f"the binding in request {named} does not match its recorded digest",
+            f"the binding or expiry in request {named} does not match its recorded digest",
             _FIX_REQUEST,
         )
     specs = binding.get("tasks")
@@ -919,7 +936,7 @@ def _verify_receipt(
             "approval_receipt_invalid", "the receipt has no binding object", _FIX_REQUEST
         )
     recorded = str(receipt.get("request_digest") or "")
-    if not recorded or recorded != binding_digest(binding):
+    if not recorded or recorded != request_digest(binding, receipt.get("expires_at")):
         raise ApprovalError(
             "approval_receipt_tampered",
             "the receipt binding does not match its recorded request digest",
@@ -1222,6 +1239,7 @@ __all__ = [
     "ApprovalError",
     "approval_key",
     "binding_digest",
+    "request_digest",
     "binding_for",
     "code_revision",
     "consume_receipt",

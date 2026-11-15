@@ -809,6 +809,7 @@ def _verify_owner_approval(
             budgets=extra,
             gates=gates,
             recovery=recovery,
+            expires_at=str(binding.get("expires_at") or "").strip() or None,
         )
         verified = approval_mod.verify_receipt(
             receipt, signing_key=signing_key, now=now, expected_binding=expected

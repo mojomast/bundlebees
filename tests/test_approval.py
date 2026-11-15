@@ -152,7 +152,7 @@ def test_a_request_binds_every_approved_fact_and_digests_the_binding(tmp_path):
     assert binding["code_rev"] == CODE_REV
     assert binding["coordinator"] == {"stop": True, "restart": True}
     assert binding["gates"] == ["merge"]
-    assert request["request_digest"] == approval.binding_digest(binding)
+    assert request["request_digest"] == approval.request_digest(binding, request["expires_at"])
     assert request["expires_at"] == "2026-11-15T12:15:00Z"
 
     path = approval.request_path(tmp_path, request["request_id"])
@@ -188,6 +188,19 @@ def test_a_tampered_request_is_refused_rather_than_read_as_a_preview(tmp_path):
     path.chmod(0o600)
     document = json.loads(path.read_text())
     document["binding"]["scope"] = ["tools/**"]
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ApprovalError) as caught:
+        approval.load_request(tmp_path, request["request_id"])
+    assert caught.value.code == "approval_request_tampered"
+
+
+def test_an_edited_expiry_is_refused_even_when_the_binding_is_unchanged(tmp_path):
+    request = make_request(tmp_path)
+    path = approval.request_path(tmp_path, request["request_id"])
+    path.chmod(0o600)
+    document = json.loads(path.read_text())
+    document["expires_at"] = "2099-01-01T00:00:00Z"
     path.write_text(json.dumps(document))
 
     with pytest.raises(ApprovalError) as caught:
