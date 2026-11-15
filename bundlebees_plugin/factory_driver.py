@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
     fcntl = None  # type: ignore[assignment]
 
 from . import bee_events
+from . import campaign as campaign_mod
 from . import job_cli
 from . import hermes_adapter
 from . import event_consumer
@@ -992,12 +993,16 @@ class FactoryDriver:
         wake_ttl_s: float = DEFAULT_WAKE_TTL_S,
         startup: bool = True,
         max_work_attempts: int = MAX_WORK_ATTEMPTS,
+        campaign_id: str | None = None,
     ) -> None:
         self.state = _state_path(state_dir)
         self.state.mkdir(parents=True, exist_ok=True)
         self.queue = queue if hasattr(queue, "list_items") else queue_mod.JsonQueue(Path(queue))
         self._tick = tick if tick is not None else mechanical_tick(self.state)
         self.tick = self._serialized_tick(self._tick)
+        self.campaign_id = str(campaign_id).strip() if campaign_id else ""
+        if self.campaign_id:
+            _ = campaign_mod.load_campaign(self.state, self.campaign_id)
         self.launcher_outbox = Path(launcher_outbox) if launcher_outbox is not None else None
         self.landing_client = landing_client if landing_client is not None else launcher_client
         self.landing_export_limit = max(1, int(landing_export_limit))
@@ -1775,6 +1780,21 @@ class FactoryDriver:
         failures.extend(self._advance_ready_work())
         wake_results = self._deliver_wakes()
 
+        campaign_result: dict[str, Any] | None = None
+        if self.campaign_id:
+            try:
+                campaign_result = campaign_mod.reconcile(
+                    self.state, self.campaign_id, now=_iso(self.now)
+                )
+            except Exception as exc:  # noqa: BLE001 - a checkpoint must not stop the factory
+                campaign_result = {
+                    "campaign_id": self.campaign_id,
+                    "phase": "blocked",
+                    "error": getattr(exc, "code", type(exc).__name__),
+                    "detail": str(exc),
+                }
+                errors.append({"stage": "campaign", "error": type(exc).__name__})
+
         try:
             ready = work_scheduler.ready_items(self.state)
         except Exception as exc:  # noqa: BLE001
@@ -1805,6 +1825,7 @@ class FactoryDriver:
             "ready_items": ready,
             "wake": [self.wake.status(name) for name in wake_names],
             "wake_delivery": wake_results,
+            "campaign": campaign_result,
             "failures": failures,
             "idle": idle,
             "inference": 0,
@@ -1832,6 +1853,7 @@ def run_pass(
     now: Any = None,
     startup: bool = True,
     max_work_attempts: int = MAX_WORK_ATTEMPTS,
+    campaign_id: str | None = None,
 ) -> dict[str, Any]:
     driver = FactoryDriver(
         state_dir,
@@ -1845,6 +1867,7 @@ def run_pass(
         now=now,
         startup=startup,
         max_work_attempts=max_work_attempts,
+        campaign_id=campaign_id,
     )
     return driver.run_pass()
 
@@ -1932,6 +1955,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="bind the configured hyvv provisioning client")
     parser.add_argument("--provisioning-host", default=None,
                         help="expected provisioning host policy label")
+    parser.add_argument("--campaign-id", default=None,
+                        help="durable campaign checkpoint to reconcile on every pass")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="run one pass and exit")
     mode.add_argument("--interval", nargs="?", const=1.0, type=float, default=None,
@@ -1987,6 +2012,7 @@ def main(argv: list[str] | None = None) -> int:
     driver = FactoryDriver(
         state,
         queue_mod.JsonQueue(queue_path),
+        campaign_id=args.campaign_id,
         **driver_options,
     )
 

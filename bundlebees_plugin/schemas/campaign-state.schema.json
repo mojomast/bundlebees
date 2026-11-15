@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rizzstack.dev/schemas/bundlebees-campaign-state/1",
+  "title": "bundlebees campaign checkpoint",
+  "description": "Durable review objective and restart checkpoint for one authorized bundlebees job. The job and its sealed authorization remain authoritative; this record does not grant permission.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "campaign_id",
+    "job_id",
+    "objective",
+    "authorization",
+    "limits",
+    "phase",
+    "active_workers",
+    "dependencies",
+    "last_completed_action",
+    "next_action",
+    "wait_condition",
+    "blocker",
+    "task_counts",
+    "revision",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema": {"const": "rizzstack.campaign-state/1"},
+    "campaign_id": {"type": "string", "minLength": 1, "maxLength": 96},
+    "job_id": {"type": "string", "minLength": 1, "maxLength": 96},
+    "objective": {"type": "string", "minLength": 1},
+    "branch": {"type": "string"},
+    "pull_request": {"type": ["integer", "null"], "minimum": 1},
+    "authorization": {
+      "type": "object",
+      "required": ["auth_id", "statement", "repo", "base_rev", "scope", "budget", "gates"],
+      "properties": {
+        "auth_id": {"type": "string"},
+        "statement": {"type": "string"},
+        "repo": {"type": "string"},
+        "base_rev": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "scope": {"type": "array", "items": {"type": "string"}},
+        "budget": {
+          "type": "object",
+          "required": ["bees", "wall_clock_s"],
+          "properties": {
+            "bees": {"type": "integer", "minimum": 1},
+            "wall_clock_s": {"type": "integer", "minimum": 1}
+          }
+        },
+        "gates": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["bees", "wall_clock_s", "scope", "human_gates"],
+      "properties": {
+        "bees": {"type": "integer", "minimum": 1},
+        "wall_clock_s": {"type": "integer", "minimum": 1},
+        "scope": {"type": "array", "items": {"type": "string"}},
+        "human_gates": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "phase": {
+      "enum": ["authorized", "ready_to_advance", "running", "ready_for_review", "blocked"]
+    },
+    "active_workers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id", "state", "attempts"],
+        "properties": {
+          "task_id": {"type": "string"},
+          "state": {"type": "string"},
+          "attempts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": {"type": "array", "items": {"type": "string"}}
+    },
+    "last_completed_action": {
+      "type": ["object", "null"],
+      "properties": {
+        "at": {"type": "string"},
+        "task_id": {"type": "string"},
+        "transition": {"type": "string"},
+        "reason": {"type": "string"}
+      }
+    },
+    "next_action": {"type": "string", "minLength": 1},
+    "wait_condition": {"type": "string", "minLength": 1},
+    "blocker": {
+      "type": ["object", "null"],
+      "properties": {
+        "code": {"type": "string"},
+        "detail": {"type": "string"},
+        "task_id": {"type": "string"},
+        "task_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "task_counts": {
+      "type": "object",
+      "required": ["total", "accepted", "active", "ready", "failed"],
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "revision": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "reconciled_at": {"type": "string"}
+  }
+}

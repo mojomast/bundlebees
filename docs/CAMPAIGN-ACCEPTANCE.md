@@ -32,6 +32,24 @@ Use the pilot as the pattern, not as a finished product:
   `visual` evidence with the viewport and final head. A DOM assertion is not a
   visual acceptance.
 
+Before dispatch, make each product criterion name its evidence, owner and stage.
+The project plan's top-level `acceptance` entries accept optional `kind`,
+`stage`, `owner` and `evidence` fields; `project.plan()` preserves them and
+refuses an unknown kind/stage. A useful split is:
+
+| Stage | Typical evidence |
+|---|---|
+| `contract` | the frozen criterion and its selector |
+| `unit` | focused test command and result |
+| `integration` | combined-tree command and result |
+| `application` | real server/browser journey, persistence and cross-feature checks |
+| `final` | full suite, performance, visual captures and asset verification on the final head |
+
+Start with one **vertical slice** that exercises the real user journey and the
+main integration risk before expanding the task graph. The Jackpot build learned
+this late: the board and meta screens were functionally reachable while the
+authored art was not yet visible.
+
 For a campaign, run the application acceptance on the **combined, final** tree,
 after the full package suite. Record the exact command, counts, exit code and
 head SHA. A worker's `result.observed` or `state: succeeded` is not evidence.

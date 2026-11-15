@@ -8,22 +8,46 @@
     {
       "id": "AC-STORAGE",
       "statement": "Todos persist in a JSON store and support create, read, update, complete, search and status filtering.",
-      "test": "pilot/todo/tests/test_store.py"
+      "test": "pilot/todo/tests/test_store.py",
+      "kind": "test",
+      "stage": "unit",
+      "owner": "builder",
+      "evidence": [
+        "pilot/todo/tests/test_store.py"
+      ]
     },
     {
       "id": "AC-API",
       "statement": "The stdlib HTTP API exposes list/create/read/update/complete routes with explicit JSON errors.",
-      "test": "pilot/todo/tests/test_server.py"
+      "test": "pilot/todo/tests/test_server.py",
+      "kind": "integration",
+      "stage": "integration",
+      "owner": "builder",
+      "evidence": [
+        "pilot/todo/tests/test_server.py"
+      ]
     },
     {
       "id": "AC-UI",
       "statement": "The browser UI supports create, edit, complete, search and status filtering with accessible controls.",
-      "test": "pilot/todo/tests/test_ui.py"
+      "test": "pilot/todo/tests/test_ui.py",
+      "kind": "visual",
+      "stage": "application",
+      "owner": "reviewer",
+      "evidence": [
+        "pilot/todo/tests/test_ui.py"
+      ]
     },
     {
       "id": "AC-APP",
       "statement": "An application-level acceptance run starts the real server, exercises the API end to end and verifies persistence.",
-      "test": "pilot/todo/tests/test_acceptance.py"
+      "test": "pilot/todo/tests/test_acceptance.py",
+      "kind": "integration",
+      "stage": "application",
+      "owner": "reviewer",
+      "evidence": [
+        "pilot/todo/tests/test_acceptance.py"
+      ]
     }
   ],
   "features": [
@@ -38,7 +62,9 @@
       ],
       "depends_on": [],
       "acceptance": {
-        "tests": ["pilot/todo/tests/test_store.py"]
+        "tests": [
+          "pilot/todo/tests/test_store.py"
+        ]
       }
     },
     {
@@ -50,7 +76,9 @@
       ],
       "depends_on": [],
       "acceptance": {
-        "tests": ["pilot/todo/tests/test_ui.py"]
+        "tests": [
+          "pilot/todo/tests/test_ui.py"
+        ]
       }
     },
     {
@@ -60,9 +88,13 @@
         "pilot/todo/server.py",
         "pilot/todo/tests/test_server.py"
       ],
-      "depends_on": ["store"],
+      "depends_on": [
+        "store"
+      ],
       "acceptance": {
-        "tests": ["pilot/todo/tests/test_server.py"]
+        "tests": [
+          "pilot/todo/tests/test_server.py"
+        ]
       }
     },
     {
@@ -72,9 +104,14 @@
         "pilot/todo/acceptance.py",
         "pilot/todo/tests/test_acceptance.py"
       ],
-      "depends_on": ["http", "ui"],
+      "depends_on": [
+        "http",
+        "ui"
+      ],
       "acceptance": {
-        "tests": ["pilot/todo/tests/test_acceptance.py"]
+        "tests": [
+          "pilot/todo/tests/test_acceptance.py"
+        ]
       }
     }
   ]
