@@ -258,7 +258,8 @@ hermes bundlebees job queue doctor
 ```
 
 `--once` is required: one pass advances every active claim first, then admits at most one new feature.
-There is no daemon in this repository. `--backend kanban` uses the configured Hermes kanban, but a Kanban
+There is no daemon in the feature queue itself; `factory_driver --interval` is the separate resident loop
+described in [campaign continuity](docs/CAMPAIGN-CONTINUITY.md). `--backend kanban` uses the configured Hermes kanban, but a Kanban
 status is never evidence that work completed — completion is derived from the job document being accepted.
 A queue run needs gitleaks and refuses before claiming anything if it is missing.
 
