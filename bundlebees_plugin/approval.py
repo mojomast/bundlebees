@@ -1029,6 +1029,12 @@ def load_receipt(
     """Load the receipt recorded for a request and verify it."""
 
     receipt = _read_json(receipt_path(state_dir, request_id), "approval_receipt")
+    if str(receipt.get("request_id") or "") != str(request_id):
+        raise ApprovalError(
+            "approval_receipt_mismatch",
+            f"the receipt at {receipt_path(state_dir, request_id)} names a different request",
+            "Use the receipt written for this exact request id.",
+        )
     return verify_receipt(receipt, signing_key=signing_key, now=now)
 
 

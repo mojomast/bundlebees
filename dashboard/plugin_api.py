@@ -796,7 +796,7 @@ def _approval_error(exc: Exception) -> DashboardError:
     code = str(getattr(exc, "code", "") or "approval_error")
     message = str(getattr(exc, "message", "") or str(exc) or "approval failed")
     fix = str(getattr(exc, "fix", "") or "")
-    if code in {"approval_conflict", "approval_consumed", "approval_scope_changed"}:
+    if code in {"approval_conflict", "approval_consumed", "approval_already_consumed", "approval_scope_changed"}:
         status = 409
     elif code in {"approval_expired", "approval_missing", "approval_request_missing", "approval_receipt_missing"}:
         status = 410
@@ -897,6 +897,10 @@ def _approval_page(document: Mapping[str, Any], *, status: int = 200, notice: st
     settled = card["status"] not in {"pending", "open"} or status != 200 or not digest
     if card["status"] == "expired" and not notice:
         notice = "This approval request has expired. Ask for a fresh preview; no decision can be recorded."
+    elif card["status"] == "declined" and not notice:
+        notice = "Declined. The coordinator must not dispatch this job."
+    elif card["status"] == "approved" and not notice:
+        notice = "Approved once. This page cannot be used as a second approval."
     buttons = (
         "<div class='actions'><button class='approve' data-decision='approve'>Approve once</button>"
         "<button class='decline' data-decision='decline'>Decline</button></div>"

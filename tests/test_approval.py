@@ -483,6 +483,20 @@ def test_a_receipt_for_another_job_is_refused(tmp_path):
     assert not jobs.authorization_path(tmp_path, "job_b").exists()
 
 
+def test_a_receipt_file_copied_to_another_request_is_refused(tmp_path):
+    request = make_request(tmp_path)
+    decide(tmp_path, request)
+    other = make_request(tmp_path, job_id="job_b")
+    source = approval.receipt_path(tmp_path, request["request_id"])
+    target = approval.receipt_path(tmp_path, other["request_id"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source.read_bytes())
+
+    with pytest.raises(ApprovalError) as caught:
+        approval.load_receipt(tmp_path, other["request_id"], signing_key=KEY, now=LATER)
+    assert caught.value.code == "approval_receipt_mismatch"
+
+
 def test_the_running_code_revision_must_match_the_approved_one(tmp_path):
     request = make_request(tmp_path)
     receipt = decide(tmp_path, request)
