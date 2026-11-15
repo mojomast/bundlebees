@@ -38,6 +38,11 @@ It never:
   launcher view);
 - merges, tags, releases, deploys or publishes.
 
+A trial also refuses to reuse a prior trial's ready/report artifacts, refuses an
+arbitrary `*.py` script in place of the Bundlebees factory driver, and on any
+failed wait stops the exact coordinator PID it recorded. If the job already
+records one attempt, the worker probe must report that same `attempt_id`.
+
 ## Two timeouts, two owners
 
 | Timeout | Owner | What it stops |
