@@ -23,11 +23,56 @@ import re
 import socket
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 SCHEMA = "rizzstack.standing-grant/1"
+GLOBAL_MAX_BEES = 12
+DEFAULT_REPO_MAX_BEES = 3
+DEFAULT_REPO_WALL_CLOCK_S = 3600
+EXCLUDED_ACTIONS = (
+    "merge",
+    "approve",
+    "release",
+    "publish",
+    "tag",
+    "deploy",
+    "restart",
+    "protected_branch_push",
+    "force_push",
+    "branch_delete",
+    "history_rewrite",
+    "catalog",
+    "worker_config",
+    "credentials",
+    "secrets",
+)
+
+
+def repo_grant_id(repo: str) -> str:
+    slug = str(repo or "").strip().lower()
+    return "repo-" + hashlib.sha256(slug.encode("utf-8")).hexdigest()[:16]
+
+
+def parse_expiry(value: str | None, *, now: float | None = None) -> float:
+    """Parse ``never`` or an ISO-8601 date/datetime into an epoch deadline."""
+    from datetime import datetime, timezone
+
+    text = str(value or "never").strip().lower()
+    if text in {"never", "none", "no-expiry", "no_expiry"}:
+        return 253402300799.0  # 9999-12-31T23:59:59Z
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GrantError("expiry_invalid", f"expiry {value!r} is not an ISO-8601 date", "Use YYYY-MM-DD, an ISO timestamp, or never.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    stamp = parsed.timestamp()
+    if stamp <= (now if now is not None else time.time()):
+        raise GrantError("grant_expired", "the grant expiry is in the past", "Set a future expiry or use never.")
+    return stamp
+
 
 
 class GrantError(Exception):
@@ -70,10 +115,10 @@ def _atomic(path: Path, payload: bytes, mode: int = 0o600) -> None:
 @dataclass(frozen=True)
 class Limits:
     max_bees: int
-    max_jobs: int
-    max_concurrent_jobs: int
-    wall_clock_s: int
-    budget_units: int
+    max_jobs: int | None = None
+    max_concurrent_jobs: int = 12
+    wall_clock_s: int = 3600
+    budget_units: int | None = None
 
 
 @dataclass(frozen=True)
@@ -87,20 +132,26 @@ class Grant:
     profiles: tuple[str, ...]
     task_scopes: tuple[str, ...]
     limits: Limits
+    statement: str = ""
     revoked_at: float | None = None
+    revoke_mode: str = "finish"
     unrestricted_scope: bool = False
 
     @classmethod
     def parse(cls, body: Mapping[str, Any]) -> "Grant":
+        if body.get("schema") != SCHEMA:
+            raise GrantError("grant_incomplete", f"grant schema must be {SCHEMA}", "Re-enroll a complete grant.")
         missing = [k for k in ("grant_id", "approved_by", "approved_at", "expires_at", "repos", "hosts", "profiles") if not body.get(k)]
         if missing:
             raise GrantError("grant_incomplete", f"grant is missing {', '.join(missing)}", "Re-enroll a complete grant.")
         limits = body.get("limits") or {}
         try:
             parsed_limits = Limits(
-                max_bees=int(limits["max_bees"]), max_jobs=int(limits["max_jobs"]),
-                max_concurrent_jobs=int(limits["max_concurrent_jobs"]),
-                wall_clock_s=int(limits["wall_clock_s"]), budget_units=int(limits["budget_units"]),
+                max_bees=int(limits["max_bees"]),
+                max_jobs=None if limits.get("max_jobs") is None else int(limits["max_jobs"]),
+                max_concurrent_jobs=int(limits.get("max_concurrent_jobs", 12)),
+                wall_clock_s=int(limits.get("wall_clock_s", 3600)),
+                budget_units=None if limits.get("budget_units") is None else int(limits["budget_units"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GrantError("grant_limits", f"grant limits are incomplete or invalid: {exc}", "Re-enroll with explicit limits.") from exc
@@ -108,7 +159,9 @@ class Grant:
             grant_id=str(body["grant_id"]), approved_by=str(body["approved_by"]), approved_at=str(body["approved_at"]),
             expires_at=float(body["expires_at"]), repos=tuple(body["repos"]), hosts=tuple(body["hosts"]),
             profiles=tuple(body["profiles"]), task_scopes=tuple(body.get("task_scopes") or ()),
-            limits=parsed_limits, revoked_at=float(body["revoked_at"]) if body.get("revoked_at") else None,
+            limits=parsed_limits, statement=str(body.get("statement") or ""),
+            revoked_at=float(body["revoked_at"]) if body.get("revoked_at") else None,
+            revoke_mode=str(body.get("revoke_mode") or "finish"),
             unrestricted_scope=bool(body.get("unrestricted_scope", False)),
         )
 
@@ -116,13 +169,14 @@ class Grant:
         body = {"schema": SCHEMA, "grant_id": self.grant_id, "approved_by": self.approved_by,
                 "approved_at": self.approved_at, "expires_at": self.expires_at, "repos": list(self.repos),
                 "hosts": list(self.hosts), "profiles": list(self.profiles),
-                "task_scopes": list(self.task_scopes),
+                "task_scopes": list(self.task_scopes), "statement": self.statement,
                 "unrestricted_scope": self.unrestricted_scope,
                 "limits": {"max_bees": self.limits.max_bees, "max_jobs": self.limits.max_jobs,
                            "max_concurrent_jobs": self.limits.max_concurrent_jobs,
                            "wall_clock_s": self.limits.wall_clock_s, "budget_units": self.limits.budget_units}}
         if self.revoked_at:
             body["revoked_at"] = self.revoked_at
+            body["revoke_mode"] = self.revoke_mode
         return body
 
     @property
@@ -256,28 +310,85 @@ class GrantStore:
     def enroll(self, grant: Grant, *, statement: str) -> Path:
         if not self._tty():
             raise GrantError("interactive_required", "enrolling a standing grant needs a real interactive terminal", "Run it yourself in a terminal; the agent must not proxy this.")
-        if not statement.strip():
+        text = str(statement or "").strip()
+        if not text:
             raise GrantError("statement_required", "enrollment requires the human's own statement of what is authorized", "Pass --statement in your own words.")
+        if not grant.repos or any(repo.count("/") != 1 or not all(repo.split("/")) for repo in grant.repos):
+            raise GrantError("repo_invalid", "each grant repository must be owner/name", "Pass a canonical repository identity.")
+        if grant.limits.max_bees < 1 or grant.limits.max_bees > 12:
+            raise GrantError("grant_limits", "max_bees must be between 1 and the global cap of 12", "Reduce the grant or use per-job authorization.")
+        if grant.limits.wall_clock_s < 60:
+            raise GrantError("grant_limits", "wall_clock_s must be at least 60 seconds", "Use a realistic bounded wall clock.")
+        if grant.limits.max_concurrent_jobs < 1:
+            raise GrantError("grant_limits", "max_concurrent_jobs must be positive", "Re-enroll with a valid concurrency limit.")
         if grant.expires_at <= self.now():
             raise GrantError("grant_expired", "the grant expires in the past", "Set a future expiry.")
+        grant = replace(grant, statement=text)
         body = seal(grant.to_dict(), self.key)
         path = self.grant_path(grant.grant_id)
         with owner_lock(path.with_suffix(".lock")):
             if path.exists():
                 raise GrantError("grant_exists", f"grant {grant.grant_id} is already enrolled", "Revoke it explicitly before re-enrolling.")
             _atomic(path, json.dumps(body, indent=2, sort_keys=True).encode())
-        self._audit({"event": "grant.enrolled", "grant_id": grant.grant_id, "digest": grant.digest, "statement": statement})
+        self._audit({"event": "grant.enrolled", "grant_id": grant.grant_id, "digest": grant.digest, "statement": text})
         return path
 
-    def revoke(self, grant_id: str, *, statement: str) -> None:
+    def revoke(self, grant_id: str, *, statement: str = "", running: str = "finish") -> None:
         if not self._tty():
             raise GrantError("interactive_required", "revoking a standing grant needs a real interactive terminal", "Run it yourself in a terminal.")
+        mode = str(running or "finish").strip().lower()
+        if mode not in {"finish", "pause"}:
+            raise GrantError("revoke_mode_invalid", "running must be 'finish' or 'pause'", "Use the default finish mode or explicitly pause.")
         path = self.grant_path(grant_id)
         with owner_lock(path.with_suffix(".lock")):
             grant = self.load(grant_id)
-            body = seal(grant.to_dict() | {"revoked_at": self.now()}, self.key)
+            body = seal(grant.to_dict() | {"revoked_at": self.now(), "revoke_mode": mode}, self.key)
             _atomic(path, json.dumps(body, indent=2, sort_keys=True).encode())
-            self._audit({"event": "grant.revoked", "grant_id": grant_id, "statement": statement})
+            self._audit({"event": "grant.revoked", "grant_id": grant_id, "statement": statement, "running": mode})
+
+    def revoke_repo(self, repo: str, *, statement: str = "", running: str = "finish") -> list[str]:
+        """Revoke every grant that names ``repo``. At least one must match."""
+        if not self._tty():
+            raise GrantError("interactive_required", "revoking a standing grant needs a real interactive terminal", "Run it yourself in a terminal.")
+        matches = [grant for grant in self.list() if repo in grant.repos and not grant.revoked_at]
+        if not matches:
+            raise GrantError("grant_missing", f"no active grant covers {repo}", "Nothing to revoke.")
+        for grant in matches:
+            self.revoke(grant.grant_id, statement=statement, running=running)
+        return [grant.grant_id for grant in matches]
+
+    def list(self) -> list[Grant]:
+        """Read every grant; malformed or tampered files are refusals, not omissions."""
+        directory = self.root / "grants"
+        if not directory.exists():
+            return []
+        grants: list[Grant] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                grants.append(Grant.parse(unseal(raw, self.key)))
+            except (OSError, ValueError, GrantError) as exc:
+                raise GrantError("grant_unreadable", f"grant {path.name} is unreadable: {exc}", "Inspect it by hand; do not proceed with a tampered grant.") from exc
+        return grants
+
+    def find_for_repo(self, repo: str) -> list[Grant]:
+        return [grant for grant in self.list() if repo in grant.repos]
+
+    def find_active_for_repo(self, repo: str) -> Grant:
+        """Return the single usable repo grant, or a fail-closed refusal."""
+        matches = self.find_for_repo(repo)
+        if not matches:
+            raise GrantError("grant_missing", f"no standing grant covers {repo}", "Enroll a repo grant in a real terminal.")
+        active = [grant for grant in matches if not grant.revoked_at and grant.expires_at > self.now()]
+        if len(active) > 1:
+            raise GrantError("grant_ambiguous", f"multiple active grants cover {repo}", "Keep one active grant per repository.")
+        if not active:
+            # Prefer the most specific refusal available.
+            revoked = [grant for grant in matches if grant.revoked_at]
+            if revoked:
+                raise GrantError("grant_revoked", f"grant {revoked[-1].grant_id} was revoked", "Enroll a new grant; do not work around this.")
+            raise GrantError("grant_expired", f"the grant for {repo} expired", "Renew it as a human, or use per-job authorization.")
+        return active[0]
 
     def renew(self, grant_id: str, *, expires_at: float, statement: str) -> None:
         if not self._tty():
@@ -324,9 +435,9 @@ class GrantStore:
 
             if repo not in grant.repos:
                 raise GrantError("repo_not_granted", f"{repo} is not in grant {grant_id}", "Ask the human to enroll a grant that includes it.")
-            if host not in grant.hosts:
+            if "*" not in grant.hosts and host not in grant.hosts:
                 raise GrantError("host_not_granted", f"{host} is not in grant {grant_id}", "Ask the human to enroll that worker host.")
-            if profile not in grant.profiles:
+            if "*" not in grant.profiles and profile not in grant.profiles:
                 raise GrantError("profile_not_granted", f"profile {profile} is not in grant {grant_id}", "Ask the human to enroll that profile.")
             if not files:
                 raise GrantError("scope_empty", "a job authorization needs at least one assigned file", "Declare the task scope; an empty scope is never unrestricted.")
@@ -403,11 +514,11 @@ class GrantStore:
                 raise GrantError("reservation_conflict", f"job {job_id} already reserved a different request", "Use a new job id; do not mutate a reservation.")
             return mine.name
 
-        if lifetime_jobs + 1 > grant.limits.max_jobs:
+        if grant.limits.max_jobs is not None and lifetime_jobs + 1 > grant.limits.max_jobs:
             raise GrantError("jobs_exhausted", f"grant {grant.grant_id} already used {lifetime_jobs}/{grant.limits.max_jobs} jobs", "Ask the human for a new grant.")
         if active_jobs + 1 > grant.limits.max_concurrent_jobs:
             raise GrantError("concurrency_exhausted", f"grant {grant.grant_id} has {active_jobs}/{grant.limits.max_concurrent_jobs} jobs active", "Wait for one to finish.")
-        if spent_units + active_units + units > grant.limits.budget_units:
+        if grant.limits.budget_units is not None and spent_units + active_units + units > grant.limits.budget_units:
             raise GrantError("budget_exhausted", f"grant {grant.grant_id} has {grant.limits.budget_units - spent_units - active_units} units left, needs {units}", "Reduce the job or ask the human to raise the grant.")
 
         record = {"grant_id": grant.grant_id, "job_id": job_id, "units": units, "active": True,

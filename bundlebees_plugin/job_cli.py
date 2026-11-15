@@ -585,6 +585,7 @@ def tick(
     )
     handoff = record_handoff(state_dir, job_id, result)
     _after_dispatch(state_dir, job_id, result)
+    jobs.release_repo_grant_for_job(state_dir, job_id)
     payload = {
         "status": result.status,
         "action": result.action,
@@ -838,6 +839,31 @@ def add_parsers(subparsers: Any) -> None:
                      help="Rebuild the RETURN from durable state and compare evidence_digest; writes nothing.")
     rep.set_defaults(command="job", job_handler="report")
 
+    repo = subparsers.add_parser(
+        "repo",
+        help="Standing repo grants: grant (human TTY), revoke (human TTY), list.",
+    )
+    rsub = repo.add_subparsers(dest="repo_handler", required=True)
+    repo_grant = rsub.add_parser("grant", help="Enroll a standing grant for one repository (interactive).")
+    repo_grant.add_argument("--repo", required=True, help="Repository as owner/name.")
+    repo_grant.add_argument("--max-bees", type=int, default=3, help="Per-job bee cap (default 3, global cap 12).")
+    repo_grant.add_argument("--wall-clock-max", type=int, default=3600, help="Per-job wall clock in seconds (default 3600).")
+    repo_grant.add_argument("--expires", default="never", help="ISO-8601 date/datetime, or never (default).")
+    repo_grant.add_argument("--statement", required=True, help="The approver's own words describing the grant.")
+    repo_grant.add_argument("--state-dir", default=None)
+    repo_grant.set_defaults(command="repo", repo_handler="grant")
+    repo_revoke = rsub.add_parser("revoke", help="Revoke the standing grant(s) for a repository (interactive).")
+    repo_revoke.add_argument("--repo", required=True, help="Repository as owner/name.")
+    repo_revoke.add_argument("--statement", default="", help="Optional human statement for the audit record.")
+    repo_revoke.add_argument("--pause-running", action="store_true",
+                             help="Record pause mode for running jobs; default is finish.")
+    repo_revoke.add_argument("--state-dir", default=None)
+    repo_revoke.set_defaults(command="repo", repo_handler="revoke")
+    repo_list = rsub.add_parser("list", help="List standing repo grants (read-only).")
+    repo_list.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    repo_list.add_argument("--state-dir", default=None)
+    repo_list.set_defaults(command="repo", repo_handler="list")
+
 
 def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
     from . import queue as queue_mod
@@ -934,6 +960,7 @@ def cmd_project(ctx: Any, args: Any, *, state_dir: Path) -> int:
         if handler == "create":
             raw_spec = _json.loads(Path(args.spec).read_text(encoding="utf-8"))
             planned = project_mod.plan(raw_spec)
+            _ensure_job_authorization(state_dir, args.job_id, planned["tasks"])
             job = jobs.create_job(state_dir, job_id=args.job_id, tasks=planned["tasks"])
             record = project_mod.create_project(state_dir, raw_spec, job_id=args.job_id, tasks=planned["tasks"])
             print(_json.dumps({"project_id": record["project_id"], "job_id": job["job_id"],
@@ -946,6 +973,113 @@ def cmd_project(ctx: Any, args: Any, *, state_dir: Path) -> int:
         raise JobCliError("invalid_argument", "project command is required", "Use plan, create or status.")
     except (project_mod.ProjectError, jobs.JobError) as exc:
         print(_json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
+        return 1
+
+
+def _ensure_job_authorization(state_dir: Path, job_id: str, tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Use an explicit human authorization if present, else a repo grant."""
+    try:
+        return jobs.load_authorization(state_dir, job_id)
+    except jobs.JobError as exc:
+        if exc.code != "authorization_missing":
+            raise
+    return jobs.authorize_from_repo_grant(state_dir, job_id=job_id, tasks=tasks)
+
+
+def cmd_repo(ctx: Any, args: Any, *, state_dir: Path) -> int:
+    """Human-only standing repo grants. Reads are safe for agents."""
+    from . import grants as grant_mod
+    from .leases import LeaseError, _ensure_key, _load_key
+    import getpass
+    import secrets
+
+    handler = getattr(args, "repo_handler", None)
+    try:
+        if handler == "list":
+            try:
+                key = _load_key(Path(state_dir))
+            except LeaseError:
+                if any((Path(state_dir) / "grants").glob("*.json")):
+                    raise grant_mod.GrantError("grant_unreadable", "the grant key is missing", "Restore the state key; do not treat unknown grants as absent.")
+                key = None
+            grants = grant_mod.GrantStore(Path(state_dir), key=key or b"").list() if key else []
+            payload = [{
+                "grant_id": grant.grant_id,
+                "repo": list(grant.repos),
+                "hosts": list(grant.hosts),
+                "profiles": list(grant.profiles),
+                "statement": grant.statement,
+                "approved_by": grant.approved_by,
+                "approved_at": grant.approved_at,
+                "expires_at": grant.expires_at,
+                "revoked_at": grant.revoked_at,
+                "revoke_mode": grant.revoke_mode,
+                "limits": {
+                    "max_bees": grant.limits.max_bees,
+                    "max_jobs": grant.limits.max_jobs,
+                    "max_concurrent_jobs": grant.limits.max_concurrent_jobs,
+                    "wall_clock_s": grant.limits.wall_clock_s,
+                    "budget_units": grant.limits.budget_units,
+                },
+            } for grant in grants]
+            if getattr(args, "json", False):
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                for item in payload:
+                    state = "revoked" if item["revoked_at"] else ("expired" if item["expires_at"] <= time.time() else "active")
+                    print(f"{item['grant_id']} {','.join(item['repo'])} {state} "
+                          f"max_bees={item['limits']['max_bees']} wall_clock_s={item['limits']['wall_clock_s']}")
+            return 0
+
+        key = _ensure_key(Path(state_dir))
+        store = grant_mod.GrantStore(Path(state_dir), key=key)
+        repo = str(getattr(args, "repo", "") or "").strip()
+        if not repo or repo.count("/") != 1 or not all(repo.split("/")):
+            raise grant_mod.GrantError("repo_invalid", "repo must be owner/name", "Pass a canonical repository identity.")
+
+        if handler == "grant":
+            expires = grant_mod.parse_expiry(getattr(args, "expires", "never") or "never")
+            max_bees = int(getattr(args, "max_bees", 3) or 3)
+            wall_clock = int(getattr(args, "wall_clock_max", 3600) or 3600)
+            existing = store.find_for_repo(repo)
+            if any(not item.revoked_at and item.expires_at > time.time() for item in existing):
+                raise grant_mod.GrantError("grant_exists", f"an active grant already covers {repo}", "Revoke it before enrolling a new grant.")
+            grant_id = grant_mod.repo_grant_id(repo)
+            if existing:
+                # A revoked/expired grant remains immutable evidence; a fresh
+                # enrollment gets a new id so the old record is never rewritten.
+                grant_id = f"{grant_id}-{secrets.token_hex(3)}"
+            grant = grant_mod.Grant(
+                grant_id=grant_id,
+                approved_by=getpass.getuser(),
+                approved_at=jobs._utc_now(),
+                expires_at=expires,
+                repos=(repo,),
+                hosts=("*",),
+                profiles=("*",),
+                task_scopes=(),
+                limits=grant_mod.Limits(max_bees=max_bees, max_jobs=None,
+                                        max_concurrent_jobs=grant_mod.GLOBAL_MAX_BEES,
+                                        wall_clock_s=wall_clock, budget_units=None),
+                statement=str(getattr(args, "statement", "") or ""),
+                unrestricted_scope=True,
+            )
+            path = store.enroll(grant, statement=str(getattr(args, "statement", "") or ""))
+            print(json.dumps({"granted": grant.grant_id, "repo": repo, "path": str(path)}, indent=2, sort_keys=True))
+            return 0
+
+        if handler == "revoke":
+            ids = store.revoke_repo(
+                repo,
+                statement=str(getattr(args, "statement", "") or ""),
+                running="pause" if getattr(args, "pause_running", False) else "finish",
+            )
+            print(json.dumps({"revoked": ids, "repo": repo}, indent=2, sort_keys=True))
+            return 0
+
+        raise JobCliError("invalid_argument", "unknown repo command", "Use grant, revoke or list.")
+    except grant_mod.GrantError as exc:
+        print(json.dumps({"error": exc.code, "message": exc.message, "fix": exc.fix}, indent=2))
         return 1
 
 
@@ -971,6 +1105,7 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
 
         if handler == "create":
             tasks = json.loads(Path(args.tasks).read_text(encoding="utf-8"))
+            _ensure_job_authorization(state_dir, job_id, tasks)
             job = jobs.create_job(state_dir, job_id=job_id, tasks=tasks)
             print(json.dumps({"job_id": job["job_id"], "tasks": len(job["tasks"])}, indent=2))
             return 0

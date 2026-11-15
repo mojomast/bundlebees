@@ -15,6 +15,13 @@ one pull request.
 
 ### Added
 
+- **Standing repository grants:** `hermes bundlebees repo grant`, `repo list`
+  and `repo revoke`. A human can enroll one TTY-only grant per repository;
+  `job create` then derives a narrow, sealed job authorization and records the
+  grant id, statement and approval time in its evidence. Grants fail closed on
+  missing, expired, revoked, malformed or tampered state, while merges,
+  protected pushes, releases, deploys, worker changes and secret access remain
+  explicit human gates. See `docs/repo-grants.md`.
 - **ACDD contracts and TDD evidence** ([docs/ACDD.md](docs/ACDD.md), the
   protocol from workflow chapter 16). `bundlebees_plugin/contract.py` validates
   `acdd/1` contracts (the bundled schema plus the eight code checks), hashes
