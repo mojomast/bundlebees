@@ -562,7 +562,7 @@ class CheckoutPin:
         assert recorded["worker"]["kind"] == "real"
         assert recorded["worker"]["interpreter"] is None
 
-    def test_the_sandbox_suite_may_not_be_the_project_venv(self):
+    def test_the_sandbox_suite_may_not_be_the_project_venv(self, tmp_path):
         contexts = th.PythonContexts(
             coordinator=th.PythonContext("coordinator", PY),
             sandbox_suite=th.PythonContext("sandbox-suite", PY),
@@ -572,8 +572,10 @@ class CheckoutPin:
             contexts.validate()
         assert caught.value.code == "interpreter_conflict"
 
-        other_venv = Path(PY).parent / "python3"
-        assert other_venv.exists(), other_venv
+        other_venv = tmp_path / "other-venv" / "bin" / "python3"
+        other_venv.parent.mkdir(parents=True)
+        os.symlink(PY, other_venv)
+        (tmp_path / "other-venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
         contexts = th.PythonContexts(
             coordinator=th.PythonContext("coordinator", PY),
             sandbox_suite=th.PythonContext("sandbox-suite", str(other_venv)),
@@ -619,11 +621,15 @@ class SuiteCommand:
             checkout.assert_suite_command(argv, ())
         assert caught.value.code == "suite_command_not_configured"
 
-    def test_a_venv_suite_interpreter_is_refused(self):
+    def test_a_venv_suite_interpreter_is_refused(self, tmp_path):
         checkout = th.Checkout(
             root=ROOT, contexts=th.default_contexts(rehearsal=False, coordinator_python=PY)
         )
-        suite = (PY, "-c", "print(1)")
+        venv_python = tmp_path / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        os.symlink(PY, venv_python)
+        (tmp_path / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        suite = (str(venv_python), "-c", "print(1)")
         argv = (PY, "-m", "bundlebees_plugin.factory_driver", "--once", "--suite-command", *suite)
         with pytest.raises(th.TrialRefused) as caught:
             checkout.assert_suite_command(argv, suite)
