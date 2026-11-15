@@ -220,6 +220,15 @@ def test_dispatch_accepts_object_and_json_string():
     assert first["task_id"] == "t1"
     second = _call(ctx, "bundlebees_dispatch", {"brief": json.dumps(_brief())}, client=client)
     assert second["ok"] is True
+    # No plugin-side default: the launcher picks its own preferred route for this host.
+    assert client.calls[-1][2]["model"] is None
+
+
+def test_dispatch_forwards_an_explicitly_allowed_model():
+    client = FakeClient()
+    payload = _call(_ctx(), "bundlebees_dispatch", {"brief": _brief(), "model": "deepseek-v4.1-flash"},
+                    client=client)
+    assert payload["ok"] is True
     assert client.calls[-1][2]["model"] == "deepseek-v4.1-flash"
 
 
