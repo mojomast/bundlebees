@@ -136,14 +136,15 @@ def require_sandbox_interpreter(preferred: str = "auto") -> None:
 
     from bundlebees_plugin import sandbox
 
-    # A configured interpreter is staged into the copy by run_in_sandbox, so reachability of the
-    # coordinator's own interpreter no longer decides whether a sandboxed python child can start.
-    if sandbox.resolve_sandbox_python(""):
-        return
+    # Backend availability decides first: without one, run_in_sandbox refuses before any interpreter
+    # question matters, so skipping on a configured interpreter alone would turn those hosts into
+    # errors. Only then does interpreter reachability matter, and staging makes it satisfiable.
     backend = sandbox.detect_backend(preferred)
     if backend is None:
         pytest.skip("no strong sandbox backend is usable on this host")
     if backend not in sandbox.HOME_HIDING_BACKENDS:
+        return
+    if sandbox.resolve_sandbox_python(""):
         return
     work = Path(tempfile.mkdtemp(prefix="bb-interp-probe-"))
     try:
