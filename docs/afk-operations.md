@@ -2,7 +2,10 @@
 
 The factory driver is `bundlebees_plugin.factory_driver`. Its parser requires
 exactly one mode: `--once` for a single pass, or `--interval SECONDS` for the
-resident loop. There is no separate enqueue, status or resume flag.
+resident loop. There is no enqueue, status or resume flag on the driver itself.
+Campaign checkpoints are separate commands (`campaign init|status|reconcile|resume-plan`);
+the driver only accepts an optional `--campaign-id` so it reconciles that
+checkpoint on each pass. The campaign record never enqueues or grants work.
 
 ## Enqueue
 
