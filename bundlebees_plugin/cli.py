@@ -1077,6 +1077,7 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         timeout = 900
     tiktoken_cache = str(config.get("sandbox_tiktoken_cache") or "").strip() or None
+    verify_python = str(config.get("verify_python") or "").strip() or None
     return {
         "backend": backend,
         "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
@@ -1085,6 +1086,7 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "timeout": max(30, min(timeout, 7200)),
         "tiktoken_cache": tiktoken_cache,
+        "python": verify_python,
     }
 
 

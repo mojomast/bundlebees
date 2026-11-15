@@ -118,3 +118,34 @@ def secret_scope(values: Mapping[str, str | None] | None = None, *, raises: bool
                 sys.modules.pop(key, None)
             else:
                 sys.modules[key] = value
+
+
+def require_sandbox_interpreter(preferred: str = "auto") -> None:
+    """Skip the caller when the sandbox cannot exec this coordinator's interpreter.
+
+    ``firejail --private=<copy>`` masks the coordinator home, and ``--private-tmp`` masks ``/tmp``
+    and ``/var/tmp``, so a pytest/Hermes interpreter living in either is unreachable inside the
+    jail. ``sandbox.run_in_sandbox`` refuses that case with ``sandbox_interpreter_hidden`` and asks
+    for ``verify_python``; tests that need a real python child skip here instead of asserting on a
+    wrapper error that never started their script.
+    """
+
+    import shutil
+
+    import pytest
+
+    from bundlebees_plugin import sandbox
+
+    backend = sandbox.detect_backend(preferred)
+    if backend is None:
+        pytest.skip("no strong sandbox backend is usable on this host")
+    if backend not in sandbox.HOME_HIDING_BACKENDS:
+        return
+    work = Path(tempfile.mkdtemp(prefix="bb-interp-probe-"))
+    try:
+        (work / "tmp").mkdir(parents=True, exist_ok=True)
+        env = sandbox.sandbox_env(work, work / "tmp")
+        if not sandbox.interpreter_visible_in_sandbox(backend, work, work, sys.executable, env):
+            pytest.skip("the sandbox cannot exec the coordinator interpreter; set verify_python")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

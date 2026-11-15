@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from bundlebees_plugin import sandbox
+from tests.fakes import require_sandbox_interpreter
 
 
 def _no_backends(name: str) -> None:
@@ -526,6 +527,7 @@ def _real_backend() -> str:
 
 def test_real_sandbox_blocks_network(tmp_path: Path):
     backend = _real_backend()
+    require_sandbox_interpreter(backend)
     script = (
         "import socket\n"
         "try:\n"
@@ -588,6 +590,7 @@ def test_real_bwrap_hides_host_files(tmp_path: Path):
 
 def test_real_sandbox_hides_the_sentinel_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     backend = _real_backend()
+    require_sandbox_interpreter(backend)
     monkeypatch.setenv("BUNDLEBEES_SENTINEL_SECRET", "sentinel-do-not-leak")
     script = "import os; print(os.environ.get('BUNDLEBEES_SENTINEL_SECRET', 'ABSENT'))\n"
 

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import site
 import subprocess
@@ -431,6 +432,115 @@ def build_command(
     ]
 
 
+#: Environment override for the interpreter the sandbox starts (same meaning as ``verify_python``).
+PYTHON_ENV = "BUNDLEBEES_VERIFY_PYTHON"
+#: Where a staged interpreter lives inside the sandbox copy.
+_SANDBOX_PYTHON_DIR = ".bundlebees-python"
+#: Backends whose wrapper remaps ``$HOME``, so a path inside the coordinator home does not exist.
+HOME_HIDING_BACKENDS: tuple[str, ...] = ("firejail",)
+_FIX_PYTHON = (
+    "Set verify_python (or BUNDLEBEES_VERIFY_PYTHON) to an absolute interpreter path outside the "
+    "coordinator home that has pytest installed (for example a venv under /var/tmp), or use "
+    "verify_isolation=bwrap on a host that allows unprivileged user namespaces."
+)
+
+
+def resolve_sandbox_python(python: str | None = None) -> str | None:
+    """Validated ``verify_python`` interpreter, or None to start the coordinator's own.
+
+    ``verify_python`` / ``BUNDLEBEES_VERIFY_PYTHON`` names the interpreter the sandbox runs.
+    Whether it can be reached is a property of the chosen backend, so ``run_in_sandbox`` probes
+    it there instead of guessing from the path.
+    """
+    explicit = str(python or os.environ.get(PYTHON_ENV) or "").strip()
+    if not explicit:
+        return None
+    path = Path(explicit).expanduser()
+    if not path.is_absolute():
+        raise SandboxUnavailable(
+            f"verify_python must be an absolute path, got {explicit!r}",
+            _FIX_PYTHON,
+            code="invalid_argument",
+        )
+    if not path.is_file() or not os.access(str(path), os.X_OK):
+        raise SandboxUnavailable(
+            f"verify_python is not an executable file: {path}",
+            _FIX_PYTHON,
+            code="invalid_argument",
+        )
+    return str(path)
+
+
+def interpreter_visible_in_sandbox(
+    backend: str,
+    copy_dir: Path,
+    home: Path,
+    interpreter: str,
+    env: dict[str, str],
+) -> bool:
+    """Probe the real backend for one thing: can the sandbox exec *interpreter*?
+
+    A path heuristic cannot answer this. ``firejail --private=<copy>`` masks the coordinator home
+    but leaves separate mounts under it reachable, so ``~/.hermes/tools/python-*`` vanishes while
+    ``~/.cache/uv/...`` does not -- and ``--private-tmp`` masks ``/tmp`` and ``/var/tmp`` as well.
+    Ask the wrapper instead.
+    """
+    probe = ["/bin/sh", "-c", f"test -x {shlex.quote(str(interpreter))}"]
+    try:
+        proc = subprocess.run(
+            build_command(backend, copy_dir, home, probe),
+            cwd=str(copy_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def stage_interpreter(copy_dir: Path, host_python: str) -> str:
+    """Copy *host_python*'s install tree into the sandbox copy and return its path there.
+
+    A sandbox that masks every writable location outside its own copy leaves no read-only bind
+    available to an unprivileged user, so the interpreter is staged instead: the copy is
+    disposable, its ``bin/python`` symlink still resolves to the visible base interpreter, and
+    ``python -m pytest`` never depends on installed console-script shebangs.
+    """
+    host = Path(host_python).expanduser()
+    root = host.parent.parent  # <venv>/bin/python -> <venv>
+    destination = Path(copy_dir) / _SANDBOX_PYTHON_DIR
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(root, destination, symlinks=True)
+    staged = destination / host.relative_to(root)
+    mode = staged.stat().st_mode
+    staged.chmod(mode | 0o500)  # copy2 keeps the mode; make sure it is executable
+    return str(staged)
+
+
+def swap_interpreter(argv: list[str], interpreter: str | None) -> list[str]:
+    """Return a copy of *argv* whose interpreter position is *interpreter* when one was resolved."""
+    argv = list(argv)
+    if not interpreter or not argv:
+        return argv
+    if not _is_coordinator_interpreter(argv[0]):
+        return argv
+    return [interpreter, *argv[1:]]
+
+
+def _is_coordinator_interpreter(path: str) -> bool:
+    """True when *path* is the interpreter this coordinator runs (a hidden one needs a substitute)."""
+    if not path:
+        return False
+    try:
+        return os.path.realpath(path) == os.path.realpath(sys.executable)
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Evidence and execution
 # ---------------------------------------------------------------------------
@@ -546,6 +656,7 @@ def run_in_sandbox(
     probe: Probe | None = None,
     tiktoken_cache: Path | str | None = None,
     collect_file: str | None = None,
+    python: str | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
@@ -559,6 +670,9 @@ def run_in_sandbox(
     explicitly requested ``unshare`` backend runs; ``auto`` never picks it.
     ``tiktoken_cache`` names an operator-owned cache bound read-only and exposed
     as ``TIKTOKEN_CACHE_DIR``; it must be an existing directory outside home.
+    ``python`` (``verify_python``) starts the child with an interpreter that
+    exists inside the sandbox; a backend that hides the coordinator home refuses
+    an interpreter living in it instead of failing inside the wrapper.
     """
     cache = _resolve_tiktoken_cache(tiktoken_cache)
     weak_ok = weak_override_enabled(allow_weak)
@@ -620,6 +734,30 @@ def run_in_sandbox(
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
 
         command_argv = _replace_evidence(argv, evidence_inside)
+        if command_argv and _is_coordinator_interpreter(command_argv[0]):
+            configured = resolve_sandbox_python(python)
+            target = configured or sys.executable
+            if chosen in HOME_HIDING_BACKENDS and not interpreter_visible_in_sandbox(
+                chosen, copy_dir, home, target, env
+            ):
+                if not configured:
+                    raise SandboxUnavailable(
+                        f"{chosen} hides {target} from the sandbox, so the worker's tests cannot "
+                        "start; the wrapper only says 'no suitable ... executable found'",
+                        _FIX_PYTHON,
+                        code="sandbox_interpreter_hidden",
+                    )
+                staged = stage_interpreter(copy_dir, configured)
+                if not interpreter_visible_in_sandbox(chosen, copy_dir, home, staged, env):
+                    raise SandboxUnavailable(
+                        f"{chosen} hides {configured} even after staging it inside the sandbox "
+                        "copy; point verify_python at a self-contained interpreter",
+                        _FIX_PYTHON,
+                        code="sandbox_interpreter_hidden",
+                    )
+                command_argv = swap_interpreter(command_argv, staged)
+            elif configured:
+                command_argv = swap_interpreter(command_argv, configured)
         if chosen is None:
             label = "none-unsafe-local"
             command = command_argv
