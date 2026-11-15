@@ -15,6 +15,16 @@ one pull request.
 
 ### Added
 
+- **Owner approval card:** the authenticated Bundlebees Desktop pane now lists
+  pending one-time job approvals and opens a plain-language card bound to the
+  exact job, repository/base revision, task leases, worker project/profile,
+  code revision, budgets and coordinator stop/restart plan. The owner clicks
+  **Approve once** or **Decline**; the decision route derives an in-process
+  owner capability, so an agent with filesystem access cannot mint a receipt.
+  The receipt authorizes only the named trial run; merge/release/deploy/publish
+  gates and final product acceptance remain separate. See
+  `docs/OWNER-APPROVAL-CARD.md`.
+
 - **Standing repository grants:** `hermes bundlebees repo grant`, `repo list`
   and `repo revoke`. A human can enroll one TTY-only grant per repository;
   `job create` then derives a narrow, sealed job authorization and records the
