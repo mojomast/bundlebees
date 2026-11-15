@@ -16,7 +16,6 @@ from typing import Any, Callable, Mapping
 
 from .brief import BriefError, validate_brief
 from .client import (
-    DEFAULT_MODEL,
     ClientError,
     client_from_config,
     public_result,
@@ -412,21 +411,26 @@ def _dispatch(
             "checks are best-effort against live attempts.",
         )
 
-    model = args.get("model") or DEFAULT_MODEL
-    if not isinstance(model, str) or not model.strip():
-        return _err("invalid_argument", "model must be a non-empty string", "Use a launcher-allowed model id.")
-    model = model.strip()
-    try:
-        health = client.health()
-    except Exception:
-        health = {}
-    allowed_models = health.get("models") if isinstance(health, Mapping) else None
-    if isinstance(allowed_models, list) and allowed_models and model not in allowed_models:
-        return _err(
-            "model_not_allowed",
-            "model is not allow-listed on the launcher",
-            "Use one of: " + ", ".join(str(item) for item in allowed_models),
-        )
+    # No model means "the launcher decides": its default is the cheapest usable route on that host
+    # (Zoo's free pass when a zoo key is readable, else the host's configured model). Substituting a
+    # plugin-side default here silently overrides that preference for every dispatch.
+    model = args.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            return _err("invalid_argument", "model must be a non-empty string",
+                        "Use a launcher-allowed model id, or omit it to let the launcher choose.")
+        model = model.strip()
+        try:
+            health = client.health()
+        except Exception:
+            health = {}
+        allowed_models = health.get("models") if isinstance(health, Mapping) else None
+        if isinstance(allowed_models, list) and allowed_models and model not in allowed_models:
+            return _err(
+                "model_not_allowed",
+                "model is not allow-listed on the launcher",
+                "Use one of: " + ", ".join(str(item) for item in allowed_models),
+            )
 
     kanban_task_id = args.get("kanban_task_id")
     if kanban_task_id is not None and not isinstance(kanban_task_id, str):
@@ -695,7 +699,7 @@ _DISPATCH_SCHEMA = _schema(
             },
             "model": {
                 "type": "string",
-                "description": "Launcher-allowed model id; defaults to deepseek-v4.1-flash.",
+                "description": "Launcher-allowed model id; omit to use the launcher's preferred route.",
             },
             "kanban_task_id": {
                 "type": "string",
