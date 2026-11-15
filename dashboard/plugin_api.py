@@ -14,6 +14,7 @@ carry secrets, bind addresses, private URLs, or local filesystem paths.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Body, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # Hermes imports this file by path (``spec_from_file_location``), so the plugin
 # root is not guaranteed to be on sys.path in the dashboard process.
@@ -763,6 +764,301 @@ def host_prompt_generate(payload: Any = Body(default=None)) -> JSONResponse:
         return {"ok": True, "prompt": prompt, "deploy_command": _DEPLOY_COMMAND}
 
     return _run(build)
+
+
+def _approval_state_dir() -> Path:
+    """The Bundlebees plugin data directory, never a request-controlled path."""
+    root = _data_dir or _default_data_dir()
+    if root is None:
+        raise DashboardError(
+            "the bundlebees approval store is not configured",
+            "not_configured",
+            "Enable the bundlebees plugin in the active Hermes profile and reload the pane.",
+            503,
+        )
+    return Path(root).expanduser().resolve()
+
+
+def _approval_api():
+    try:
+        from bundlebees_plugin import approval
+    except Exception as exc:  # pragma: no cover - import failure is a deployment fault
+        raise DashboardError(
+            "the bundlebees approval module is unavailable",
+            "not_configured",
+            "Install the bundlebees plugin version that includes owner approvals and retry.",
+            503,
+        ) from exc
+    return approval
+
+
+def _approval_error(exc: Exception) -> DashboardError:
+    code = str(getattr(exc, "code", "") or "approval_error")
+    message = str(getattr(exc, "message", "") or str(exc) or "approval failed")
+    fix = str(getattr(exc, "fix", "") or "")
+    if code in {"approval_conflict", "approval_consumed", "approval_scope_changed"}:
+        status = 409
+    elif code in {"approval_expired", "approval_missing", "approval_request_missing", "approval_receipt_missing"}:
+        status = 410
+    elif code in {"approval_owner_required", "approval_owner_capability_invalid"}:
+        status = 403
+    elif code in {"approval_key_unavailable"}:
+        status = 503
+    else:
+        status = 400
+    return DashboardError(message, code, fix, status)
+
+
+def _approval_public(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Only the owner-facing card projection; no internal paths or credentials."""
+    binding = row.get("binding") if isinstance(row.get("binding"), Mapping) else {}
+    tasks = binding.get("tasks") if isinstance(binding.get("tasks"), list) else []
+    task_rows = []
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            continue
+        task_rows.append({
+            "task_id": str(task.get("task_id") or ""),
+            "objective": str(task.get("objective") or ""),
+            "lease": [str(item) for item in (task.get("lease") or [])],
+        })
+    worker = binding.get("worker") if isinstance(binding.get("worker"), Mapping) else {}
+    coordinator = binding.get("coordinator") if isinstance(binding.get("coordinator"), Mapping) else {}
+    budgets = binding.get("budgets") if isinstance(binding.get("budgets"), Mapping) else {}
+    stop = coordinator.get("stop") if isinstance(coordinator.get("stop"), Mapping) else {}
+    restart = coordinator.get("restart") if isinstance(coordinator.get("restart"), Mapping) else {}
+    return {
+        "request_id": str(row.get("request_id") or ""),
+        "request_digest": str(row.get("request_digest") or row.get("digest") or ""),
+        "job_id": str(binding.get("job_id") or ""),
+        "statement": str(row.get("statement") or binding.get("statement") or ""),
+        "repo": str(binding.get("repo") or ""),
+        "base_rev": str(binding.get("base_rev") or ""),
+        "scope": [str(item) for item in (binding.get("scope") or [])],
+        "tasks": task_rows,
+        "worker_project": str(worker.get("project") or ""),
+        "worker_profile": str(worker.get("profile") or ""),
+        "code_rev": str(binding.get("code_rev") or ""),
+        "bees": int(budgets.get("bees") or 0),
+        "wall_clock_s": int(budgets.get("wall_clock_s") or 0),
+        "attempts": int(budgets.get("attempts") or 0),
+        "accepted_waves": int(budgets.get("accepted_waves") or 0),
+        "coordinator_stop": dict(stop) if isinstance(stop, Mapping) else {"planned": stop},
+        "restart": dict(restart) if isinstance(restart, Mapping) else {"planned": restart},
+        "created_at": row.get("created_at"),
+        "expires_at": row.get("expires_at"),
+        "status": str(row.get("status") or "pending"),
+    }
+
+
+def _format_time(value: Any) -> str:
+    try:
+        import datetime
+
+        if isinstance(value, str) and value.strip():
+            parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        number = float(value)
+        return datetime.datetime.fromtimestamp(number, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OSError):
+        return str(value or "unknown")
+
+
+def _approval_page(document: Mapping[str, Any], *, status: int = 200, notice: str = "") -> HTMLResponse:
+    card = _approval_public(document)
+    request_id = card["request_id"]
+    digest = card["request_digest"]
+    tasks = "".join(
+        f"<li><strong>{html.escape(task['task_id'] or 'task')}</strong> — "
+        f"{html.escape(task['objective'] or 'no objective')} "
+        f"<span class='muted'>({html.escape(', '.join(task['lease']) or 'no lease')})</span></li>"
+        for task in card["tasks"]
+    ) or "<li>No task scope was recorded.</li>"
+    stop_doc = card["coordinator_stop"]
+    stop_text = html.escape(str(stop_doc.get("after") or stop_doc.get("planned") or "after the first dispatch"))
+    if stop_doc.get("driver_exit_confirmed") is True:
+        stop_text += "; the coordinator process exit is confirmed"
+    restart_doc = card["restart"]
+    if restart_doc.get("planned") is not None:
+        restart_text = html.escape(str(restart_doc.get("planned")))
+    else:
+        restart_text = html.escape(
+            f"{restart_doc.get('coordinator_restarts', 1)} restart(s), "
+            f"one overall deadline of {restart_doc.get('deadline_s', 'unknown')} seconds"
+        )
+    expiry = html.escape(_format_time(card["expires_at"]))
+    settled = card["status"] not in {"pending", "open"} or status != 200 or not digest
+    if card["status"] == "expired" and not notice:
+        notice = "This approval request has expired. Ask for a fresh preview; no decision can be recorded."
+    buttons = (
+        "<div class='actions'><button class='approve' data-decision='approve'>Approve once</button>"
+        "<button class='decline' data-decision='decline'>Decline</button></div>"
+        if not settled
+        else ""
+    )
+    body = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bundlebees job approval</title>
+<style>
+:root{{color-scheme:dark;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}}
+body{{margin:0;background:#0b0f14;color:#e6edf5}}
+main{{max-width:760px;margin:0 auto;padding:28px 20px 42px}}
+.card{{background:#111821;border:1px solid #243242;border-radius:12px;padding:20px 22px}}
+h1{{font-size:22px;margin:0 0 8px}} h2{{font-size:15px;margin:22px 0 8px;color:#93a4b8;text-transform:uppercase;letter-spacing:.06em}}
+p{{margin:8px 0}} .muted{{color:#93a4b8}} .row{{display:grid;grid-template-columns:180px minmax(0,1fr);gap:10px;padding:6px 0;border-bottom:1px solid #1c2835}}
+.key{{color:#93a4b8}} .value{{overflow-wrap:anywhere}} code{{color:#54d3a1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}
+.actions{{display:flex;gap:12px;flex-wrap:wrap;margin-top:24px}}
+button{{border:1px solid #243242;border-radius:8px;padding:10px 18px;font:inherit;cursor:pointer;color:#e6edf5;background:#17212c}}
+button.approve{{border-color:#54d3a1;color:#54d3a1}} button.decline{{border-color:#f27f8b;color:#f27f8b}}
+button:disabled{{opacity:.45;cursor:not-allowed}} .notice{{margin-top:16px;padding:10px 12px;border:1px solid #243242;border-radius:8px;color:#f0b86e}}
+.ok{{color:#54d3a1}} .error{{color:#f27f8b}} ul{{padding-left:20px}} li{{margin:6px 0}}
+summary{{cursor:pointer;color:#93a4b8}} .digest{{font-size:12px;color:#93a4b8;overflow-wrap:anywhere}}
+</style></head><body><main><div class="card">
+<h1>Bundlebees asks for one-time approval</h1>
+<p class="muted">Review this exact run. Approve starts only this job; it does not approve a merge, release, deployment, publication or final product acceptance.</p>
+<div class="row"><span class="key">Job</span><span class="value"><code>{html.escape(card['job_id'] or 'unknown')}</code> — {html.escape(card['statement'] or 'no statement')}</span></div>
+<div class="row"><span class="key">Repository</span><span class="value"><code>{html.escape(card['repo'] or 'unknown')}</code></span></div>
+<div class="row"><span class="key">Base revision</span><span class="value"><code>{html.escape(card['base_rev'] or 'unknown')}</code></span></div>
+<div class="row"><span class="key">Authorized paths</span><span class="value">{html.escape(', '.join(card['scope']) or 'none')}</span></div>
+<div class="row"><span class="key">Worker</span><span class="value">project <code>{html.escape(card['worker_project'] or 'unknown')}</code>; profile <code>{html.escape(card['worker_profile'] or 'unknown')}</code></span></div>
+<div class="row"><span class="key">Code revision</span><span class="value"><code>{html.escape(card['code_rev'] or 'unknown')}</code></span></div>
+<div class="row"><span class="key">Budget</span><span class="value">{card['bees']} bee(s); {card['wall_clock_s']} seconds; {card['attempts']} attempt(s); {card['accepted_waves']} accepted wave(s)</span></div>
+<div class="row"><span class="key">Coordinator stop</span><span class="value">{stop_text}</span></div>
+<div class="row"><span class="key">Restart</span><span class="value">{restart_text}</span></div>
+<div class="row"><span class="key">Expires</span><span class="value">{expiry}</span></div>
+<h2>Task scope</h2><ul>{tasks}</ul>
+<details><summary>Exact preview identity</summary><p class="digest">request {html.escape(request_id)}<br>digest {html.escape(digest)}</p></details>
+<div class="actions">{buttons}</div>
+<div id="status" class="notice" role="status" aria-live="polite">{html.escape(notice)}</div>
+</div></main>
+<script>
+(() => {{
+  const requestId = {json.dumps(request_id)};
+  const digest = {json.dumps(digest)};
+  const buttons = [...document.querySelectorAll('button[data-decision]')];
+  const status = document.getElementById('status');
+  buttons.forEach(button => button.addEventListener('click', async () => {{
+    const decision = button.dataset.decision;
+    if (!['approve','decline'].includes(decision)) return;
+    if (decision === 'approve' && !confirm('Approve exactly this job, revision, scope, worker and budget?')) return;
+    if (decision === 'decline' && !confirm('Decline this job? No work will be dispatched.')) return;
+    buttons.forEach(item => item.disabled = true);
+    status.textContent = decision === 'approve' ? 'Recording approval…' : 'Recording decline…';
+    try {{
+      const response = await fetch('../approvals/' + encodeURIComponent(requestId) + '/decision', {{
+        method: 'POST', headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{decision, expected_digest: digest}})
+      }});
+      const data = await response.json();
+      if (!response.ok || data.ok !== true) throw Error(data.error || data.code || 'decision was refused');
+      status.className = 'notice ok';
+      status.textContent = decision === 'approve'
+        ? 'Approved once. The coordinator may now proceed; this page cannot be used as a second approval.'
+        : 'Declined. The coordinator must not dispatch this job.';
+    }} catch (error) {{
+      buttons.forEach(item => item.disabled = false);
+      status.className = 'notice error';
+      status.textContent = String(error.message || error);
+    }}
+  }}));
+}})();
+</script></body></html>"""
+    return HTMLResponse(body, status_code=status, headers={
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+    })
+
+
+@router.get("/approvals")
+def approvals() -> JSONResponse:
+    def build() -> dict[str, Any]:
+        module = _approval_api()
+        try:
+            rows = module.list_pending(_approval_state_dir())
+        except Exception as exc:
+            raise _approval_error(exc) from exc
+        return {"ok": True, "approvals": [_approval_public(row) for row in rows]}
+
+    return _run(build)
+
+
+@router.post("/approvals/{request_id}/decision")
+def approval_decision(request_id: str, payload: Any = Body(default=None)) -> JSONResponse:
+    def build() -> dict[str, Any]:
+        data = _as_mapping(payload)
+        decision = str(data.get("decision") or "").strip().lower()
+        if decision not in {"approve", "decline"}:
+            raise DashboardError(
+                "decision must be approve or decline",
+                "invalid_argument",
+                "Reload the approval card and choose Approve once or Decline.",
+            )
+        expected = str(data.get("expected_digest") or "").strip()
+        if not expected:
+            raise DashboardError(
+                "the exact preview digest is required",
+                "stale_resource",
+                "Reload the card and review the current preview before deciding.",
+                409,
+            )
+        module = _approval_api()
+        try:
+            capability = module.owner_capability(request_id)
+            receipt = module.record_decision(
+                _approval_state_dir(),
+                request_id,
+                decision="approved" if decision == "approve" else "declined",
+                expected_digest=expected,
+                owner="owner",
+                auth_method="hermes_dashboard_session",
+                owner_capability=capability,
+            )
+        except Exception as exc:
+            raise _approval_error(exc) from exc
+        return {"ok": True, "receipt": receipt}
+
+    return _run(build)
+
+
+@router.get("/approval/{request_id}", response_class=HTMLResponse)
+def approval_card(request_id: str) -> HTMLResponse:
+    try:
+        module = _approval_api()
+        row = module.load_request(_approval_state_dir(), request_id)
+        try:
+            receipt = module.load_receipt(_approval_state_dir(), request_id)
+        except Exception as exc:
+            if str(getattr(exc, "code", "")) not in {
+                "approval_receipt_missing",
+                "approval_receipt_invalid",
+            }:
+                raise
+        else:
+            row = dict(row)
+            row["status"] = str(receipt.get("decision") or "settled")
+        if str(row.get("status") or "pending") in {"pending", "open"}:
+            from datetime import datetime, timezone
+            try:
+                expiry = datetime.fromisoformat(str(row.get("expires_at") or "").replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry <= datetime.now(timezone.utc):
+                    row = dict(row)
+                    row["status"] = "expired"
+            except ValueError:
+                pass
+    except Exception as exc:
+        mapped = _approval_error(exc)
+        return _approval_page(
+            {"request_id": request_id, "request_digest": "", "binding": {}},
+            status=mapped.status,
+            notice=mapped.error,
+        )
+    return _approval_page(row)
 
 
 @router.api_route(
