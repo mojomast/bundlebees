@@ -196,7 +196,7 @@ class ProcessControl:
 
         record = th.start_driver(
             argv, run=1, cwd=tmp_path, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-            log_path=log, clock=clock,
+            log_path=log, clock=clock, validate_argv=False,
         )
         try:
             child_pid = int(wait_for_file(pid_file))
@@ -226,6 +226,19 @@ class ProcessControl:
             if record.returncode is None:  # pragma: no cover - defensive cleanup
                 record.proc.kill()
 
+    def test_an_arbitrary_python_script_is_not_the_driver(self, tmp_path):
+        script = write_script(tmp_path, "not-the-driver.py", CHILD_SLEEPER)
+        with pytest.raises(th.TrialRefused) as caught:
+            th.start_driver(
+                (PY, str(script)),
+                run=1,
+                cwd=tmp_path,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                log_path=tmp_path / "log",
+                clock=th.SystemClock(),
+            )
+        assert caught.value.code == "driver_argv_not_the_driver"
+
     def test_a_shell_pipeline_is_refused_before_any_process_is_started(self, tmp_path):
         with pytest.raises(th.TrialRefused) as shell:
             th.validate_driver_argv(["bash", "-c", "python -m bundlebees_plugin.factory_driver"])
@@ -253,6 +266,7 @@ class ProcessControl:
                 env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
                 log_path=tmp_path / "log",
                 clock=th.SystemClock(),
+                validate_argv=False,
             )
         assert caught.value.code == "driver_identity_mismatch"
 
@@ -267,6 +281,7 @@ class ProcessControl:
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
             log_path=tmp_path / "log",
             clock=clock,
+            validate_argv=False,
         )
         try:
             assert int(wait_for_file(pid_file)) == record.pid
@@ -301,6 +316,7 @@ class ProcessControl:
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
             log_path=tmp_path / "log",
             clock=clock,
+            validate_argv=False,
         )
         try:
             assert int(wait_for_file(pid_file)) == record.pid
@@ -990,7 +1006,7 @@ class FakeApproval:
     def __init__(self, *, verify_result: dict[str, Any] | None = None,
                  consume_result: dict[str, Any] | None = None) -> None:
         self.verify_result = verify_result or {"ok": True, "receipt_id": "receipt-1"}
-        self.consume_result = consume_result or {"consumed": True}
+        self.consume_result = {"consumed": True} if consume_result is None else consume_result
         self.verified: list[dict[str, Any]] = []
         self.consumed: list[dict[str, Any]] = []
 
@@ -1021,6 +1037,22 @@ class ApprovalBinding:
         assert report["approval"]["receipt_id"] == "receipt-1"
         assert len(approval.verified) == 1 and len(approval.consumed) == 1
 
+    def test_a_malformed_consume_result_is_refused(self, tmp_path):
+        with pytest.raises(th.TrialRefused) as caught:
+            th.run_rehearsal(
+                state_dir=tmp_path / "state",
+                keep=True,
+                approval=FakeApproval(consume_result={}),
+                receipt={"receipt_id": "receipt-1", "code_rev": th.code_rev_of(ROOT)},
+            )
+        assert caught.value.code == "approval_receipt_not_consumed"
+
+    def test_a_reused_rehearsal_report_is_refused(self, tmp_path):
+        th.run_rehearsal(state_dir=tmp_path / "state", keep=True)
+        with pytest.raises(th.TrialRefused) as caught:
+            th.run_rehearsal(state_dir=tmp_path / "state", keep=True)
+        assert caught.value.code == "trial_artifacts_already_exist"
+
     def test_an_already_consumed_receipt_is_refused(self, tmp_path):
         approval = FakeApproval(consume_result={"consumed": False})
         with pytest.raises(th.TrialRefused) as caught:
@@ -1029,7 +1061,7 @@ class ApprovalBinding:
                 approval=approval,
                 receipt={"receipt_id": "receipt-1"},
             )
-        assert caught.value.code == "approval_receipt_already_consumed"
+        assert caught.value.code == "approval_receipt_not_consumed"
         assert len(approval.verified) == 1
 
     def test_a_rejected_receipt_is_refused_before_consumption(self, tmp_path):

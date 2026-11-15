@@ -771,6 +771,14 @@ def validate_driver_argv(
             )
     modules = [items[i + 1] for i, item in enumerate(items[:-1]) if item == "-m"]
     scripts = [item for item in items if item.endswith(".py")]
+    if scripts:
+        names = {Path(item).name for item in scripts}
+        if names != {"factory_driver.py"}:
+            raise TrialRefused(
+                "driver_argv_not_the_driver",
+                f"the coordinator script is {sorted(names)!r}, not the Bundlebees factory driver",
+                "Run bundlebees_plugin.factory_driver directly; any other script is a wrapper.",
+            )
     if not any(module in allowed_modules for module in modules) and not scripts:
         raise TrialRefused(
             "driver_argv_not_the_driver",
@@ -836,6 +844,7 @@ def start_driver(
     log_path: Path,
     clock: Clock,
     allowed_modules: Sequence[str] = ("bundlebees_plugin.factory_driver",),
+    validate_argv: bool = True,
 ) -> DriverProcess:
     """Start the coordinator directly and prove the recorded PID is the driver.
 
@@ -846,7 +855,11 @@ def start_driver(
     is signalled.
     """
 
-    items = validate_driver_argv(argv, allowed_modules=allowed_modules)
+    items = (
+        validate_driver_argv(argv, allowed_modules=allowed_modules)
+        if validate_argv
+        else tuple(str(item) for item in argv)
+    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(log_path, "ab", buffering=0)
     try:
@@ -1975,6 +1988,9 @@ class TrialPlan:
     restart_min_remaining_s: float = 1.0
     report_path: Path | None = None
     launcher: Any = None
+    #: An optional attempt identity that the worker observation must match.
+    #: When the job already records one attempt, the preflight derives it.
+    expected_attempt_id: str = ""
     #: The exact code revision the trial exercises. Empty means "read the
     #: checkout's git HEAD"; a non-empty value must match that HEAD.
     code_rev: str = ""
@@ -2048,6 +2064,7 @@ class RestartTrial:
         self._stops: list[StopReport] = []
         self._observations: list[WorkerObservation] = []
         self._limitations: list[str] = []
+        self.expected_attempt_id: str = str(plan.expected_attempt_id or "").strip()
 
     # -- report scaffolding -------------------------------------------------
 
@@ -2123,6 +2140,19 @@ class RestartTrial:
                 f"the trial state directory does not exist: {state}",
                 "Create or pass the coordinator state directory.",
             )
+        # A trial is disposable. Reusing its ready/report artefacts can make a
+        # later run look successful before either driver has done anything.
+        for label, path in (
+            ("report", self.plan.report_path),
+            ("ready", self.plan.ready_path),
+            ("restart_ready", self.plan.restart_ready_path),
+        ):
+            if path is not None and Path(path).exists():
+                raise TrialRefused(
+                    "trial_artifacts_already_exist",
+                    f"the {label} path already exists for this trial: {path}",
+                    "Use a fresh trial_id/report path; never reuse a prior trial's evidence.",
+                )
         try:
             job = jobs.load_job(state, self.plan.job_id, recover=False)
         except jobs.JobError as exc:
@@ -2141,6 +2171,31 @@ class RestartTrial:
                 ),
                 "Run the restart trial against a single-task job, or extend the evidence model first.",
             )
+        recorded_attempts = sorted(
+            {
+                str(attempt)
+                for task in tasks
+                for attempt in (task.get("attempts") or [])
+                if str(attempt or "").strip()
+            }
+        )
+        if len(recorded_attempts) > 1:
+            raise TrialRefused(
+                "trial_requires_single_attempt",
+                f"the trial job already records attempts {recorded_attempts!r}",
+                "Use a job with at most one recorded attempt; this harness proves one dispatch.",
+            )
+        if recorded_attempts:
+            if self.expected_attempt_id and self.expected_attempt_id != recorded_attempts[0]:
+                raise TrialRefused(
+                    "expected_attempt_mismatch",
+                    (
+                        f"the plan expects attempt {self.expected_attempt_id!r}, but the job records "
+                        f"{recorded_attempts[0]!r}"
+                    ),
+                    "Correct the plan; the harness will not accept a different worker's evidence.",
+                )
+            self.expected_attempt_id = recorded_attempts[0]
         if self.plan.campaign_id:
             try:
                 campaign_mod.load_campaign(state, self.plan.campaign_id)
@@ -2220,11 +2275,14 @@ class RestartTrial:
                     "Do not weaken the receipt binding; obtain a receipt for this revision.",
                 )
             consumed = self.approval.consume_receipt(dict(self.plan.approval_receipt))
-            if isinstance(consumed, Mapping) and consumed.get("consumed") is False:
+            if not isinstance(consumed, Mapping) or consumed.get("consumed") is not True:
                 raise TrialRefused(
-                    "approval_receipt_already_consumed",
-                    "the approval receipt was already consumed; a receipt admits one trial",
-                    "Obtain a new receipt from the approval lane.",
+                    "approval_receipt_not_consumed",
+                    (
+                        "the approval lane did not return an explicit consumed=true receipt; "
+                        f"got {type(consumed).__name__}"
+                    ),
+                    "A receipt must be consumed exactly once before any driver starts.",
                 )
             approval = {
                 "verified": True,
@@ -2321,6 +2379,46 @@ class RestartTrial:
             )
         return stop
 
+    def _cleanup_leftover_drivers(self) -> None:
+        """Stop any coordinator child that a failed wait left alive.
+
+        The normal path already stops run 1 and run 2. This is the failure
+        path: a deadline or readiness refusal must not leave a driver running
+        after the harness itself exits. Only PIDs this harness recorded are
+        signalled; workers are never touched.
+        """
+        if not self._drivers:
+            return
+        deadline = self.deadline
+        if deadline is None:
+            deadline = Deadline.start(
+                max(1.0, float(self.plan.term_grace_s) + float(self.plan.kill_grace_s) + 1.0),
+                clock=self.clock,
+            )
+        for record in self._drivers:
+            if record.returncode is not None:
+                continue
+            try:
+                stop = stop_driver(
+                    record,
+                    deadline=deadline,
+                    clock=self.clock,
+                    term_grace_s=self.plan.term_grace_s,
+                    kill_grace_s=self.plan.kill_grace_s,
+                )
+                self._stops.append(stop)
+                self._step(f"driver_{record.run}_cleanup", **stop.to_dict())
+                if not stop.shutdown_confirmed or stop.returncode is None:
+                    self._limitations.append(
+                        f"driver_{record.run}_cleanup_unconfirmed: pid {record.pid} code={stop.code}"
+                    )
+            except Exception as exc:  # pragma: no cover - best-effort failure path
+                self._limitations.append(
+                    f"driver_{record.run}_cleanup_failed: {type(exc).__name__}: {exc}"
+                )
+            finally:
+                record.close_log()
+
     # -- waits --------------------------------------------------------------
 
     def _wait_for(self, predicate: Callable[[], Any], *, code: str, what: str) -> Any:
@@ -2350,6 +2448,17 @@ class RestartTrial:
                 "Inject a launcher attempt probe (real) or the scripted rehearsal probe.",
             )
         observations = [item for item in self.worker_probe.observe()]
+        if self.expected_attempt_id:
+            wrong = [item for item in observations if item.attempt_id != self.expected_attempt_id]
+            if wrong:
+                raise TrialIncomplete(
+                    "worker_attempt_mismatch",
+                    (
+                        f"the trial expects attempt {self.expected_attempt_id!r}, but the probe observed "
+                        f"{sorted({item.attempt_id for item in wrong})!r}"
+                    ),
+                    "Use the attempt this job actually dispatched; never accept another job's evidence.",
+                )
         self._observations.extend(observations)
         self._step(
             "worker_observed",
@@ -2538,10 +2647,12 @@ class RestartTrial:
             self._step("trial_passed")
         except TrialError as exc:
             self._fail(exc)
+            self._cleanup_leftover_drivers()
             report = self._write_report()
             exc.report = report
             raise
         finally:
+            self._cleanup_leftover_drivers()
             for record in self._drivers:
                 record.close_log()
         return self._write_report()
