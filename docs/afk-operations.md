@@ -2,7 +2,10 @@
 
 The factory driver is `bundlebees_plugin.factory_driver`. Its parser requires
 exactly one mode: `--once` for a single pass, or `--interval SECONDS` for the
-resident loop. There is no separate enqueue, status or resume flag.
+resident loop. There is no enqueue, status or resume flag on the driver itself.
+Campaign checkpoints are separate commands (`campaign init|status|reconcile|resume-plan`);
+the driver only accepts an optional `--campaign-id` so it reconciles that
+checkpoint on each pass. The campaign record never enqueues or grants work.
 
 ## Enqueue
 
@@ -40,6 +43,12 @@ One pass, then exit:
 python -m bundlebees_plugin.factory_driver --state "$STATE" --once
 ```
 
+With no launcher URL this is the **observation-only** pass: the mechanical tick
+cannot dispatch, verify, integrate or adopt a worker result, so the pass reports
+the queued and active cards and moves none of them. Its JSON carries
+`observation_only: true` and the queue action is `observation_only`; a one-line
+warning goes to stderr.
+
 A real job tick also needs the repository, scanner and launcher URL:
 
 ```bash
@@ -51,6 +60,11 @@ python -m bundlebees_plugin.factory_driver \
   --provisioning --provisioning-host HOST_LABEL \
   --once --suite-command python -m pytest -q
 ```
+
+The selection is not silent: `--repo` without a launcher URL exits with the
+missing option named instead of degrading to the observation tick. A launcher URL
+without `--repo` is allowed for landing-only use and runs `observation_only`; it
+never claims a card. A `--tick module:callable` override is used as given.
 
 `--provisioning` binds the existing hyvv provisioning client over the same
 authenticated launcher connection; `--provisioning-host` is the expected host
@@ -101,7 +115,8 @@ hermes bundlebees job status --job-id job_a --state-dir "$STATE"
 ```
 
 `--once` also prints the driver pass result, including the queue action,
-landing and event counts, ready work, wake state and errors.
+landing and event counts, ready work, wake state, errors and whether the pass was
+`observation_only`.
 
 ## Resume
 
@@ -112,7 +127,9 @@ python -m bundlebees_plugin.factory_driver --state "$STATE" --interval 1
 ```
 
 Resident mode requires the `--interval` flag: bare `--interval` defaults to
-1.0, and `--interval 1` is the explicit form. Ctrl-C exits 130.
+1.0, and `--interval 1` is the explicit form. Ctrl-C exits 130. Add `--repo`,
+`--gitleaks` and `--launcher-url` for a dispatch-capable loop; the command above
+is the observation-only loop and never claims work.
 
 After a crash or rejection, inspect the job, record or print the recovery
 request, then advance it with one tick:

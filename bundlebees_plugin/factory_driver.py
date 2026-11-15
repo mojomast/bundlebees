@@ -22,6 +22,7 @@ import importlib
 import inspect
 import json
 import os
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
     fcntl = None  # type: ignore[assignment]
 
 from . import bee_events
+from . import campaign as campaign_mod
 from . import job_cli
 from . import hermes_adapter
 from . import event_consumer
@@ -896,11 +898,16 @@ def startup_reconcile(
     state_dir: Any,
     queue: Any,
     *,
-    tick: Any = None,
     launcher_outbox: Any = None,
     now: Any = None,
+    tick: Any = None,
 ) -> dict[str, Any]:
-    """Repair crash residue through the durable modules, before the first pass."""
+    """Repair crash residue through the durable modules, before the first pass.
+
+    It never ticks a job: adoption belongs to the regular queue pass, and ticking
+    here as well would drive the same claim twice on every restart. The ``tick``
+    keyword is accepted for compatibility with older callers and ignored.
+    """
 
     state = _state_path(state_dir)
     report: dict[str, Any] = {
@@ -945,11 +952,9 @@ def startup_reconcile(
     abandoned = [str(record.get("feature_id")) for record in active if not _pid_alive(record.get("pid"))]
     report["abandoned_claims"] = abandoned
 
-    if abandoned:
-        try:
-            report["repair"] = queue_mod.run_once(state, queue, tick=tick or mechanical_tick(state))
-        except Exception as exc:  # noqa: BLE001 - the regular pass still runs
-            report["errors"].append({"repair": type(exc).__name__})
+    # Adoption is the regular queue pass's job. Running run_once here as well
+    # would tick the same claim twice on every restart.
+    report["repair"] = None
 
     return report
 
@@ -992,12 +997,18 @@ class FactoryDriver:
         wake_ttl_s: float = DEFAULT_WAKE_TTL_S,
         startup: bool = True,
         max_work_attempts: int = MAX_WORK_ATTEMPTS,
+        campaign_id: str | None = None,
     ) -> None:
         self.state = _state_path(state_dir)
         self.state.mkdir(parents=True, exist_ok=True)
         self.queue = queue if hasattr(queue, "list_items") else queue_mod.JsonQueue(Path(queue))
         self._tick = tick if tick is not None else mechanical_tick(self.state)
+        # A tick that cannot dispatch or verify must never claim queue work.
+        self.observation_only = bool(getattr(self._tick, "observation_only", False))
         self.tick = self._serialized_tick(self._tick)
+        self.campaign_id = str(campaign_id).strip() if campaign_id else ""
+        if self.campaign_id:
+            _ = campaign_mod.load_campaign(self.state, self.campaign_id)
         self.launcher_outbox = Path(launcher_outbox) if launcher_outbox is not None else None
         self.landing_client = landing_client if landing_client is not None else launcher_client
         self.landing_export_limit = max(1, int(landing_export_limit))
@@ -1037,6 +1048,7 @@ class FactoryDriver:
                 result = core(job_id)
                 return result if isinstance(result, dict) else {"status": str(result)}
 
+        tick.observation_only = bool(getattr(core, "observation_only", False))  # type: ignore[attr-defined]
         return tick
 
     def _live_queue_owner(self, job_id: str) -> int | None:
@@ -1145,7 +1157,6 @@ class FactoryDriver:
         self.startup_report = startup_reconcile(
             self.state,
             self.queue,
-            tick=self.tick,
             launcher_outbox=self.launcher_outbox,
             now=self.now,
         )
@@ -1232,9 +1243,7 @@ class FactoryDriver:
                 "tick": {"status": "error", "error": type(exc).__name__},
             }
         try:
-            job = jobs.load_job(self.state, job_id, recover=False)
-            tasks = job.get("tasks") or []
-            done = bool(tasks) and all(str(task.get("state")) == "accepted" for task in tasks)
+            done = queue_mod.job_accepted(self.state, job_id)
         except Exception:  # noqa: BLE001
             done = False
         completed = done or str(tick_result.get("action") or "") in {
@@ -1692,7 +1701,9 @@ class FactoryDriver:
 
         queue_result: dict[str, Any]
         try:
-            queue_result = queue_mod.run_once(self.state, self.queue, tick=self.tick)
+            queue_result = queue_mod.run_once(
+                self.state, self.queue, tick=self.tick, admit=not self.observation_only
+            )
         except Exception as exc:  # noqa: BLE001 - landing and events still run
             queue_result = {"action": "error", "detail": f"{type(exc).__name__}: {exc}"}
             errors.append({"stage": "queue", "error": type(exc).__name__})
@@ -1775,6 +1786,21 @@ class FactoryDriver:
         failures.extend(self._advance_ready_work())
         wake_results = self._deliver_wakes()
 
+        campaign_result: dict[str, Any] | None = None
+        if self.campaign_id:
+            try:
+                campaign_result = campaign_mod.reconcile(
+                    self.state, self.campaign_id, now=_iso(self.now)
+                )
+            except Exception as exc:  # noqa: BLE001 - a checkpoint must not stop the factory
+                campaign_result = {
+                    "campaign_id": self.campaign_id,
+                    "phase": "blocked",
+                    "error": getattr(exc, "code", type(exc).__name__),
+                    "detail": str(exc),
+                }
+                errors.append({"stage": "campaign", "error": type(exc).__name__})
+
         try:
             ready = work_scheduler.ready_items(self.state)
         except Exception as exc:  # noqa: BLE001
@@ -1805,8 +1831,10 @@ class FactoryDriver:
             "ready_items": ready,
             "wake": [self.wake.status(name) for name in wake_names],
             "wake_delivery": wake_results,
+            "campaign": campaign_result,
             "failures": failures,
             "idle": idle,
+            "observation_only": self.observation_only,
             "inference": 0,
             "model_calls": 0,
             "errors": errors,
@@ -1832,6 +1860,7 @@ def run_pass(
     now: Any = None,
     startup: bool = True,
     max_work_attempts: int = MAX_WORK_ATTEMPTS,
+    campaign_id: str | None = None,
 ) -> dict[str, Any]:
     driver = FactoryDriver(
         state_dir,
@@ -1845,6 +1874,7 @@ def run_pass(
         now=now,
         startup=startup,
         max_work_attempts=max_work_attempts,
+        campaign_id=campaign_id,
     )
     return driver.run_pass()
 
@@ -1853,7 +1883,13 @@ run_once = run_pass
 
 
 def mechanical_tick(state_dir: Any) -> Any:
-    """A no-inference tick that persists crash-adopted integration waves."""
+    """A no-inference tick that persists crash-adopted integration waves.
+
+    The returned tick is marked ``observation_only``: it cannot dispatch, verify,
+    integrate or adopt a worker result, so the driver must not let it claim a
+    queue feature. A claim here would only mark a card running with nothing able
+    to advance it.
+    """
 
     state = _state_path(state_dir)
 
@@ -1866,6 +1902,7 @@ def mechanical_tick(state_dir: Any) -> Any:
             jobs.save_job(state, job)
         return {"status": "idle", "detail": "no worker configured; mechanical reconcile only"}
 
+    tick.observation_only = True  # type: ignore[attr-defined]
     return tick
 
 
@@ -1932,6 +1969,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="bind the configured hyvv provisioning client")
     parser.add_argument("--provisioning-host", default=None,
                         help="expected provisioning host policy label")
+    parser.add_argument("--campaign-id", default=None,
+                        help="durable campaign checkpoint to reconcile on every pass")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="run one pass and exit")
     mode.add_argument("--interval", nargs="?", const=1.0, type=float, default=None,
@@ -1945,15 +1984,26 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
     tick = load_tick(args.tick)
+    launcher_url = str(args.launcher_url or "").strip()
+    repo_arg = str(args.repo or "").strip()
+    if tick is None:
+        # Production selection is explicit. A partial launcher/worktree
+        # configuration used to fall through to the mechanical tick, which then
+        # claimed queue cards it could never dispatch or verify.
+        if repo_arg and not launcher_url:
+            raise SystemExit(
+                "--repo requires --launcher-url or BUNDLEBEES_LAUNCHER_URL: without a launcher "
+                "the driver would only run a mechanical tick and could not dispatch or verify"
+            )
     client = None
-    if args.launcher_url:
+    if launcher_url:
         from .client import LauncherClient
 
         token = os.environ.get("BUNDLEBEES_LAUNCHER_TOKEN", "")
         if not token:
             raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
-        client = LauncherClient(args.launcher_url, token=token)
-    if tick is None and client is not None and args.repo:
+        client = LauncherClient(launcher_url, token=token)
+    if tick is None and client is not None and repo_arg:
         if not args.gitleaks:
             raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
         provisioner = None
@@ -1967,13 +2017,18 @@ def main(argv: list[str] | None = None) -> int:
         tick = make_job_tick(
             state,
             client=client,
-            repo=Path(args.repo),
+            repo=Path(repo_arg),
             gitleaks=args.gitleaks,
             suite_command=args.suite_command,
             provisioner=provisioner,
         )
     if tick is None:
         tick = mechanical_tick(state)
+        print(
+            "bundlebees factory-driver: no launcher URL configured; running the mechanical "
+            "observation tick, which cannot claim, dispatch, verify or integrate",
+            file=sys.stderr,
+        )
     subscribers = args.subscribers or None
     driver_options: dict[str, Any] = {
         "tick": tick,
@@ -1987,6 +2042,7 @@ def main(argv: list[str] | None = None) -> int:
     driver = FactoryDriver(
         state,
         queue_mod.JsonQueue(queue_path),
+        campaign_id=args.campaign_id,
         **driver_options,
     )
 

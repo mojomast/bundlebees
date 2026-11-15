@@ -184,6 +184,133 @@ class QueueTests(unittest.TestCase):
                 code = job_cli.cmd_queue(ctx, args, state_dir=Path(tmp), client_factory=lambda: None)
         self.assertEqual(code, 2)
 
+    # -- a tick's own status is not progress evidence ----------------------
+
+    def _claimed(self, tick, *, task_state="dispatched"):
+        """Claim f1, then run one pass with a job row in ``task_state``."""
+        job = {"job_id": "job_1", "tasks": [{"task_id": "T1", "state": task_state}]}
+        patcher = mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: job)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed")
+        return store, Q.run_once(self.tmp, self.queue, tick=tick)
+
+    def test_an_escalated_tick_blocks_the_card_instead_of_marking_it_running(self):
+        store, result = self._claimed(lambda job_id: {"status": "escalated", "action": "integrate",
+                                                      "detail": "two integration attempts failed"})
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+        self.assertIn("integration attempts failed", store.read("f1")["evidence"]["detail"])
+
+    def test_an_awaiting_decision_tick_blocks_the_card(self):
+        store, result = self._claimed(lambda job_id: {"status": "awaiting_decision", "action": "recovery"})
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+
+    def test_a_locked_tick_defers_without_rewriting_the_claim(self):
+        store, result = self._claimed(lambda job_id: {"status": "locked", "detail": "another live tick"})
+        self.assertEqual(result["action"], "deferred")
+        self.assertEqual(self.queue.get("f1").status, "claimed", "a pass that did not run must not re-status the card")
+        self.assertEqual(store.read("f1")["state"], "claimed")
+
+    def test_an_idle_tick_with_a_worker_in_flight_keeps_the_card_running(self):
+        store, result = self._claimed(lambda job_id: {"status": "idle", "detail": "nothing to do"})
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(self.queue.get("f1").status, "running")
+
+    def test_an_idle_tick_with_no_worker_in_flight_blocks_the_card(self):
+        # A verified row is integration work, not a worker; the tick said idle,
+        # so integration declined to advance and nothing will move this job
+        # without a decision.
+        store, result = self._claimed(lambda job_id: {"status": "idle", "detail": "integration budget exhausted"},
+                                      task_state="verified")
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+        self.assertIn("integration budget exhausted", store.read("f1")["evidence"]["detail"])
+
+    def test_an_idle_tick_on_a_rejected_job_blocks_the_card(self):
+        store, result = self._claimed(lambda job_id: {"status": "idle"}, task_state="rejected")
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+
+    def test_a_requeued_card_names_its_existing_claim_instead_of_raising(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "blocked", "job_id": "job_1"})
+        called = []
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(called, [])
+        self.assertIn("blocked", result["detail"])
+        # The stale record is not deleted; the card is made visibly blocked so
+        # it cannot be re-admitted on every pass and starve later work.
+        self.assertEqual(self.queue.get("f1").status, "blocked", "a refused admission must move the card out of queued")
+
+    def test_a_refused_card_does_not_starve_the_next_eligible_card(self):
+        self.path.write_text(json.dumps({
+            "f1": card("f1"),
+            "f2": card("f2", job_id="job_2"),
+        }))
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "blocked", "job_id": "job_1"})
+        calls = []
+
+        def tick(job_id):
+            calls.append(job_id)
+            return {"status": "ok"}
+
+        with mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id}):
+            first = Q.run_once(self.tmp, self.queue, tick=tick)
+            second = Q.run_once(self.tmp, self.queue, tick=tick)
+
+        self.assertEqual(first["action"], "blocked")
+        self.assertEqual(first["feature"], "f1")
+        self.assertEqual(second["feature"], "f2")
+        self.assertEqual(calls, ["job_2"])
+
+    def test_a_claim_held_for_another_job_is_refused(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_other"})
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+        self.assertEqual(result["action"], "blocked")
+        self.assertIn("job_other", result["detail"])
+        self.assertIn("job_1", result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+
+    def test_a_failed_card_write_leaves_the_claim_active_for_a_retry(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        self.queue.set_status("f1", "claimed")
+
+        class BrokenQueue:
+            def list_items(self):
+                return self._queue.list_items()
+
+            def set_status(self, *args, **kwargs):
+                raise RuntimeError("card write failed")
+
+        broken = BrokenQueue()
+        broken._queue = self.queue
+
+        with self.assertRaises(RuntimeError):
+            Q.run_once(self.tmp, broken, tick=lambda job_id: {"status": "escalated", "detail": "terminal"})
+
+        # The record must remain active when the card could not be acknowledged;
+        # otherwise the next pass reports idle and the card stays claimed forever.
+        self.assertEqual(store.read("f1")["state"], "running")
+        self.assertEqual(self.queue.get("f1").status, "claimed")
+
+    def test_a_pass_without_a_dispatch_capable_tick_claims_nothing(self):
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "idle"}, admit=False)
+        self.assertEqual(result["action"], "observation_only")
+        self.assertIsNone(Q.QueueStore(self.tmp).read("f1"))
+        self.assertEqual(self.queue.get("f1").status, "queued")
+
 
 if __name__ == "__main__":
     unittest.main()

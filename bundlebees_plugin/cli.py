@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
+from . import campaign_cli
 from . import job_cli
 from . import acdd_cli, adapters, leases, metrics, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
@@ -243,6 +244,7 @@ def _build_parser(parser: Any) -> Any:
 
     acdd_cli.add_parsers(subparsers)
     job_cli.add_parsers(subparsers)
+    campaign_cli.add_parsers(subparsers)
     return group
 
 def _dispatch(ctx: Any, args: Any) -> int:
@@ -281,10 +283,12 @@ def _dispatch(ctx: Any, args: Any) -> int:
             )
         if command == "repo":
             return job_cli.cmd_repo(ctx, args, state_dir=_state_dir(ctx, args))
+        if command == "campaign":
+            return campaign_cli.cmd_campaign(ctx, args, state_dir=_state_dir(ctx, args))
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job, repo.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job, repo, campaign.",
         )
     except CliError as exc:
         _print_error(exc)

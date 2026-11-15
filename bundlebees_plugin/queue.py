@@ -26,6 +26,19 @@ class QueueError(Exception):
 
 STATES = ("queued", "claimed", "running", "ready_for_review", "blocked", "failed", "needs_approval")
 
+#: Tick statuses that hand the job back to a human: nothing advances by itself.
+#: ``escalated`` is a terminal integration stop and ``awaiting_decision`` is a
+#: rejection waiting on a validated recovery decision; neither is progress.
+HALTED_TICK_STATUSES = frozenset(
+    {"blocked", "failed", "error", "escalated", "awaiting_decision", "needs_approval"}
+)
+#: Tick statuses where another live process already owns the job lock.
+DEFERRED_TICK_STATUSES = frozenset({"locked", "deferred"})
+#: Tick statuses that are positive progress on their own.
+PROGRESS_TICK_STATUSES = frozenset({"ok", "running", "reconcile_wait"})
+#: Task states a worker can still land a result for.
+WORKER_TASK_STATES = frozenset({"dispatching", "dispatched", "running", "verifying"})
+
 
 def _checkpoint(name: str, **payload: Any) -> None:
     """Fire a fault-injection checkpoint, if the faults lane installed one.
@@ -298,16 +311,120 @@ def _handoff_dependents(state_dir: Path, items: Mapping[str, "Item"], done: set[
     return created
 
 
+def _job_has_worker(state_dir: Path, job_id: str) -> bool:
+    """Whether the durable job still has a task a worker can land a result for.
+
+    A tick can honestly report ``idle`` while a worker runs: the reconciler has
+    nothing to do until the result lands. The job document, not the status
+    string, says whether that wait is a worker wait.
+    """
+
+    try:
+        job = jobs.load_job(state_dir, job_id)
+    except Exception:  # noqa: BLE001 - an unreadable job is a named queue outcome below
+        return False
+    for task in job.get("tasks") or []:
+        if isinstance(task, Mapping) and str(task.get("state") or "") in WORKER_TASK_STATES:
+            return True
+    return False
+
+
+def _tick_status(result: Any) -> str:
+    return str(result.get("status") or "") if hasattr(result, "get") else ""
+
+
+def _settle(
+    state_dir: Path,
+    queue: QueueAdapter,
+    store: "QueueStore",
+    feature_id: str,
+    job_id: str,
+    record: Mapping[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    """Turn one tick result into a durable card/record state.
+
+    A tick status is never accepted as completion on its own: a halted tick
+    blocks the card instead of leaving it at ``running`` forever, a known
+    progress status can keep an active card ``running``, and a tick that did not
+    run (another live process holds the job lock) rewrites nothing.
+    """
+
+    status = _tick_status(result)
+    if _job_accepted(state_dir, job_id):
+        # Acknowledge the card before relaxing the local record, so a crash in
+        # between leaves a record that is still active and is re-acked on the
+        # next pass, rather than a card stuck at "running" with nothing left
+        # to drive it.
+        _checkpoint("queue.before_ack", feature_id=feature_id, job_id=job_id,
+                    state="ready_for_review")
+        queue.set_status(feature_id, "ready_for_review", {"job_id": job_id})
+        store.write(feature_id, dict(record, state="ready_for_review", evidence=result, pid=os.getpid()))
+        return {"action": "ready_for_review", "status": status}
+    if status in DEFERRED_TICK_STATUSES:
+        return {
+            "action": "deferred",
+            "status": status,
+            "detail": str(result.get("detail") or "another tick holds the job lock"),
+        }
+    if status in HALTED_TICK_STATUSES:
+        settled_state = "failed" if status in ("failed", "error") else "blocked"
+        detail = str(result.get("detail") or result.get("action") or status)
+        # Acknowledge the card before relaxing the record. If the card write
+        # fails, the claim stays active and the next pass retries; the reverse
+        # order would leave a non-active record behind a card stuck at running.
+        queue.set_status(feature_id, settled_state, {"detail": detail[:400]})
+        store.write(feature_id, dict(record, state=settled_state, evidence=result, pid=os.getpid()))
+        return {"action": settled_state, "status": status, "detail": detail}
+    if status in PROGRESS_TICK_STATUSES or _job_has_worker(state_dir, job_id):
+        store.write(feature_id, dict(record, state="running", evidence=result, pid=os.getpid()))
+        queue.set_status(feature_id, "running", {"job_id": job_id})
+        return {"action": "running", "status": status}
+
+    detail = str(result.get("detail") or "") if hasattr(result, "get") else ""
+    message = (
+        f"the tick reported {status or 'no status'!r}, the job is not accepted and no task is "
+        "in flight: nothing will advance it without a decision"
+    )
+    if detail:
+        message += f" ({detail})"
+    # Same card-first rule as the halted branch: never strand an active-looking
+    # card behind a record that already says blocked.
+    queue.set_status(feature_id, "blocked", {"detail": message[:400]})
+    store.write(feature_id, dict(record, state="blocked", evidence=result, pid=os.getpid()))
+    return {"action": "blocked", "status": status, "detail": message}
+
+
 def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None,
-             handoff_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+             handoff_context: Mapping[str, Any] | None = None,
+             admit: bool = True) -> dict[str, Any]:
     """One pass: reconcile active work first, then admit at most one new feature.
 
     A feature that is claimed or running is never dropped from scheduling because
     of its displayed status, and completion is derived from the job document.
+    ``admit=False`` is the observation-only pass: a tick that cannot dispatch or
+    verify must not claim a feature, because the claim would only mark a card
+    running with nothing able to advance it.
     """
 
     store = QueueStore(state_dir)
     items = {item.feature_id: item for item in queue.list_items()}
+    if not admit:
+        queued = sorted(feature_id for feature_id, item in items.items() if item.status == "queued")
+        active = sorted(str(record.get("feature_id")) for record in store.active())
+        if not queued and not active:
+            return {"action": "idle", "feature": None}
+        return {
+            "action": "observation_only",
+            "feature": None,
+            "queued": queued[:50],
+            "active": active[:50],
+            "detail": (
+                "this pass has no dispatch-capable tick (no launcher/repo/suite); it cannot "
+                "claim, dispatch, verify or integrate, so no card was moved"
+            ),
+        }
+
     done = {feature_id for feature_id, item in items.items() if _job_accepted(state_dir, item.job_id)}
     if handoff_context:
         created = _handoff_dependents(state_dir, items, done, handoff_context)
@@ -320,66 +437,82 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         item = items.get(feature_id)
         if item is None:
             continue
+        claimed_job = str(record.get("job_id") or "")
+        if claimed_job and claimed_job != item.job_id:
+            # The claim and the card disagree about the job. Ticking either one
+            # would attach a live claim to authority it was not taken for.
+            detail = (
+                f"the claim names job {claimed_job!r} but the card names "
+                f"{item.job_id!r}; refusing to tick either"
+            )
+            queue.set_status(feature_id, "blocked", {"detail": detail[:400]})
+            store.write(feature_id, dict(record, state="blocked", detail=detail, pid=os.getpid()))
+            return {
+                "action": "blocked",
+                "feature": feature_id,
+                "job": claimed_job,
+                "detail": detail,
+            }
         job = _load_job_or_none(state_dir, item.job_id)
         if job is None:
-            store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist"))
             queue.set_status(feature_id, "needs_approval", {"detail": "claimed but no job; authorization or packet must be re-registered"})
+            store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist", pid=os.getpid()))
             return {"action": "blocked", "feature": feature_id, "job": item.job_id,
                     "detail": "a claim exists but its job does not; recreate the authorized job, then re-run"}
         result = tick(item.job_id)
-        status = str(result.get("status") or "") if hasattr(result, "get") else ""
-        if _job_accepted(state_dir, item.job_id):
-            # Acknowledge the card before relaxing the local record, so a crash in
-            # between leaves a record that is still active and is re-acked on the
-            # next pass, rather than a card stuck at "running" with nothing left
-            # to drive it.
-            _checkpoint("queue.before_ack", feature_id=feature_id, job_id=item.job_id,
-                       state="ready_for_review")
-            queue.set_status(feature_id, "ready_for_review", {"job_id": item.job_id})
-            store.write(feature_id, dict(record, state="ready_for_review", evidence=result))
-            return {"action": "ready_for_review", "feature": feature_id, "job": item.job_id, "status": status}
-        if status in ("blocked", "failed", "error"):
-            store.write(feature_id, dict(record, state="blocked" if status == "blocked" else "failed", evidence=result))
-            queue.set_status(feature_id, "blocked" if status == "blocked" else "failed",
-                             {"detail": str(result.get("detail") or "")[:400]})
-            return {"action": status, "feature": feature_id, "job": item.job_id, "status": status}
-        store.write(feature_id, dict(record, state="running", evidence=result))
-        queue.set_status(feature_id, "running", {"job_id": item.job_id})
-        return {"action": "advanced", "feature": feature_id, "job": item.job_id, "status": status}
+        settled = _settle(state_dir, queue, store, feature_id, item.job_id, record, result)
+        payload = {"action": settled["action"], "feature": feature_id, "job": item.job_id,
+                   "status": settled.get("status", "")}
+        if settled.get("detail"):
+            payload["detail"] = settled["detail"]
+        return payload
 
     # 2. Admit one eligible feature, judged only against evidence.
     item = eligible(list(items.values()), done)
     if item is None:
         return {"action": "idle", "feature": None}
 
-    record = store.claim(item.feature_id, job_id=item.job_id)
+    try:
+        record = store.claim(item.feature_id, job_id=item.job_id)
+    except QueueError as exc:
+        if exc.code != "already_claimed":
+            raise
+        existing = store.read(item.feature_id) or {}
+        existing_state = str(existing.get("state") or "") or "unreadable"
+        if existing_state in ("claimed", "running"):
+            return {"action": "deferred", "feature": item.feature_id, "job": item.job_id,
+                    "detail": f"{item.feature_id} is already {existing_state} under another consumer"}
+        detail = (
+            f"the card is queued but its claim record is {existing_state!r}; inspect "
+            f"queue/{item.feature_id}.json and release it before requeueing"
+        )
+        # Mark the card blocked so this refusal cannot starve every later
+        # eligible card on each pass. Releasing the stale record stays human work.
+        queue.set_status(item.feature_id, "blocked", {"detail": detail[:400]})
+        return {
+            "action": "blocked",
+            "feature": item.feature_id,
+            "job": item.job_id,
+            "detail": detail,
+        }
     queue.set_status(item.feature_id, "claimed", {"job_id": item.job_id})
     if _load_job_or_none(state_dir, item.job_id) is None:
-        store.write(item.feature_id, dict(record, state="needs_approval", detail="job missing at claim time"))
         queue.set_status(item.feature_id, "needs_approval", {"detail": "no authorized job for this feature"})
+        store.write(item.feature_id, dict(record, state="needs_approval", detail="job missing at claim time", pid=os.getpid()))
         return {"action": "blocked", "feature": item.feature_id, "job": item.job_id,
                 "detail": "claimed, but the authorized job does not exist"}
 
     result = tick(item.job_id)
-    status = str(result.get("status") or "") if hasattr(result, "get") else ""
-    if _job_accepted(state_dir, item.job_id):
-        _checkpoint("queue.before_ack", feature_id=item.feature_id, job_id=item.job_id,
-                   state="ready_for_review")
-        queue.set_status(item.feature_id, "ready_for_review", {"job_id": item.job_id})
-        store.write(item.feature_id, dict(record, state="ready_for_review", evidence=result))
-        action = "ready_for_review"
-    elif status in ("blocked", "failed", "error"):
-        store.write(item.feature_id, dict(record, state="blocked", evidence=result))
-        queue.set_status(item.feature_id, "blocked", {"detail": str(result.get("detail") or "")[:400]})
-        action = "blocked"
-    else:
-        store.write(item.feature_id, dict(record, state="running", evidence=result))
-        queue.set_status(item.feature_id, "running", {"job_id": item.job_id})
-        action = "running"
+    settled = _settle(state_dir, queue, store, item.feature_id, item.job_id, record, result)
+    action = settled["action"]
 
     if on_status is not None:
         on_status(item.feature_id, action)
-    return {"action": action, "feature": item.feature_id, "job": item.job_id, "status": status}
+    payload = {"action": action, "feature": item.feature_id, "job": item.job_id,
+               "status": settled.get("status", "")}
+    if settled.get("detail"):
+        payload["detail"] = settled["detail"]
+    return payload
 
 
 def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
@@ -433,6 +566,16 @@ def _job_accepted_reasons(state_dir: Path, job_id: str) -> list[str]:
 def _job_accepted(state_dir: Path, job_id: str) -> bool:
     """Completion requires real verification records, not status strings."""
     return not _job_accepted_reasons(state_dir, job_id)
+
+
+def job_accepted(state_dir: Path | str, job_id: str) -> bool:
+    """Public read-only job-completion check for campaign/continuity callers."""
+    return _job_accepted(Path(state_dir), job_id)
+
+
+def job_accepted_reasons(state_dir: Path | str, job_id: str) -> list[str]:
+    """Public read-only list of missing job evidence; empty means accepted."""
+    return _job_accepted_reasons(Path(state_dir), job_id)
 
 
 def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:

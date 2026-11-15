@@ -64,10 +64,12 @@ def _overlap(left: str, right: str) -> bool:
     return left == right or left.startswith(right + "/") or right.startswith(left + "/")
 
 
-def _validate_acceptance(entries: Any, field: str) -> list[dict[str, str]]:
+def _validate_acceptance(entries: Any, field: str) -> list[dict[str, Any]]:
     if not isinstance(entries, (list, tuple)) or not entries:
         raise ProjectError("project_acceptance_missing", f"{field} must be a non-empty list")
-    result: list[dict[str, str]] = []
+    kinds = {"test", "integration", "visual", "performance", "asset", "manual"}
+    stages = {"contract", "unit", "integration", "application", "final"}
+    result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping):
@@ -78,7 +80,35 @@ def _validate_acceptance(entries: Any, field: str) -> list[dict[str, str]]:
         seen.add(criterion_id)
         statement = _text(entry.get("statement"), f"{field}[{index}].statement")
         test = _text(entry.get("test"), f"{field}[{index}].test")
-        result.append({"id": criterion_id, "statement": statement, "test": test})
+        kind = str(entry.get("kind") or "test").strip()
+        if kind not in kinds:
+            raise ProjectError(
+                "project_acceptance_kind",
+                f"{field}[{index}].kind must be one of {', '.join(sorted(kinds))}",
+            )
+        stage = str(entry.get("stage") or "unit").strip()
+        if stage not in stages:
+            raise ProjectError(
+                "project_acceptance_stage",
+                f"{field}[{index}].stage must be one of {', '.join(sorted(stages))}",
+            )
+        owner = str(entry.get("owner") or "").strip()
+        raw_evidence = entry.get("evidence") or []
+        if not isinstance(raw_evidence, (list, tuple)):
+            raise ProjectError(
+                "project_acceptance_invalid",
+                f"{field}[{index}].evidence must be a list",
+            )
+        evidence = [_text(item, f"{field}[{index}].evidence") for item in raw_evidence]
+        result.append({
+            "id": criterion_id,
+            "statement": statement,
+            "test": test,
+            "kind": kind,
+            "stage": stage,
+            "owner": owner,
+            "evidence": evidence,
+        })
     return result
 
 

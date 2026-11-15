@@ -77,6 +77,30 @@ class PlanTests(unittest.TestCase):
             project.plan(duplicate)
         self.assertEqual(caught.exception.code, "project_lease_overlap")
 
+    def test_acceptance_metadata_is_preserved_for_the_evidence_plan(self):
+        spec_with_metadata = spec()
+        spec_with_metadata["acceptance"][0].update(
+            {
+                "kind": "visual",
+                "stage": "application",
+                "owner": "reviewer",
+                "evidence": ["evidence/store-1440.png"],
+            }
+        )
+        planned = project.plan(spec_with_metadata)
+        criterion = planned["acceptance"][0]
+        self.assertEqual(criterion["kind"], "visual")
+        self.assertEqual(criterion["stage"], "application")
+        self.assertEqual(criterion["owner"], "reviewer")
+        self.assertEqual(criterion["evidence"], ["evidence/store-1440.png"])
+
+    def test_unknown_acceptance_kind_is_refused(self):
+        broken = spec()
+        broken["acceptance"][0]["kind"] = "vibes"
+        with self.assertRaises(project.ProjectError) as caught:
+            project.plan(broken)
+        self.assertEqual(caught.exception.code, "project_acceptance_kind")
+
     def test_load_plan_reads_json(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "project.json"
