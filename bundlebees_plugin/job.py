@@ -827,12 +827,18 @@ def _verify_owner_approval(
                     "the task list to authorize is not the task list the owner approved",
                     "Re-request approval for the exact task set; do not substitute tasks.",
                 )
-        local_rev = str(code_rev or "").strip().lower() or approval_mod.code_revision()
+        local_rev = approval_mod.code_revision()
         if not local_rev:
             raise approval_mod.ApprovalError(
                 "approval_code_rev_unverifiable",
                 "the Bundlebees checkout cannot name its own revision",
-                "Run the authorization from the approved checkout, or pass code_rev explicitly.",
+                "Run the authorization from the approved checkout.",
+            )
+        if code_rev is not None and str(code_rev).strip().lower() != local_rev:
+            raise approval_mod.ApprovalError(
+                "approval_code_rev_mismatch",
+                "the caller-supplied code revision is not this checkout's HEAD",
+                "Use the checkout that will run; do not substitute a revision string.",
             )
         if local_rev != str(verified["binding"].get("code_rev") or ""):
             raise approval_mod.ApprovalError(
