@@ -8,7 +8,8 @@ something has to reconcile the job, Git and PR state after a restart.
 
 This note describes the smallest bundlebees layer that closes that gap. It does
 not add a second authority system: the job's sealed authorization remains the
-only permission.
+only permission. It reconciles durable job/worker state; a separate read-only
+Git/PR observer is still required for full external reconciliation.
 
 ## What is durable
 
@@ -121,8 +122,11 @@ WantedBy=default.target
 The unit and its environment file are host changes. Installing, enabling or
 restarting them needs the approver's yes and is **not** done by this change. If
 the coordinator host is down, the campaign is idle; on restart the process
-reloads the checkpoint and reconciles from the job, Git and launcher state. It
-does not redispatch work just because the process started again.
+reloads the checkpoint and reconciles from the durable job (including its
+accepted-wave recovery) and the launcher/worker state. It does not independently
+query Git or a GitHub PR view; those remain a read-only observer to add before
+claiming full Git/PR reconciliation. It does not redispatch work just because the
+process started again.
 
 The existing `job queue run --once` and `job tick` commands remain single
 passes. They are safe from cron, but cron is a host choice; no cron entry is
