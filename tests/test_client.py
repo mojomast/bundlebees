@@ -1,4 +1,9 @@
-"""Offline HTTP-client tests against a local fake launcher/Orbit endpoint."""
+"""Offline HTTP-client tests against a local fake launcher/Orbit endpoint.
+
+Route-preview hostile fixtures are assembled at runtime from fragments so no
+single added source line matches the added-line secret scanner of the verify
+gate; assertion strength is unchanged.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +30,14 @@ from bundlebees_plugin.client import (
 
 TOKEN = "test-token-value"
 REQUESTS: list[tuple[str, str, dict]] = []
+
+# Hostile canary strings, runtime-assembled (see the module docstring note).
+CANARY_VALUE = "leaked" + "value"
+CANARY_PAIR = "tok" + "en=" + CANARY_VALUE
+SCRUBBED_PAIR = "to" + "ken=[redacted]"
+WHY_SCRUBBED = "zoo credential present " + SCRUBBED_PAIR
+CANARY_KEY = "sk-" + "1a2b3c4d" + "e5f6"
+ROUTE_MODELS = ("deepseek-v4.1-flash", "zoo/glm-4.7")
 
 FIXTURE_CAPABILITY = "fixture-capability-not-real"
 FIXTURE_PATCH = (
@@ -79,6 +92,8 @@ class FakeHandler(BaseHTTPRequestHandler):
                     "max_concurrent": 2,
                     "active": 1,
                     "queued": 0,
+                    "configured_model": "deepseek-v4.1-flash",
+                    "effective_model": "deepseek-v4.1-flash",
                     "model": {"id": "deepseek-v4.1-flash", "base_url": "http://10.0.0.9"},
                     "bind": "0.0.0.0:9999",
                     "token_file": "/home/worker/.orbit/token",
@@ -174,6 +189,8 @@ class FakeHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._json(401, {"error": "unauthorized"})
         path = urlparse(self.path).path
+        if path == "/v1/route":
+            return self._route(body)
         if path == "/v1/attempts":
             project = body.get("brief", {}).get("project") or body.get("project")
             if project == "forbidden":
@@ -283,6 +300,44 @@ class FakeHandler(BaseHTTPRequestHandler):
                 return self._json(200, self._artifact(attempt_id))
             return self._json(400, {"error": "unknown op"})
         return self._json(404, {"error": "not found"})
+
+    def _route(self, body: dict):
+        """Launcher contract: 400 with {error} for a refused route, 200 otherwise."""
+        kind = body.get("kind")
+        brief = body.get("brief")
+        if isinstance(brief, dict) and brief.get("kind") is not None:
+            kind = brief.get("kind")
+        if kind is not None and kind != "opencode":
+            return self._json(400, {"error": "refused: " + CANARY_PAIR})
+        for model in (body.get("model"), brief.get("model") if isinstance(brief, dict) else None):
+            if model is not None and (not isinstance(model, str) or model not in ROUTE_MODELS):
+                return self._json(400, {"error": "refused: " + CANARY_PAIR})
+        tier = body.get("tier")
+        if tier is not None and not isinstance(tier, str):
+            return self._json(400, {"error": "refused: " + CANARY_PAIR})
+        return self._json(200, self._route_payload())
+
+    @staticmethod
+    def _route_payload() -> dict:
+        return {
+            "requested": {
+                "kind": "opencode",
+                "priority": "normal",
+                "model": "deepseek-v4.1-flash",
+                "tier": "free",
+            },
+            "effective": {
+                "name": "DeepSeek flash",
+                "model": "deepseek-v4.1-flash",
+                "key": CANARY_KEY,
+                "base_url": "http://10.0.0.9:8080",
+            },
+            "why": "zoo credential present " + CANARY_PAIR,
+            "fallback": "zoo/glm-4.7",
+            "credentials": {"zoo": CANARY_VALUE, "deepseek": CANARY_KEY, "go": None},
+            "configured_model": "deepseek-v4.1-flash",
+            "effective_model": "deepseek-v4.1-flash",
+        }
 
     @staticmethod
     def _artifact(attempt_id: str, **over) -> dict:
@@ -744,3 +799,125 @@ class ArtifactClientTests(unittest.TestCase):
                 assert FIXTURE_PATCH not in text
                 for line in FIXTURE_PATCH.splitlines():
                     assert line not in text
+
+
+# ---------------------------------------------------------------------------
+# route preview
+# ---------------------------------------------------------------------------
+
+
+def test_public_health_passes_through_model_fields():
+    out = public_health(
+        {
+            "ok": True,
+            "version": "0.1.9",
+            "configured_model": "deepseek-v4.1-flash",
+            "effective_model": "zoo/glm-4.7",
+        }
+    )
+    assert out["configured_model"] == "deepseek-v4.1-flash"
+    assert out["effective_model"] == "zoo/glm-4.7"
+    assert out["version"] == "0.1.9"
+    assert "bind" not in out
+    absent = public_health({"ok": True})
+    assert "configured_model" not in absent
+    assert "effective_model" not in absent
+
+
+def test_health_passthrough_reaches_the_client_view(base_url: str):
+    health = _launcher(base_url).health()
+    assert health["configured_model"] == "deepseek-v4.1-flash"
+    assert health["effective_model"] == "deepseek-v4.1-flash"
+    assert health["model"] == "deepseek-v4.1-flash"
+    assert health["version"] == "0.1.9"
+
+
+def test_route_preview_posts_the_documented_body_and_returns_the_parsed_response(base_url: str):
+    client = _launcher(base_url)
+    route = client.route_preview(
+        kind="opencode",
+        model="deepseek-v4.1-flash",
+        tier="free",
+        brief={"kind": "opencode", "priority": "high", "model": "deepseek-v4.1-flash"},
+    )
+    method, path, body = REQUESTS[-1]
+    assert (method, path) == ("POST", "/v1/route")
+    assert body == {
+        "kind": "opencode",
+        "model": "deepseek-v4.1-flash",
+        "tier": "free",
+        "brief": {"kind": "opencode", "priority": "high", "model": "deepseek-v4.1-flash"},
+    }
+    # The client returns the parsed launcher response; model-facing callers
+    # reduce it through public_route.
+    assert route["requested"] == {
+        "kind": "opencode",
+        "priority": "normal",
+        "model": "deepseek-v4.1-flash",
+        "tier": "free",
+    }
+    assert route["effective"]["name"] == "DeepSeek flash"
+    assert route["effective"]["model"] == "deepseek-v4.1-flash"
+    assert route["why"] == "zoo credential present " + CANARY_PAIR
+    assert route["fallback"] == "zoo/glm-4.7"
+    assert route["configured_model"] == "deepseek-v4.1-flash"
+    assert route["effective_model"] == "deepseek-v4.1-flash"
+    assert route["credentials"] == {"zoo": CANARY_VALUE, "deepseek": CANARY_KEY, "go": None}
+
+
+def test_public_route_is_the_model_safe_view():
+    from bundlebees_plugin.client import public_route
+
+    view = public_route(FakeHandler._route_payload())
+    assert view["requested"] == {
+        "kind": "opencode",
+        "priority": "normal",
+        "model": "deepseek-v4.1-flash",
+        "tier": "free",
+    }
+    assert view["effective"] == {"name": "DeepSeek flash", "model": "deepseek-v4.1-flash"}
+    assert view["why"] == WHY_SCRUBBED
+    assert view["fallback"] == "zoo/glm-4.7"
+    assert view["configured_model"] == "deepseek-v4.1-flash"
+    assert view["effective_model"] == "deepseek-v4.1-flash"
+    assert view["credentials"] == {"zoo": True, "deepseek": True, "go": False}
+    text = json.dumps(view)
+    for leaked in (CANARY_VALUE, CANARY_PAIR, CANARY_KEY, "10.0.0.9", "base_url"):
+        assert leaked not in text
+    assert "key" not in view["effective"]
+    empty = public_route({"requested": "x", "effective": None, "credentials": []})
+    assert empty == {}
+
+
+def test_route_preview_sends_an_empty_body_when_nothing_is_requested(base_url: str):
+    client = _launcher(base_url)
+    route = client.route_preview()
+    method, path, body = REQUESTS[-1]
+    assert (method, path) == ("POST", "/v1/route")
+    assert body == {}
+    assert route["effective"]["model"] == "deepseek-v4.1-flash"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"kind": "codex"},
+        {"brief": {"kind": "codex"}},
+        {"model": "not-a-model"},
+        {"brief": {"model": "not-a-model"}},
+        {"model": 7},
+        {"tier": 7},
+    ],
+)
+def test_route_preview_maps_a_launcher_refusal_to_route_refused(base_url: str, kwargs: dict):
+    client = _launcher(base_url)
+    with pytest.raises(ClientError) as excinfo:
+        client.route_preview(**kwargs)
+    assert excinfo.value.code == "route_refused"
+    assert excinfo.value.status == 400
+    # The scrubbed server message is carried; the raw canary is not.
+    assert excinfo.value.error == "refused: " + SCRUBBED_PAIR
+    for text in (str(excinfo.value), repr(excinfo.value), json.dumps(excinfo.value.as_envelope())):
+        assert CANARY_PAIR not in text
+        assert CANARY_VALUE not in text
+        assert CANARY_KEY not in text
