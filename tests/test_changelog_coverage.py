@@ -139,6 +139,7 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "reconciliation report",
             "bans re-integration",
         ),
+    },
     {
         # feat/cli-attempts-status: read-only attempts/status CLI subcommands
         # for the observatory fleet view (M1 packet 1).
@@ -148,7 +149,6 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "attempts and status CLI",
             "bee cap",
         ),
-    },
     },
 )
 
