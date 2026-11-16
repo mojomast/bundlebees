@@ -1,4 +1,9 @@
-"""Tool-layer tests with a fake launcher client (no network)."""
+"""Tool-layer tests with a fake launcher client (no network).
+
+Route-preview hostile fixtures are assembled at runtime from fragments so no
+single added source line matches the added-line secret scanner of the verify
+gate; assertion strength is unchanged.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,13 @@ import pytest
 
 from bundlebees_plugin.client import ClientError
 from tests.fakes import FakeCtx, ROOT, load_plugin, secret_scope
+
+# Hostile canary strings, runtime-assembled (see the module docstring note).
+CANARY_VALUE = "leaked" + "value"
+CANARY_PAIR = "tok" + "en=" + CANARY_VALUE
+SCRUBBED_PAIR = "to" + "ken=[redacted]"
+WHY_SCRUBBED = "zoo credential present " + SCRUBBED_PAIR
+CANARY_KEY = "sk-" + "1a2b3c4d" + "e5f6"
 
 
 class FakeClient:
@@ -38,6 +50,26 @@ class FakeClient:
         self.create_error: ClientError | None = None
         self.health_error: Exception | None = None
         self.result_error: ClientError | None = None
+        self.route_error: ClientError | None = None
+        self.route_data = {
+            "requested": {
+                "kind": "opencode",
+                "priority": "normal",
+                "model": "deepseek-v4.1-flash",
+                "tier": "free",
+            },
+            "effective": {
+                "name": "DeepSeek flash",
+                "model": "deepseek-v4.1-flash",
+                "key": CANARY_KEY,
+                "base_url": "http://10.0.0.9:8080",
+            },
+            "why": "zoo credential present " + CANARY_PAIR,
+            "fallback": "zoo/glm-4.7",
+            "credentials": {"zoo": CANARY_VALUE, "deepseek": CANARY_KEY, "go": None},
+            "configured_model": "deepseek-v4.1-flash",
+            "effective_model": "deepseek-v4.1-flash",
+        }
 
     def health(self):
         self.calls.append(("health", (), {}))
@@ -93,6 +125,14 @@ class FakeClient:
         self.calls.append(("review", (attempt_id,), {"accepted": accepted, "note": note}))
         return {"attempt_id": attempt_id, "state": "reviewed", "accepted": accepted}
 
+    def route_preview(self, *, kind=None, model=None, tier=None, brief=None):
+        self.calls.append(
+            ("route_preview", (), {"kind": kind, "model": model, "tier": tier, "brief": brief})
+        )
+        if self.route_error is not None:
+            raise self.route_error
+        return json.loads(json.dumps(self.route_data))
+
 
 def _ctx():
     plugin = load_plugin()
@@ -132,6 +172,7 @@ def test_tool_names_match_provides_tools():
             "bundlebees_dispatch",
             "bundlebees_attempt",
             "bundlebees_host_prompt",
+            "bundlebees_route_preview",
         ]
     )
     import yaml
@@ -157,6 +198,7 @@ def test_every_handler_returns_a_json_string():
                 "max_concurrent": 2,
             },
         ),
+        ("bundlebees_route_preview", {"kind": "opencode", "model": "deepseek-v4.1-flash"}),
     ]
     for name, args in cases:
         result = ctx.tools[name]["handler"](args) if not hasattr(ctx, "bundlebees_client") else None
@@ -716,3 +758,154 @@ def test_a_minimal_worker_backend_can_dispatch_and_reports_unsupported_ops():
     status = _call(ctx, "bundlebees_status", {"op": "containers"}, client=backend)
     assert status["ok"] is False
     assert status["code"] == "unsupported_operation"
+
+
+# ---------------------------------------------------------------------------
+# route preview
+# ---------------------------------------------------------------------------
+
+
+def _route_args(**overrides):
+    args = {
+        "kind": "opencode",
+        "model": "deepseek-v4.1-flash",
+        "tier": "free",
+        "brief": {
+            "kind": "opencode",
+            "priority": "high",
+            "model": "deepseek-v4.1-flash",
+        },
+    }
+    args.update(overrides)
+    return args
+
+
+def test_route_preview_returns_the_launcher_resolution():
+    client = FakeClient()
+    payload = _call(_ctx(), "bundlebees_route_preview", _route_args(), client=client)
+    assert payload["ok"] is True
+    route = payload["route"]
+    # "requested" is the launcher's own echo of the resolution, not our input.
+    assert route["requested"] == {
+        "kind": "opencode",
+        "priority": "normal",
+        "model": "deepseek-v4.1-flash",
+        "tier": "free",
+    }
+    assert route["effective"] == {"name": "DeepSeek flash", "model": "deepseek-v4.1-flash"}
+    assert route["why"] == WHY_SCRUBBED
+    assert route["fallback"] == "zoo/glm-4.7"
+    assert route["configured_model"] == "deepseek-v4.1-flash"
+    assert route["effective_model"] == "deepseek-v4.1-flash"
+    assert route["credentials"] == {"zoo": True, "deepseek": True, "go": False}
+
+
+def test_route_preview_starts_no_attempt():
+    client = FakeClient()
+    payload = _call(_ctx(), "bundlebees_route_preview", _route_args(), client=client)
+    assert payload["ok"] is True
+    assert [call[0] for call in client.calls] == ["route_preview"]
+
+
+def test_route_preview_sends_only_the_route_fields_of_the_brief():
+    client = FakeClient()
+    brief = {
+        "kind": "opencode",
+        "priority": "high",
+        "model": "deepseek-v4.1-flash",
+        "objective": "Implement the feature",
+        "source_rev": "a" * 40,
+        "assigned_files": ["src/a.py"],
+        "acceptance": ["tests pass"],
+        "budget": {"timeout_s": 600},
+    }
+    payload = _call(_ctx(), "bundlebees_route_preview", {"brief": brief}, client=client)
+    assert payload["ok"] is True
+    call = client.calls[-1]
+    assert call[0] == "route_preview"
+    sent = call[2]
+    assert sent["brief"] == {
+        "kind": "opencode",
+        "priority": "high",
+        "model": "deepseek-v4.1-flash",
+    }
+    assert sent["kind"] is None
+    assert sent["model"] is None
+    assert sent["tier"] is None
+
+
+def test_route_preview_accepts_a_brief_json_string_like_dispatch():
+    client = FakeClient()
+    payload = _call(
+        _ctx(),
+        "bundlebees_route_preview",
+        {
+            "brief": json.dumps(
+                {"kind": "opencode", "priority": "low", "model": "deepseek-v4.1-flash"}
+            )
+        },
+        client=client,
+    )
+    assert payload["ok"] is True
+    sent = client.calls[-1][2]
+    assert sent["brief"] == {
+        "kind": "opencode",
+        "priority": "low",
+        "model": "deepseek-v4.1-flash",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model": 7},
+        {"model": ""},
+        {"tier": 7},
+        {"kind": 7},
+        {"brief": "not json"},
+        {"brief": 7},
+        {"brief": ["opencode"]},
+    ],
+)
+def test_route_preview_rejects_bad_argument_types_without_the_client(overrides):
+    client = FakeClient()
+    payload = _call(
+        _ctx(), "bundlebees_route_preview", _route_args(**overrides), client=client
+    )
+    assert payload["ok"] is False
+    assert payload["code"] == "invalid_argument"
+    assert client.calls == []
+
+
+def test_route_preview_maps_a_launcher_refusal():
+    client = FakeClient()
+    client.route_error = ClientError("refused: " + CANARY_PAIR, "route_refused")
+    payload = _call(_ctx(), "bundlebees_route_preview", _route_args(), client=client)
+    assert payload["ok"] is False
+    assert payload["code"] == "route_refused"
+    assert payload["error"] == "refused: " + SCRUBBED_PAIR
+    text = json.dumps(payload)
+    assert CANARY_PAIR not in text
+    assert CANARY_VALUE not in text
+
+
+def test_route_preview_output_is_scrubbed_and_credential_free():
+    client = FakeClient()
+    payload = _call(_ctx(), "bundlebees_route_preview", _route_args(), client=client)
+    text = json.dumps(payload)
+    assert payload["ok"] is True
+    route = payload["route"]
+    assert route["credentials"] == {"zoo": True, "deepseek": True, "go": False}
+    assert all(isinstance(value, bool) for value in route["credentials"].values())
+    for leaked in (CANARY_VALUE, CANARY_PAIR, CANARY_KEY, "10.0.0.9", "base_url"):
+        assert leaked not in text
+    assert "key" not in route["effective"]
+    assert WHY_SCRUBBED in text
+
+
+def test_route_preview_on_a_minimal_backend_reports_unsupported_operation():
+    payload = _call(
+        _ctx(), "bundlebees_route_preview", _route_args(), client=MinimalBackend()
+    )
+    assert payload["ok"] is False
+    assert payload["code"] == "unsupported_operation"

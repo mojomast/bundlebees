@@ -227,7 +227,15 @@ def public_health(payload: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "ok" in data:
         out["ok"] = bool(data.get("ok"))
-    for key in ("version", "max_concurrent", "active", "queued", "paused"):
+    for key in (
+        "version",
+        "max_concurrent",
+        "active",
+        "queued",
+        "paused",
+        "configured_model",
+        "effective_model",
+    ):
         if key in data:
             out[key] = data[key]
     models = _model_ids(data)
@@ -398,6 +406,50 @@ def public_result(payload: Any) -> dict[str, Any]:
     if isinstance(checks, (list, tuple)):
         out["checks"] = [_public_check(item) for item in checks]
     # worker_claims is a worker self-report, not evidence; omit it entirely.
+    return out
+
+
+def public_route(payload: Any) -> dict[str, Any]:
+    """Model-safe view of one launcher route resolution.
+
+    Allowlists the caller's echo (``requested`` kind/priority/model/tier) and
+    the resolved route (``effective`` name and model only), passes the
+    launcher's explanation fields, and reduces the ``credentials`` block to
+    presence booleans. ``effective.key``, credential values, base URLs and any
+    other response field never reach the view; ``why`` is launcher text and is
+    scrubbed like every other upstream string.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    out: dict[str, Any] = {}
+    requested = data.get("requested")
+    if isinstance(requested, Mapping):
+        req_view: dict[str, Any] = {}
+        for key in ("kind", "priority", "model", "tier"):
+            if requested.get(key) is not None:
+                req_view[key] = requested[key]
+        if req_view:
+            out["requested"] = req_view
+    effective = data.get("effective")
+    if isinstance(effective, Mapping):
+        eff_view: dict[str, Any] = {}
+        for key in ("name", "model"):
+            if effective.get(key) is not None:
+                eff_view[key] = effective[key]
+        if eff_view:
+            out["effective"] = eff_view
+    for key in ("configured_model", "effective_model", "fallback"):
+        if data.get(key) is not None:
+            out[key] = data[key]
+    why = data.get("why")
+    if isinstance(why, str) and why:
+        out["why"] = scrub(why)
+    credentials = data.get("credentials")
+    if isinstance(credentials, Mapping):
+        out["credentials"] = {
+            name: bool(credentials.get(name))
+            for name in ("zoo", "deepseek", "go")
+            if name in credentials
+        }
     return out
 
 
@@ -882,6 +934,45 @@ class LauncherClient(_BaseClient):
                 return merged
             return dict(data)
         return {"result": data}
+
+    def route_preview(
+        self,
+        *,
+        kind: str | None = None,
+        model: str | None = None,
+        tier: str | None = None,
+        brief: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Ask the launcher which route a dispatch would take, starting nothing.
+
+        POSTs ``/v1/route`` with only the optional ``kind``, ``model``, ``tier``
+        and ``brief`` fields it was given and returns the parsed response.
+        Model-facing callers reduce it through :func:`public_route` before it
+        can reach an envelope. A launcher refusal (HTTP 400) maps to a
+        ``route_refused`` error carrying the scrubbed server message.
+        """
+        payload: dict[str, Any] = {}
+        if kind is not None:
+            payload["kind"] = kind
+        if model is not None:
+            payload["model"] = model
+        if tier is not None:
+            payload["tier"] = tier
+        if brief is not None:
+            payload["brief"] = dict(brief)
+        try:
+            data = self.request_json("POST", "/v1/route", payload)
+        except ClientError as exc:
+            if exc.status == 400:
+                raise ClientError(
+                    exc.error,
+                    "route_refused",
+                    "The launcher refused this route preview. Check kind, model "
+                    "and tier values; nothing was started.",
+                    status=400,
+                ) from exc
+            raise
+        return data
 
     def create(
         self,
