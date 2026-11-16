@@ -15,6 +15,7 @@ one pull request.
 
 ### Added
 
+- **rizzstack doctor:** `hermes bundlebees doctor` reports four-repo revision parity (checkout, origin main, installed package, gateway-loaded plugin, deployed runtime) with explicit per-component states (healthy, stale, unavailable, inaccessible, unknown, incompatible), launcher/gateway contract-incompatibility detection, executable / sandbox / pinned-source / credential-presence checks, `--json` output, and `--check-parity` exit semantics that exit nonzero on any divergence, all strictly read-only.
 - **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
 - **integrated_not_pr_merged detection:** the read-only Git/PR observer now
   classifies a PR whose exact head is already an ancestor of authoritative main
