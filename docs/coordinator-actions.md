@@ -38,6 +38,7 @@ processes, not merely threads.
   "kind": "merge",
   "repo": "mojomast/bundlebees",
   "target": "",
+  "workflow_ref": "9c69d3a987ea9544a77cdd9b5a259904eb36f006",
   "payload": {"pr": 42},
   "status": "claimed",
   "fence_seq": 2,
@@ -60,6 +61,7 @@ processes, not merely threads.
 | `kind` | A short label. Only `merge` and `deploy` hold repo leases. |
 | `repo` | The repository the action names, when it has one. Never interpreted. |
 | `target` | Optional sub-target inside the repo (for example a branch). Empty means the whole repo. |
+| `workflow_ref` | The exact workflow protocol commit (full 40-hex SHA, stored lowercased) under which the action was authorized and will be executed. Empty only for the legacy unpinned shape. See "The protocol pin". |
 | `payload` | Caller data the queue stores verbatim and never interprets. |
 | `status` | `queued`, `claimed` or `done`. |
 | `fence_seq` | The fencing value minted at claim time; `0` while never claimed. |
@@ -73,20 +75,57 @@ processes, not merely threads.
 ## Enqueue and idempotent replay
 
 `enqueue(state, action_id, action_key=..., kind=..., repo="", target="",
-payload=None, now=None)` is create-only. Replaying an existing `action_id`
-with its original `action_key` and shape (kind, repo, target) returns the
-stored record unchanged — including the originally stored payload, however the
-replay's payload differs. Nothing else happens: no new file, no fencing value,
-no timestamp churn. Two shapes of misuse are refused precisely:
+workflow_ref=..., payload=None, now=None)` is create-only. Replaying an
+existing `action_id` with its original `action_key` and shape (kind, repo,
+target and `workflow_ref`) returns the stored record unchanged — including
+the originally stored payload and pin, however the replay's payload or pin
+differs. Nothing else happens: no new file, no fencing value, no timestamp
+churn. Three shapes of misuse are refused precisely:
 
 * the same `action_key` under a different `action_id` — `action_key_conflict`,
   naming the action that already holds the key;
 * a different `action_key` under the same `action_id` — `action_id_conflict`,
-  naming the stored key.
+  naming the stored key;
+* the same key and shape under a different `workflow_ref` — also
+  `action_id_conflict`: the pin is part of the action's authorization, and a
+  replay under another protocol commit is a different action.
 
-Unsafe ids, labels, kinds and payloads are refused before anything is written
-(`invalid_action_id`, `invalid_action_key`, `invalid_kind`, `invalid_repo`,
-`invalid_target`, `payload_invalid`).
+Unsafe ids, labels, kinds, pins and payloads are refused before anything is
+written (`invalid_action_id`, `invalid_action_key`, `invalid_kind`,
+`invalid_repo`, `invalid_target`, `invalid_workflow_ref`, `payload_invalid`).
+
+## The protocol pin
+
+Every durable record carries `workflow_ref`, the exact workflow protocol
+commit under which the action was authorized and will be executed. The
+owner's convention of Nov 13: *workflow is a dependency of execution, not
+merely a source of inspiration*. The queue is the coordinator's durable
+memory of actions that must happen at most once and never unsupervised, so
+each of those actions binds to the protocol revision it ran under, and the
+`result` recorded at completion sits in the same record as its pin — verify
+and review evidence can always name the protocol the action was executed
+under.
+
+The pin is taken at enqueue and never changes: `claim`, `adopt`, `renew` and
+`complete` carry it untouched and every returned record surfaces it. A
+caller-supplied pin must be a full 40-hex commit SHA and is stored
+lowercased; a shorter, malformed or non-string pin is refused with
+`invalid_workflow_ref`. Passing `workflow_ref=None` or an empty string — a
+declaration that the action has no protocol commit — is refused at the
+append with `missing_workflow_ref`. Omitting the argument entirely is the
+legacy unpinned shape, kept for callers that do not know their protocol
+commit yet: the record still carries the field, empty, exactly the way
+main's job records carry it.
+
+The pin is also a write-path invariant, not only an intake check. Every
+durable action-record write — the enqueue append and every claim, adoption,
+renewal and completion rewrite — runs a validator first: a record that does
+not carry the `workflow_ref` field is refused with `missing_workflow_ref`
+and left exactly as it was, before any fencing value is minted and before
+any lease changes, so a pre-convention record can never be silently
+perpetuated through the fence path. Reads stay permissive (`load`,
+`list_actions` return such a record as-is) so an operator can see what is
+stored; the next mutation is what refuses it.
 
 ## Claims and fencing
 
@@ -166,7 +205,9 @@ two live overlapping leases on one repository can never exist.
 | `fence_mismatch` | The presented fencing value is not the current one in any direction. |
 | `fence_invalid` | The presented fencing value is not an int. |
 | `action_key_conflict` | The key already names another action. |
-| `action_id_conflict` | The id already exists with a different key. |
+| `action_id_conflict` | The id already exists with a different key, shape or protocol pin. |
+| `missing_workflow_ref` | The record does not carry its `workflow_ref` protocol pin: an enqueue that declared no pin, or a mutation of a stored record that lacks the field. |
+| `invalid_workflow_ref` | The supplied `workflow_ref` is not a full 40-hex commit SHA. |
 | `payload_invalid`, `result_invalid` | The value does not survive a JSON round trip. |
 | `state_corrupt` | A record is unreadable or not this schema; fail closed. |
 | `fence_counter_corrupt` | The counter cannot be read or is not this schema; the next value is unknown, so nothing claims. |

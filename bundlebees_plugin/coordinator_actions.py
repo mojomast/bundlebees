@@ -50,9 +50,25 @@ on different targets, proceeds in parallel; the queue records, it does not
 arbitrate more than asked.
 
 Replay is idempotent by ``action_key``: re-enqueueing an existing action id
-with its original key and shape returns the stored record untouched — no new
-file, no burned fence value, no timestamp churn. The same key under a
-different id, or a different key under the same id, is refused precisely.
+with its original key and shape (kind, repo, target and the protocol pin)
+returns the stored record untouched — no new file, no burned fence value, no
+timestamp churn. The same key under a different id, or a different key under
+the same id, is refused precisely.
+
+Every record is pinned to the protocol it runs under. ``workflow_ref`` names
+the exact workflow protocol commit under which the action was authorized and
+will be executed — the owner's convention of Nov 13: workflow is a dependency
+of execution, not merely a source of inspiration. The pin is validated as a
+full 40-hex commit at enqueue, carried untouched through every claim,
+adoption, renewal and completion, and surfaced on every returned record so
+verify and review evidence binds to the protocol revision the action actually
+ran under. A caller that declares no pin (``workflow_ref=None`` or an empty
+string) is refused as ``missing_workflow_ref``; a caller that omits the
+argument entirely — the legacy shape — still gets the field, empty, exactly
+the way main's job records carry it. And no record is ever durably written
+without the field: every append and every rewrite runs a validator that
+refuses a record lacking ``workflow_ref`` before anything is written, before
+any fencing value is minted and before any lease changes.
 
 Error text is passed through :func:`bundlebees_plugin.security.scrub`. The
 clock is injectable (``now``) in every mutating call, so ordering and
@@ -108,6 +124,7 @@ DEFAULT_TTL_S = 900.0
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _KIND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_LABEL = 200
 
 _FIX_ID = "Use letters, digits, '-', '_' and '.' only, at most 128 characters."
@@ -117,6 +134,15 @@ _FIX_FENCE = (
     "Do not edit the fencing counter. Restore the queue from its last durable "
     "copy; guessing a fencing value would defeat the fence."
 )
+_FIX_WORKFLOW_REF = (
+    "Pin the exact workflow protocol commit the action is authorized and executed under."
+)
+
+#: Sentinel for :func:`enqueue`'s ``workflow_ref``. An omitted argument is the
+#: legacy unpinned shape — the record still carries the field, empty. A caller
+#: that passes ``None`` or an empty string instead *declares* that the action
+#: has no protocol commit, and that append is refused as ``missing_workflow_ref``.
+_WORKFLOW_REF_UNSET = object()
 
 
 class ActionError(Exception):
@@ -215,6 +241,50 @@ def _jsonable(value: Any, what: str) -> Any:
         ) from exc
 
 
+def _pinned_workflow_ref(value: Any) -> str:
+    """Validate a caller-supplied protocol pin; return it lowercased.
+
+    ``None`` and the empty string are a declaration that the action has no
+    protocol commit; they are refused as ``missing_workflow_ref`` rather than
+    silently appended. Anything else must be a full 40-hex commit.
+    """
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise ActionError(
+            "missing_workflow_ref",
+            "workflow_ref is required: a queue record without its protocol commit is not a record",
+            _FIX_WORKFLOW_REF,
+        )
+    text = value if isinstance(value, str) else ""
+    if not _SHA_RE.fullmatch(text.lower()):
+        raise ActionError(
+            "invalid_workflow_ref", f"workflow_ref {text[:40]!r} is not a full 40-hex commit",
+            _FIX_WORKFLOW_REF,
+        )
+    return text.lower()
+
+
+def _require_workflow_ref(record: Mapping[str, Any]) -> None:
+    """Refuse any durable record write whose record does not carry its pin.
+
+    Runs before every append and every rewrite (enqueue, claim, adoption,
+    renewal, completion), so a record without the field — a pre-convention
+    record or a tampered one — is refused as ``missing_workflow_ref`` before
+    any fencing value is minted, any lease changes and any file is touched.
+    An empty string passes: that is the legacy unpinned shape, and the field
+    itself is what must never be dropped.
+    """
+
+    ref = record.get("workflow_ref")
+    if not isinstance(ref, str):
+        raise ActionError(
+            "missing_workflow_ref",
+            f"action {record.get('action_id')} does not carry a workflow_ref; "
+            "the queue never writes a record without its protocol commit",
+            "Enqueue the action again with the workflow_ref it is authorized under.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # durable paths and atomic writes
 # ---------------------------------------------------------------------------
@@ -287,6 +357,18 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _write_record(state: Any, action_id: str, record: Mapping[str, Any]) -> None:
+    """Validate then durably write one action record.
+
+    The single choke point every action-record append and rewrite passes
+    through: a record that does not carry ``workflow_ref`` is refused here,
+    so no durable queue record can ever exist without its protocol pin.
+    """
+
+    _require_workflow_ref(record)
+    _write_json(action_path(state, action_id), record)
 
 
 @contextmanager
@@ -476,16 +558,27 @@ def enqueue(
     kind: str,
     repo: str = "",
     target: str = "",
+    workflow_ref: Any = _WORKFLOW_REF_UNSET,
     payload: Any = None,
     now: Any = None,
 ) -> dict[str, Any]:
     """Queue one coordinator action. Create-only; replays return the record.
 
     Re-enqueueing an existing ``action_id`` with its original ``action_key``
-    and shape (kind, repo, target) is an idempotent replay: the stored record
-    is returned unchanged, including its original payload, and nothing else
-    happens — no new file, no fencing value, no timestamp churn. A different
-    key under the same id, or the same key under a different id, is refused.
+    and shape (kind, repo, target and ``workflow_ref``) is an idempotent
+    replay: the stored record is returned unchanged, including its original
+    payload and pin, and nothing else happens — no new file, no fencing
+    value, no timestamp churn. A different key under the same id, or the same
+    key under a different id, is refused.
+
+    ``workflow_ref`` pins the exact workflow protocol commit the action is
+    authorized and executed under; it must be a full 40-hex commit and is
+    stored lowercased. Passing ``None`` or an empty string — declaring that
+    the action has no protocol commit — is refused as ``missing_workflow_ref``;
+    a pin that is not a full commit is refused as ``invalid_workflow_ref``.
+    Omitting the argument is the legacy unpinned shape: the record still
+    carries the field, empty, and every later mutation keeps refusing records
+    that lack the field entirely.
     """
 
     action_id = _action_id(action_id)
@@ -493,6 +586,7 @@ def enqueue(
     kind = _kind(kind)
     repo = _label(repo, "repo", allow_empty=True)
     target = _label(target, "target", allow_empty=True)
+    ref = "" if workflow_ref is _WORKFLOW_REF_UNSET else _pinned_workflow_ref(workflow_ref)
     body = {} if payload is None else _jsonable(payload, "payload")
     epoch = _epoch(now)
 
@@ -503,6 +597,7 @@ def enqueue(
         "kind": kind,
         "repo": repo,
         "target": target,
+        "workflow_ref": ref,
         "payload": body,
         "status": "queued",
         "fence_seq": 0,
@@ -523,6 +618,7 @@ def enqueue(
                 and existing.get("kind") == kind
                 and existing.get("repo") == repo
                 and existing.get("target") == target
+                and existing.get("workflow_ref") == ref
             ):
                 return existing
             raise ActionError(
@@ -537,7 +633,7 @@ def enqueue(
                     f"action_key {action_key!r} already belongs to action {other.get('action_id')}",
                     "One action key names one logical action; enqueue the replay under its own id.",
                 )
-        _write_json(action_path(state, action_id), record)
+        _write_record(state, action_id, record)
     return record
 
 
@@ -598,6 +694,7 @@ def _take(
 
     with _locked(state):
         record = _read_record_or_raise(state, action_id)
+        _require_workflow_ref(record)
         status = record.get("status")
         if status == "done":
             raise ActionError("action_done", f"action {action_id} is already done", "Enqueue a new action.")
@@ -633,7 +730,7 @@ def _take(
             adopted_from=record.get("owner") if adopt_expired and status == "claimed" else None,
             updated_at=_iso(epoch),
         )
-        _write_json(action_path(state, action_id), record)
+        _write_record(state, action_id, record)
     return record
 
 
@@ -707,6 +804,7 @@ def renew(
 
     with _locked(state):
         record = _read_record_or_raise(state, action_id)
+        _require_workflow_ref(record)
         status = record.get("status")
         if status == "done":
             raise ActionError("action_done", f"action {action_id} is already done", "Enqueue a new action.")
@@ -719,7 +817,7 @@ def renew(
         _refuse_overlapping_leases(state, record, epoch)
         record["lease_expires_at"] = epoch + ttl
         record["updated_at"] = _iso(epoch)
-        _write_json(action_path(state, action_id), record)
+        _write_record(state, action_id, record)
     return record
 
 
@@ -745,6 +843,7 @@ def complete(
 
     with _locked(state):
         record = _read_record_or_raise(state, action_id)
+        _require_workflow_ref(record)
         status = record.get("status")
         if status == "done":
             raise ActionError("action_done", f"action {action_id} is already done", "Enqueue a new action.")
@@ -760,5 +859,5 @@ def complete(
             lease_expires_at=None,
             updated_at=_iso(epoch),
         )
-        _write_json(action_path(state, action_id), record)
+        _write_record(state, action_id, record)
     return record
