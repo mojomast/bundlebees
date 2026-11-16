@@ -286,8 +286,17 @@ def _python_prefixes() -> list[str]:
     return prefixes
 
 
-def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
-    """Resolve an operator tiktoken cache, refusing unsafe locations."""
+def _resolve_tiktoken_cache(
+    value: Path | str | None, *, backend: str | None = None
+) -> Path | None:
+    """Resolve an operator tiktoken cache, refusing unsafe locations.
+
+    The masked-root refusal is backend-scoped: only a backend whose wrapper replaces the masked
+    tmp roots (firejail ``--private-tmp``) makes a cache under them unusable, so only such a
+    backend -- and, failing closed, a call that names no known backend id -- is refused one.
+    bwrap ro-binds the individual cache directory and unshare masks nothing, so both accept the
+    cache's host path.
+    """
     if value is None:
         return None
     raw = os.fspath(value)
@@ -301,15 +310,19 @@ def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
             _FIX_CACHE_DIR,
             code="unsafe_cache_dir",
         )
-    for root in _MASKED_TMP_ROOTS:
-        masked = Path(root)
-        if cache == masked or masked in cache.parents:
-            raise SandboxUnavailable(
-                f"sandbox_tiktoken_cache must not live under {root}: a backend that masks "
-                "that root would stage a copy of the whole masked root into the sandbox copy",
-                _FIX_CACHE_DIR,
-                code="unsafe_cache_dir",
-            )
+    if backend is None or backend not in BACKENDS or backend in _TMP_MASKING_BACKENDS:
+        # Fail closed without a backend id, for an unknown id, and for ``auto`` (a selection
+        # policy, not a backend id: it may still pick the masking backend); only a known
+        # non-masking backend accepts a cache under the masked roots.
+        for root in _MASKED_TMP_ROOTS:
+            masked = Path(root)
+            if cache == masked or masked in cache.parents:
+                raise SandboxUnavailable(
+                    f"sandbox_tiktoken_cache must not live under {root}: a backend that masks "
+                    "that root would stage a copy of the whole masked root into the sandbox copy",
+                    _FIX_CACHE_DIR,
+                    code="unsafe_cache_dir",
+                )
     if not cache.is_dir():
         raise SandboxUnavailable(
             "sandbox_tiktoken_cache is not an existing directory",
@@ -451,6 +464,8 @@ _SANDBOX_TIKTOKEN_DIR = ".bundlebees-tiktoken"
 HOME_HIDING_BACKENDS: tuple[str, ...] = ("firejail",)
 #: Filesystem roots ``firejail --private-tmp`` replaces with a fresh tmpfs.
 _MASKED_TMP_ROOTS: tuple[str, ...] = ("/tmp", "/var/tmp")
+#: Backends whose wrapper replaces the masked tmp roots; only these refuse a cache under one.
+_TMP_MASKING_BACKENDS: frozenset[str] = frozenset({"firejail"})
 _FIX_PYTHON = (
     "Set verify_python (or BUNDLEBEES_VERIFY_PYTHON) to an absolute interpreter path outside the "
     "coordinator home that has pytest installed (for example a venv under /var/tmp), or use "
@@ -727,7 +742,7 @@ def run_in_sandbox(
     exists inside the sandbox; a backend that hides the coordinator home refuses
     an interpreter living in it instead of failing inside the wrapper.
     """
-    cache = _resolve_tiktoken_cache(tiktoken_cache)
+    cache = _resolve_tiktoken_cache(tiktoken_cache, backend=backend)
     weak_ok = weak_override_enabled(allow_weak)
     source = Path(workdir)
     root = Path(tempfile.mkdtemp(prefix="bundlebees-verify-"))

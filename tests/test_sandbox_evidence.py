@@ -343,3 +343,77 @@ class TestRealFirejailTiktokenCache:
             for i in range(0, len(encoded), 2)
         )
         assert decoded == str(cache), out
+
+
+class TestResolveMaskedRootsAreBackendScoped:
+    """The masked-root refusal in ``_resolve_tiktoken_cache`` is scoped to the backend that masks.
+
+    ``firejail --private-tmp`` replaces ``/tmp`` and ``/var/tmp`` with fresh tmpfs, so a cache under
+    either is unusable there and stays refused outright for that backend. bwrap ro-binds the
+    individual cache directory at a fixed inside path and masks nothing, and unshare masks nothing
+    at all, so for those backends the cache's host path stays legal and resolves unchanged. A call
+    that names no backend keeps refusing: fail closed, exactly like the blanket refusal this scopes.
+    """
+
+    @staticmethod
+    def _resolve(value: str, backend: str | None = None) -> Path | None:
+        """Thread *backend* into the resolver only when the resolver accepts it.
+
+        At the base revision the resolver took no backend argument and refused masked roots for
+        every backend. Omitting the keyword there reproduces exactly that blanket refusal, so the
+        accept cases fail RED with the refusal itself instead of a TypeError, and the refusal
+        cases pin preserved behavior both before and after the change.
+        """
+        import inspect
+
+        resolver = sandbox._resolve_tiktoken_cache
+        if backend is not None and "backend" in inspect.signature(resolver).parameters:
+            return resolver(value, backend=backend)
+        return resolver(value)
+
+    @pytest.fixture(autouse=True)
+    def _home_outside_the_masked_roots(self, monkeypatch, tmp_path: Path):
+        # Pin what the code calls "home" away from the masked roots (hermetic against a TMPDIR
+        # under the account home): the home refusal is unconditional and must not swallow the
+        # masked-root verdict under test here.
+        monkeypatch.setenv("HOME", str(tmp_path / "sandbox-home"))
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ["/tmp", "/var/tmp", "/tmp/bundlebees-scoped-cache", "/var/tmp/bundlebees-scoped-cache"],
+    )
+    def test_a_masked_root_cache_is_refused_for_the_masking_backend(self, candidate: str):
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate, backend="firejail")
+        assert excinfo.value.code == "unsafe_cache_dir"
+        assert "must not live under" in excinfo.value.error, excinfo.value.error
+
+    @pytest.mark.parametrize("root", ["/tmp", "/var/tmp"])
+    @pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+    def test_a_masked_root_cache_is_accepted_for_a_non_masking_backend(
+        self, root: str, backend: str
+    ):
+        cache = Path(tempfile.mkdtemp(prefix="bb-scoped-cache-", dir=root))
+        try:
+            resolved = self._resolve(str(cache), backend=backend)
+            assert resolved == Path(cache).resolve(), resolved
+            assert resolved.is_dir()
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ["/tmp", "/var/tmp", "/tmp/bundlebees-scoped-cache", "/var/tmp/bundlebees-scoped-cache"],
+    )
+    def test_a_direct_call_without_a_backend_still_refuses(self, candidate: str):
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate)
+        assert excinfo.value.code == "unsafe_cache_dir"
+
+    @pytest.mark.parametrize("candidate", ["/tmp", "/var/tmp"])
+    def test_auto_is_not_a_backend_and_still_refuses(self, candidate: str):
+        # "auto" is a selection policy, not a backend id: it may still pick the masking backend,
+        # so a cache under a masked root fails closed for it too.
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate, backend="auto")
+        assert excinfo.value.code == "unsafe_cache_dir"
