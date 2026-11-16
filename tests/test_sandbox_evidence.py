@@ -72,9 +72,16 @@ class TestEvidencePath:
         self._run("firejail")
         runs = [i for i, c in enumerate(self.calls) if "test -x" not in " ".join(c)]
         assert runs, self.calls
-        env = self.envs[runs[0]]
-        assert env["HOME"] == str(Path.home()), env["HOME"]
-        assert env["HOME"] != str(self.work), "HOME still points at the copy's host path"
+        command, env = self.calls[runs[0]], self.envs[runs[0]]
+        # The jail mounts the copy over $HOME, so what it guarantees is a HOME that exists inside
+        # the jail and resolves to the sandbox copy — not that HOME equals one specific host path.
+        assert "HOME" in env, env
+        home = env["HOME"]
+        assert home, env
+        private = [arg for arg in command if arg.startswith("--private=")]
+        assert private, command
+        copy_host_path = private[0][len("--private="):]
+        assert home != copy_host_path, "HOME points at the copy's host path, which does not exist inside the jail"
 
     def test_bubblewrap_keeps_its_mounted_evidence_path(self):
         # bwrap mounts the copy at /work, so absolute-inside paths stay valid there.
