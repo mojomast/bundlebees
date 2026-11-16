@@ -9,6 +9,13 @@ of the integrated HEAD.
 
 Only then is `integrate_wave` called, with the same ancestry and suite checks it
 has always enforced. Nothing here weakens it.
+
+A rejected wave is attributed causally: the failing test selectors the suite
+reported are correlated with the attempts whose leases cover the failing files,
+and the result names the offending attempt (or states explicitly that the
+evidence is ambiguous and names none). The result carries the structured
+attribution and a recovery-ready failure record, so the recovery request the
+failure earns names the patch that caused it, not just the failing suite.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import revision, sandbox, test_receipts as receipts, verify_local
+from . import recovery, revision, sandbox, test_receipts as receipts, verify_local
 
 DEFAULT_SANDBOX_TIMEOUT_S = 900
 _MAX_SANDBOX_TIMEOUT_S = 7200
@@ -161,6 +168,23 @@ def verified_attempts(job: Mapping[str, Any]) -> list[str]:
     return attempts
 
 
+def _failed_case_ids(evidence: Mapping[str, Any]) -> list[str]:
+    """The failing test ids a sandbox run's per-case results named, bounded."""
+
+    cases = evidence.get("cases")
+    if not isinstance(cases, (list, tuple)):
+        return []
+    found = sorted({
+        str(case.get("id"))
+        for case in cases
+        if isinstance(case, Mapping)
+        and isinstance(case.get("id"), str)
+        and case.get("id").strip()
+        and str(case.get("outcome") or "").strip().lower() in {"failed", "error"}
+    })
+    return found[:200]
+
+
 def _suite_evidence(
     workdir: Path,
     argv: Sequence[str],
@@ -176,7 +200,8 @@ def _suite_evidence(
     No child inherits the coordinator environment (``BUNDLEBEES_*``/``HERMES_*``
     are absent because the sandbox builds an exact environment), the cwd is the
     disposable copy of *workdir*, and a missing backend fails closed with
-    ``IntegrateError("sandbox_unavailable")``.
+    ``IntegrateError("sandbox_unavailable")``. The failing test ids the run
+    reported are kept: causal attribution needs them, not just the exit code.
     """
 
     bounded = max(1, min(int(timeout), _MAX_SANDBOX_TIMEOUT_S))
@@ -216,6 +241,7 @@ def _suite_evidence(
         "tail": str(evidence.get("output_tail") or evidence.get("tail") or "").strip()[-300:],
         "junit": evidence.get("junit"),
         "backend": evidence.get("backend"),
+        "failed_tests": _failed_case_ids(evidence),
     }
 
 
@@ -403,6 +429,10 @@ def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
             "duration_s": receipt.get("duration_s"),
         },
     }
+    failed = result.get("failed_tests")
+    evidence["failed_tests"] = (
+        [str(item) for item in failed] if isinstance(failed, (list, tuple)) else []
+    )
     return evidence
 
 
@@ -494,6 +524,92 @@ def _run_suite_with_receipt(
         return evidence
     finally:
         claim.release()
+
+
+def _failing_test_ids(suite: Any) -> list[str]:
+    """The failing selectors a rejected wave's suite evidence names.
+
+    Classified regressions first (the CLI's pre-existing/environmental split),
+    then the suite's own failing ids, then per-case results, and finally the
+    output tail: attribution is only as good as the evidence, and a tail that
+    names no selector means no attribution, never a guess.
+    """
+
+    if not isinstance(suite, Mapping):
+        return []
+    failures = suite.get("failures")
+    if isinstance(failures, Mapping):
+        named = failures.get("failed_tests")
+        if isinstance(named, (list, tuple)) and named:
+            return [str(item) for item in named if str(item).strip()][:200]
+    failed = suite.get("failed_tests")
+    if isinstance(failed, (list, tuple)) and failed:
+        return [str(item) for item in failed if str(item).strip()][:200]
+    cases = suite.get("cases")
+    if isinstance(cases, (list, tuple)):
+        found = _failed_case_ids({"cases": cases})
+        if found:
+            return found
+    return recovery.test_ids_in(str(suite.get("tail") or ""))[:200]
+
+
+def _attribution_summary(attribution: Mapping[str, Any]) -> str:
+    """One sentence about the cause: the offender, or why none is named."""
+
+    if attribution.get("attributed"):
+        return (
+            f"; offending attempt {attribution.get('attempt_id')} (its lease covered "
+            f"{recovery._listing(attribution.get('files'))}) failed "
+            f"{recovery._listing(attribution.get('tests'))}"
+        )
+    reason = str(attribution.get("reason") or "").strip()
+    return f"; no offending attempt named: {reason}" if reason else ""
+
+
+def _rejection_evidence(
+    record: Mapping[str, Any], attribution: Mapping[str, Any] | None
+) -> str:
+    """A rejected wave's evidence, headed by its cause, not just the suite.
+
+    The leading code is the canonical integration code the failure belongs to,
+    so the recovery classification names the mechanism (a patch set the wave
+    rejected, or a combined suite the wave broke), and the attribution sentence
+    names the patch that caused it — or says explicitly that none can be named.
+    """
+
+    head = "wave_rejected" if record.get("problems") else "combined_suite_failed"
+    text = (
+        f"{head}: wave {record.get('wave_id')} rejected: "
+        f"{record.get('problems') or record.get('suite')}"
+    )
+    if isinstance(attribution, Mapping):
+        summary = _attribution_summary(attribution)
+        if summary:
+            text = f"{text}{summary}"
+    return text
+
+
+def _integration_failure_record(
+    record: Mapping[str, Any],
+    failed_tests: Sequence[str],
+    attribution: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """The recovery-ready failure record for a rejected wave.
+
+    ``recovery.build_request`` consumes it as ``failure=``: the code classifies
+    the mechanism, ``failed_tests`` keeps the selectors attributable, and the
+    attribution rides with it so the durable request names the cause.
+    """
+
+    body: dict[str, Any] = {
+        "code": "wave_rejected" if record.get("problems") else "combined_suite_failed",
+        "evidence": _rejection_evidence(record, attribution),
+        "wave_id": str(record.get("wave_id") or ""),
+        "failed_tests": list(failed_tests),
+    }
+    if attribution is not None:
+        body["attribution"] = dict(attribution)
+    return body
 
 
 def integrate(
@@ -744,19 +860,34 @@ def _integrate_locked(
 
     accepted = bool(record.get("accepted"))
     head_ref = ref if accepted else None
+    attribution = None
+    failed_tests: list[str] = []
+    if not accepted:
+        # Causal regression attribution: which attempt's patch broke the wave.
+        failed_tests = _failing_test_ids(record.get("suite"))
+        attribution = recovery.attribute_regressions(
+            state_dir,
+            job,
+            failed_tests=failed_tests,
+            attempts=[attempt_id for attempt_id, _sha in shas],
+        )
     return {
         "ok": accepted,
         "evidence": (
             f"wave {record.get('wave_id')} accepted at {str(record.get('head_sha'))[:8]} "
             f"with {len(attempts)} verified commit(s)"
             if accepted
-            else f"wave {record.get('wave_id')} rejected: {record.get('problems') or record.get('suite')}"
+            else _rejection_evidence(record, attribution)
         ),
         "record": record,
         "integration_ref": head_ref,
         "start_rev": start_rev,
         "recovered": False,
         "request_identity_digest": identity_digest,
+        "attribution": attribution,
+        "failure": (
+            None if accepted else _integration_failure_record(record, failed_tests, attribution)
+        ),
         "test_cache": dict(stats),
     }
 
