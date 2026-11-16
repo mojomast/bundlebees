@@ -15,6 +15,11 @@ one pull request.
 
 ### Added
 
+- **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
+- **integrated_not_pr_merged detection:** the read-only Git/PR observer now
+  classifies a PR whose exact head is already an ancestor of authoritative main
+  while the PR metadata still reports open, and the reconciliation report stops
+  the wait and bans re-integration instead of executing it.
 - **Owner approval card:** the authenticated Bundlebees Desktop pane now lists
   pending one-time job approvals and opens a plain-language card bound to the
   exact job, repository/base revision, task leases, worker project/profile,
@@ -130,6 +135,21 @@ one pull request.
   flags are appended. Definite provisioning refusals keep their structured CLI errors.
   The approver's sealed recovery ceiling is exposed through interactive
   `job authorize` CLI flags.
+- **Queue runs report typed provisioning refusals instead of crashing.** A tick
+  that raises `ProvisionError` or `ProvisionBindError` — on an already-claimed
+  card or on a card the pass just admitted — no longer escapes
+  `queue.run_once`: the run returns a `blocked` result carrying the typed code
+  and detail, the card is set to `blocked` with the refusal (code, message,
+  fix) recorded as its evidence, and nothing else is admitted behind the
+  refusal, the same short-circuit the job CLI already applied. The client now
+  accepts the host's typed refusal code from either the launcher contract's
+  `code` field or the provisioning host's 409 body's `error` field (only a
+  bare lowercase identifier counts as a code; a human-readable string stays a
+  message), so a full profile's `quota_exhausted` denial survives the
+  authenticated transport as a typed `ProvisionDenied` instead of degrading
+  into a generic conflict — pinned end to end: a host 409
+  `{"error": "quota_exhausted"}` travels the real HTTP path and the provisioner
+  refuses with that exact code before a journal entry is written.
 
 ### Security
 
@@ -188,6 +208,52 @@ one pull request.
   `docs/ADAPTERS.md`. Core modules never name an agent or launcher (tested).
 - Settings `verify_isolation`, `verify_allow_unsafe_local`, `verify_timeout_s`;
   `doctor` reports the sandbox backend.
+- **Read-only Git/PR drift observer (workflow-F3).**
+  `reconcile.campaign_git_drift` compares a campaign checkpoint's recorded
+  base revision, branch and pull request against the world as it actually is —
+  real git refs in a worktree and open PR heads reported by `gh` — and returns
+  the difference as drift with the exact expected-vs-actual values:
+  `branch_moved`, `branch_missing`, `pr_merged`, `pr_closed`, `pr_missing`,
+  `pr_head_branch_changed`, `unexpected_pr_head`. Strictly report-only: only
+  allowlisted read-only git subcommands (`rev-parse`, `show-ref`,
+  `merge-base`, `rev-list`, `cat-file`, `symbolic-ref`) and read-only
+  `gh pr view`/`gh pr list` queries ever run; nothing is reset, pushed,
+  merged, closed or rewritten, and no checkpoint is modified — drift is
+  returned for a caller to act on, never applied. Subprocesses run under
+  `child_env()` (no ambient credential is forwarded, and `gh` is never handed
+  a token on argv), free text is redacted through `scrub` (a validated commit
+  digest prints verbatim, exactly like the coordinator prints digests), and
+  the report never carries a URL. An unobservable world raises
+  `GitObserverError` with a stable code: an observation failure is never
+  reported as drift.
+- **Causal regression attribution: name the attempt behind a failing test or
+  integration.** When a wave is rejected, the failing test selectors the
+  combined suite reported are correlated with the attempts whose leases cover
+  the failing files, and exactly one attempt covering every failing file is
+  named as the offending attempt. Ambiguous evidence — two attempts' leases
+  covering one file, no attempt's lease covering it, or a lease that could not
+  be verified — names no attempt and says why instead of guessing, and
+  attribution is lease-based, so it survives supersession: the named attempt
+  is the one whose lease covered the failing file. The integration result
+  carries the structured attribution and a recovery-ready failure record
+  (`wave_rejected` or `combined_suite_failed`, with `failed_tests`); the suite
+  evidence keeps the failing test ids from per-case sandbox results (and,
+  failing that, from the output tail — a tail naming no selector means no
+  attribution, never a guess); and a recovery request built from an
+  integration failure is recorded against the offending attempt's task, with
+  the cause named in the rationale and the outstanding question.
+- **Design document: a native, durable bee-completion signal.**
+  `docs/w6-native-completion-design.md` (docs only) designs the fix for the
+  fragile continuation path: today the coordinator learns a bee finished only
+  through a cron rule on the Hermes host, and one recorded one-shot wakeup
+  cron whose fire time fell inside a gateway-restart window was silently
+  dropped, leaving a finished bee unprocessed until a human nudged. The
+  design gives the launcher a blocking wait operation, exposes it as
+  `bundlebees_attempt op=await`, and makes the coordinator's own tool call the
+  continuation — a level-triggered wait on a durable completion fact, with no
+  schedule artifact left to drop — while the existing 10-minute heartbeat
+  stays as the backstop and the multi-bee sweep, not the primary wait.
+  Status: design document only; no code changes.
 
 ### Changed
 
