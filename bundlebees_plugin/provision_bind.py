@@ -110,7 +110,10 @@ def advance(
     """Advance every task that needs provisioning. Returns a compact outcome.
 
     The intent is persisted before the POST. An uncertain POST is reconciled with
-    the read-only receipt lookup; it is never repeated blindly.
+    the read-only receipt lookup; it is never repeated blindly. The single
+    exception is a host-answered receipt_unknown: the identical request may be
+    replayed within the existing POST ceiling, relying on host idempotency.
+    Absence of a current receipt is not proof that an earlier POST never arrived.
     """
 
     with _tick_lock(state_dir, str(job["job_id"])):
@@ -147,15 +150,9 @@ def _advance_locked(
         prior_state = str(intent.get("state") or "requested")
         receipt = None
 
-        if prior_state == "denied":
-            raise ProvisionBindError(
-                str(intent.get("error_code") or "provision_denied"),
-                str(intent.get("detail") or "provisioning was refused"),
-                "Inspect the recorded refusal and host policy; do not replay a denied request.",
-            )
-
         if prior_state in ("preparing", "uncertain", "ready"):
-            # The POST may already have landed. Reconcile read-only; never re-POST.
+            # The POST may already have landed. Reconcile read-only first; only
+            # a host-answered receipt_unknown may re-POST the identical request.
             intent["state"] = "uncertain" if prior_state != "ready" else "ready"
             jobs.save_job(state_dir, job)
             try:
@@ -166,11 +163,49 @@ def _advance_locked(
                     expect_host=expect_host or spec["host"] or None,
                 )
             except P.ProvisionError as lookup_exc:
-                intent.update(state="uncertain", detail=f"reconciled without a POST: {lookup_exc}")
-                jobs.save_job(state_dir, job)
-                outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
-                continue
+                if lookup_exc.code == "receipt_unknown" and int(intent.get("attempts") or 0) <= 3:
+                    # receipt_unknown is the host itself answering that no record
+                    # currently exists under this key. Bounded replay relies on
+                    # the host's idempotency; this does not prove a prior POST
+                    # never arrived. Other lookup failures remain read-only.
+                    intent["attempts"] = int(intent.get("attempts") or 0) + 1
+                    intent["state"] = "preparing"
+                    jobs.save_job(state_dir, job)
+                    try:
+                        receipt = provisioner.provision(request)
+                        intent["state"] = "ready"
+                    except P.ProvisionUncertain as exc:
+                        intent.update(state="uncertain", detail=str(exc))
+                        jobs.save_job(state_dir, job)
+                        try:
+                            receipt = provisioner.authoritative_receipt(
+                                key,
+                                expect_repo=spec["repo"], expect_rev=spec["source_rev"],
+                                expect_profile=spec["profile"], expect_project=spec["project"],
+                                expect_host=expect_host or spec["host"] or None,
+                            )
+                        except P.ProvisionError as late_lookup_exc:
+                            intent["detail"] = f"{exc}; lookup: {late_lookup_exc}"
+                            jobs.save_job(state_dir, job)
+                            outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
+                            continue
+                    except P.ProvisionError as exc:
+                        intent.update(state="denied", error_code=exc.code, detail=f"re-POST refused: {exc.code}: {exc.message}")
+                        jobs.save_job(state_dir, job)
+                        outcomes.append({"task_id": task["task_id"], "state": "denied", "detail": intent["detail"]})
+                        continue
+                else:
+                    intent.update(state="uncertain", detail=f"reconciled without a POST: {lookup_exc}")
+                    jobs.save_job(state_dir, job)
+                    outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
+                    continue
         else:
+            if prior_state == "denied":
+                # A definitive refusal is terminal: a later pass must not re-POST it.
+                outcomes.append({"task_id": task["task_id"], "state": "denied",
+                                 "detail": str(intent.get("detail") or ""),
+                                 "error_code": str(intent.get("error_code") or "provision_denied")})
+                continue
             intent["state"] = "preparing"
             intent["attempts"] = int(intent.get("attempts") or 0) + 1
             jobs.save_job(state_dir, job)
@@ -194,10 +229,8 @@ def _advance_locked(
                     continue
             except P.ProvisionError as exc:
                 # A received refusal is different from a lost acknowledgement.
-                # Leaving preparing here made the next tick search forever for
-                # a receipt for a request the host had explicitly refused.
                 intent.update(state="denied", error_code=exc.code,
-                              detail=f"{exc.code}: {exc.message}")
+                              detail=f"post refused: {exc.code}: {exc.message}")
                 jobs.save_job(state_dir, job)
                 raise
 

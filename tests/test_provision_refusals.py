@@ -36,9 +36,9 @@ class ProvisionRefusals(unittest.TestCase):
                     restarted = saved[-1]
                     self.assertEqual(restarted["tasks"][0]["provisioning"]["state"], "denied")
                     self.assertEqual(restarted["tasks"][0]["provisioning"]["error_code"], error.code)
-                    with self.assertRaises(B.ProvisionBindError) as caught:
-                        B._advance_locked(Path(tmp), restarted, provisioner=host)
-                    self.assertEqual(caught.exception.code, error.code)
+                    result = B._advance_locked(Path(tmp), restarted, provisioner=host)
+                    self.assertEqual(result["outcomes"][0]["state"], "denied")
+                    self.assertEqual(result["outcomes"][0]["error_code"], error.code)
                 self.assertEqual(host.posts, 1)
                 self.assertEqual(host.lookups, 0)
 
@@ -54,7 +54,7 @@ class ProvisionRefusals(unittest.TestCase):
                 raise P.ProvisionUncertain("provision_uncertain", "lost response")
             def authoritative_receipt(self, *args, **kwargs):
                 self.lookups += 1
-                raise P.ProvisionError("receipt_unknown", "absent")
+                raise P.ProvisionUncertain("receipt_unavailable", "lookup timed out")
         host = Lost()
         with patch.object(B, "_authorization_matches"), patch.object(B.jobs, "save_job"):
             for _ in range(2):

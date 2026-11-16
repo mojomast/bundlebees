@@ -57,11 +57,14 @@ detail. Further ticks report that refusal instead of looking for a nonexistent
 receipt or replaying the denied request. The job CLI returns structured error
 JSON and a nonzero exit code for provisioning and binding refusals.
 
-A lost acknowledgement or crash remains uncertain and is reconciled read-only.
-This change does not automatically reset historical `preparing`/`uncertain`
-intents. Inspect the original intent and host journal before taking a recovery
-action. Likewise, a denied request requires inspection and an explicit recovery
-decision; changing host policy does not silently replay it.
+A lost acknowledgement or crash is reconciled by receipt lookup. Upstream PR #43
+also permits bounded replay of the identical idempotency-key request when the
+host specifically answers `receipt_unknown`; this patch preserves that behavior.
+A timeout or unavailable lookup remains read-only. An absent current receipt is
+not proof an earlier POST never arrived: replay relies on host idempotency.
+This change does not manually reset historical intents. A denied request still
+requires inspection and a recovery decision; changing host policy does not
+silently replay it.
 
 `receipt_unknown` alone does not establish a disabled host. Receipt lookup checks
 capabilities first; a disabled advertisement yields `provisioning_disabled`.
