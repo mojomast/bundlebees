@@ -20,6 +20,12 @@ principal that can read the key can seal a new authorization. The separate
 interactive path exists so a coordinator cannot mint authority for itself, not
 to defend against a principal that already owns the state directory.
 
+An authorization can also be recorded from a one-time owner approval receipt
+(:mod:`bundlebees_plugin.approval`). That path does not weaken the terminal
+rule: the receipt must be verified, unexpired, unused, and its binding must
+equal the authorization fields exactly. It authorizes the trial run only; it
+grants no merge, release, deploy or acceptance.
+
 Refusal codes are stable strings, because a coordinator that cannot tell "the
 file was edited" from "the scope was widened" cannot respond correctly.
 """
@@ -613,14 +619,40 @@ def record_authorization(
     interactive: bool | None = None,
     by: str | None = None,
     recovery: Mapping[str, Any] | None = None,
+    approval_receipt: Mapping[str, Any] | None = None,
+    approval_signing_key: bytes | str | None = None,
+    tasks: Sequence[Mapping[str, Any]] | None = None,
+    code_rev: str | None = None,
+    now: Any = None,
 ) -> dict[str, Any]:
     """Record one human authorization. Immutable once written.
 
     ``interactive`` defaults to whether stdin is a TTY. A coordinator running
     from cron has no TTY and therefore cannot mint authority for itself.
+
+    ``approval_receipt`` is the additive, non-TTY path: a receipt written by
+    the owner through the trusted application (:mod:`bundlebees_plugin.approval`).
+    It is accepted only with ``require_tty=False``, only after its signature,
+    expiry, one-time consumption and exact binding are verified, and only when
+    ``tasks`` (when supplied) and the running Bundlebees revision match what the
+    owner approved. The sealed authorization then names ``owner-approval`` and
+    keeps the receipt identity and digest for audit. The receipt never grants
+    acceptance, integration, merge, release or deployment.
     """
 
-    is_tty = sys.stdin.isatty() if interactive is None else bool(interactive)
+    if approval_receipt is not None and require_tty:
+        raise JobError(
+            "authorization_receipt_requires_nontty",
+            "an owner approval receipt is only accepted on the non-interactive authorization path",
+            "Call the receipt path with require_tty=False; a receipt never substitutes for a typed authorization.",
+        )
+
+    is_tty = sys.stdin.isatty()
+    if interactive is False:
+        is_tty = False
+    # ``interactive=True`` is deliberately not a bypass: a caller that cannot
+    # show a real terminal cannot mint authority by asserting one. Tests set a
+    # fake isatty() instead of lying through this argument.
     if require_tty and not is_tty:
         raise JobError(
             "authorization_not_interactive",
@@ -651,6 +683,25 @@ def record_authorization(
     key = _ensure_key(state_dir)
     authorized_gates = sorted({_slug(gate) for gate in gates}) or ["merge"]
     envelope = _recovery_envelope(recovery, gates=authorized_gates, scope=globs)
+    approval_block: dict[str, Any] = {}
+    if approval_receipt is not None:
+        approval_block = _verify_owner_approval(
+            state_dir,
+            receipt=approval_receipt,
+            signing_key=approval_signing_key,
+            job_id=job_id,
+            statement=text,
+            repo=str(repo).strip(),
+            base_rev=str(base_rev).strip().lower(),
+            scope=globs,
+            bees=int(bees),
+            wall_clock_s=int(wall_clock_s),
+            gates=authorized_gates,
+            recovery=envelope,
+            tasks=tasks,
+            code_rev=code_rev,
+            now=now,
+        )
     body = {
         "schema_version": JOB_SCHEMA_VERSION,
         "kind": "authorization",
@@ -673,13 +724,175 @@ def record_authorization(
         # A job or task policy may restate it to narrow it, never to widen it,
         # and no job document is consulted for a permission.
         body["recovery"] = envelope
+    if approval_block:
+        # The owner's decision is the authority, and the receipt identity plus
+        # digest stay in the sealed body so the record can be audited without
+        # trusting an agent-supplied receipt later.
+        body["by"] = f"owner:{approval_block['owner']}"
+        body["authority"] = "owner-approval"
+        body["approval"] = approval_block
     if not _create_only(path, _canonical(_seal(body, key)) + b"\n", mode=0o400):
+        if approval_block:
+            existing = load_authorization(state_dir, job_id)
+            if all(existing.get(name) == body.get(name) for name in _APPROVAL_IDENTITY):
+                # Replaying the same receipt against the same authorization is
+                # safe and must not turn a successful owner click into an error.
+                return existing
         raise JobError(
             "authorization_exists",
             "an authorization already exists for this job id",
             "Authorize a new job id; recorded authorizations are immutable.",
         )
     return body
+
+
+#: The authorization fields an owner receipt is replayed against. ``auth_id``
+#: and ``at`` are random/time values, so they are deliberately excluded.
+_APPROVAL_IDENTITY = (
+    "job_id", "statement", "repo", "base_rev", "scope", "budget", "gates",
+    "recovery_digest", "authority", "approval",
+)
+
+
+def _verify_owner_approval(
+    state_dir: Path,
+    *,
+    receipt: Mapping[str, Any],
+    signing_key: bytes | str | None,
+    job_id: str,
+    statement: str,
+    repo: str,
+    base_rev: str,
+    scope: Sequence[str],
+    bees: int,
+    wall_clock_s: int,
+    gates: Sequence[str],
+    recovery: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]] | None,
+    code_rev: str | None,
+    now: Any,
+) -> dict[str, Any]:
+    """Verify one owner receipt against the exact authorization being written.
+
+    The expected binding is rebuilt with the same normaliser the requester
+    used, taking only the non-authorization facts (tasks, worker
+    project/profile, code revision, coordinator plan, extra budgets) from the
+    receipt itself. A changed statement, scope, budget, gate or recovery
+    ceiling therefore changes the digest and is refused. The receipt is then
+    consumed exactly once, before the authorization is created.
+    """
+
+    from . import approval as approval_mod  # noqa: PLC0415 - approval imports this module lazily
+
+    binding = receipt.get("binding") if isinstance(receipt, Mapping) else None
+    if not isinstance(binding, Mapping):
+        raise JobError(
+            "approval_receipt_invalid", "the approval receipt has no binding object", _FIX_AUTH
+        )
+    raw_worker = binding.get("worker")
+    worker: Mapping[str, Any] = dict(raw_worker) if isinstance(raw_worker, Mapping) else {}
+    raw_coordinator = binding.get("coordinator")
+    coordinator: Mapping[str, Any] = dict(raw_coordinator) if isinstance(raw_coordinator, Mapping) else {}
+    raw_budgets = binding.get("budgets")
+    budgets: Mapping[str, Any] = dict(raw_budgets) if isinstance(raw_budgets, Mapping) else {}
+    extra = {name: value for name, value in budgets.items() if name not in {"bees", "wall_clock_s"}}
+    try:
+        expected = approval_mod.binding_for(
+            job_id=job_id,
+            statement=statement,
+            repo=repo,
+            base_rev=base_rev,
+            scope=scope,
+            tasks=binding.get("tasks") or [],
+            bees=int(bees),
+            wall_clock_s=int(wall_clock_s),
+            worker_project=str(worker.get("project") or ""),
+            worker_profile=str(worker.get("profile") or ""),
+            code_rev=str(binding.get("code_rev") or ""),
+            coordinator_stop=coordinator.get("stop"),
+            restart=coordinator.get("restart"),
+            budgets=extra,
+            gates=gates,
+            recovery=recovery,
+            expires_at=str(binding.get("expires_at") or "").strip() or None,
+        )
+        verified = approval_mod.verify_receipt(
+            receipt, signing_key=signing_key, now=now, expected_binding=expected
+        )
+        if str(verified.get("decision")) != "approved":
+            raise approval_mod.ApprovalError(
+                "approval_declined",
+                f"the owner declined request {verified.get('request_id')}",
+                "Nothing is authorized. Ask for a new request if the work changes.",
+            )
+        if tasks is not None:
+            approved = str(verified["binding"].get("tasks_digest") or "")
+            if approval_mod.tasks_digest(tasks) != approved:
+                raise approval_mod.ApprovalError(
+                    "approval_tasks_mismatch",
+                    "the task list to authorize is not the task list the owner approved",
+                    "Re-request approval for the exact task set; do not substitute tasks.",
+                )
+        local_rev = approval_mod.code_revision()
+        if not local_rev:
+            raise approval_mod.ApprovalError(
+                "approval_code_rev_unverifiable",
+                "the Bundlebees checkout cannot name its own revision",
+                "Run the authorization from the approved checkout.",
+            )
+        if code_rev is not None and str(code_rev).strip().lower() != local_rev:
+            raise approval_mod.ApprovalError(
+                "approval_code_rev_mismatch",
+                "the caller-supplied code revision is not this checkout's HEAD",
+                "Use the checkout that will run; do not substitute a revision string.",
+            )
+        if local_rev != str(verified["binding"].get("code_rev") or ""):
+            raise approval_mod.ApprovalError(
+                "approval_code_rev_mismatch",
+                "the running Bundlebees revision is not the revision the owner approved",
+                "Re-request approval from the revision that will run.",
+            )
+        consumer = "job-authorization:" + hashlib.sha256(
+            _canonical(
+                {
+                    "job_id": _job_id(job_id),
+                    "statement": statement,
+                    "repo": repo,
+                    "base_rev": base_rev,
+                    "scope": list(scope),
+                    "budget": {"bees": int(bees), "wall_clock_s": int(wall_clock_s)},
+                    "gates": list(gates),
+                    "recovery_digest": recovery_digest(recovery),
+                }
+            )
+        ).hexdigest()
+        approval_mod.consume_receipt(
+            state_dir,
+            verified,
+            signing_key=signing_key,
+            now=now,
+            expected_binding=expected,
+            consumer=consumer,
+        )
+    except approval_mod.ApprovalError as exc:
+        raise JobError(exc.code, exc.message, exc.fix) from exc
+    return {
+        "schema": approval_mod.RECEIPT_SCHEMA,
+        "request_id": str(verified["request_id"]),
+        "receipt_id": str(verified["receipt_id"]),
+        "receipt_digest": approval_mod.receipt_digest(verified),
+        "request_digest": str(verified["request_digest"]),
+        "decision": str(verified["decision"]),
+        "owner": str(verified["owner"]),
+        "auth_method": str(verified["auth_method"]),
+        "issued_at": str(verified["issued_at"]),
+        "expires_at": str(verified["expires_at"]),
+        "code_rev": str(verified["binding"].get("code_rev") or ""),
+        "tasks_digest": str(verified["binding"].get("tasks_digest") or ""),
+        "worker": dict(verified["binding"].get("worker") or {}),
+        "coordinator": dict(verified["binding"].get("coordinator") or {}),
+        "budgets": dict(verified["binding"].get("budgets") or {}),
+    }
 
 
 def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
@@ -694,6 +907,15 @@ def load_authorization(state_dir: Path, job_id: str) -> dict[str, Any]:
             _FIX_AUTH,
         ) from exc
     body = _unseal(authorization_path(state_dir, job_id), key, "authorization")
+    if str(body.get("job_id") or "") != _job_id(job_id):
+        raise JobError(
+            "authorization_job_mismatch",
+            (
+                f"the authorization at {authorization_path(state_dir, job_id)} names job "
+                f"{body.get('job_id')!r}, not {job_id!r}"
+            ),
+            "Refuse it; an authorization is never valid for a different job id.",
+        )
     block = body.get("recovery")
     block = dict(block) if isinstance(block, Mapping) else {}
     if "recovery" in body or "recovery_digest" in body:
@@ -890,7 +1112,12 @@ def record_approval(
 ) -> dict[str, Any]:
     """Record a gate decision. Only a TTY can write one."""
 
-    is_tty = sys.stdin.isatty() if interactive is None else bool(interactive)
+    is_tty = sys.stdin.isatty()
+    if interactive is False:
+        is_tty = False
+    # ``interactive=True`` is deliberately not a bypass: a caller that cannot
+    # show a real terminal cannot mint authority by asserting one. Tests set a
+    # fake isatty() instead of lying through this argument.
     if require_tty and not is_tty:
         raise JobError(
             "approval_not_interactive",
@@ -922,6 +1149,64 @@ def record_approval(
     return body
 
 
+def load_approval(state_dir: Path, job_id: str, gate: str) -> dict[str, Any]:
+    """Load and verify one recorded gate decision.
+
+    A file at ``approvals/<job>.<gate>.json`` is *not* a decision until its
+    sealed envelope verifies, its job id and gate match the request exactly,
+    and its verdict is one of ``granted`` or ``refused``. A hand-written
+    ``{}``, a copied file, or a flipped verdict raises a named refusal instead
+    of reading as consent.
+    """
+
+    identity = _job_id(job_id)
+    name = _slug(gate)
+    try:
+        key = _load_key(state_dir)
+    except LeaseError as exc:
+        raise JobError(
+            "approval_missing",
+            f"no approval decision exists for job {identity!r} gate {name!r}",
+            _FIX_AUTH,
+        ) from exc
+    body = _unseal(approval_path(state_dir, identity, name), key, "approval")
+    if str(body.get("kind")) != "approval":
+        raise JobError(
+            "approval_invalid", "the approval document is not an approval record", _FIX_TAMPERED
+        )
+    if str(body.get("job_id")) != identity:
+        raise JobError(
+            "approval_mismatch",
+            f"the approval document names job {body.get('job_id')!r}, not {identity!r}",
+            "Refuse it; a gate decision never carries to another job.",
+        )
+    if str(body.get("gate")) != name:
+        raise JobError(
+            "approval_mismatch",
+            f"the approval document decides gate {body.get('gate')!r}, not {name!r}",
+            "Refuse it; a gate decision never carries to another gate.",
+        )
+    if str(body.get("decision")) not in {"granted", "refused"}:
+        raise JobError(
+            "approval_invalid", "the approval document has no valid decision", _FIX_TAMPERED
+        )
+    return body
+
+
+def gate_decision(state_dir: Path, job_id: str, gate: str) -> str | None:
+    """Return ``granted``/``refused`` for a verified decision, else ``None``.
+
+    A missing file is ``None``. A file that exists but does not verify raises
+    with its own code: a damaged or forged record is never read as "no
+    decision", because that would let it disappear from a report silently.
+    """
+
+    path = Path(state_dir) / APPROVALS_DIR / f"{_job_id(job_id)}.{_slug(gate)}.json"
+    if not path.exists():
+        return None
+    return str(load_approval(state_dir, job_id, gate)["decision"])
+
+
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
@@ -946,6 +1231,26 @@ def create_job(
     """
 
     authorization = load_authorization(state_dir, job_id)
+    normalized_tasks = [_normalize_task(task, for_create=True) for task in tasks]
+    approval = authorization.get("approval")
+    approval = dict(approval) if isinstance(approval, Mapping) else {}
+    approved_tasks_digest = str(approval.get("tasks_digest") or "")
+    if approved_tasks_digest:
+        from . import approval as approval_mod  # noqa: PLC0415 - approval imports this module lazily
+
+        try:
+            digest = approval_mod.tasks_digest(normalized_tasks)
+        except approval_mod.ApprovalError as exc:
+            raise JobError(exc.code, exc.message, exc.fix) from exc
+        if digest != approved_tasks_digest:
+            # The owner approved an exact task set. A job that substitutes,
+            # adds or rewrites tasks is a different trial run, even when every
+            # lease still fits the scope and the bee budget.
+            raise JobError(
+                "approval_scope_changed",
+                "the job's tasks are not the task set the owner approved",
+                "Re-request approval for the exact task list; do not substitute tasks.",
+            )
     packet_digest = ""
     if packet is not None:
         packet_digest = packets.validate(packet)
@@ -986,6 +1291,7 @@ def create_job(
             "grant_id": str(authorization.get("grant_id") or ""),
             "grant_statement": str(authorization.get("grant_statement") or ""),
             "grant_approved_at": str(authorization.get("grant_approved_at") or ""),
+            "approval": approval,
         },
         "goal": {
             "summary": str(summary or authorization["statement"]),
@@ -996,7 +1302,7 @@ def create_job(
             "workflow_ref": str(workflow_ref or ""),
             "packet_digest": packet_digest,
         },
-        "tasks": [_normalize_task(task, for_create=True) for task in tasks],
+        "tasks": normalized_tasks,
         "integration": {
             "wave": "w1",
             "state": "pending",
