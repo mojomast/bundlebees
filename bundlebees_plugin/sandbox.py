@@ -301,6 +301,15 @@ def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
             _FIX_CACHE_DIR,
             code="unsafe_cache_dir",
         )
+    for root in _MASKED_TMP_ROOTS:
+        masked = Path(root)
+        if cache == masked or masked in cache.parents:
+            raise SandboxUnavailable(
+                f"sandbox_tiktoken_cache must not live under {root}: a backend that masks "
+                "that root would stage a copy of the whole masked root into the sandbox copy",
+                _FIX_CACHE_DIR,
+                code="unsafe_cache_dir",
+            )
     if not cache.is_dir():
         raise SandboxUnavailable(
             "sandbox_tiktoken_cache is not an existing directory",
