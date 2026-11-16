@@ -1185,6 +1185,22 @@ class ApprovalBinding:
             th.RestartTrial(plan).run()
         assert caught.value.code == "live_trial_not_confirmed"
 
+    def test_a_rehearsal_does_not_require_an_approval_receipt_even_when_the_lane_is_bound(
+        self, tmp_path
+    ):
+        # The #26 approval lane auto-binds wherever it is importable (CI checks
+        # out the PR merge ref, which contains it once the lane is on main).
+        # A rehearsal dispatches nothing real (the B1 gate pins it to the
+        # simulated driver), so the report basis "local rehearsal dispatches
+        # nothing and needs no approval receipt" must hold even with a bound
+        # lane and no receipt. RED on 8f66670: the bound-but-empty lane raised
+        # approval_receipt_missing for every rehearsal_trial-based test.
+        trial = rehearsal_trial(tmp_path, trial_kwargs={"approval": FakeApproval()})
+        report = trial.run()
+        assert report["verdict"] == "pass"
+        assert report["approval"]["required"] is False
+        assert report["approval"]["verified"] is False
+
     def test_the_harness_does_not_implement_a_second_approval_system(self):
         tree = ast.parse(Path(th.__file__).read_text(encoding="utf-8"))
         top_level = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}

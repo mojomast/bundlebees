@@ -2319,48 +2319,59 @@ class RestartTrial:
             self._step("launcher_read_only_preflight", health_keys=sorted(health))
         approval: dict[str, Any] | None = None
         if self.approval is not None:
-            if self.plan.approval_receipt is None:
+            if self.plan.approval_receipt is None and not self.plan.rehearsal:
+                # A live trial must bind a receipt. A rehearsal dispatches
+                # nothing real (the rehearsal gate pins the driver to the
+                # simulated one), so a bound lane without a receipt is
+                # recorded as not-required in the report instead of refused;
+                # when a rehearsal DOES carry a receipt it is still verified
+                # and consumed exactly once below.
                 raise TrialRefused(
                     "approval_receipt_missing",
                     "an approval adapter is bound but no receipt was supplied",
                     "Pass the approval lane's receipt for this trial.",
                 )
-            receipt = dict(self.plan.approval_receipt)
-            receipt_rev = str(receipt.get("code_rev") or "")
-            if receipt_rev and self.code_rev and receipt_rev != self.code_rev:
-                raise TrialRefused(
-                    "approval_receipt_code_rev_mismatch",
-                    f"the receipt is bound to code_rev {receipt_rev}, but the trial runs {self.code_rev}",
-                    "Obtain a receipt for the revision being exercised; the harness never widens a receipt.",
-                )
-            verified = _verified_receipt(self.approval.verify_receipt(receipt))
-            verified_rev = str(verified.get("code_rev") or "")
-            if verified_rev and self.code_rev and verified_rev != self.code_rev:
-                raise TrialRefused(
-                    "approval_receipt_code_rev_mismatch",
-                    f"the approval lane verified code_rev {verified_rev}, but the trial runs {self.code_rev}",
-                    "Do not weaken the receipt binding; obtain a receipt for this revision.",
-                )
-            consumed = self.approval.consume_receipt(dict(self.plan.approval_receipt))
-            if not isinstance(consumed, Mapping) or consumed.get("consumed") is not True:
-                raise TrialRefused(
-                    "approval_receipt_not_consumed",
-                    (
-                        "the approval lane did not return an explicit consumed=true receipt; "
-                        f"got {type(consumed).__name__}"
+            receipt = (
+                dict(self.plan.approval_receipt)
+                if self.plan.approval_receipt is not None
+                else None
+            )
+            if receipt is not None:
+                receipt_rev = str(receipt.get("code_rev") or "")
+                if receipt_rev and self.code_rev and receipt_rev != self.code_rev:
+                    raise TrialRefused(
+                        "approval_receipt_code_rev_mismatch",
+                        f"the receipt is bound to code_rev {receipt_rev}, but the trial runs {self.code_rev}",
+                        "Obtain a receipt for the revision being exercised; the harness never widens a receipt.",
+                    )
+                verified = _verified_receipt(self.approval.verify_receipt(receipt))
+                verified_rev = str(verified.get("code_rev") or "")
+                if verified_rev and self.code_rev and verified_rev != self.code_rev:
+                    raise TrialRefused(
+                        "approval_receipt_code_rev_mismatch",
+                        f"the approval lane verified code_rev {verified_rev}, but the trial runs {self.code_rev}",
+                        "Do not weaken the receipt binding; obtain a receipt for this revision.",
+                    )
+                consumed = self.approval.consume_receipt(dict(self.plan.approval_receipt))
+                if not isinstance(consumed, Mapping) or consumed.get("consumed") is not True:
+                    raise TrialRefused(
+                        "approval_receipt_not_consumed",
+                        (
+                            "the approval lane did not return an explicit consumed=true receipt; "
+                            f"got {type(consumed).__name__}"
+                        ),
+                        "A receipt must be consumed exactly once before any driver starts.",
+                    )
+                approval = {
+                    "verified": True,
+                    "consumed": True,
+                    "receipt_id": str(
+                        verified.get("receipt_id") or verified.get("request_id") or verified.get("id") or ""
                     ),
-                    "A receipt must be consumed exactly once before any driver starts.",
-                )
-            approval = {
-                "verified": True,
-                "consumed": True,
-                "receipt_id": str(
-                    verified.get("receipt_id") or verified.get("request_id") or verified.get("id") or ""
-                ),
-                "code_rev": receipt_rev or verified_rev or "",
-                "basis": sorted(str(key) for key in verified),
-            }
-            self._step("approval_receipt_consumed", receipt_id=approval["receipt_id"])
+                    "code_rev": receipt_rev or verified_rev or "",
+                    "basis": sorted(str(key) for key in verified),
+                }
+                self._step("approval_receipt_consumed", receipt_id=approval["receipt_id"])
         elif not self.plan.rehearsal:
             raise TrialRefused(
                 "approval_unavailable",
