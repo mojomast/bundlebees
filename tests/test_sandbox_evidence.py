@@ -5,9 +5,15 @@ the copy answers ENOENT inside the jail, while ``./…`` and ``$HOME/…`` resol
 evidence directory was passed as its host path, so the ACDD collector wrote no manifest and every
 ``tdd red`` / ``verify`` on such a host reported ``tests_uncollectable`` / ``test_ref_unknown`` — a
 collection failure that looked like a bad patch.
+
+The same law applies to ``TIKTOKEN_CACHE_DIR``: ``--private-tmp`` masks ``/tmp`` and ``/var/tmp`` (and the
+private home mount masks the coordinator home), so a cache there must be staged into the sandbox copy and
+named relative to the child's cwd — exactly like a staged interpreter.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 import tempfile
@@ -89,6 +95,127 @@ class TestEvidencePath:
         assert prefixes == ["/work/"], prefixes
 
 
+class TestMaskedCachePredicate:
+    """Which cache locations the firejail wrapper masks, decided without running it."""
+
+    def test_tmp_and_var_tmp_are_masked_by_private_tmp(self):
+        assert sandbox._cache_masked_in_sandbox(Path("/tmp")) is True
+        assert sandbox._cache_masked_in_sandbox(Path("/tmp/tiktoken-cache")) is True
+        assert sandbox._cache_masked_in_sandbox(Path("/var/tmp")) is True
+        assert sandbox._cache_masked_in_sandbox(Path("/var/tmp/tiktoken-cache")) is True
+
+    def test_the_coordinator_home_is_masked_by_the_private_home_mount(self):
+        assert sandbox._cache_masked_in_sandbox(Path.home() / ".cache" / "tiktoken") is True
+
+    def test_paths_outside_the_masked_roots_stay_visible(self):
+        assert sandbox._cache_masked_in_sandbox(Path("/opt/bundlebees/tiktoken-cache")) is False
+        assert sandbox._cache_masked_in_sandbox(Path("/usr/share/tiktoken")) is False
+
+
+class TestTiktokenCachePath:
+    """The firejail child's ``TIKTOKEN_CACHE_DIR`` must name a directory that exists in the jail.
+
+    ``--private-tmp`` replaces ``/tmp`` and ``/var/tmp`` with fresh tmpfs mounts, so a host cache under
+    either is ENOENT inside the jail: tiktoken silently rebuilds (or fails offline). The cache must be
+    staged into the sandbox copy and named relative to the child's cwd, like a staged interpreter.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_jail(self, monkeypatch, tmp_path: Path):
+        self.calls: list[list[str]] = []
+        self.envs: list[dict] = []
+        self.seen: list[dict] = []  # state of the staged copy at the moment each call ran
+
+        class Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            self.calls.append([str(part) for part in command])
+            self.envs.append(dict(kwargs.get("env") or {}))
+            staged = Path(kwargs.get("cwd") or ".") / sandbox._SANDBOX_TIKTOKEN_DIR
+            self.seen.append(
+                {
+                    "exists": staged.is_dir(),
+                    "files": sorted(p.name for p in staged.iterdir()) if staged.is_dir() else [],
+                }
+            )
+            return Done()
+
+        monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+        self.work = tmp_path / "work"
+        (self.work / "tests").mkdir(parents=True)
+        # Under the system tmp, so firejail --private-tmp masks it — the case that was broken.
+        self.cache = tmp_path / "tiktoken-cache"
+        self.cache.mkdir()
+        (self.cache / "fd9f0f3d3f6f4fe9").write_text("cached-encoding", encoding="utf-8")
+
+    def _run(self, backend: str, **kw):
+        return sandbox.run_in_sandbox(
+            self.work,
+            ["/bin/true"],
+            backend=backend,
+            tiktoken_cache=self.cache,
+            probe=lambda name: True,
+            which=lambda name: "/usr/bin/" + name,
+            **kw,
+        )
+
+    def _jail_visible(self, value: str) -> bool:
+        """The env value is either the relative staged path or a host path the jail still sees."""
+        if value == f"./{sandbox._SANDBOX_TIKTOKEN_DIR}":
+            return True
+        for root in sandbox._MASKED_TMP_ROOTS:
+            if value == root or value.startswith(root.rstrip("/") + "/"):
+                return False  # masked: ENOENT inside the jail
+        home = str(Path.home())
+        if value == home or value.startswith(home.rstrip("/") + "/"):
+            return False  # masked by the private home mount
+        return os.path.isdir(value)
+
+    def test_the_firejail_env_names_a_jail_visible_cache(self):
+        self._run("firejail")
+        assert self.envs, self.calls
+        value = self.envs[0].get("TIKTOKEN_CACHE_DIR", "")
+        assert self._jail_visible(value), value
+        assert value != str(self.cache), "the masked host cache path is passed through verbatim"
+
+    def test_a_masked_cache_is_staged_into_the_sandbox_copy(self):
+        self._run("firejail")
+        value = self.envs[0]["TIKTOKEN_CACHE_DIR"]
+        assert value == f"./{sandbox._SANDBOX_TIKTOKEN_DIR}", value
+        # At the moment the wrapper ran, the staged copy existed in the child's cwd with the cache's
+        # content — the child can read it before the disposable copy is deleted.
+        assert self.seen[0]["exists"] is True, self.seen
+        assert self.seen[0]["files"] == ["fd9f0f3d3f6f4fe9"], self.seen
+        assert str(self.cache) not in " ".join(self.calls[0]), self.calls[0]
+
+    def test_a_genuinely_visible_cache_is_left_as_is(self, monkeypatch):
+        # No writable location outside /tmp, /var/tmp and home is assumed on every host, so the masked
+        # roots are narrowed here; the predicate itself pins the real-world visible cases above.
+        monkeypatch.setattr(sandbox, "_MASKED_TMP_ROOTS", ())
+        self._run("firejail")
+        assert self.envs[0]["TIKTOKEN_CACHE_DIR"] == str(self.cache)
+        assert self.seen[0]["exists"] is False, "nothing is staged for a visible cache"
+
+    def test_bubblewrap_still_binds_the_cache_at_the_fixed_inside_path(self):
+        self._run("bwrap")
+        assert self.envs[0]["TIKTOKEN_CACHE_DIR"] == sandbox._TIKTOKEN_CACHE_INSIDE
+        pairs = [
+            (self.calls[0][i + 1], self.calls[0][i + 2])
+            for i, part in enumerate(self.calls[0])
+            if part == "--ro-bind"
+        ]
+        assert (str(self.cache), sandbox._TIKTOKEN_CACHE_INSIDE) in pairs, pairs
+        assert self.seen[0]["exists"] is False, "bwrap binds the cache instead of staging it"
+        assert sandbox._SANDBOX_TIKTOKEN_DIR not in " ".join(self.calls[0])
+
+    def test_unshare_keeps_the_host_path(self):
+        self._run("unshare", allow_weak=True)
+        assert self.envs[0]["TIKTOKEN_CACHE_DIR"] == str(self.cache)
+
+
 class TestRealFirejailWritesTheManifest:
     """The collector must actually run and its manifest must come back across the boundary."""
 
@@ -113,3 +240,37 @@ class TestRealFirejailWritesTheManifest:
         )
         assert evidence.get("exit_code") == 0, (evidence.get("exit_code"), evidence.get("output_tail"))
         assert evidence.get("collected") == {"ids": ["tests/test_a.py::test_ok"]}
+
+
+class TestRealFirejailTiktokenCache:
+    """The cache directory the firejail child's env names must exist inside the jail."""
+
+    def test_the_child_sees_an_existing_cache_directory(self):
+        from tests.fakes import require_sandbox_interpreter
+
+        require_sandbox_interpreter("firejail")
+        work = Path(tempfile.mkdtemp(prefix="bb-tiktoken-real-"))
+        # Under the system tmp: --private-tmp masks it, so the child can only see it staged.
+        cache = Path(tempfile.mkdtemp(prefix="bb-tiktoken-real-cache-"))
+        (cache / "fd9f0f3d3f6f4fe9").write_text("cached-encoding", encoding="utf-8")
+        script = (
+            "import json, os\n"
+            "d = os.environ.get('TIKTOKEN_CACHE_DIR', '')\n"
+            "print(json.dumps({'dir': d, 'isdir': os.path.isdir(d), "
+            "'files': sorted(os.listdir(d)) if d and os.path.isdir(d) else []}))\n"
+        )
+        result = sandbox.run_in_sandbox(
+            work,
+            [sys.executable, "-c", script],
+            backend="firejail",
+            tiktoken_cache=cache,
+            timeout=120,
+        )
+        assert result.get("exit_code") == 0, (result.get("exit_code"), result.get("output_tail"))
+        line = [ln for ln in result["output_tail"].splitlines() if ln.startswith("{")][-1]
+        out = json.loads(line)
+        assert out["isdir"] is True, out
+        assert out["files"] == ["fd9f0f3d3f6f4fe9"], out
+        # The relative staged path (this cache is masked) or a genuinely visible host path — and the
+        # directory it names exists, which isdir already proved above.
+        assert out["dir"] in ("./.bundlebees-tiktoken", str(cache)), out
