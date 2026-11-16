@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import dispatch
 from .security import scrub
 
 __all__ = [
@@ -405,9 +406,33 @@ def record_lease(
     The brief must already carry ``source_rev`` (40 or 64 hex), a non-empty
     ``assigned_files`` list, and ``acceptance``. An existing record is never
     overwritten: it raises :class:`LeaseError` with ``code="lease_exists"``.
+
+    The record also pins the lease payload: the digest manifest of what the
+    coordinator actually serves is recorded as ``brief["payload"]`` through
+    :func:`bundlebees_plugin.dispatch.payload_digest` of
+    :func:`bundlebees_plugin.dispatch.collect_payload`. With no pins
+    configured the key stays absent (never an empty manifest); a pin that is
+    set but unusable fails dispatch closed with the named
+    :class:`bundlebees_plugin.dispatch.PayloadError`. A manifest the brief
+    already carries keeps binding verify unchanged.
     """
     attempt = _validate_attempt_id(attempt_id)
     normalized = _normalize_brief(brief)
+
+    # The manifest is coordinator truth, never worker input: digest what this
+    # coordinator serves now. A set-but-unusable pin raises the named
+    # dispatch.PayloadError, so dispatch fails closed before any state is
+    # written; with no pins configured the key stays absent.
+    served = dispatch.collect_payload()
+    served_manifest = dispatch.payload_digest(served) if served else None
+    if not normalized.get("payload"):
+        if served_manifest is not None:
+            normalized["payload"] = served_manifest
+        else:
+            normalized.pop("payload", None)
+    # A manifest the brief already carries is operator-authored; it keeps
+    # binding verify exactly as dispatched.
+
     state = Path(state_dir)
     leases = _ensure_leases_dir(state)
     key = _ensure_key(state)
