@@ -156,7 +156,7 @@ jobs:
         # EXPECTED_TOOLS tools registered.
         env:
           HERMES_HOME: ${{ runner.temp }}/hermes-home
-          EXPECTED_TOOLS: "4"
+          EXPECTED_TOOLS: "5"
         run: |
           mkdir -p "$HERMES_HOME"
           HERMES_BIN="$RUNNER_TEMP/hermes-agent/.venv/bin/hermes"
