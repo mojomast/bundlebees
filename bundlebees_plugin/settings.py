@@ -13,7 +13,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .security import config_flag
+
 PLUGIN_ID = "bundlebees"
+
+#: The F2 enforcement flag. Durable plugin configuration, resolved at the
+#: campaign/repository/execution-profile boundary; never session state and
+#: never read from a brief.
+REQUIRE_CONTRACT_KEY = "require_contract"
 
 DEFAULTS: dict[str, Any] = {
     "adapter": "orbit-loopback",
@@ -38,6 +45,47 @@ DEFAULTS: dict[str, Any] = {
     "integrate_security_tests": "",
     "integrate_base": "",
 }
+
+
+def require_contract(
+    config: Mapping[str, Any],
+    *,
+    campaign: str | None = None,
+    repository: str | None = None,
+) -> bool:
+    """The durable ``require_contract`` enforcement flag (default off).
+
+    The value is read from the settings mapping this module produces — the
+    active execution profile's plugin settings (``settings_from_ctx``) or the
+    repository's Hermes profile file (``settings_from_hermes_config``). A plain
+    boolean opts the whole scope in. A mapping scopes the flag per campaign or
+    repository::
+
+        {"require_contract": {"default": false,
+                              "campaigns": {"reliability": true},
+                              "repositories": {"mojomast/bundlebees": true}}}
+
+    An explicit campaign or repository win over the default; anything absent,
+    ``None`` or unparsable is off, so enforcement can never be enabled by
+    accident. The brief carries no vote: callers must not pass brief values
+    here.
+    """
+    if not isinstance(config, Mapping):
+        return False
+    value = config.get(REQUIRE_CONTRACT_KEY)
+    if isinstance(value, Mapping):
+        if campaign and _scope_enabled(value.get("campaigns"), str(campaign)):
+            return True
+        if repository and _scope_enabled(value.get("repositories"), str(repository)):
+            return True
+        return config_flag(value.get("default"), False)
+    return config_flag(value, False)
+
+
+def _scope_enabled(table: Any, name: str) -> bool:
+    if not isinstance(table, Mapping):
+        return False
+    return config_flag(table.get(name), False)
 
 
 def settings_from_ctx(ctx: Any) -> dict[str, Any]:
