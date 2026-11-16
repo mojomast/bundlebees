@@ -87,6 +87,28 @@ one pull request.
 - **Route preview:** `bundlebees_route_preview` previews the model and
   credential route a dispatch would take, starting no attempt (the fifth
   registered tool).
+- **Completion events drive the coordinator action queue.** The landing event
+  consumer now composes the durable bee-landed terminal signal with the
+  coordinator action queue: `consume_completions` subscribes a
+  `coordinator-actions` subscriber, classifies each delivered event, and
+  translates every terminal completion (`landed`, `succeeded`, `failed`,
+  `cancelled`) into create-only action items keyed by the idempotent keys
+  `verify:<attempt>` (for a result-carrying landing) and
+  `process-completion:<attempt>`, recording one accepted decision per
+  `(attempt_id, state)` in a completion ledger. Exactly once is layered:
+  per-event acknowledgements, create-only idempotent keys and the ledger give
+  zero duplicate actions across duplicate delivery, explicit replay and
+  coordinator restart; action claims are fenced, and a stale consumer's
+  fencing token is refused (`stale_fence`). Failure modes are bounded: an
+  unavailable queue releases the event into its durable inbox record with a
+  30 s backoff and `COMPLETION_MAX_ATTEMPTS` claims (an exhausted delivery is
+  recoverable through the explicit `requeue_failed`), and malformed or
+  non-terminal events are skipped with a counted reason instead of retrying.
+  The consumer is additive: the mechanical tick, the Hermes wake path and the
+  10-minute heartbeat remain the backstop, so a worker completion advances
+  the pipeline without polling and without Hermes being awake. Item shapes
+  and the queue seam are documented in `docs/event-consumer.md`. Built
+  test-first (`tests/test_event_consumer_actions.py`).
 
 ### Fixed
 

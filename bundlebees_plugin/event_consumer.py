@@ -1121,23 +1121,895 @@ def inbox_summary(state_dir: Path, subscriber: str | None = None) -> dict[str, A
     }
 
 
+# ---------------------------------------------------------------------------
+# Coordinator action queue, composed with terminal completion events
+# ---------------------------------------------------------------------------
+#
+# W6 landed the durable completion signal: a bee's terminal landing event is
+# recorded once in the outbox and delivered to every subscriber. F6 (the
+# coordinator action queue, PR #54) names *what* the coordinator should do
+# next as durable items with idempotent keys. This section is the composition:
+# a consumer that subscribes to the landing events and translates each
+# terminal completion into two action-queue items, so worker completions
+# advance the pipeline without polling and without Hermes being awake.
+#
+# The composition is additive. The mechanical tick, the Hermes wake path and
+# the 10-minute heartbeat remain exactly what they were; a completion that the
+# consumer has not seen yet is still picked up by the heartbeat as before.
+#
+# Exactly-once is layered, not promised by one mechanism:
+#
+# * event level: ``consume_once`` acknowledges each (subscriber, event_id)
+#   exactly once, so duplicate delivery never reaches the handler again;
+# * effect level: the completion ledger records one accepted decision per
+#   ``(attempt_id, state)`` and action items are published create-only under
+#   their idempotent key (``verify:<attempt>`` / ``process-completion:<attempt>``),
+#   so a crash after the effect replays into the same items, never new ones;
+# * claim level: action items are claimed under ``flock`` with a fencing
+#   token that increments on every claim; a stale consumer's token is refused.
+#
+# Failure modes: a queue that cannot be written raises ``ActionQueueError``,
+# which releases the event for a bounded backoff inside its still-durable
+# inbox record (the outbox event is never deleted); a malformed or
+# non-terminal event is skipped with a counted reason and never enqueued; a
+# completion that was already processed is a no-op.
+
+ACTION_SCHEMA = "rizzstack.coordinator-action/1"
+ACTION_SUMMARY_SCHEMA = "rizzstack.coordinator-action-summary/1"
+COMPLETION_SCHEMA = "rizzstack.completion-ledger/1"
+SKIPS_SCHEMA = "rizzstack.completion-skips/1"
+
+#: The kinds of coordinator action this composition enqueues, and the
+#: idempotent-key prefix each one uses.
+ACTION_KINDS: tuple[str, ...] = ("verify", "process-completion")
+
+ACTION_STATUSES: tuple[str, ...] = ("pending", "claimed", "done", "failed")
+
+#: Landing states that mean the bee's work is finished. ``landed`` and
+#: ``succeeded`` carry a result the coordinator should verify; every terminal
+#: state is processed as a completion.
+TERMINAL_COMPLETION_STATES = frozenset({"landed", "succeeded", "failed", "cancelled"})
+VERIFY_ELIGIBLE_STATES = frozenset({"landed", "succeeded"})
+
+#: The inbox subscriber the composed consumer reads by default, the default
+#: consumer name on action claims, and the backoff between queue retries.
+DEFAULT_COMPLETION_SUBSCRIBER = "coordinator-actions"
+DEFAULT_ACTION_CONSUMER = "coordinator-actions"
+DEFAULT_RETRY_BACKOFF_S = 30.0
+
+#: Action claims are bounded like event claims. A claim counts before the
+#: owner acts, so a crash after the claim still spends one attempt.
+MAX_ACTION_ATTEMPTS = 2
+
+#: Completion deliveries get a deeper budget than the inbox default so a
+#: transient action-queue outage is bridged by the bounded backoff instead of
+#: stranding events in ``failed``. An exhausted event is still recoverable
+#: through :func:`requeue_failed`.
+COMPLETION_MAX_ATTEMPTS = 4
+
+ACTION_FIX = (
+    "Inspect coordinator/actions and coordinator/completions; an action item or "
+    "a completion decision is never overwritten to hide a second decision."
+)
+
+
+class ActionQueueError(Exception):
+    """An action-queue item cannot be enqueued, claimed or completed."""
+
+    def __init__(self, code: str, message: str, fix: str = ACTION_FIX) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+        self.fix = str(fix)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"error": self.code, "message": self.message, "fix": self.fix}
+
+
+def actions_dir(state_dir: Path) -> Path:
+    return Path(state_dir) / "coordinator" / "actions"
+
+
+def completions_dir(state_dir: Path) -> Path:
+    return Path(state_dir) / "coordinator" / "completions"
+
+
+def action_path(state_dir: Path, action_id: str) -> Path:
+    return actions_dir(state_dir) / f"{_safe_id(action_id, 'action_id')}.json"
+
+
+def _action_lock_path(state_dir: Path, action_id: str) -> Path:
+    return (
+        actions_dir(state_dir)
+        / ".locks"
+        / f"{_safe_id(action_id, 'action_id')}.lock"
+    )
+
+
+def completion_path(state_dir: Path, attempt_id: str, state: str) -> Path:
+    key = _safe_id(f"{_safe_id(attempt_id, 'attempt_id')}:{_safe_id(state, 'state')}", "completion key")
+    return completions_dir(state_dir) / f"{key}.json"
+
+
+def _completion_lock_path(state_dir: Path, attempt_id: str, state: str) -> Path:
+    path = completion_path(state_dir, attempt_id, state)
+    return path.parent / ".locks" / f"{path.stem}.lock"
+
+
+def _skips_path(state_dir: Path) -> Path:
+    return actions_dir(state_dir) / ".skipped.json"
+
+
+def _safe_attempt(value: Any) -> str | None:
+    """A validated attempt/job/task identifier, or ``None`` when unusable."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > 160
+        or text in {".", ".."}
+        or any(ch not in _ALLOWED_ID for ch in text)
+    ):
+        return None
+    return text
+
+
+def _advisory_text(value: Any, limit: int = 200) -> str:
+    """An advisory, non-load-bearing copy: safe strings pass, the rest drop."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > limit or any(ch not in _ALLOWED_ID for ch in text):
+        return ""
+    return text
+
+
+def _advisory_path(value: Any, limit: int = 200) -> str:
+    """An advisory path-like copy (lease files, refs): safe strings pass."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > limit or "\x00" in text:
+        return ""
+    return text
+
+
+def _advisory_files(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [
+        _advisory_path(item)
+        for item in value
+        if isinstance(item, str) and _advisory_path(item)
+    ]
+
+
+def action_id_for(kind: str, attempt_id: str) -> str:
+    """The F6 idempotent key for one action: ``<kind>:<attempt_id>``."""
+
+    if kind not in ACTION_KINDS:
+        raise ActionQueueError(
+            "action_kind_invalid",
+            f"kind {kind!r} is not one of {', '.join(ACTION_KINDS)}",
+        )
+    attempt = _safe_attempt(attempt_id)
+    if attempt is None:
+        raise ActionQueueError(
+            "action_attempt_invalid",
+            f"attempt id {attempt_id!r} is not a safe identifier",
+        )
+    return f"{kind}:{attempt}"
+
+
+def classify_completion(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify one delivered event as a terminal completion or a skip.
+
+    Both shapes are accepted: the canonical ``rizzstack.bee.landed/1``
+    CloudEvents envelope (facts under ``data``) and a flat event mapping that
+    carries the fields at the top level. The result is ``{"completion": False,
+    "reason": ...}`` for anything that must not enqueue — malformed facts or a
+    non-terminal state — and the completion facts otherwise. Only load-bearing
+    identifiers are validated strictly; advisory copies (``source_rev``,
+    ``result_reference``, ``lease_files``) drop unsafe values instead of
+    refusing the event.
+    """
+
+    if not isinstance(event, Mapping):
+        return {"completion": False, "reason": "malformed_event"}
+    data = event.get("data")
+    if not isinstance(data, Mapping):
+        data = event
+    attempt = _safe_attempt(data.get("attempt_id") or event.get("attempt_id"))
+    if attempt is None:
+        missing = data.get("attempt_id") or event.get("attempt_id")
+        return {
+            "completion": False,
+            "reason": "malformed_attempt_missing" if missing in (None, "") else "malformed_attempt_id",
+        }
+    state = data.get("state") or event.get("state")
+    if not isinstance(state, str) or not state.strip():
+        return {"completion": False, "reason": "malformed_state_missing"}
+    state = state.strip()
+    if state not in TERMINAL_COMPLETION_STATES:
+        return {
+            "completion": False,
+            "reason": "not_terminal",
+            "state": state,
+        }
+    for name in ("job_id", "task_id"):
+        value = data.get(name) or event.get(name)
+        if value in (None, ""):
+            continue
+        if _safe_attempt(value) is None:
+            return {"completion": False, "reason": f"malformed_{name}"}
+    result = data.get("result") if isinstance(data.get("result"), Mapping) else {}
+    event_id = ""
+    for key in ("event_id", "id"):
+        raw = event.get(key) or data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            event_id = raw.strip()
+            break
+    return {
+        "completion": True,
+        "attempt_id": attempt,
+        "state": state,
+        "event_id": _advisory_text(event_id, 160),
+        "job_id": _safe_attempt(data.get("job_id") or event.get("job_id")) or "",
+        "task_id": _safe_attempt(data.get("task_id") or event.get("task_id")) or "",
+        "source_rev": _advisory_text(data.get("source_rev") or event.get("source_rev")),
+        "result_available": (
+            bool(result.get("available")) if "available" in result else None
+        ),
+        "result_reference": _advisory_path(result.get("reference")),
+        "lease_files": _advisory_files(
+            (data.get("lease") or {}).get("assigned_files")
+            if isinstance(data.get("lease"), Mapping)
+            else event.get("assigned_files")
+        ),
+    }
+
+
+def enqueue_action(
+    state_dir: Path,
+    action_id: str,
+    *,
+    kind: str,
+    attempt_id: str,
+    event_id: str = "",
+    event_state: str = "",
+    job_id: str = "",
+    task_id: str = "",
+    source_rev: str = "",
+    lease_files: Any = (),
+    result_available: bool | None = None,
+    result_reference: str = "",
+    dedupe_key: str = "",
+    now: Any = None,
+) -> dict[str, Any]:
+    """Publish one action item under its idempotent key, create-only.
+
+    Replaying the same key returns the stored item with ``created: False`` and
+    never overwrites it; a different ``kind``/``attempt_id`` under a live key
+    is refused with ``action_conflict``. A ``done`` item stays ``done``: a
+    later event for the same attempt is a no-op, never a resurrection.
+    """
+
+    if kind not in ACTION_KINDS:
+        raise ActionQueueError(
+            "action_kind_invalid",
+            f"kind {kind!r} is not one of {', '.join(ACTION_KINDS)}",
+        )
+    attempt = _safe_attempt(attempt_id)
+    if attempt is None:
+        raise ActionQueueError(
+            "action_attempt_invalid",
+            f"attempt id {attempt_id!r} is not a safe identifier",
+        )
+    expected = f"{kind}:{attempt}"
+    path = action_path(state_dir, action_id)
+    stamp = _iso(_clock(now))
+    with _locked(_action_lock_path(state_dir, action_id)):
+        stored = _read_json(path)
+        if stored is not None:
+            if (
+                str(stored.get("kind") or "") != kind
+                or str(stored.get("attempt_id") or "") != attempt
+            ):
+                raise ActionQueueError(
+                    "action_conflict",
+                    f"{action_id} already exists for a different attempt or kind",
+                    "Keep one durable item per idempotent key; do not rewrite it.",
+                )
+            return {
+                "action_id": action_id,
+                "created": False,
+                "duplicate": True,
+                "status": str(stored.get("status") or ""),
+                "item": stored,
+            }
+        if str(action_id or "").strip() != expected:
+            raise ActionQueueError(
+                "action_id_mismatch",
+                f"action_id {action_id!r} must be the idempotent key {expected!r}",
+            )
+        item = {
+            "schema": ACTION_SCHEMA,
+            "action_id": action_id,
+            "kind": kind,
+            "attempt_id": attempt,
+            "job_id": _safe_attempt(job_id) or "",
+            "task_id": _safe_attempt(task_id) or "",
+            "event_id": _advisory_text(event_id, 160),
+            "event_state": _safe_attempt(event_state) or "",
+            "dedupe_key": _safe_attempt(dedupe_key) or "",
+            "source_rev": _advisory_text(source_rev),
+            "lease_files": _advisory_files(lease_files),
+            "result_available": result_available,
+            "result_reference": _advisory_path(result_reference),
+            "status": "pending",
+            "attempts": 0,
+            "fence": 0,
+            "claimed_by": "",
+            "claimed_at": "",
+            "claim_pid": 0,
+            "claim_expires_at": "",
+            "next_attempt_at": "",
+            "result": None,
+            "error": "",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        if not _create_only_json(path, item):
+            stored = _read_json(path)
+            return {
+                "action_id": action_id,
+                "created": False,
+                "duplicate": True,
+                "status": str((stored or {}).get("status") or ""),
+                "item": stored or item,
+            }
+        return {
+            "action_id": action_id,
+            "created": True,
+            "duplicate": False,
+            "status": "pending",
+            "item": item,
+        }
+
+
+def _clear_claim(item: dict[str, Any]) -> None:
+    item["claimed_by"] = ""
+    item["claimed_at"] = ""
+    item["claim_pid"] = 0
+    item["claim_expires_at"] = ""
+
+
+def claim_action(
+    state_dir: Path,
+    action_id: str,
+    *,
+    consumer: str,
+    now: Any = None,
+    ttl_s: float = DEFAULT_CLAIM_TTL_S,
+) -> dict[str, Any]:
+    """Claim one action item atomically and return its fencing token.
+
+    The fence increments on every claim, so a token issued to a consumer whose
+    claim was later adopted (its TTL expired or its pid died) is stale. The
+    claim is durable before the caller acts. ``done`` and ``failed`` items are
+    terminal and are never claimed again.
+    """
+
+    name = str(consumer or "").strip()
+    if not name:
+        raise ActionQueueError("consumer_invalid", "the consumer must have a name")
+    clock = _clock(now)
+    ttl = float(ttl_s)
+    if ttl <= 0:
+        raise ActionQueueError("ttl_invalid", "the claim TTL must be positive")
+    path = action_path(state_dir, action_id)
+    stamp = _iso(clock)
+    with _locked(_action_lock_path(state_dir, action_id)):
+        item = _read_json(path)
+        if item is None:
+            raise ActionQueueError(
+                "action_missing", f"{action_id} does not exist in the queue"
+            )
+        status = str(item.get("status") or "")
+        if status in ("done", "failed"):
+            return {"status": status, "claimed": False, "fence": int(item.get("fence") or 0), "item": item}
+        if status == "claimed":
+            claim = {
+                "pid": item.get("claim_pid"),
+                "expires_at": item.get("claim_expires_at"),
+            }
+            if not _claim_expired(claim, clock):
+                return {"status": "busy", "claimed": False, "fence": int(item.get("fence") or 0), "item": item}
+        if status == "pending":
+            not_before = _epoch(item.get("next_attempt_at"))
+            if not_before is not None and clock < not_before:
+                # A released item waits out its bounded backoff before the
+                # next claim; a resumed or restart adopter sees the same rule.
+                return {"status": "backoff", "claimed": False, "fence": int(item.get("fence") or 0), "item": item}
+        attempts = int(item.get("attempts") or 0)
+        if attempts >= MAX_ACTION_ATTEMPTS:
+            item.update(
+                status="failed",
+                failed_at=stamp,
+                error=str(item.get("error") or "attempts_exhausted"),
+                updated_at=stamp,
+            )
+            _clear_claim(item)
+            _write_json(path, item)
+            return {"status": "exhausted", "claimed": False, "fence": int(item.get("fence") or 0), "item": item}
+        attempts += 1
+        fence = int(item.get("fence") or 0) + 1
+        item.update(
+            status="claimed",
+            attempts=attempts,
+            fence=fence,
+            claimed_by=name,
+            claimed_at=stamp,
+            claim_pid=os.getpid(),
+            claim_expires_at=_iso(clock + ttl),
+            next_attempt_at="",
+            updated_at=stamp,
+        )
+        _write_json(path, item)
+        return {"status": "claimed", "claimed": True, "fence": fence, "item": item}
+
+
+def _fenced_item(state_dir: Path, action_id: str, fence: Any) -> dict[str, Any]:
+    path = action_path(state_dir, action_id)
+    item = _read_json(path)
+    if item is None:
+        raise ActionQueueError(
+            "action_missing", f"{action_id} does not exist in the queue"
+        )
+    try:
+        presented = int(fence)
+    except (TypeError, ValueError) as exc:
+        raise ActionQueueError("fence_invalid", "the fencing token must be an integer") from exc
+    if int(item.get("fence") or 0) != presented:
+        raise ActionQueueError(
+            "stale_fence",
+            f"fencing token {presented} is stale; the item is at fence "
+            f"{int(item.get('fence') or 0)}",
+            "Re-read the item and claim it again with the current fence.",
+        )
+    return item
+
+
+def complete_action(
+    state_dir: Path,
+    action_id: str,
+    *,
+    fence: Any,
+    result: Mapping[str, Any] | None = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Complete a claimed action item; the current fence proves ownership."""
+
+    stamp = _iso(_clock(now))
+    with _locked(_action_lock_path(state_dir, action_id)):
+        item = _fenced_item(state_dir, action_id, fence)
+        if str(item.get("status") or "") == "done":
+            return {"status": "done", "duplicate": True, "item": item}
+        item.update(
+            status="done",
+            result=dict(result) if isinstance(result, Mapping) else {},
+            completed_at=stamp,
+            error="",
+            updated_at=stamp,
+        )
+        _clear_claim(item)
+        _write_json(action_path(state_dir, action_id), item)
+        return {"status": "done", "duplicate": False, "item": item}
+
+
+def fail_action(
+    state_dir: Path,
+    action_id: str,
+    *,
+    fence: Any,
+    error: str,
+    now: Any = None,
+    retry_backoff_s: float = 0.0,
+) -> dict[str, Any]:
+    """Release a claimed item for one bounded retry, or mark it failed.
+
+    The fence must be current: a stale consumer cannot release an item a
+    newer claim owns. ``attempts`` is already counted by the claim, so the
+    second failure of one item is terminal.
+    """
+
+    clock = _clock(now)
+    stamp = _iso(clock)
+    with _locked(_action_lock_path(state_dir, action_id)):
+        item = _fenced_item(state_dir, action_id, fence)
+        if str(item.get("status") or "") == "done":
+            return {"status": "done", "duplicate": True, "item": item}
+        attempts = int(item.get("attempts") or 0)
+        exhausted = attempts >= MAX_ACTION_ATTEMPTS
+        try:
+            delay = max(0.0, float(retry_backoff_s))
+        except (TypeError, ValueError) as exc:
+            raise ActionQueueError(
+                "backoff_invalid", "retry_backoff_s must be a non-negative number"
+            ) from exc
+        next_attempt = "" if exhausted or delay <= 0 else _iso(clock + delay)
+        item.update(
+            status="failed" if exhausted else "pending",
+            error=str(error)[:500],
+            next_attempt_at=next_attempt,
+            updated_at=stamp,
+        )
+        if exhausted:
+            item["failed_at"] = stamp
+        _clear_claim(item)
+        _write_json(action_path(state_dir, action_id), item)
+        return {
+            "status": str(item.get("status")),
+            "attempts": attempts,
+            "exhausted": exhausted,
+            "retry_after": next_attempt,
+            "item": item,
+        }
+
+
+def actions_summary(state_dir: Path) -> dict[str, Any]:
+    """Count action items by status."""
+
+    root = actions_dir(state_dir)
+    counts = {"total": 0, "pending": 0, "claimed": 0, "done": 0, "failed": 0}
+    if root.is_dir():
+        for path in sorted(root.iterdir(), key=lambda item: item.name):
+            if path.name.startswith(".") or path.suffix != ".json" or not path.is_file():
+                continue
+            item = _read_json(path)
+            status = str(item.get("status") or "pending")
+            counts["total"] += 1
+            counts[status] = counts.get(status, 0) + 1
+    return {"schema": ACTION_SUMMARY_SCHEMA, "counts": counts}
+
+
+def _bump_skip(state_dir: Path, reason: str, *, now: Any = None) -> dict[str, Any]:
+    """Count one skipped delivery durably, by reason."""
+
+    path = _skips_path(state_dir)
+    stamp = _iso(_clock(now))
+    with _locked(actions_dir(state_dir) / ".locks" / "skips.lock"):
+        record = _read_json(path) or {"schema": SKIPS_SCHEMA, "counts": {}}
+        counts = record.get("counts") if isinstance(record.get("counts"), dict) else {}
+        counts[str(reason)] = int(counts.get(str(reason)) or 0) + 1
+        record.update(counts=counts, updated_at=stamp)
+        _write_json(path, record)
+        return dict(record)
+
+
+def skipped_events(state_dir: Path) -> dict[str, Any]:
+    """The durable counter of skipped completion deliveries, by reason."""
+
+    record = _read_json(_skips_path(state_dir))
+    if record is None:
+        return {"schema": SKIPS_SCHEMA, "counts": {}}
+    counts = record.get("counts") if isinstance(record.get("counts"), dict) else {}
+    return {"schema": SKIPS_SCHEMA, "counts": dict(counts)}
+
+
+def record_completion(
+    state_dir: Path,
+    *,
+    attempt_id: str,
+    state: str,
+    event_id: str = "",
+    actions: Any = (),
+    job_id: str = "",
+    task_id: str = "",
+    now: Any = None,
+) -> dict[str, Any]:
+    """Record the one accepted decision for ``(attempt_id, state)``.
+
+    Create-only: replaying the same pair returns the stored record with
+    ``created: False``. This ledger is the dedupe key the consumer enforces,
+    so a second event for an already-processed attempt is a no-op.
+    """
+
+    attempt = _safe_attempt(attempt_id)
+    if attempt is None:
+        raise ActionQueueError(
+            "action_attempt_invalid",
+            f"attempt id {attempt_id!r} is not a safe identifier",
+        )
+    state_name = _safe_attempt(state)
+    if state_name is None:
+        raise ActionQueueError("state_invalid", f"state {state!r} is not a safe identifier")
+    path = completion_path(state_dir, attempt, state_name)
+    stamp = _iso(_clock(now))
+    with _locked(_completion_lock_path(state_dir, attempt, state_name)):
+        stored = _read_json(path)
+        if stored is not None:
+            return {"created": False, "duplicate": True, "record": stored}
+        record = {
+            "schema": COMPLETION_SCHEMA,
+            "attempt_id": attempt,
+            "state": state_name,
+            "event_id": _advisory_text(event_id, 160),
+            "job_id": _safe_attempt(job_id) or "",
+            "task_id": _safe_attempt(task_id) or "",
+            "actions": [_advisory_text(action, 160) for action in actions if isinstance(action, str)],
+            "processed_at": stamp,
+        }
+        if not _create_only_json(path, record):
+            stored = _read_json(path) or record
+            return {"created": False, "duplicate": True, "record": stored}
+        return {"created": True, "duplicate": False, "record": record}
+
+
+def completion_record(
+    state_dir: Path, attempt_id: str, state: str
+) -> dict[str, Any] | None:
+    """The stored completion decision for ``(attempt_id, state)``, if any."""
+
+    attempt = _safe_attempt(attempt_id)
+    state_name = _safe_attempt(state)
+    if attempt is None or state_name is None:
+        return None
+    return _read_json(completion_path(state_dir, attempt, state_name))
+
+
+def action_queue_handler(
+    state_dir: Path,
+    *,
+    now: Any = None,
+    enqueue: Any = None,
+) -> Any:
+    """Build the ``consume_once`` handler that translates completions.
+
+    The handler classifies the event, skips malformed or non-terminal
+    deliveries with a counted reason, honours the completion ledger, enqueues
+    the F6 action items under their idempotent keys and records the decision.
+    A queue write failure raises ``ActionQueueError``, which releases the
+    event for its bounded backoff — the buffering failure mode.
+    """
+
+    state = Path(state_dir)
+    enqueue_fn = enqueue if enqueue is not None else enqueue_action
+
+    def handler(event: Mapping[str, Any]) -> dict[str, Any]:
+        classified = classify_completion(event)
+        if not classified.get("completion"):
+            reason = str(classified.get("reason") or "malformed_event")
+            skips = _bump_skip(state, reason, now=now)
+            total = sum(int(value) for value in skips.get("counts", {}).values())
+            return {
+                "accepted": True,
+                "skipped": True,
+                "reason": reason,
+                "actions": [],
+                "skipped_total": total,
+            }
+        attempt = str(classified["attempt_id"])
+        event_state = str(classified["state"])
+        existing = completion_record(state, attempt, event_state)
+        if existing is not None:
+            return {
+                "accepted": True,
+                "skipped": False,
+                "duplicate": True,
+                "reason": "completion_already_processed",
+                "actions": [str(action) for action in existing.get("actions") or []],
+            }
+        dedupe_key = f"{attempt}:{event_state}"
+        wanted: list[tuple[str, str]] = []
+        if event_state in VERIFY_ELIGIBLE_STATES:
+            wanted.append(("verify", action_id_for("verify", attempt)))
+        wanted.append(("process-completion", action_id_for("process-completion", attempt)))
+        outcomes: list[dict[str, Any]] = []
+        for kind, action_id in wanted:
+            outcome = enqueue_fn(
+                state,
+                action_id,
+                kind=kind,
+                attempt_id=attempt,
+                event_id=str(classified.get("event_id") or ""),
+                event_state=event_state,
+                job_id=str(classified.get("job_id") or ""),
+                task_id=str(classified.get("task_id") or ""),
+                source_rev=str(classified.get("source_rev") or ""),
+                lease_files=classified.get("lease_files") or (),
+                result_available=classified.get("result_available"),
+                result_reference=str(classified.get("result_reference") or ""),
+                dedupe_key=dedupe_key,
+                now=now,
+            )
+            outcomes.append(
+                {
+                    "action_id": action_id,
+                    "kind": kind,
+                    "created": bool(outcome.get("created")),
+                    "duplicate": bool(outcome.get("duplicate")),
+                    "status": str(outcome.get("status") or ""),
+                }
+            )
+        record = record_completion(
+            state,
+            attempt_id=attempt,
+            state=event_state,
+            event_id=str(classified.get("event_id") or ""),
+            actions=[outcome["action_id"] for outcome in outcomes],
+            job_id=str(classified.get("job_id") or ""),
+            task_id=str(classified.get("task_id") or ""),
+            now=now,
+        )
+        return {
+            "accepted": True,
+            "skipped": False,
+            "duplicate": False,
+            "actions": [outcome["action_id"] for outcome in outcomes],
+            "created": [outcome["action_id"] for outcome in outcomes if outcome["created"]],
+            "completion_created": bool(record.get("created")),
+        }
+
+    return handler
+
+
+def consume_completions(
+    state_dir: Path,
+    *,
+    subscriber: str = DEFAULT_COMPLETION_SUBSCRIBER,
+    consumer: str = DEFAULT_ACTION_CONSUMER,
+    now: Any = None,
+    ttl_s: float = DEFAULT_CLAIM_TTL_S,
+    max_attempts: int = COMPLETION_MAX_ATTEMPTS,
+    retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
+    handler: Any = None,
+    enqueue: Any = None,
+) -> dict[str, Any] | None:
+    """Consume at most one terminal completion into action-queue items.
+
+    This is the whole composition in one call: the durable inbox claim from
+    :func:`consume_once` plus :func:`action_queue_handler`. ``None`` means
+    nothing was claimable. A queue outage releases the event with
+    ``retry_backoff_s`` between attempts, ``max_attempts`` claims in total;
+    beyond the budget the event is marked failed and stays recoverable through
+    :func:`requeue_failed`.
+    """
+
+    state = Path(state_dir)
+    handle = handler if handler is not None else action_queue_handler(state, now=now, enqueue=enqueue)
+    return consume_once(
+        state,
+        subscriber,
+        handle,
+        consumer=consumer,
+        now=now,
+        ttl_s=ttl_s,
+        max_attempts=max_attempts,
+        retry_backoff_s=retry_backoff_s,
+    )
+
+
+def requeue_failed(
+    state_dir: Path, subscriber: str, event_id: str
+) -> dict[str, Any]:
+    """Return one failed delivery to the retryable state, explicitly.
+
+    This is the operator's recovery path for an event whose retries were
+    exhausted while the action queue was down. It never touches an
+    acknowledged event (that is :func:`replay_acked`) and never resets a
+    claim; it only clears the terminal failure so the next pass may claim it.
+    """
+
+    state = Path(state_dir)
+    name = _safe_id(subscriber, "subscriber")
+    identifier = _safe_id(event_id, "event_id")
+    path = _find_event_path(state, name, identifier)
+    if path is None:
+        return {
+            "requeued": False,
+            "event_id": identifier,
+            "subscriber": name,
+            "reason": "event_missing",
+        }
+    ack, _location = _find_ack(state, name, identifier)
+    if ack is not None:
+        return {
+            "requeued": False,
+            "event_id": identifier,
+            "subscriber": name,
+            "reason": "acked",
+        }
+    lock = _lock_path(state, name, identifier)
+    with _locked(lock):
+        fresh = _read_json(path)
+        if fresh is None:
+            return {
+                "requeued": False,
+                "event_id": identifier,
+                "subscriber": name,
+                "reason": "event_missing",
+            }
+        delivery = _delivery_of(fresh)
+        if str(delivery.get("state") or "") != "failed":
+            return {
+                "requeued": False,
+                "event_id": identifier,
+                "subscriber": name,
+                "reason": f"state_{delivery.get('state') or 'pending'}",
+            }
+        delivery.update(
+            state="retryable",
+            claim=None,
+            attempts=0,
+            last_error="",
+            last_error_code="",
+            last_error_fix="",
+            next_attempt_at="",
+            failed_at="",
+            updated_at=_iso(time.time()),
+        )
+        fresh["_delivery"] = delivery
+        _write_json(path, fresh)
+    return {
+        "requeued": True,
+        "event_id": identifier,
+        "subscriber": name,
+    }
+
+
 __all__ = [
     "ACK_SCHEMA",
+    "ACTION_FIX",
+    "ACTION_KINDS",
+    "ACTION_SCHEMA",
+    "ACTION_STATUSES",
+    "ACTION_SUMMARY_SCHEMA",
+    "COMPLETION_MAX_ATTEMPTS",
+    "COMPLETION_SCHEMA",
+    "DEFAULT_ACTION_CONSUMER",
     "DEFAULT_CLAIM_TTL_S",
+    "DEFAULT_COMPLETION_SUBSCRIBER",
+    "DEFAULT_RETRY_BACKOFF_S",
     "DELIVERY_SCHEMA",
     "EventConsumerError",
+    "MAX_ACTION_ATTEMPTS",
     "MAX_ATTEMPTS",
     "SCHEMA",
+    "SKIPS_SCHEMA",
     "STATES",
     "SUMMARY_SCHEMA",
+    "TERMINAL_COMPLETION_STATES",
+    "VERIFY_ELIGIBLE_STATES",
     "ack_path",
     "acks_dir",
+    "action_id_for",
+    "action_path",
+    "action_queue_handler",
+    "actions_dir",
+    "actions_summary",
+    "claim_action",
+    "classify_completion",
+    "complete_action",
+    "completion_path",
+    "completion_record",
+    "completions_dir",
+    "consume_completions",
     "consume_once",
     "enqueue",
+    "enqueue_action",
     "enqueue_event",
+    "fail_action",
     "inbox_dir",
     "inbox_path",
     "inbox_summary",
     "publish_event",
+    "record_completion",
     "replay_acked",
+    "requeue_failed",
+    "skipped_events",
 ]
