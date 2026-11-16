@@ -15,6 +15,7 @@ one pull request.
 
 ### Added
 
+- **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
 - **Standing repository grants:** `hermes bundlebees repo grant`, `repo list`
   and `repo revoke`. A human can enroll one TTY-only grant per repository;
   `job create` then derives a narrow, sealed job authorization and records the
