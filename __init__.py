@@ -13,9 +13,10 @@ if str(_ROOT) not in sys.path:
 BUNDLEBEES_SYSTEM_PROMPT_SECTION = (
     "Bundlebees orchestrates CUA bees (cheap coding workers in disposable "
     "sandboxes on a worker machine the user controls). Drive it ONLY with "
-    "bundlebees_status, bundlebees_dispatch, bundlebees_attempt, and "
-    "bundlebees_host_prompt (toolset bundlebees). If those tools are not in "
-    "your visible list, call tool_search([\"bundlebees\"]) or "
+    "bundlebees_status, bundlebees_dispatch, bundlebees_attempt, "
+    "bundlebees_host_prompt, and bundlebees_route_preview (toolset "
+    "bundlebees). If those tools are not in your visible list, call "
+    'tool_search(["bundlebees"]) or '
     'skill_view("bundlebees:bundlebees-operator"), then use them. '
     "Do not shell out to curl against the launcher or invent a client. "
     "verify and deploy are user-run CLI commands, not model tools. "

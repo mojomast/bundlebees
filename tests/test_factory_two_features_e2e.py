@@ -10,6 +10,8 @@ acceptance is PASS.
 When the pinned hyvv, workflow-recovery or gitleaks checkouts are absent this
 file installs local doubles for those external tools, and when no strong
 sandbox backend is available it uses the production unsafe-local mode.  The
+doubles are installed inside an autouse fixture that saves and restores the
+environment, so modules collected after this one never inherit them.  The
 Gate C fixture and every production module are used unchanged.
 """
 
@@ -25,6 +27,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 _FAKE_HYVV = r'''
 from __future__ import annotations
@@ -220,7 +224,12 @@ def validate_pair(request, decision, **kwargs):
 
 
 def _install_gatec_dependencies() -> None:
-    """Supply local doubles only when the pinned external tools are absent."""
+    """Supply local doubles only when the pinned external tools are absent.
+
+    The doubles' locations are published through ``os.environ``; the autouse
+    fixture below is the only caller and saves and restores every variable it
+    touches, so the write never outlives this module's own tests.
+    """
 
     workflow = os.environ.get("WORKFLOW_SRC", "")
     if not (workflow and (Path(workflow) / "tools" / "recovery.py").is_file()):
@@ -255,16 +264,38 @@ def _install_gatec_dependencies() -> None:
         os.environ["GITLEAKS"] = str(gitleaks)
 
 
-_install_gatec_dependencies()
-
 from bundlebees_plugin import contract as contract_mod
 from bundlebees_plugin import factory_driver, job as jobs, queue, return_report, sandbox
 
 from tests import test_queue_factory_e2e as gatec
 
-gatec.HYVV_SRC = os.environ.get("HYVV_SRC") or gatec.HYVV_SRC
-gatec.HAS_HYVV = bool(gatec.HYVV_SRC) and (Path(gatec.HYVV_SRC) / "provisioning.py").exists()
-gatec.GITLEAKS = os.environ.get("GITLEAKS") or gatec.GITLEAKS
+
+@pytest.fixture(scope="module", autouse=True)
+def _gatec_doubles():
+    """Install the doubles for this module's tests, then restore the environment.
+
+    Modules collected after this one must see the coordinator's real
+    environment, never the doubles: every variable the installation writes is
+    saved first and restored afterwards, and so are the Gate C fixture globals
+    the installation republishes.
+    """
+
+    saved = {name: os.environ.get(name)
+             for name in ("WORKFLOW_SRC", "HYVV_SRC", "GITLEAKS")}
+    gatec_before = (gatec.HYVV_SRC, gatec.HAS_HYVV, gatec.GITLEAKS)
+    try:
+        _install_gatec_dependencies()
+        gatec.HYVV_SRC = os.environ.get("HYVV_SRC") or gatec.HYVV_SRC
+        gatec.HAS_HYVV = bool(gatec.HYVV_SRC) and (Path(gatec.HYVV_SRC) / "provisioning.py").exists()
+        gatec.GITLEAKS = os.environ.get("GITLEAKS") or gatec.GITLEAKS
+        yield
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+        gatec.HYVV_SRC, gatec.HAS_HYVV, gatec.GITLEAKS = gatec_before
 
 
 class ScriptedWorker:

@@ -16,6 +16,7 @@ import pytest
 
 from bundlebees_plugin import leases, tdd
 from bundlebees_plugin import contract as acdd
+from tests.fakes import require_sandbox_interpreter
 from tests.test_cli_acdd import (
     APPROVED_TEST, CID, TEST_ID, _contract, _ctx, _frozen, _invoke, _repo, _write,
 )
@@ -92,6 +93,7 @@ def test_tdd_not_applicable_contracts_need_no_collection(tmp_path, capsys):
 
 
 def test_a_syntax_error_in_an_approved_test_is_refused(tmp_path, capsys):
+    require_sandbox_interpreter()
     repo, base = _repo(tmp_path, "def test_broken(:\n    pass\n")
     tests = [APPROVED_TEST + "::test_broken"]
     rc, out = _freeze(tmp_path, _contract(base, acceptance_criteria=_criteria(tests)),
@@ -102,6 +104,7 @@ def test_a_syntax_error_in_an_approved_test_is_refused(tmp_path, capsys):
 
 
 def test_freeze_refuses_more_than_the_collected_id_limit(tmp_path, monkeypatch, capsys):
+    require_sandbox_interpreter()
     from bundlebees_plugin import acdd_cli
 
     repo, base = _repo(tmp_path)

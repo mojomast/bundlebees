@@ -309,6 +309,124 @@ class VerticalSlice(unittest.TestCase):
         self.assertEqual(launcher.posts, [])
 
 
+class ProvisionBindRecovery(unittest.TestCase):
+    """The provisioning dead-end seen on jobs acceptance-20261115d and 15f.
+
+    A reconcile pass whose POST never landed parked the intent at state
+    "uncertain" with detail "reconciled without a POST" forever, so dispatch was
+    refused even though the host itself had answered receipt_unknown - which is
+    proof no record exists under the idempotency key, i.e. the POST never
+    arrived. A first-POST refusal, meanwhile, propagated with the persisted
+    intent carrying no trace of why. These tests pin both repairs.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.sha = "b" * 40
+        self.contract_sha = "c" * 64
+        from bundlebees_plugin import provision_bind
+
+        self.provision_bind = provision_bind
+        jobs.record_authorization(
+            self.state, job_id="job_recovery", statement="Execute the smoke task in the disposable repo",
+            repo="mojomast/smoke-real", base_rev=self.sha, scope=["smoke/answer.py"],
+            bees=1, wall_clock_s=1800, require_tty=False, interactive=False, by="reviewer",
+        )
+        jobs.create_job(self.state, job_id="job_recovery", summary="provision then dispatch", tasks=[{
+            "task_id": "T1",
+            "objective": "Create smoke/answer.py returning 42",
+            "assigned_files": ["smoke/answer.py"],
+            "lease": ["smoke/answer.py"],
+            "acceptance": {"criteria": ["answer() == 42"],
+                           "tests": ["tests/test_smoke.py::test_answer_is_42"],
+                           "commands": ["python -m pytest -q"]},
+            "provision": {"repo": "mojomast/smoke-real", "source_rev": self.sha, "host": "worker-1",
+                          "profile": "smoke", "project": "smoke-real", "contract_sha256": self.contract_sha},
+        }])
+
+    def _receipt(self):
+        return P.Receipt(schema=P.CAPABILITY_SCHEMA, status="ready", project="smoke-real",
+                         repo="mojomast/smoke-real", resolved_revision=self.sha,
+                         workspace=str(self.tmp / "workspaces" / "smoke-real"),
+                         profile="smoke", host="worker-1")
+
+    def _seed_preparing(self):
+        key = self.provision_bind.stable_key("job_recovery", "T1")
+        job = jobs.load_job(self.state, "job_recovery")
+        job["tasks"][0]["provisioning"] = {
+            "state": "preparing", "key": key, "attempts": 1,
+            "request": {"repo": "mojomast/smoke-real", "source_rev": self.sha, "profile": "smoke",
+                        "project": "smoke-real", "job_id": "job_recovery", "idempotency_key": key},
+        }
+        jobs.save_job(self.state, job)
+        return key, job
+
+    def test_a_reconcile_the_host_answers_receipt_unknown_recovers_with_one_repost(self):
+        key, job = self._seed_preparing()
+        provisioner = FakeProvisioner(self._receipt())
+
+        outcome = self.provision_bind.advance(self.state, job, provisioner=provisioner)
+
+        self.assertEqual(len(provisioner.posts), 1)
+        self.assertEqual(provisioner.posts[0]["idempotency_key"], key)
+        self.assertEqual(provisioner.posts[0]["project"], "smoke-real")
+        self.assertEqual(provisioner.lookups, [key])
+        task = jobs.load_job(self.state, "job_recovery")["tasks"][0]
+        self.assertEqual(task["provisioning"]["state"], "bound")
+        self.assertEqual(task["provisioning"]["attempts"], 2)
+        self.assertEqual(task["binding"]["project"], "smoke-real")
+        self.assertEqual(len(task["binding"]["receipt_digest"]), 64)
+        self.assertFalse(outcome["blocked"])
+
+    def test_a_repost_refusal_parks_the_intent_at_a_terminal_denied_state(self):
+        key, job = self._seed_preparing()
+        provisioner = FakeProvisioner(
+            self._receipt(),
+            post_error=P.ProvisionError("provision_failed",
+                                        "the host refused provisioning with 400: profile_not_enrolled"),
+        )
+        self.provision_bind.advance(self.state, job, provisioner=provisioner)
+
+        task = jobs.load_job(self.state, "job_recovery")["tasks"][0]
+        self.assertEqual(task["provisioning"]["state"], "denied")
+        self.assertEqual(task["provisioning"]["detail"],
+                         "re-POST refused: provision_failed: the host refused provisioning with 400: profile_not_enrolled")
+        self.assertEqual(task["provisioning"]["attempts"], 2)
+        self.assertIsNone(task["binding"])
+
+        second_provisioner = FakeProvisioner(self._receipt())
+        second = self.provision_bind.advance(self.state, jobs.load_job(self.state, "job_recovery"),
+                                             provisioner=second_provisioner)
+        self.assertEqual(second_provisioner.posts, [])
+        self.assertEqual(len(second["outcomes"]), 1)
+        self.assertEqual(second["outcomes"][0]["state"], "denied")
+        self.assertIn("re-POST refused: provision_failed:", second["outcomes"][0]["detail"])
+        self.assertEqual(jobs.load_job(self.state, "job_recovery")["tasks"][0]["provisioning"]["attempts"], 2)
+
+    def test_a_first_post_refusal_is_persisted_on_the_intent_before_it_propagates(self):
+        provisioner = FakeProvisioner(
+            self._receipt(),
+            post_error=P.ProvisionError("provision_failed",
+                                        "the host refused provisioning with 400: profile_not_enrolled"),
+        )
+        job = jobs.load_job(self.state, "job_recovery")
+
+        with self.assertRaises(P.ProvisionError):
+            self.provision_bind.advance(self.state, job, provisioner=provisioner)
+
+        self.assertEqual(len(provisioner.posts), 1)
+        task = jobs.load_job(self.state, "job_recovery")["tasks"][0]
+        self.assertEqual(task["provisioning"]["state"], "denied")
+        self.assertEqual(task["provisioning"]["attempts"], 1)
+        detail = str(task["provisioning"].get("detail") or "")
+        self.assertIn("post refused: provision_failed:", detail)
+        self.assertIn("the host refused provisioning with 400: profile_not_enrolled", detail)
+
+
 class FakeLauncher:
     def __init__(self):
         self.posts: list[dict] = []
@@ -336,6 +454,39 @@ class FakeLauncher:
     @property
     def idempotent(self):
         return False
+
+
+class FakeProvisioner:
+    """A host journal behind the WorkerProvisioner seam.
+
+    provision() records the receipt under the request's idempotency key; an
+    empty journal makes the read-only lookup answer receipt_unknown, exactly
+    like a host that never received the POST.
+    """
+
+    def __init__(self, receipt, post_error=None):
+        self.receipt = receipt
+        self.post_error = post_error
+        self.posts: list[dict] = []
+        self.lookups: list[str] = []
+        self._journal: dict[str, P.Receipt] = {}
+
+    def capabilities(self):
+        raise AssertionError("advance() must never need capabilities")
+
+    def provision(self, request):
+        self.posts.append(dict(request))
+        if self.post_error is not None:
+            raise self.post_error
+        self._journal[str(request.get("idempotency_key"))] = self.receipt
+        return self.receipt
+
+    def authoritative_receipt(self, key, **_):
+        self.lookups.append(str(key))
+        found = self._journal.get(str(key))
+        if found is None:
+            raise P.ProvisionError("receipt_unknown", f"the host has no record for {key}")
+        return found
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import sys
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,6 +25,21 @@ class FakeClient:
 
 
 class FactoryTests(unittest.TestCase):
+    def test_authenticated_client_keeps_the_host_quota_error(self):
+        from bundlebees_plugin.client import ClientError
+        class FullHost(FakeClient):
+            def request_json(self, method, path, payload=None):
+                if path == P.CAPABILITY_PATH:
+                    return super().request_json(method, path, payload)
+                error = ClientError("profile smoke is full", status=409)
+                error.upstream_code = "quota_exhausted"
+                raise error
+        provisioner = P.from_client({"provisioning_enabled": True}, FullHost())
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            provisioner.provision({"repo": "mojomast/smoke-real", "source_rev": "a" * 40,
+                                   "profile": "smoke", "project": "smoke-real", "job_id": "j", "idempotency_key": "k"})
+        self.assertEqual(caught.exception.code, "quota_exhausted")
+
     def test_a_disabled_config_yields_no_provisioner(self):
         self.assertIsNone(P.from_client({"provisioning": {"enabled": False}}, FakeClient()))
         self.assertIsNone(P.from_client({}, FakeClient()))
@@ -65,7 +81,7 @@ class CmdJobWiringTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(job_cli, "tick", original))
 
         with TemporaryDirectory() as tmp:
-            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=None,
+            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=sys.executable,
                              state_dir=tmp, note=None)
             sentinel = object()
             code = job_cli.cmd_job(None, args, state_dir=Path(tmp), client_factory=lambda: FakeClient(),
@@ -85,7 +101,7 @@ class CmdJobWiringTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(job_cli, "tick", original))
 
         with TemporaryDirectory() as tmp:
-            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=None,
+            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=sys.executable,
                              state_dir=tmp, note=None)
             job_cli.cmd_job(None, args, state_dir=Path(tmp), client_factory=lambda: FakeClient())
         self.assertIsNone(captured.get("provisioner"))

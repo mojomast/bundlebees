@@ -330,6 +330,15 @@ def _environment_policy(runner: TestRunner | None) -> dict[str, Any]:
         policy["runner"] = str(
             getattr(runner, "__qualname__", type(runner).__name__)
         )
+        identity = getattr(runner, "receipt_identity", None)
+        if callable(identity):
+            try:
+                policy["execution"] = identity()
+            except sandbox.SandboxUnavailable as exc:
+                raise VerifyError(exc.code, exc.error, exc.fix) from exc
+            except OSError as exc:
+                raise VerifyError("environment_unavailable", "configured verifier inputs cannot be read",
+                                  "Repair the interpreter/cache before verification.") from exc
     return policy
 
 
@@ -510,7 +519,18 @@ def _assert_sandbox_usable(
 ) -> None:
     """Re-check the sandbox policy even when a receipt supplies the result."""
 
-    if runner is not None or allow_unsafe_local:
+    if runner is not None:
+        check = getattr(runner, "check_available", None)
+        if callable(check):
+            try:
+                check()
+            except sandbox.SandboxUnavailable as exc:
+                raise VerifyError(exc.code, exc.error, exc.fix) from exc
+            except ValueError as exc:
+                raise VerifyError("invalid_argument", "invalid configured sandbox backend",
+                                  "Use a supported verify_isolation setting.") from exc
+        return
+    if allow_unsafe_local:
         return
     try:
         chosen = sandbox.detect_backend(

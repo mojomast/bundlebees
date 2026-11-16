@@ -290,6 +290,10 @@ CI pins workflow `9c69d3a987ea9544a77cdd9b5a259904eb36f006` and hyvv
 when either is absent. At runtime, a missing workflow checkout refuses packet admission and every recovery
 operation (`recovery_protocol_unavailable`); there is no local fallback validator.
 
+Locally, one command clones/updates both pinned checkouts (plus gitleaks) under
+`~/.rizzstack/pinned/` and prints the export lines: `sh scripts/setup-pinned-sources.sh`
+(see [docs/pinned-sources.md](docs/pinned-sources.md)).
+
 ### Inspecting and verifying RETURN evidence
 
 `job report` writes two files under `<state_dir>/jobs/<job_id>/`:
@@ -504,6 +508,11 @@ Secret (Hermes secrets, not config):
 
 ```bash
 python -m pip install -e '.[dev]'
+
+# Wire up the pinned sources once (idempotent: clones/updates workflow + hyvv
+# at the pinned revisions and gitleaks under ~/.rizzstack/pinned, then prints
+# the export lines — see docs/pinned-sources.md):
+eval "$(sh scripts/setup-pinned-sources.sh)"
 
 # Deterministic suite. CI pins both protocol checkouts by commit and makes them mandatory:
 #   workflow 9c69d3a987ea9544a77cdd9b5a259904eb36f006  (reviewed protocol revision)

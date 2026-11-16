@@ -174,6 +174,7 @@ def _build_parser(parser: Any) -> Any:
     verify.add_argument(
         "--tests",
         nargs="+",
+        action="extend",
         default=None,
         help="Test targets to run. Defaults to the brief's named tests.",
     )
@@ -1071,21 +1072,9 @@ def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) 
 
 
 def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
-    backend = str(config.get("verify_isolation") or "auto").strip().lower()
-    try:
-        timeout = int(config.get("verify_timeout_s") or 900)
-    except (TypeError, ValueError):
-        timeout = 900
-    tiktoken_cache = str(config.get("sandbox_tiktoken_cache") or "").strip() or None
-    return {
-        "backend": backend,
-        "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
-        "allow_weak": sandbox.weak_override_enabled(
-            config_flag(config.get("verify_allow_weak_unshare"), False)
-        ),
-        "timeout": max(30, min(timeout, 7200)),
-        "tiktoken_cache": tiktoken_cache,
-    }
+    from .execution import sandbox_options
+
+    return sandbox_options(config)
 
 
 def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
@@ -1372,7 +1361,10 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
     files = [str(item.get("path")) for item in (patch_block.get("files") or []) if item.get("path")]
     source = str(((envelope.get("source") or {}).get("repo_rev")) or "")
     tests = list(getattr(args, "tests", None) or [])
-    gitleaks = shutil.which("gitleaks")
+    from .execution import SandboxRunner, scanner
+
+    config = _config(ctx)
+    gitleaks = scanner(config)
 
     try:
         record = verify_local.verify_and_commit(
@@ -1384,6 +1376,7 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
             base_rev=source,
             tests=tests,
             gitleaks=gitleaks,
+            runner=SandboxRunner(config),
         )
     except verify_local.VerifyError as exc:
         raise CliError(exc.code, exc.message, exc.fix) from exc

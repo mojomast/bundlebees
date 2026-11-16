@@ -20,6 +20,7 @@ import json
 from bundlebees_plugin import cli, metrics
 from tests.test_cli_acdd import (ATTEMPT_ID, BRANCH, CID, GOOD_PATCH, FakeClient, _ctx, _frozen, _git, _invoke,
                                  _lease, _records, _repo, _result, _write)
+from tests.fakes import require_sandbox_interpreter
 from tests.test_self_integration import _integrate, _verified
 
 
@@ -134,6 +135,7 @@ def test_integration_record_fails_when_an_approved_test_file_is_missing(tmp_path
 
 
 def test_red_refuses_test_references_pytest_did_not_collect(tmp_path, capsys):
+    require_sandbox_interpreter()
     repo, base = _repo(tmp_path)
     state = tmp_path / "state"
     frozen = _frozen(base, acceptance_criteria=[

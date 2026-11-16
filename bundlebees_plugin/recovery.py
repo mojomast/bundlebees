@@ -19,6 +19,15 @@ The protocol is owned by the pinned workflow checkout, not by this module:
   codes (``test_unresolved`` and its synonyms become ``test_not_found``). The
   original observation is preserved verbatim in the evidence artefact and is
   named in the rationale.
+* an integration failure is attributed causally (:func:`attribute_regressions`):
+  each failing test selector is correlated with the attempts whose leases cover
+  the failing file. One attempt covering every failing file makes it the
+  offending attempt — the request is then recorded against that attempt's task
+  and its rationale and outstanding question name the cause. Ambiguous evidence
+  (two attempts' leases cover a file, or none does) names no attempt and says
+  so explicitly instead of guessing. Attribution is lease-based, so it survives
+  supersession: a superseded attempt is not a candidate, and the named attempt
+  is the one whose lease covered the failing file.
 * the envelope comes from the sealed authorization alone: attempts, corrections,
   the exact replacement selectors, the file and test scope a correction may
   touch, and the human gates that stay in force are all named there. A job or
@@ -84,6 +93,7 @@ from typing import Any, Mapping, Sequence
 
 from . import contract as acdd
 from . import job as jobs
+from . import leases
 from .contract import ContractError
 
 #: The one protocol version this module emits and accepts.
@@ -184,6 +194,7 @@ _CODE_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     # environment: the worker host lacked a tool, dependency or route
     ("environment", "toolchain_missing", (
         "toolchain_missing", "security_tool_missing", "tool_missing", "python_missing",
+        "sandbox_interpreter_hidden", "unsafe_cache_dir",
         "git_error", "permission_denied",
     )),
     ("environment", "dependency_unavailable", (
@@ -808,6 +819,12 @@ def _test_ids_in(text: str) -> list[str]:
     return found
 
 
+def test_ids_in(text: str) -> list[str]:
+    """Every ``path/to/test.py::Test::test_x`` shaped id mentioned in *text*."""
+
+    return _test_ids_in(text)
+
+
 def contract_tests(contract: Mapping[str, Any] | None) -> tuple[set[str], set[str]]:
     """The declared test ids and the approved test files of a frozen contract."""
 
@@ -831,6 +848,228 @@ def contract_tests(contract: Mapping[str, Any] | None) -> tuple[set[str], set[st
 
 def _article(name: str) -> str:
     return "an" if name[:1] in "aeiou" else "a"
+
+
+def _listing(items: Any) -> str:
+    """``["a.py", "b.py"]`` -> ``"a.py and b.py"``; empty -> ``"(none)"``."""
+
+    found = [str(item) for item in (items or []) if str(item or "").strip()]
+    if not found:
+        return "(none)"
+    if len(found) == 1:
+        return found[0]
+    return ", ".join(found[:-1]) + " and " + found[-1]
+
+
+def _wave_attempts(job: Mapping[str, Any]) -> list[str]:
+    """The current lease holders: each verified task's latest attempt.
+
+    A superseded attempt is never a candidate: its lease may still cover the
+    file, but it is not the patch the wave integrated. Attribution names the
+    attempt that holds the lease *now*, so a supersession does not turn the
+    evidence ambiguous or name a patch that is no longer in play.
+    """
+
+    found: list[str] = []
+    for task in job.get("tasks") or []:
+        if not isinstance(task, Mapping):
+            continue
+        if str(task.get("state") or "") not in {"verified", "integrating"}:
+            continue
+        attempt = (task.get("attempts") or [None])[-1]
+        candidate = str(attempt or "").strip()
+        if candidate and candidate not in found:
+            found.append(candidate)
+    return found
+
+
+def _lease_coverage(
+    state_dir: Path, attempts: Sequence[str]
+) -> tuple[dict[str, set[str]], list[str]]:
+    """The files each attempt's verified lease covers, and the unreadable leases.
+
+    The lease is the authority on what an attempt was allowed to touch, and
+    verification proved the patch touched exactly its lease. A lease that
+    cannot be read is not skipped silently: an attribution built while a lease
+    is unreadable would be a guess about an attempt the evidence cannot see.
+    """
+
+    covered: dict[str, set[str]] = {}
+    unresolved: list[str] = []
+    for attempt in attempts:
+        try:
+            record = leases.load_lease(Path(state_dir), attempt)
+            covered[attempt] = set(leases.lease_files(record))
+        except leases.LeaseError:
+            unresolved.append(attempt)
+    return covered, unresolved
+
+
+def attribute_regressions(
+    state_dir: Path,
+    job: Mapping[str, Any],
+    *,
+    failed_tests: Sequence[str],
+    attempts: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Name the offending attempt of a failed wave, or say why none can be named.
+
+    Causal regression attribution: the failing test selectors of the combined
+    suite are correlated with the attempts whose leases cover the failing
+    files. An attempt is the offender only when *every* failing file is covered
+    by exactly one attempt and that attempt is the same for all of them. When
+    two attempts' leases cover a file the evidence is ambiguous and nothing is
+    guessed; when no attempt's lease covers a file (a pre-existing or
+    environmental failure) the record says so too.
+
+    ``attempts`` are the attempts the wave integrated — the current lease
+    holders. Without them the job's verified tasks supply the candidates, which
+    is the same set: attribution survives supersession because a superseded
+    attempt is no longer a candidate, and the named attempt is the one whose
+    lease covered the failing file.
+    """
+
+    selectors = sorted({
+        str(item).strip()
+        for item in (failed_tests or [])
+        if isinstance(item, str) and str(item).strip()
+    })
+    files = sorted({selector.split("::", 1)[0] for selector in selectors})
+    if not selectors:
+        return {
+            "attributed": False,
+            "attempt_id": "",
+            "tests": [],
+            "files": [],
+            "candidates": {},
+            "ambiguous": [],
+            "uncovered": [],
+            "unresolved_leases": [],
+            "reason": "the suite evidence names no failing test",
+        }
+    if attempts is None:
+        attempts = _wave_attempts(job)
+    ids: list[str] = []
+    for attempt in attempts:
+        candidate = str(attempt or "").strip()
+        if candidate and candidate not in ids:
+            ids.append(candidate)
+    covered, unresolved = _lease_coverage(state_dir, ids)
+    candidates: dict[str, list[str]] = {
+        name: sorted(attempt for attempt in ids if name in covered.get(attempt, set()))
+        for name in files
+    }
+    ambiguous = sorted(name for name, found in candidates.items() if len(found) > 1)
+    uncovered = sorted(name for name, found in candidates.items() if not found)
+    unique = {found[0] for found in candidates.values() if len(found) == 1}
+    attributed = bool(
+        ids and not ambiguous and not uncovered and not unresolved and len(unique) == 1
+    )
+    attempt_id = next(iter(unique)) if attributed else ""
+    notes: list[str] = []
+    for name in ambiguous:
+        notes.append(
+            f"{name} is covered by the leases of {_listing(candidates[name])}, so the "
+            "offending attempt is ambiguous"
+        )
+    for name in uncovered:
+        notes.append(f"no attempt in the wave has a lease covering {name}")
+    for attempt in unresolved:
+        notes.append(f"the lease for {attempt} could not be verified")
+    if not notes and len(unique) > 1:
+        notes.append(
+            "the failing files are covered by different attempts ("
+            + ", ".join(sorted(unique))
+            + "), so no single offending attempt is named"
+        )
+    return {
+        "attributed": attributed,
+        "attempt_id": attempt_id,
+        "tests": selectors if attributed else [],
+        "files": files,
+        "candidates": candidates,
+        "ambiguous": ambiguous,
+        "uncovered": uncovered,
+        "unresolved_leases": unresolved,
+        "reason": "" if attributed else "; ".join(notes),
+    }
+
+
+def _is_integration_record(record: Mapping[str, Any]) -> bool:
+    """True when a failure record observes an integration-class code."""
+
+    declared = str(record.get("code") or "").strip().lower()
+    if declared and class_for_code(declared) == "integration":
+        return True
+    return any(class_for_code(token) == "integration" for token in _tokens(record))
+
+
+def _integration_attribution(
+    state_dir: Path, job: Mapping[str, Any], record: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The attribution an integration record carries, computes, or ``None``.
+
+    A record produced by ``integrate_job`` carries the attribution it already
+    computed. A bare record that only names the failing tests still gets an
+    attribution, recomputed from the same leases, so the causal verdict does
+    not depend on which caller recorded the failure.
+    """
+
+    carried = record.get("attribution")
+    if isinstance(carried, Mapping) and carried:
+        return dict(carried)
+    failed = record.get("failed_tests")
+    if isinstance(failed, (list, tuple)) and failed:
+        attempts = record.get("attempts")
+        return attribute_regressions(
+            Path(state_dir),
+            job,
+            failed_tests=[str(item) for item in failed],
+            attempts=(
+                [str(item) for item in attempts]
+                if isinstance(attempts, (list, tuple))
+                else None
+            ),
+        )
+    return None
+
+
+def _task_for_attempt(job: Mapping[str, Any], attempt_id: str) -> Mapping[str, Any] | None:
+    """The task whose attempt ledger holds ``attempt_id``, or ``None``."""
+
+    for task in job.get("tasks") or []:
+        if not isinstance(task, Mapping):
+            continue
+        ledger = [str(item) for item in task.get("attempts") or []]
+        if attempt_id in ledger:
+            return task
+    return None
+
+
+def _classified_with_attribution(
+    classified: Mapping[str, Any], attribution: Mapping[str, Any]
+) -> dict[str, Any]:
+    """State the causal verdict in the classified failure's rationale, explicitly.
+
+    An attributed failure names the offending attempt and its failing tests;
+    an ambiguous one says that no attempt is named and why. The rationale is
+    the request's own words about the cause, so the decider reads the cause,
+    not just the failing suite.
+    """
+
+    base = str(classified.get("rationale") or "").strip()
+    if attribution.get("attributed"):
+        cause = (
+            f" The offending attempt is {attribution.get('attempt_id')}: its lease covered "
+            f"{_listing(attribution.get('files'))} and the combined suite failed on "
+            f"{_listing(attribution.get('tests'))}."
+        )
+    else:
+        reason = str(attribution.get("reason") or "").strip() or (
+            "the evidence is inconclusive"
+        )
+        cause = f" No offending attempt is named: {reason}."
+    return dict(classified, rationale=_text(f"{base}{cause}"))
 
 
 def _failure(failure_class: str, code: str, evidence: str, rationale: str) -> dict[str, Any]:
@@ -1578,7 +1817,12 @@ def _admit_request(state_dir: Path, request: Mapping[str, Any], *, module: Any =
 
 
 def _conflicted_paths(record: Any) -> list[str]:
-    """The conflicted paths a record names, for a ``conflict`` evidence entry."""
+    """The conflicted paths a record names, for a ``conflict`` evidence entry.
+
+    A combined-suite failure names no conflicted merge path; its failing test
+    files are the paths the wave broke, so they are recorded when the record
+    carries them. A record with neither is not distinct repair evidence.
+    """
 
     found: set[str] = set()
 
@@ -1599,6 +1843,9 @@ def _conflicted_paths(record: Any) -> list[str]:
         if isinstance(inner, Mapping):
             for key in ("paths", "conflicted_paths", "conflicts"):
                 add(inner.get(key))
+        for selector in record.get("failed_tests") or []:
+            if isinstance(selector, str) and selector.strip():
+                found.add(selector.strip().split("::", 1)[0])
     return sorted(found)
 
 
@@ -1657,19 +1904,36 @@ def _evidence_entry(
 
 
 def _outstanding_question(task_id: str, failure: Mapping[str, Any], envelope: Mapping[str, Any],
-                          remaining: int, can_supersede: bool) -> str:
+                          remaining: int, can_supersede: bool,
+                          attribution: Mapping[str, Any] | None = None) -> str:
     options: list[str] = []
     if can_supersede:
         options.append("supersede the same frozen contract once with an authorised corrected test selection")
     if str(failure.get("class")) not in _NO_DISPATCH:
         options.append(f"retry once within the remaining budget ({remaining} attempt(s) left)")
     options.append("escalate to a human")
-    return (
+    question = (
         f"Task {task_id} was rejected as {_article(str(failure.get('class')))} {failure.get('class')} failure "
-        f"({failure.get('code')}). Decide whether to {'; '.join(options)}. "
+        f"({failure.get('code')})."
+    )
+    if isinstance(attribution, Mapping):
+        if attribution.get("attributed"):
+            question += (
+                f" The offending attempt is {attribution.get('attempt_id')}: its lease covered "
+                f"{_listing(attribution.get('files'))} and the combined suite failed on "
+                f"{_listing(attribution.get('tests'))}."
+            )
+        else:
+            reason = str(attribution.get("reason") or "").strip() or (
+                "the evidence is inconclusive"
+            )
+            question += f" No offending attempt is named: {reason}."
+    question += (
+        f" Decide whether to {'; '.join(options)}. "
         "Record the decision with `bundlebees job recover --job-id ... --decision-file ...`; "
         "no corrective attempt is dispatched until a validated decision exists."
     )
+    return question
 
 
 def build_request(
@@ -1686,14 +1950,32 @@ def build_request(
     Repeated calls for the same attempt and canonical code return the request
     that already exists; a different failure for the same attempt gets a new
     numbered request. Nothing here changes the job or dispatches anything.
+
+    An integration failure is attributed before the request is written: the
+    failing test selectors are correlated with the attempts whose leases cover
+    the failing files, and an attributed request is recorded against the
+    offending attempt's task, with the cause named in the rationale and the
+    outstanding question. Ambiguous evidence names no attempt and says so.
     """
 
     state = Path(state_dir)
     job_id = _safe_id(job.get("job_id"), "job_id")
-    task_id = _safe_id(task.get("task_id"), "task_id")
 
     # Fail closed before writing anything: no validator, no request.
     module = protocol_validator()
+
+    # Causal attribution for an integration failure: which worker's patch caused
+    # the rejection. The offending attempt is the one whose lease covered the
+    # failing file, so an attributed request is recorded against the attempt
+    # that caused the failure, not against whichever task the caller named.
+    attribution: dict[str, Any] | None = None
+    if isinstance(failure, Mapping) and _is_integration_record(failure):
+        attribution = _integration_attribution(state, job, failure)
+        if attribution and attribution.get("attributed") and attribution.get("attempt_id"):
+            offender = _task_for_attempt(job, str(attribution["attempt_id"]))
+            if offender is not None:
+                task = offender
+    task_id = _safe_id(task.get("task_id"), "task_id")
 
     contract = task.get("contract") if isinstance(task.get("contract"), Mapping) else None
     contract_block = _contract_block(task)
@@ -1721,6 +2003,8 @@ def build_request(
         )
 
     classified = _normalise_failure(failure, contract)
+    if attribution is not None:
+        classified = _classified_with_attribution(classified, attribution)
     envelope = envelope_for(job, task, authorization)
     permitted = supersession_permitted(job, task, classified, envelope)
     if permitted and not _correction_in_scope(task, envelope):
@@ -1753,7 +2037,12 @@ def build_request(
         int(final_envelope["max_attempts_per_task"])
         - len([item for item in task.get("attempts") or [] if item]),
     )
-    evidence = _evidence_entry(state, job_id, task_id, number, classified, failure)
+    # The evidence artefact preserves the raw record verbatim, so the causal
+    # attribution survives with it: the request references it by digest.
+    evidence_raw: Any = failure
+    if attribution is not None and isinstance(failure, Mapping) and "attribution" not in failure:
+        evidence_raw = dict(failure, attribution=attribution)
+    evidence = _evidence_entry(state, job_id, task_id, number, classified, evidence_raw)
     body: dict[str, Any] = {
         "schema": SCHEMA,
         "request_id": request_id_for(job_id, task_id, number),
@@ -1771,7 +2060,7 @@ def build_request(
         "supersession_permitted": bool(permitted),
         "envelope": final_envelope,
         "outstanding_question": _outstanding_question(
-            task_id, classified, final_envelope, remaining, permitted
+            task_id, classified, final_envelope, remaining, permitted, attribution=attribution
         ),
     }
     body["request_digest"] = request_digest(body)
@@ -2782,6 +3071,7 @@ __all__ = [
     "SCHEMA",
     "SELECTION_CODES",
     "apply_ready_decisions",
+    "attribute_regressions",
     "attributed",
     "build_request",
     "canonical_bytes",
@@ -2821,5 +3111,6 @@ __all__ = [
     "summarize",
     "supersession_permitted",
     "test_authorized",
+    "test_ids_in",
     "workflow_src",
 ]
