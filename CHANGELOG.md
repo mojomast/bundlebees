@@ -15,6 +15,7 @@ one pull request.
 
 ### Added
 
+- **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
 - **integrated_not_pr_merged detection:** the read-only Git/PR observer now
   classifies a PR whose exact head is already an ancestor of authoritative main
   while the PR metadata still reports open, and the reconciliation report stops

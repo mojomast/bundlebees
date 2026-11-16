@@ -140,6 +140,16 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "bans re-integration",
         ),
     },
+    {
+        # feat/cli-attempts-status: read-only attempts/status CLI subcommands
+        # for the observatory fleet view (M1 packet 1).
+        "pr": 52,
+        "name": "attempts and status CLI",
+        "keywords": (
+            "attempts and status CLI",
+            "bee cap",
+        ),
+    },
 )
 
 
