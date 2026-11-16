@@ -460,6 +460,10 @@ PYTHON_ENV = "BUNDLEBEES_VERIFY_PYTHON"
 _SANDBOX_PYTHON_DIR = ".bundlebees-python"
 #: Where a staged tiktoken cache lives inside the sandbox copy.
 _SANDBOX_TIKTOKEN_DIR = ".bundlebees-tiktoken"
+#: Where a served lease payload lives inside the sandbox copy.
+_SANDBOX_PAYLOAD_DIR = ".bundlebees-payload"
+#: Shape of a lease-payload entry name (it becomes an environment variable).
+PAYLOAD_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 #: Backends whose wrapper remaps ``$HOME``, so a path inside the coordinator home does not exist.
 HOME_HIDING_BACKENDS: tuple[str, ...] = ("firejail",)
 #: Filesystem roots ``firejail --private-tmp`` replaces with a fresh tmpfs.
@@ -470,6 +474,10 @@ _FIX_PYTHON = (
     "Set verify_python (or BUNDLEBEES_VERIFY_PYTHON) to an absolute interpreter path outside the "
     "coordinator home that has pytest installed (for example a venv under /var/tmp), or use "
     "verify_isolation=bwrap on a host that allows unprivileged user namespaces."
+)
+_FIX_PAYLOAD = (
+    "Point the lease payload's variable at an existing checkout directory "
+    "(see docs/pinned-sources.md), or unset it so nothing is served."
 )
 
 
@@ -595,6 +603,60 @@ def stage_tiktoken_cache(copy_dir: Path, cache: Path) -> str:
         shutil.rmtree(destination)
     shutil.copytree(cache, destination, symlinks=True)
     return f"./{_SANDBOX_TIKTOKEN_DIR}"
+
+
+#: Directory names a served lease payload leaves out (git history, caches, virtualenvs).
+PAYLOAD_IGNORED_NAMES: frozenset[str] = _IGNORED_COPY_NAMES
+
+
+def stage_payload(copy_dir: Path, payload: Mapping[str, Path | str]) -> dict[str, str]:
+    """Copy the lease payload's sources into the sandbox copy; return the relative paths.
+
+    This is the serving half of the lease payload: each named source tree is staged into the
+    sandbox copy exactly like a staged interpreter or tiktoken cache, and the returned paths are
+    **relative** (``./.bundlebees-payload/<name>``) because the jail's cwd is always the copy
+    while the copy's host path does not exist inside the jail. A wrapper that masks the
+    coordinator home (``firejail --private=<copy>``) and the masked tmp roots
+    (``--private-tmp``) leaves a payload addressed at its absolute host path unreachable inside,
+    so the served path never names a host location and the host checkout stays hidden.
+
+    Each entry name must be an environment-variable-shaped identifier (it becomes one in the
+    child env) and each source must be an existing directory. ``.git``, caches and virtualenvs
+    are left out, so the payload serves the checkout's files, not its history. Symlinks are
+    copied, never followed. The staging is disposable and deleted with the rest of the sandbox.
+    """
+    if not payload:
+        raise ValueError("an empty payload serves nothing; omit it instead")
+    names = list(payload)
+    for name in names:
+        if not PAYLOAD_NAME_RE.fullmatch(str(name)):
+            raise ValueError(f"invalid payload name: {name!r}")
+        source = Path(payload[name]).expanduser()
+        try:
+            resolved = source.resolve()
+        except OSError as exc:
+            raise SandboxUnavailable(
+                f"payload source {name} cannot be resolved: {exc}", _FIX_PAYLOAD,
+                code="payload_unservable",
+            ) from exc
+        if not resolved.is_dir():
+            raise SandboxUnavailable(
+                f"payload source {name} is not an existing directory: {resolved}",
+                _FIX_PAYLOAD,
+                code="payload_unservable",
+            )
+    served: dict[str, str] = {}
+    root = Path(copy_dir) / _SANDBOX_PAYLOAD_DIR
+    for name in names:
+        source = Path(payload[name]).expanduser().resolve()
+        destination = root / str(name)
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
+        elif destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination, symlinks=True, ignore=_ignore_copy)
+        served[str(name)] = f"./{_SANDBOX_PAYLOAD_DIR}/{name}"
+    return served
 
 
 def _is_coordinator_interpreter(path: str) -> bool:
@@ -727,6 +789,7 @@ def run_in_sandbox(
     tiktoken_cache: Path | str | None = None,
     collect_file: str | None = None,
     python: str | None = None,
+    payload: Mapping[str, Path | str] | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
@@ -745,6 +808,14 @@ def run_in_sandbox(
     ``python`` (``verify_python``) starts the child with an interpreter that
     exists inside the sandbox; a backend that hides the coordinator home refuses
     an interpreter living in it instead of failing inside the wrapper.
+
+    ``payload`` is the lease payload: a mapping of environment-variable names to
+    coordinator-side source directories (the pinned ``WORKFLOW_SRC`` /
+    ``HYVV_SRC`` checkouts). Every entry is staged into the sandbox copy by
+    :func:`stage_payload` and the child env names it by the returned relative
+    path, so the child consumes the served payload through its cwd while the
+    host checkout's own path stays out of the child env and, on a wrapper that
+    masks it, nonexistent inside the jail.
     """
     cache = _resolve_tiktoken_cache(tiktoken_cache, backend=backend)
     weak_ok = weak_override_enabled(allow_weak)
@@ -817,6 +888,9 @@ def run_in_sandbox(
             env = sandbox_env(home, tmp)
             if cache is not None:
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
+
+        if payload:
+            env.update(stage_payload(copy_dir, payload))
 
         command_argv = _replace_evidence(argv, evidence_inside)
         if command_argv and _is_coordinator_interpreter(command_argv[0]):
