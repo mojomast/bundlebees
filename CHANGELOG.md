@@ -87,6 +87,7 @@ one pull request.
   credential route a dispatch would take, starting no attempt (the fifth
   registered tool).
 
+- **Launcher build-identity evidence tiers:** the doctor's launcher build-identity check reports the running launcher's identity in three evidence tiers — receipt-backed, version-string-only, unavailable — and classifies one read-only `GET /v1/provision/capabilities` through the already-authenticated client. A version string without a deployment receipt is always flagged as not deployment evidence (owner directive, 2026-11-14); the capabilities classification never upgrades the identity tier. See `docs/doctor.md`.
 ### Fixed
 
 - `return_report.pending_approvals` treated the mere presence of

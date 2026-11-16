@@ -163,6 +163,20 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "incompatible",
         ),
     },
+    {
+        # feat/doctor-launcher-identity: the doctor reports the running
+        # launcher's build identity in three evidence tiers and classifies a
+        # read-only capabilities probe; a version string without a deployment
+        # receipt is always flagged (owner directive 2026-11-14).
+        "pr": 57,
+        "name": "doctor launcher build identity",
+        "keywords": (
+            "launcher build-identity",
+            "evidence tiers",
+            "not deployment evidence",
+            "provision/capabilities",
+        ),
+    },
 )
 
 
