@@ -4,7 +4,9 @@ The reliability campaign's F2 machinery: a project, campaign or execution
 profile can require every dispatch to carry a valid, frozen `acdd/1` contract.
 The enforcement lives in `bundlebees_plugin/contracts.py` (validation and
 refusals) and `bundlebees_plugin/contract_gate.py` (the dispatch gate); the setting
-is resolved through `bundlebees_plugin/settings.py`.
+is resolved through `bundlebees_plugin/settings.py`. The gate module is
+`contract_gate.py` — `dispatch.py` in the same package is the unrelated
+lease-payload server and plays no part in enforcement.
 
 ## Where the flag lives
 
@@ -24,7 +26,11 @@ profile. A brief carries no vote: a `contract` field is the work contract
 itself, and no field of the brief can switch enforcement off.
 
 The flag is a plain boolean, or a mapping that scopes it per campaign or
-repository (an explicit campaign or repository wins over the default):
+repository. An explicit campaign or repository value wins over the default —
+including an explicit `false`, which opts that one scope out; a scope that is
+absent, `null` or unparsable does not vote and the default decides, and an
+unparsable or absent default is off. The campaign table is consulted before
+the repository table:
 
 ```json
 {
@@ -58,7 +64,8 @@ the `acdd` envelope block, or raises `ContractRefusal`. `contract_gate.dispatch(
 brief, config=..., send=...)` refuses first and only then performs the send,
 so a refused brief never reaches the launcher. The CLI dry run is
 `python3 -m bundlebees_plugin.contract_gate check BRIEF.json` (exit 0 admitted,
-exit 1 refused, the refusal JSON on stdout).
+exit 1 refused, the refusal JSON on stdout; an unreadable brief file refuses
+with `brief_invalid` instead of a traceback).
 
 When the flag is on and the brief has no contract, the refusal is precisely:
 
@@ -124,7 +131,14 @@ python3 -m bundlebees_plugin.contracts scaffold \
 ```
 
 It writes `acdd/contract.json` and `acdd/packet.json` (create-only; it never
-overwrites). The contract is **valid as generated** — it passes
+overwrites: a rerun into a used directory refuses with `scaffold_exists`).
+The lease entries the operator passes are exact file paths, never directories —
+a directory-style entry like `shop/` is refused with `contract_invalid`, the
+same code a contract that fails validation carries. A scaffold that cannot
+produce a valid contract — no `--test`, or an unusable `--out` — refuses with
+`scaffold_invalid`; every scaffold refusal reaches the caller as the same
+machine-readable envelope, never a traceback. The contract is **valid as
+generated** — it passes
 `contract validate` and can be frozen after review. The packet is a
 **skeleton** for the pinned `rizzstack.feature-packet/1` protocol: its
 `workflow_ref` (`PIN-THE-WORKFLOW-REV`), authorization and budget blocks are
