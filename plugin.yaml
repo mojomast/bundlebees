@@ -156,6 +156,17 @@ config_schema:
     type: int
     default: 900
     description: Wall-clock limit in seconds for one sandboxed test run.
+  provisioning_enabled:
+    type: bool
+    default: false
+    description: >-
+      Enable job provisioning through the launcher when ticking jobs whose
+      tasks declare a provision spec. Off keeps the bare CLI behaviour.
+  provisioning_host:
+    type: str
+    default: ''
+    description: >-
+      Optional expected workspace host validated by the provisioner.
   sandbox_tiktoken_cache:
     type: str
     default: ''
