@@ -27,6 +27,8 @@ DEFAULTS: dict[str, Any] = {
     "verify_isolation": "auto",
     "verify_python": "",
     "sandbox_tiktoken_cache": "",
+    "provisioning_enabled": False,
+    "provisioning_host": "",
     "verify_allow_unsafe_local": False,
     "verify_allow_weak_unshare": False,
     "require_contract": False,

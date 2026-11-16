@@ -180,6 +180,13 @@ def from_client(config: Mapping[str, Any] | None, client: Any) -> "HyvvProvision
     behaviour for jobs that never asked for it.
     """
     block = (config or {}).get("provisioning") or {}
+    # Declared flat settings keys: ``settings_from_ctx`` only returns declared
+    # keys, so without these the installed CLI could never enable provisioning.
+    if not block.get("enabled"):
+        block = {
+            "enabled": bool((config or {}).get("provisioning_enabled", False)),
+            "host": (config or {}).get("provisioning_host") or "",
+        }
     if not block.get("enabled"):
         return None
 
