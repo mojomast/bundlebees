@@ -299,6 +299,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "--commit-local",
         ),
     },
+    {
+        # feat/contract-followups: the F5 regression net for the d8c2356
+        # import-alias defect class plus settings precedence and scaffold
+        # lease/refusal followups.
+        "pr": 67,
+        "name": "contract-enforcement regression net",
+        "keywords": (
+            "import-identity",
+            "explicit `false`",
+            "scaffold_invalid",
+            "directory-style",
+        ),
+    },
 )
 
 
