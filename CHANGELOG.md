@@ -15,6 +15,10 @@ one pull request.
 
 ### Added
 
+- **integrated_not_pr_merged detection:** the read-only Git/PR observer now
+  classifies a PR whose exact head is already an ancestor of authoritative main
+  while the PR metadata still reports open, and the reconciliation report stops
+  the wait and bans re-integration instead of executing it.
 - **Owner approval card:** the authenticated Bundlebees Desktop pane now lists
   pending one-time job approvals and opens a plain-language card bound to the
   exact job, repository/base revision, task leases, worker project/profile,

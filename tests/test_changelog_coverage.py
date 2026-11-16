@@ -127,6 +127,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "10-minute heartbeat",
         ),
     },
+    {
+        # fix/integrated-not-pr-merged-detection: the read-only observer
+        # classifies a PR whose exact head is already an ancestor of
+        # authoritative main while the PR metadata still reports open, and the
+        # reconciliation report stops the wait and bans re-integration.
+        "pr": 51,
+        "name": "integrated_not_pr_merged detection",
+        "keywords": (
+            "integrated_not_pr_merged",
+            "reconciliation report",
+            "bans re-integration",
+        ),
+    },
 )
 
 
