@@ -766,6 +766,7 @@ def verify_and_commit(
     sandbox_allow_weak: bool = False,
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     cacheable: bool = True,
+    reuse_record: bool = True,
 ) -> dict[str, Any]:
     """Verify one patch and commit it locally. Returns the verify record.
 
@@ -816,6 +817,7 @@ def verify_and_commit(
             sandbox_allow_weak=sandbox_allow_weak,
             sandbox_timeout=sandbox_timeout,
             cacheable=cacheable,
+            reuse_record=reuse_record,
             stats=_test_cache_stats(),
         )
     finally:
@@ -846,6 +848,7 @@ def _verify_and_commit_locked(
     sandbox_allow_weak: bool = False,
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     cacheable: bool = True,
+    reuse_record: bool = True,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     state_dir = Path(state_dir)
@@ -924,8 +927,11 @@ def _verify_and_commit_locked(
 
     # 3. Idempotent restart: an accepted record with a real commit is reused.
     # Reuse is proof about this exact execution identity, never mere presence.
+    # ``reuse_record=False`` (the verify-worker shadow lane) observes a real
+    # execution instead: the second path must run, not inherit the first's
+    # record.
     existing = read_record(state_dir, attempt_id)
-    if existing and existing.get("ok") is True:
+    if reuse_record and existing and existing.get("ok") is True:
         if _record_still_valid(
             existing,
             repo,
@@ -1381,3 +1387,25 @@ def _diff_files(repo: Path, base_rev: str, sha: str) -> list[str]:
     if proc.returncode != 0:
         raise VerifyError("git_error", f"cannot diff {base_rev}..{sha}", "Inspect the repository.")
     return sorted(line for line in proc.stdout.splitlines() if line.strip())
+
+
+def reprove_commit(repo: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-prove a verify record's git facts without running any test.
+
+    The coordinator consumes worker verification by checking the evidence, not
+    by re-running the suite. This re-proves the cheap, decisive git facts the
+    merge gate depends on: the commit exists, its parent is the record's pinned
+    base revision, and its file set is exactly the record's file set. Anything
+    else is reported as a named problem, never silently accepted.
+    """
+
+    repo = Path(repo)
+    sha = str(record.get("sha") or "")
+    base_rev = str(record.get("base_rev") or "")
+    files = sorted(str(item) for item in (record.get("files") or []))
+    problems: list[str] = []
+    if not sha or not _commit_exists(repo, sha):
+        problems.append("commit_missing")
+    elif not base_rev or not _commit_matches(repo, sha, base_rev, files):
+        problems.append("commit_mismatch")
+    return {"ok": not problems, "problems": problems}
