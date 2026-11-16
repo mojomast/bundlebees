@@ -420,7 +420,7 @@ class ProvisionBindRecovery(unittest.TestCase):
 
         self.assertEqual(len(provisioner.posts), 1)
         task = jobs.load_job(self.state, "job_recovery")["tasks"][0]
-        self.assertEqual(task["provisioning"]["state"], "preparing")
+        self.assertEqual(task["provisioning"]["state"], "denied")
         self.assertEqual(task["provisioning"]["attempts"], 1)
         detail = str(task["provisioning"].get("detail") or "")
         self.assertIn("post refused: provision_failed:", detail)
