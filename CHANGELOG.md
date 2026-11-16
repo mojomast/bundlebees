@@ -15,6 +15,7 @@ one pull request.
 
 ### Added
 
+- **Coordinator action queue:** a durable per-item coordinator action queue over the existing state dir with atomic per-item claims, monotonically increasing durable fencing values (`fence`/`fence_seq`), precise stale refusals, idempotent replay by action key, stale-owner adoption, and per-repo serialization only for overlapping merge and deploy leases; an AST guard proves the queue only records, claims and fences and never executes anything.
 - **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
 - **integrated_not_pr_merged detection:** the read-only Git/PR observer now
   classifies a PR whose exact head is already an ancestor of authoritative main
