@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import agent_work as work_queue
+from . import git_observer
 from . import job as jobs
 from . import recovery as recoveries
 from .brief import BriefError, validate_brief
@@ -1305,6 +1306,37 @@ def _dispatch_one(
 
 
 # --- intents ---------------------------------------------------------------
+
+
+def campaign_git_drift(
+    state_dir: Path | str,
+    campaign_id: str,
+    *,
+    repo: Path | str | None = None,
+    git: git_observer.GitRunner | None = None,
+    pull_requests: git_observer.PullRequestSource | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Observe a campaign checkpoint against real git refs and open PR heads.
+
+    Read-only and report-only (workflow-F3): the checkpoint's recorded base
+    revision, branch and pull request are compared with the actual refs in
+    ``repo`` and the open PR heads ``gh`` reports, and the difference is
+    returned as drift with the exact expected-vs-actual values. Nothing is
+    resolved, reset, pushed, merged or rewritten here, and no checkpoint is
+    modified; a caller decides what, if anything, to do about drift. An
+    unobservable world raises :class:`git_observer.GitObserverError` — an
+    observation failure is never reported as drift.
+    """
+
+    return git_observer.observe_campaign(
+        state_dir,
+        campaign_id,
+        repo=repo,
+        git=git,
+        pull_requests=pull_requests,
+        now=now,
+    )
 
 
 def _intent_for(state_dir: Path, job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any] | None:
