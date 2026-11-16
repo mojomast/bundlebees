@@ -4,7 +4,9 @@ version: "0.2.0"
 description: >-
   Orchestrate CUA bees from Hermes: check launcher health, dispatch leased
   briefs, watch attempts, and generate a paste-ready host setup prompt.
-  Disclosure — talks to a local or user-configured worker launcher (loopback
+  bundlebees_route_preview previews the model and credential route a
+  dispatch would take without starting an attempt. Disclosure — talks to a
+  local or user-configured worker launcher (loopback
   by default; a private or LAN launcher URL requires allow_private=true in
   plugin settings); dispatching a bee can spend model budget on that worker
   machine; secrets are read only through Hermes get_secret; the user-run CLI

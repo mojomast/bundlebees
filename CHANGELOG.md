@@ -53,6 +53,9 @@ one pull request.
   explicit `--none` skip) when the contract lists `refactor`.
 - The shared evidence schema allows `classification: "failed"`, for review
   records only (a rejected review).
+- **Route preview:** `bundlebees_route_preview` previews the model and
+  credential route a dispatch would take, starting no attempt (the fifth
+  registered tool).
 
 ### Fixed
 

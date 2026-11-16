@@ -177,6 +177,7 @@ def test_tool_operations_and_user_run_cli_are_documented() -> None:
         "bundlebees_dispatch",
         "bundlebees_attempt",
         "bundlebees_host_prompt",
+        "bundlebees_route_preview",
     ):
         assert name in text, f"missing tool {name}"
     for op in ("health", "capacity", "attempts", "events", "containers", "projects"):
