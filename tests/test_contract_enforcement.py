@@ -18,16 +18,25 @@ Reliability campaign F2 (corrected-lease r2). Contract:
 - Legacy compatibility: enforcement is disabled by default and every legacy
   dispatch is labelled, never silent. The only profile that ships with the
   flag on is the documented M2 canary profile, which opts in explicitly.
+- The gate is imported by its real name: the F2 gate lives in
+  ``bundlebees_plugin.contract_gate``; the package's ``dispatch`` submodule is
+  the unrelated payload-server module, and no enforcement file may alias it as
+  the gate (the d8c2356 defect class: the indented fourth import variant
+  ``from bundlebees_plugin import contracts, dispatch`` silently aliased the
+  payload server as the gate and passed review at the wrong content).
 """
 
 from __future__ import annotations
 
+import ast
 import copy
+import importlib
 import json
 import os
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -578,3 +587,239 @@ def test_check_cli_prints_the_refusal_and_exits_nonzero(tmp_path, capsys):
     assert code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False and payload["code"] == "contract_required"
+
+
+# ---------------------------------------------------------------------------
+# The gate is imported by its real name (the d8c2356 defect class)
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_submodule_imports(source: str) -> list[str]:
+    """Import sites in *source* that bind the payload-server ``dispatch`` module.
+
+    The F2 gate lives in ``bundlebees_plugin.contract_gate``. The package's
+    ``dispatch`` submodule is the unrelated payload-server module; the d8c2356
+    defect was an indented fourth import variant,
+    ``from bundlebees_plugin import contracts, dispatch``, which silently
+    aliased the payload server as the gate and passed review at the wrong
+    content. Parsing with :mod:`ast` keeps the sweep tolerant of indentation,
+    parentheses, backslash continuations and multi-line import lists; only the
+    *imported symbol* matters, so the shipped
+    ``from bundlebees_plugin import contract_gate as dispatch`` stays clean,
+    and so does an explicit ``from bundlebees_plugin.dispatch import fn``.
+    """
+    hits: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            # ``from bundlebees_plugin import ...`` (absolute) and the gate
+            # modules' ``from . import ...`` (relative) both resolve into this
+            # package; either spelling that names the ``dispatch`` submodule
+            # binds the payload server.
+            from_package = node.module == "bundlebees_plugin" or (
+                node.level >= 1 and not node.module
+            )
+            if not from_package:
+                continue
+            for alias in node.names:
+                if alias.name == "dispatch":
+                    shown = f"dispatch as {alias.asname}" if alias.asname else "dispatch"
+                    hits.append(f"line {node.lineno}: from ... import {shown}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "bundlebees_plugin.dispatch":
+                    shown = alias.name + (f" as {alias.asname}" if alias.asname else "")
+                    hits.append(f"line {node.lineno}: import {shown}")
+    return hits
+
+
+def test_the_gate_lives_in_contract_gate_not_the_payload_dispatch_module():
+    gate_module = importlib.import_module("bundlebees_plugin.contract_gate")
+    payload_module = importlib.import_module("bundlebees_plugin.dispatch")
+
+    assert gate_module is not payload_module
+    # The gate's surface is defined in contract_gate itself, not re-exported
+    # from somewhere else under the wrong name.
+    for name in ("gate", "dispatch", "enforcement_config"):
+        member = getattr(gate_module, name)
+        assert callable(member), name
+        assert member.__module__ == "bundlebees_plugin.contract_gate", name
+    assert issubclass(gate_module.ContractRefusal, Exception)
+    # The payload-server dispatch module serves lease payloads; it has none of
+    # the gate's surface, so aliasing it as the gate cannot work silently.
+    for name in ("gate", "dispatch", "enforcement_config", "ContractRefusal"):
+        assert not hasattr(payload_module, name), name
+    assert callable(payload_module.collect_payload)
+
+
+def test_no_enforcement_file_imports_the_payload_dispatch_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    watched = [Path(__file__)] + [
+        repo_root / "bundlebees_plugin" / name for name in ("contract_gate.py", "contracts.py")
+    ]
+    hits = [hit for path in watched for hit in _dispatch_submodule_imports(path.read_text(encoding="utf-8"))]
+    assert hits == [], (
+        "the F2 gate lives in bundlebees_plugin.contract_gate; these lines "
+        "import the unrelated payload-server dispatch submodule instead (the "
+        "d8c2356 defect class): " + "; ".join(hits)
+    )
+
+
+def test_the_alias_sweep_catches_every_import_variant_of_the_defect():
+    defect = "from bundlebees_plugin import contracts, " + "dispatch"
+    variants = [
+        defect,
+        "from bundlebees_plugin import (" + "dispatch" + ",)",
+        "from bundlebees_plugin import \\\n    contracts, " + "dispatch",
+        "def _test_body():\n    " + defect,
+        "import bundlebees_plugin." + "dispatch",
+        "from . import contracts, " + "dispatch",
+    ]
+    for variant in variants:
+        assert _dispatch_submodule_imports(variant), f"sweep missed the defect variant:\n{variant}"
+    for clean in [
+        "from bundlebees_plugin import contract_gate as dispatch",
+        "from bundlebees_plugin import contracts, contract_gate as dispatch",
+        "from bundlebees_plugin import (\n    contracts,\n    contract_gate as dispatch,\n)",
+        "from . import contracts as _contracts",
+        "from bundlebees_plugin.dispatch import collect_payload",
+    ]:
+        assert _dispatch_submodule_imports(clean) == [], f"sweep flagged correct code:\n{clean}"
+
+
+# ---------------------------------------------------------------------------
+# Settings precedence: an explicit scope value beats the default
+# ---------------------------------------------------------------------------
+
+
+def test_an_explicit_scope_value_beats_the_default_in_both_directions():
+    from bundlebees_plugin import settings
+
+    opted_out = {
+        "require_contract": {
+            "default": True,
+            "campaigns": {"reliability": False},
+            "repositories": {"mojomast/bundlebees": False},
+        }
+    }
+    assert settings.require_contract(opted_out, campaign="reliability") is False
+    assert settings.require_contract(opted_out, repository="mojomast/bundlebees") is False
+
+    opted_in = {
+        "require_contract": {
+            "default": False,
+            "campaigns": {"reliability": True},
+            "repositories": {"mojomast/bundlebees": True},
+        }
+    }
+    assert settings.require_contract(opted_in, campaign="reliability") is True
+    assert settings.require_contract(opted_in, repository="mojomast/bundlebees") is True
+
+    both = {
+        "require_contract": {
+            "default": False,
+            "campaigns": {"reliability": True},
+            "repositories": {"reliability": False},
+        }
+    }
+    assert settings.require_contract(both, campaign="reliability", repository="reliability") is True
+
+    # A scope that says nothing parseable does not vote; the default decides.
+    silent = {
+        "require_contract": {
+            "default": True,
+            "campaigns": {"reliability": None, "other": "garbage"},
+        }
+    }
+    assert settings.require_contract(silent, campaign="reliability") is True
+    assert settings.require_contract(silent, campaign="absent") is True
+
+
+# ---------------------------------------------------------------------------
+# Scaffold lease checks
+# ---------------------------------------------------------------------------
+
+
+def test_the_scaffolded_packet_keeps_the_approved_tests_read_only():
+    from bundlebees_plugin import contracts
+
+    built = contracts.scaffold(
+        contract_id="W1-f2",
+        title="Add apply_tax",
+        summary="apply_tax adds ten percent",
+        tests=[TEST_ID],
+        assigned_files=[ASSIGNED],
+        test_files=[TEST_FILE],
+        read_only=["docs/spec.md"],
+        source_rev=SHA,
+    )
+    read_only = built["packet"]["scope"]["read_only"]
+    assert "docs/spec.md" in read_only
+    assert TEST_FILE in read_only, read_only
+    assert built["contract"]["scope"]["read_only"] == ["docs/spec.md"]
+
+    plain = contracts.scaffold(
+        contract_id="W1-f2",
+        title="Add apply_tax",
+        summary="apply_tax adds ten percent",
+        tests=[TEST_ID],
+        assigned_files=[ASSIGNED],
+        source_rev=SHA,
+    )
+    assert plain["packet"]["scope"]["read_only"] == [TEST_FILE]
+
+
+@pytest.mark.parametrize(
+    "field, values",
+    [
+        ("contract.scope.assigned_files", ["shop/"]),
+        ("contract.scope.test_files", ["tests/"]),
+        ("contract.scope.read_only", ["docs/"]),
+    ],
+)
+def test_the_scaffold_refuses_directory_style_lease_entries(field, values):
+    from bundlebees_plugin import contracts
+
+    kwargs = {
+        "assigned_files": [ASSIGNED],
+        "test_files": [TEST_FILE],
+        "read_only": [],
+    }
+    key = field.rsplit(".", 1)[1]
+    kwargs[key] = values
+    with pytest.raises(contracts.ContractRefusal) as caught:
+        contracts.scaffold(
+            contract_id="W1-f2",
+            title="Directory lease",
+            summary="a lease entry like docs/ is not a lease",
+            tests=[TEST_ID],
+            source_rev=SHA,
+            **kwargs,
+        )
+    refusal = caught.value
+    assert refusal.code == "contract_invalid"
+    assert refusal.field == field
+    assert "exact" in refusal.fix
+
+
+def test_the_scaffold_cli_refuses_an_unusable_out_with_a_refusal_envelope(tmp_path, capsys):
+    from bundlebees_plugin import contracts
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    code = contracts.main(
+        [
+            "scaffold",
+            "--id", "W1-f2",
+            "--title", "Add apply_tax",
+            "--summary", "apply_tax adds ten percent",
+            "--test", TEST_ID,
+            "--assigned", ASSIGNED,
+            "--source-rev", SHA,
+            "--out", str(blocker),
+        ]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["code"] == "scaffold_invalid"
+    assert payload["error"].strip() and payload["fix"].strip()

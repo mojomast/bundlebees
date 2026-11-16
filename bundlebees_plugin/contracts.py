@@ -81,6 +81,24 @@ _FIX_CONTRACT = (
 _FIX_PACKET = "Re-issue the packet from the frozen contract; never edit a frozen contract."
 
 
+def _require_exact_paths(values: Sequence[Any], field: str) -> None:
+    """Refuse directory-style lease entries: leases speak in exact file paths.
+
+    The r1 lesson this module inlines: a lease entry like ``docs/`` is not a
+    lease. Normalising ``shop/`` to ``shop`` would silently mint an exact path
+    the operator never asked for, so scaffolding refuses instead.
+    """
+    for value in values:
+        if isinstance(value, str) and value.strip().endswith("/"):
+            _refuse(
+                "contract_invalid",
+                f"{field} entry {value!r} is a directory-style lease entry",
+                "Leases speak in exact repository-relative file paths, never "
+                "directories; pass the exact file path instead.",
+                field,
+            )
+
+
 class ContractRefusal(Exception):
     """A dispatch refusal with the machine-readable code, error and fix.
 
@@ -405,9 +423,12 @@ def scaffold(
             "a scaffolded contract needs at least one test to anchor a criterion",
             "Pass --test tests/test_x.py::test_y (one acceptance criterion each).",
         )
+    _require_exact_paths(assigned_files, "contract.scope.assigned_files")
     behaviors = [item for item in behaviors if isinstance(item, str) and item.strip()]
     statements = [item for item in statements if isinstance(item, str) and item.strip()]
     test_files = [item for item in test_files if isinstance(item, str) and item.strip()]
+    _require_exact_paths(test_files, "contract.scope.test_files")
+    _require_exact_paths(read_only, "contract.scope.read_only")
     if not test_files:
         test_files = sorted({item.split("::", 1)[0] for item in tests})
     criteria = []
@@ -468,7 +489,7 @@ def scaffold(
         "acceptance_ids": ids,
         "tests": sorted({test_id for item in criteria for test_id in item["tests"]}),
         "scope": {"lease": list(contract["scope"]["assigned_files"]),
-                  "read_only": list(read_only or test_files)},
+                  "read_only": list(dict.fromkeys([*read_only, *test_files]))},
         "budget": {"bees": 1, "wall_clock_s": 1800},
         "required_evidence": ["red", "green"],
         "prohibited": ["push to origin", "merge", "deploy", "edit approved tests", *prohibited],
@@ -548,6 +569,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json(out / "packet.json", built["packet"])
     except ContractRefusal as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True))
+        return 1
+    except OSError as exc:
+        # Refusal-code completeness: every scaffold refusal reaches the caller
+        # as the machine-readable envelope, never as a traceback.
+        refusal = ContractRefusal(
+            "scaffold_invalid",
+            f"the --out location cannot be used: {exc}",
+            "Choose a writable --out directory; scaffolding never overwrites "
+            "or creates partial output.",
+        )
+        print(json.dumps(refusal.to_dict(), sort_keys=True))
         return 1
     print(f"contract: {out / 'contract.json'}")
     print(f"packet skeleton: {out / 'packet.json'}")

@@ -65,27 +65,55 @@ def require_contract(
                               "campaigns": {"reliability": true},
                               "repositories": {"mojomast/bundlebees": true}}}
 
-    An explicit campaign or repository win over the default; anything absent,
-    ``None`` or unparsable is off, so enforcement can never be enabled by
-    accident. The brief carries no vote: callers must not pass brief values
-    here.
+    An explicit campaign or repository value wins over the default — including
+    an explicit ``false``, which opts that one scope out of enforcement. A
+    scope that is absent, ``None`` or unparsable does not vote and the default
+    decides; an unparsable or absent default is off, so enforcement can never
+    be enabled by accident. The campaign table is consulted before the
+    repository table. The brief carries no vote: callers must not pass brief
+    values here.
     """
     if not isinstance(config, Mapping):
         return False
     value = config.get(REQUIRE_CONTRACT_KEY)
     if isinstance(value, Mapping):
-        if campaign and _scope_enabled(value.get("campaigns"), str(campaign)):
-            return True
-        if repository and _scope_enabled(value.get("repositories"), str(repository)):
-            return True
+        for table, name in (
+            (value.get("campaigns"), campaign),
+            (value.get("repositories"), repository),
+        ):
+            vote = _scope_vote(table, name)
+            if vote is not None:
+                return vote
         return config_flag(value.get("default"), False)
     return config_flag(value, False)
 
 
-def _scope_enabled(table: Any, name: str) -> bool:
-    if not isinstance(table, Mapping):
+def _scope_vote(table: Any, name: Any) -> bool | None:
+    """The named scope's own vote from *table*, or ``None`` when it is silent.
+
+    A parseable boolean-shaped value votes that value — an explicit ``false``
+    included, so it can outvote a ``default: true``. An empty name, a missing
+    table, an absent key, ``None`` or an unparsable value does not vote.
+    """
+    if not name or not isinstance(table, Mapping):
+        return None
+    return _flag_or_none(table.get(str(name)))
+
+
+def _flag_or_none(value: Any) -> bool | None:
+    """``config_flag``'s parse rules, but ``None`` for anything unparsable."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
         return False
-    return config_flag(table.get(name), False)
+    return None
 
 
 def settings_from_ctx(ctx: Any) -> dict[str, Any]:
