@@ -151,6 +151,20 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         ),
     },
     {
+        # feat/coordinator-action-queue: durable per-item coordinator action
+        # queue with fencing values, stale refusals, idempotent replay and an
+        # AST guard proving it never executes anything.
+        "pr": 54,
+        "name": "coordinator action queue",
+        "keywords": (
+            "coordinator action queue",
+            "fence_seq",
+            "idempotent replay",
+            "stale-owner adoption",
+            "never executes",
+        ),
+    },
+    {
         # feat/rizzstack-doctor: the rizzstack doctor subcommand - stack parity
         # and health diagnostic across checkout, origin main, installed package,
         # gateway-loaded plugin and deployed runtime revisions.
