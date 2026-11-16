@@ -31,7 +31,26 @@ Drift kinds, each carrying the exact expected-vs-actual values:
   recorded branch;
 * ``unexpected_pr_head`` — an open PR head for the recorded branch that the
   checkpoint does not record (an extra head, or any head when none is
-  recorded).
+  recorded);
+* ``integrated_not_pr_merged`` — the PR's *exact head revision* is already an
+  ancestor of the authoritative main branch while GitHub still reports the PR
+  unmerged (open, or closed with no merged event): the work is integrated but
+  the pull request was never merged. The real case is orbitdesktop #34, whose
+  head ``94123f2a…`` sat on main ``16b86209…`` while GitHub showed the PR open
+  with no merge commit and later closed it without a merged event;
+* ``equivalent_content_unverified`` — main carries a patch-equivalent of the
+  PR's commits (a cherry-pick-like landing) but the exact head is not an
+  ancestor of main. Equivalent content is *not* a proved merge and is never
+  reported as one;
+* ``pr_head_moved`` — the recorded branch advanced past the head revision the
+  PR still reports (the branch moved after the recorded head).
+
+The integration checks run only when the caller names the authoritative main
+branch (``main_ref``); without one the observer behaves exactly as before and
+reports ``actual.integration.verdict == "unobserved"``. A classification needs
+proof: an API-reported head that is absent locally, a view without a head
+digest, or an unresolvable main ref is ``unverifiable`` and is never reported
+as integrated or equivalent.
 """
 
 from __future__ import annotations
@@ -64,6 +83,7 @@ _MAX_ERROR_TEXT = 300
 
 _SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_MAIN_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./_-]{0,127}")
 
 _FIX_READONLY = (
     "The observer is read-only by construction; mutation belongs to an explicit, "
@@ -76,6 +96,10 @@ _FIX_WORLD = (
 _FIX_CHECKPOINT = (
     "Re-create or repair the campaign checkpoint; the observer refuses to guess "
     "what a malformed record meant."
+)
+_FIX_MAIN_REF = (
+    "Pass the authoritative main branch's name (e.g. 'main'); the observer reads "
+    "it read-only from the worktree's refs."
 )
 
 
@@ -333,6 +357,255 @@ def _ahead_count(runner: GitRunner, repo: Path, base: str, head: str) -> int | N
         raise GitObserverError("git_failed", "git rev-list returned an unusable count", _FIX_WORLD) from exc
 
 
+# ---------------------------------------------------------------------------
+# Integration evidence: is the PR's exact work already on main?
+# ---------------------------------------------------------------------------
+
+
+def _main_ref_text(main_ref: Any) -> str:
+    """Validate the caller-named authoritative main branch, or refuse."""
+
+    text = main_ref.strip() if isinstance(main_ref, str) else ""
+    if not text or not _MAIN_REF_RE.fullmatch(text) or ".." in text:
+        raise GitObserverError("main_ref_invalid", "main_ref is not a usable branch or ref name", _FIX_MAIN_REF)
+    return text
+
+
+def _main_head(runner: GitRunner, repo: Path, main_ref: str) -> str | None:
+    """The authoritative main head: the pushed remote-tracking ref, else local."""
+
+    for candidate in (f"remotes/origin/{main_ref}", f"heads/{main_ref}"):
+        head = _head_of(runner, repo, candidate)
+        if head is not None:
+            return head
+    return None
+
+
+def _rev_list_count(runner: GitRunner, repo: Path, extra: Sequence[str]) -> int:
+    code, out, err = _guarded_git(runner, repo, ["rev-list", "--count", *extra])
+    if code != 0:
+        raise GitObserverError("git_failed", f"git rev-list failed: {_clip(scrub(err.strip()))}", _FIX_WORLD)
+    try:
+        return max(0, int(out.strip() or 0))
+    except ValueError as exc:
+        raise GitObserverError("git_failed", "git rev-list returned an unusable count", _FIX_WORLD) from exc
+
+
+def _equivalent_on_main(runner: GitRunner, repo: Path, main_head: str, pr_head: str) -> dict[str, Any]:
+    """Patch-equivalence of the PR's own commits against main — never a proof.
+
+    ``rev-list --count --right-only A...B`` counts the commits reachable from
+    the PR head but not from main; adding ``--cherry-pick`` omits the ones whose
+    patch-id has an equivalent on main. Zero remaining commits means main
+    carries equivalent content for every PR commit — a cherry-pick-like
+    landing. It says nothing about whether GitHub recorded a merge, so the
+    caller must never treat it as one.
+    """
+
+    range_expr = f"{main_head}...{pr_head}"
+    total = _rev_list_count(runner, repo, ["--right-only", range_expr])
+    missing = _rev_list_count(runner, repo, ["--right-only", "--cherry-pick", range_expr])
+    return {
+        "equivalent": total > 0 and missing == 0,
+        "pr_side_commits": total,
+        "without_equivalent": missing,
+    }
+
+
+def _integration_block(
+    observed: bool,
+    main_ref: str,
+    main_head: str | None,
+    pr_head: str | None,
+    ancestor: bool | None,
+    equivalent: bool | None,
+    verdict: str,
+    *,
+    github_state: str = "",
+    pr_side: int | None = None,
+    without_equivalent: int | None = None,
+) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "observed": observed,
+        "main_ref": _text(main_ref),
+        "main_head": main_head,
+        "pr_head": pr_head,
+        "head_ancestor_of_main": ancestor,
+        "equivalent_on_main": equivalent,
+        "verdict": verdict,
+    }
+    if observed:
+        block["github_state"] = github_state
+        block["pr_side_commits"] = pr_side
+        block["pr_commits_without_patch_equivalent_on_main"] = without_equivalent
+    return block
+
+
+#: Verdicts the integration evidence can reach. ``merged`` means GitHub itself
+#: reports the merge; ``integrated_not_pr_merged`` means git proves the exact
+#: head is on main while GitHub does not report a merge; ``unverified`` content
+#: equivalence is ``equivalent_content_unverified``; everything a missing or
+#: stale observation cannot prove is ``unverifiable``.
+_VERDICT_MERGED = "merged"
+_VERDICT_INTEGRATED = "integrated_not_pr_merged"
+_VERDICT_EQUIVALENT = "equivalent_content_unverified"
+_VERDICT_NOT_INTEGRATED = "not_integrated"
+_VERDICT_UNVERIFIABLE = "unverifiable"
+_VERDICT_UNOBSERVED = "unobserved"
+
+
+def _observe_integration(
+    runner: GitRunner | None,
+    repo: Path | None,
+    main_ref: str,
+    pr_seen: dict[str, Any],
+) -> dict[str, Any]:
+    """Classify the recorded PR's integration state from git and the PR API.
+
+    Read-only: only allowlisted git reads and the PR view already observed. The
+    verdict is decided by proof, never by absence of evidence — anything the
+    world does not prove is ``unverifiable``.
+    """
+
+    if not main_ref or runner is None or repo is None or not pr_seen["observed"]:
+        return _integration_block(False, "", None, None, None, None, _VERDICT_UNOBSERVED)
+    view = pr_seen["view"]
+    state = _pr_state(view) if isinstance(view, Mapping) else ""
+    head = _sha(view.get("headRefOid")) if isinstance(view, Mapping) else None
+    main_head = _main_head(runner, repo, main_ref)
+    if head is None or main_head is None:
+        return _integration_block(True, main_ref, main_head, head, None, None, _VERDICT_UNVERIFIABLE, github_state=state)
+    if not _resolves(runner, repo, head):
+        # The API names a head the worktree cannot resolve: stale or incomplete
+        # API data. Nothing can be proved from a revision that is not here.
+        return _integration_block(True, main_ref, main_head, head, None, None, _VERDICT_UNVERIFIABLE, github_state=state)
+    ancestor = _descends(runner, repo, head, main_head)
+    if ancestor:
+        # The exact head is on main. If GitHub reports the PR merged, that is
+        # the ordinary merged state; if it still reports the PR unmerged, the
+        # work was integrated without a recorded merge (the #34 class).
+        verdict = {
+            "merged": _VERDICT_MERGED,
+            "open": _VERDICT_INTEGRATED,
+            "closed": _VERDICT_INTEGRATED,
+        }.get(state, _VERDICT_UNVERIFIABLE)
+        return _integration_block(True, main_ref, main_head, head, True, None, verdict, github_state=state)
+    if state == "merged":
+        return _integration_block(True, main_ref, main_head, head, False, None, _VERDICT_MERGED, github_state=state)
+    if state not in {"open", "closed"}:
+        return _integration_block(True, main_ref, main_head, head, False, None, _VERDICT_UNVERIFIABLE, github_state=state)
+    equivalence = _equivalent_on_main(runner, repo, main_head, head)
+    verdict = _VERDICT_EQUIVALENT if equivalence["equivalent"] else _VERDICT_NOT_INTEGRATED
+    return _integration_block(
+        True,
+        main_ref,
+        main_head,
+        head,
+        False,
+        equivalence["equivalent"],
+        verdict,
+        github_state=state,
+        pr_side=equivalence["pr_side_commits"],
+        without_equivalent=equivalence["without_equivalent"],
+    )
+
+
+def _integration_drift(number: int | None, integration: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Drift for the two integration anomalies; ordinary states stay as they were."""
+
+    drift: list[dict[str, Any]] = []
+    if number is None or not integration.get("observed"):
+        return drift
+    verdict = integration.get("verdict")
+    if verdict == _VERDICT_INTEGRATED:
+        drift.append(
+            _drift(
+                "integrated_not_pr_merged",
+                {"pull_request": int(number), "integrated": False},
+                {
+                    "pull_request": int(number),
+                    "integrated": True,
+                    "pr_head": integration.get("pr_head"),
+                    "main_head": integration.get("main_head"),
+                    "main_ref": _text(integration.get("main_ref")),
+                    "github_state": _text(str(integration.get("github_state") or "")),
+                    "github_reports_merged": False,
+                },
+                (
+                    f"PR {number}'s exact head {integration.get('pr_head')} is already an ancestor of "
+                    f"{integration.get('main_ref')} ({integration.get('main_head')}) while GitHub reports the "
+                    f"PR {integration.get('github_state')}, not merged; the work is integrated but the pull "
+                    "request was never merged"
+                ),
+            )
+        )
+    elif verdict == _VERDICT_EQUIVALENT:
+        drift.append(
+            _drift(
+                "equivalent_content_unverified",
+                {"pull_request": int(number), "integrated": False},
+                {
+                    "pull_request": int(number),
+                    "integrated": "unverified",
+                    "pr_head": integration.get("pr_head"),
+                    "main_head": integration.get("main_head"),
+                    "main_ref": _text(integration.get("main_ref")),
+                    "pr_side_commits": integration.get("pr_side_commits"),
+                    "pr_commits_without_patch_equivalent_on_main": integration.get(
+                        "pr_commits_without_patch_equivalent_on_main"
+                    ),
+                },
+                (
+                    f"PR {number}'s exact head is not an ancestor of {integration.get('main_ref')}, but main "
+                    "carries a patch-equivalent commit; equivalent content is not proof the PR merged"
+                ),
+            )
+        )
+    return drift
+
+
+def _head_movement_drift(
+    number: int | None,
+    branch: str,
+    git_seen: Mapping[str, Any],
+    pr_seen: Mapping[str, Any],
+    runner: GitRunner | None,
+    repo: Path | None,
+) -> list[dict[str, Any]]:
+    """Drift when the recorded branch moved after the PR's recorded head.
+
+    The comparison needs both revisions to exist locally: a head oid the
+    worktree cannot resolve is stale or incomplete API data, and stale data is
+    never reported as movement.
+    """
+
+    if number is None or not git_seen.get("observed") or not pr_seen.get("observed"):
+        return []
+    if runner is None or repo is None:
+        return []
+    view = pr_seen.get("view")
+    if not isinstance(view, Mapping) or _pr_state(view) != "open":
+        return []
+    view_oid = _sha(view.get("headRefOid"))
+    head_branch = view.get("headRefName")
+    head_branch = head_branch.strip() if isinstance(head_branch, str) else ""
+    if not view_oid or _text(head_branch) != _text(branch):
+        return []
+    head = git_seen.get("local_head") or git_seen.get("remote_head")
+    if not head or view_oid == head:
+        return []
+    if not _resolves(runner, repo, view_oid):
+        return []
+    return [
+        _drift(
+            "pr_head_moved",
+            {"pull_request": int(number), "head_oid": view_oid},
+            {"pull_request": int(number), "head_oid": head, "branch": _text(branch)},
+            f"the recorded branch {branch} moved after PR {number}'s recorded head",
+        )
+    ]
+
+
 def _observe_git(
     runner: GitRunner | None,
     repo: Path | None,
@@ -521,18 +794,25 @@ def observe(
     git: GitRunner | None = None,
     pull_requests: PullRequestSource | None = None,
     now: str | None = None,
+    main_ref: str | None = None,
 ) -> dict[str, Any]:
     """Compare a campaign checkpoint's recorded revisions with the real world.
 
     ``record`` is the campaign checkpoint. ``repo`` is the local worktree the
     git refs are read from (``None`` observes the PR side only). ``git`` and
     ``pull_requests`` inject the world for tests; the defaults are the read-only
-    git subprocess and the gh CLI. The returned report is a plain dict; nothing
-    is written anywhere, and drift is never resolved here.
+    git subprocess and the gh CLI. ``main_ref`` names the authoritative main
+    branch: when given, the recorded PR's exact head is checked against it and
+    the integration verdict (``integrated_not_pr_merged``,
+    ``equivalent_content_unverified``, ``merged``, ``not_integrated``,
+    ``unverifiable``) is reported; without it the integration evidence stays
+    ``unobserved`` and the report is exactly as before. The returned report is a
+    plain dict; nothing is written anywhere, and drift is never resolved here.
     """
 
     facts = _checkpoint_facts(record)
     slug, branch, number = facts["repo"], facts["branch"], facts["pull_request"]
+    main_name = _main_ref_text(main_ref) if main_ref is not None else ""
     observed_at = _text(now) if now else _now()
     if not observed_at:
         observed_at = _now()
@@ -550,14 +830,26 @@ def observe(
         "view": None,
         "open": [],
     }
+    integration = (
+        _observe_integration(git_runner, worktree, main_name, pr_seen)
+        if number is not None
+        else _integration_block(False, "", None, None, None, None, _VERDICT_UNOBSERVED)
+    )
 
     scope: list[str] = []
     if git_seen["observed"]:
         scope.append("git")
     if pr_seen["observed"]:
         scope.append("pr")
+    if integration["observed"]:
+        scope.append("integration")
 
-    drift = _branch_drift(facts["base_rev"], branch, git_seen) + _pr_drift(slug, branch, number, pr_seen)
+    drift = (
+        _branch_drift(facts["base_rev"], branch, git_seen)
+        + _pr_drift(slug, branch, number, pr_seen)
+        + _integration_drift(number, integration)
+        + _head_movement_drift(number, branch, git_seen, pr_seen, git_runner, worktree)
+    )
     view = pr_seen["view"]
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -588,6 +880,7 @@ def observe(
                 else None
             ),
             "open_heads": pr_seen["open"],
+            "integration": integration,
         },
         "drift": drift,
         "clean": not drift,
@@ -603,8 +896,16 @@ def observe_campaign(
     git: GitRunner | None = None,
     pull_requests: PullRequestSource | None = None,
     now: str | None = None,
+    main_ref: str | None = None,
 ) -> dict[str, Any]:
     """Load one campaign checkpoint and observe its world. Report-only."""
 
     record = campaign_state.load_campaign(state_dir, campaign_id)
-    return observe(record, repo=repo, git=git, pull_requests=pull_requests, now=now)
+    return observe(
+        record,
+        repo=repo,
+        git=git,
+        pull_requests=pull_requests,
+        now=now,
+        main_ref=main_ref,
+    )

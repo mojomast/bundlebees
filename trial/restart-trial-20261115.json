@@ -1,0 +1,55 @@
+{
+  "schema": "bundlebees.restart-trial-plan/1",
+  "trial_id": "restart-trial-20261115",
+  "job_id": "restart-trial-20261115",
+  "campaign_id": "campaign-restart-20261115",
+  "repository": "mojomast/rizzstack-smoke",
+  "base_rev": "93b02f138b09db25a27fb79995d02ced460e75c1",
+  "statement": "Run one disposable restart trial on smoke-firejail5: one task, one bee, one dispatch, one coordinator stop and one restart. This authorizes the trial run only.",
+  "scope": ["smoke/answer.py"],
+  "tasks": [
+    {
+      "task_id": "T1",
+      "objective": "Create smoke/answer.py with a single function answer() that returns the integer 42. Do not modify any other file.",
+      "lease": ["smoke/answer.py"],
+      "acceptance": {
+        "commands": [
+          "/usr/bin/python3 -c \"import sys; sys.path.insert(0, '.'); import tests.test_smoke as t; t.test_answer_is_42()\""
+        ],
+        "criteria": ["answer() == 42 and tests/test_smoke.py passes"],
+        "tests": ["tests/test_smoke.py::test_answer_is_42"]
+      }
+    }
+  ],
+  "worker": {"project": "smoke-firejail5", "profile": "smoke"},
+  "budgets": {"bees": 1, "wall_clock_s": 1200, "attempts": 1, "accepted_waves": 1, "verifications": 1},
+  "coordinator": {
+    "stop": "after the first dispatch, after the worker is observed running; confirm the actual driver PID exited",
+    "restart": "one restart only; one overall deadline covers both driver runs and the downtime",
+    "deadline_s": 1200,
+    "driver_stop_grace_s": 10
+  },
+  "python_contexts": {
+    "coordinator": "PINNED_PROJECT_VENV",
+    "sandbox_suite": "/usr/bin/python3",
+    "worker": "real; owned by smoke-firejail5/launcher, never started or stopped by the harness"
+  },
+  "suite_command": [
+    "/usr/bin/python3",
+    "-c",
+    "import sys; sys.path.insert(0, '.'); import tests.test_smoke as t; t.test_answer_is_42()"
+  ],
+  "readiness": "dispatch",
+  "restart_readiness": "job-complete",
+  "approval": {
+    "required": true,
+    "one_time": true,
+    "trusted_path": "authenticated Bundlebees Desktop owner card",
+    "secret": "BUNDLEBEES_APPROVAL_SECRET in the Hermes secret scope (value never recorded)",
+    "code_rev": "PINNED_MERGED_BUNDLEBEES_REV"
+  },
+  "expected_final_phase": "job_complete",
+  "campaign_closeout_pending": true,
+  "owner_acceptance_pending": true,
+  "forbidden": ["merge", "tag", "release", "deploy", "publish", "worker cancellation", "substitute fixture"]
+}

@@ -11,7 +11,9 @@ runs the full suite on the combined branch; only an accepted wave counts.
 ``lease`` records a lease for a brief dispatched outside the tool, and
 ``metrics`` summarizes the append-only outcome log. ``deploy`` prints the host
 setup prompt by default and only reaches a host when the user passes
-``--execute`` with an alias already stored in plugin config.
+``--execute`` with an alias already stored in plugin config. ``attempts`` and
+``status`` are read-only JSON views over the local attempt store: they never
+touch the network and never need a configured credential.
 
 All child processes receive ``security.child_env`` rather than the ambient
 environment. Nothing here reads credentials from the environment; the
@@ -250,6 +252,20 @@ def _build_parser(parser: Any) -> Any:
     doctor.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     doctor.set_defaults(command="doctor")
 
+    attempts_cmd = subparsers.add_parser(
+        "attempts",
+        help="List recorded attempts from the local store as JSON (read-only).",
+    )
+    attempts_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    attempts_cmd.set_defaults(command="attempts")
+
+    status_cmd = subparsers.add_parser(
+        "status",
+        help="Summarize in-flight work and the bee cap as JSON (read-only).",
+    )
+    status_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    status_cmd.set_defaults(command="status")
+
     acdd_cli.add_parsers(subparsers)
     job_cli.add_parsers(subparsers)
     campaign_cli.add_parsers(subparsers)
@@ -272,6 +288,10 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_integrate(ctx, args)
         if command == "metrics":
             return _cmd_metrics(ctx, args)
+        if command == "attempts":
+            return _cmd_attempts(ctx, args)
+        if command == "status":
+            return _cmd_status(ctx, args)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
@@ -296,7 +316,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, contract, tdd, job, repo, campaign.",
+            "Use one of: verify, integrate, lease, metrics, deploy, doctor, "
+            "contract, tdd, job, repo, campaign, attempts, status.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -310,6 +331,163 @@ def _dispatch(ctx: Any, args: Any) -> int:
             )
         )
         return 1
+
+
+# ---------------------------------------------------------------------------
+# Read-only attempt-store views (no network, no credentials)
+# ---------------------------------------------------------------------------
+
+_ATTEMPT_DISPATCHED = "dispatched"
+_ATTEMPT_VERIFIED = "verified"
+_ATTEMPT_FAILED = "failed"
+_ATTEMPT_ACCEPTED = "accepted"
+
+#: Work has started but no final outcome is recorded yet.
+_IN_FLIGHT_STATES = frozenset({_ATTEMPT_DISPATCHED, _ATTEMPT_VERIFIED})
+
+
+def _text_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _latest_stamp(*values: Any) -> str:
+    """The newest well-formed ISO-8601 Zulu stamp; equal formats sort lexically."""
+    best = ""
+    for value in values:
+        text = str(value or "").strip()
+        if len(text) >= 20 and text > best:
+            best = text
+    return best
+
+
+def _accepted_waves(state_dir: Path) -> dict[str, str]:
+    """Attempt id -> the accepted wave's stamp, from the durable wave records.
+
+    A wave file that cannot be read is skipped here: this is a reporting view,
+    while the paths that decide whether to integrate again use ``read_wave``,
+    which treats damage as a refusal rather than as absence.
+    """
+    accepted: dict[str, str] = {}
+    try:
+        paths = sorted((Path(state_dir) / "waves").glob("*.json"))
+    except OSError:
+        return accepted
+    for path in paths:
+        record = revision.load_wave(state_dir, path.stem)
+        if not record or record.get("accepted") is not True:
+            continue
+        stamp = str(record.get("at") or "")
+        for item in record.get("attempts") or []:
+            if isinstance(item, str) and item:
+                name = item
+            elif isinstance(item, Mapping) and isinstance(item.get("attempt_id"), str):
+                name = str(item["attempt_id"])
+            else:
+                continue
+            accepted[name] = _latest_stamp(accepted.get(name), stamp)
+    return accepted
+
+
+def _lease_records(state_dir: Path) -> list[dict[str, Any]]:
+    """Verified lease records from the local attempt store, oldest first.
+
+    A record that fails its MAC check is skipped, never listed, and never an
+    error: this view is read-only, and verify keeps refusing such attempts.
+    """
+    records: list[dict[str, Any]] = []
+    try:
+        paths = sorted((Path(state_dir) / "leases").glob("*.json"))
+    except OSError:
+        return records
+    for path in paths:
+        try:
+            records.append(leases.load_lease(state_dir, path.stem))
+        except Exception:  # noqa: BLE001 - an unreadable lease is skipped, not fatal
+            continue
+    records.sort(
+        key=lambda record: (
+            str(record.get("created_at") or ""),
+            str(record.get("attempt_id") or ""),
+        )
+    )
+    return records
+
+
+def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
+    """One row per recorded attempt, derived from local evidence only.
+
+    The state comes from the coordinator's own records -- an accepted wave
+    record first, then the verify result -- so the view never asks the launcher
+    and never widens what the lease recorded. Every value passes through
+    ``scrub`` before it can reach the output; a validated attempt id survives
+    because it is evidence, not a credential.
+    """
+    from . import verify_local
+
+    accepted = _accepted_waves(state_dir)
+    rows: list[dict[str, Any]] = []
+    for record in _lease_records(state_dir):
+        attempt_id = str(record.get("attempt_id") or "")
+        if not attempt_id:
+            continue
+        brief = record.get("brief") if isinstance(record.get("brief"), Mapping) else {}
+        result = verify_local.read_record(state_dir, attempt_id) or {}
+        evidence = result.get("evidence") if isinstance(result.get("evidence"), Mapping) else {}
+        if attempt_id in accepted:
+            state = _ATTEMPT_ACCEPTED
+        elif result.get("ok") is True:
+            state = _ATTEMPT_VERIFIED
+        elif result.get("ok") is False:
+            state = _ATTEMPT_FAILED
+        else:
+            state = _ATTEMPT_DISPATCHED
+        row = {
+            "attempt_id": attempt_id,
+            "state": state,
+            "branch": _text_or_none(record.get("branch")),
+            "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model")),
+            "project": _text_or_none(brief.get("project")),
+            "created_at": str(record.get("created_at") or ""),
+            "updated_at": _latest_stamp(
+                record.get("created_at"), result.get("at"), accepted.get(attempt_id)
+            ),
+        }
+        clean = scrub(row)
+        if _ATTEMPT_ID_RE.fullmatch(attempt_id) and ".." not in attempt_id:
+            clean["attempt_id"] = attempt_id
+        rows.append(clean)
+    return rows
+
+
+def _cmd_attempts(ctx: Any, args: Any) -> int:
+    """``attempts``: the local attempt store as JSON; strictly read-only."""
+    state_dir = _state_dir(ctx, args)
+    print(json.dumps({"attempts": _attempt_rows(state_dir)}, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_status(ctx: Any, args: Any) -> int:
+    """``status``: in-flight work, the bee cap, and credential-free launcher health."""
+    from . import grants as grants_mod
+
+    state_dir = _state_dir(ctx, args)
+    config = _config(ctx)
+    rows = _attempt_rows(state_dir)
+    in_flight = [row["attempt_id"] for row in rows if row["state"] in _IN_FLIGHT_STATES]
+    payload = {
+        "in_flight": len(in_flight),
+        "in_flight_attempts": in_flight,
+        "bee_cap": int(grants_mod.GLOBAL_MAX_BEES),
+        "health": {
+            "adapter": str(config.get("adapter") or "orbit-loopback"),
+            "launcher_url_configured": bool(str(config.get("launcher_url") or "").strip()),
+            "credential_configured": bool(_token_configured(ctx)),
+        },
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
 
 
 # ---------------------------------------------------------------------------
