@@ -11,6 +11,7 @@ from bundlebees_plugin import provision_bind as B, provisioning as P
 class ProvisionRefusals(unittest.TestCase):
     def test_known_refusal_stays_denied_and_never_reposts(self):
         for error in (P.ProvisionDenied("profile_not_enrolled", "not enrolled"),
+                      P.ProvisionDenied("quota_exhausted", "profile is full"),
                       P.ProvisionUnavailable("provisioning_disabled", "disabled"),
                       P.ProvisionError("provision_conflict", "conflict")):
             with self.subTest(code=error.code), tempfile.TemporaryDirectory() as tmp:

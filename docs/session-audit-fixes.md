@@ -71,6 +71,11 @@ capabilities first; a disabled advertisement yields `provisioning_disabled`.
 No config-preservation change is justified without the actual update wrapper
 and before/after host evidence.
 
+The authenticated transport now retains the host error code, and a 409
+`quota_exhausted` remains a typed quota denial rather than a generic conflict.
+A full profile can refuse before a journal entry is written. Such a denial does
+not authorize cleanup, a policy increase, or another worker dispatch.
+
 ## Remaining acceptance
 
 These fixes do not activate or restart a service. Verify runtime revision parity
