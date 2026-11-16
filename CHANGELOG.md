@@ -88,6 +88,7 @@ one pull request.
   credential route a dispatch would take, starting no attempt (the fifth
   registered tool).
 
+- **Launcher build-identity evidence tiers:** the doctor's launcher build-identity check reports the running launcher's identity in three evidence tiers — receipt-backed, version-string-only, unavailable — and classifies one read-only `GET /v1/provision/capabilities` through the already-authenticated client. A version string without a deployment receipt is always flagged as not deployment evidence (owner directive, 2026-11-14); the capabilities classification never upgrades the identity tier. See `docs/doctor.md`.
 ### Fixed
 
 - **`attempts`/`status`: a secret-shaped attempt id keeps its scrubbed form.** The read-only views re-inserted a validated attempt id after scrubbing, so an id that itself looked like a credential (e.g. an `sk-`-prefixed string that passed the attempt-id grammar) was scrubbed to `[redacted]` and then put back raw — a narrow scrub bypass. The re-insertion now requires the id not to look like a secret, so the scrub result always wins for a secret-shaped id; ordinary validated attempt ids are unchanged. Found by an external reviewer and closed with a regression test written first against the unfixed tree.

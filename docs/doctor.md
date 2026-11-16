@@ -73,6 +73,75 @@ never a guess.
 | `usage_accounting` | the append-only outcome log is readable and has recorded runs. |
 | `observatory` | reachability of the endpoint named by the optional `observatory_url` plugin setting (one bounded GET, redirects refused, the endpoint value never displayed). Unset is `unavailable`; an endpoint the address policy refuses is `incompatible`. |
 | `hermes_api_floor` | the installed Hermes version against the plugin manifest floor (`requires_hermes`, `api_version`). Below the floor is `incompatible` and actionable. |
+| `launcher_identity` | the running launcher's exact build identity in three evidence tiers — receipt-backed, version-string-only (always flagged: a version string is not deployment evidence), unavailable — plus a read-only classification of `GET /v1/provision/capabilities` through the already-authenticated launcher client. A capabilities outcome never upgrades the identity tier. |
+
+## The launcher identity check
+
+The Nov 14–15 worker-update saga mistook version strings for deployment
+evidence. This check names that drift class explicitly: what the launcher
+claims in a version string is a claim, and only a deployment receipt is
+evidence about what is actually running.
+
+### Identity evidence tiers
+
+| Tier | Evidence | Row state |
+|---|---|---|
+| receipt-backed | the health/admin payload carries a validated `deployment_receipt` | judged against the reviewed release pin: `healthy` on match, `stale` on mismatch |
+| version-string-only | only a health `version` string, no usable receipt | always `unknown`, always flagged: "a version string is not deployment evidence", with the confirm-through-receipt fix |
+| unavailable | no adapter configured, health unreachable, or no identity field in the answer | `unavailable` (nothing configured), `inaccessible` (no answer), or `unknown` (answered, no usable identity) |
+
+A receipt counts as evidence only when it is an object carrying a non-empty
+`deployed_at` and a validated build identity — a dotted `version`, or a
+40/64-character hex `rev`, `revision` or `source_rev`. A receipt that names a
+hex revision is not comparable to the dotted release pin and reports
+`unknown`; a receipt whose build identity disagrees with the runtime's own
+version string reports `unknown` (the evidence disagrees) rather than picking
+a side.
+
+### The capabilities probe
+
+One read-only `GET /v1/provision/capabilities` (the path constant lives in
+`provisioning.py`) through the already-authenticated launcher client — the
+same channel every other launcher read uses, with the token read from Hermes
+secret scope inside the client. Classified exactly one of:
+
+| Classification | Meaning |
+|---|---|
+| `ok` | 200 with a parseable `rizzstack.provisioning/1` advertisement, provisioning enabled |
+| `disabled` | the advertisement parses but says provisioning is disabled |
+| `incompatible` | the advertisement violates the known contract (foreign schema, unusable profile list) |
+| `not advertised` | the launcher answered 404 |
+| `refused` | the launcher answered 401 or 403 to the authorized read |
+| `answered N` | the launcher answered another HTTP status |
+| `unreadable` | no authenticated client, no credential configured, or an unparseable response |
+
+The classification is appended to the row's detail as report text and never
+changes the identity tier: `ok` capabilities cannot make an unproven identity
+healthy, and an `incompatible` advertisement cannot make receipt-backed
+evidence stale.
+
+### Read-path and no-unpause guarantees
+
+- exactly two launcher reads, both GETs through the authenticated client (the
+  health read and the capabilities GET); no request body, no subprocess, no
+  curl-with-credentials in any argv, no secret value in any output — pinned
+  by a test that records the exact request list and refuses any subprocess;
+- the launcher is never restarted, edited or redeployed by this check, and
+  dispatch pause state is never touched: the doctor has no write path to it.
+  (Recorded gap: the no-unpause rule is not written anywhere in this repo —
+  a RULES.md with the referenced section 4 does not exist here — so the rule
+  is enforced structurally, by the absence of any write path, and pinned by
+  the exact-request-list test.)
+
+### Recorded gap (deliberately not fixed here)
+
+`client.public_health` whitelists health-payload keys, so a real launcher's
+deployment receipt is stripped before the doctor sees it; `client.py` is
+outside this check's file scope. Until the client mapping learns the
+`deployment_receipt` key, a real deployment reports version-string-only and is
+flagged — which is the honest state, not a malfunction. A test in
+`tests/test_doctor_launcher_identity.py` pins the stripping behavior so the
+future client change flips that test consciously.
 
 ## Parity semantics
 
@@ -158,7 +227,11 @@ resets, or restarts anything by itself; the doctor performs none of them.
 - the outcome log is read with the existing metrics readers, which never
   create or rewrite state;
 - the only network access is one bounded GET to an explicitly configured
-  observatory endpoint, with redirects refused and ambient proxies stripped;
+  observatory endpoint, with redirects refused and ambient proxies stripped,
+  plus the launcher-identity check's two authorized launcher reads (health and
+  `GET /v1/provision/capabilities`) through the already-authenticated client —
+  no subprocess, no request body, and no credential ever enters an argument
+  vector or the report;
 - credential checks answer presence only; no secret value is ever read into
   a printable form, and any unexpected probe result collapses to the
   redaction marker.
@@ -172,4 +245,6 @@ optional keyword argument, and every probe is a replaceable field that takes
 the run context and returns one `Finding`. A test context can inject a whole
 probe set through the `bundlebees_doctor_checkers` attribute, the same way
 `bundlebees_client` and the credential-presence injection work elsewhere in
-the plugin.
+the plugin. The launcher-identity probe takes its launcher reads from the
+same `bundlebees_client` injection as the deployed-runtime probe, so fixture
+launcher states are plain client fakes.
