@@ -1,9 +1,14 @@
 """Read-only ``hermes bundlebees attempts`` and ``status`` CLI views.
 
 Both commands answer from the plugin's local attempt store -- leases, verify
-results and accepted wave records -- with no network and no configured
-credential. The lookalike value below is assembled from fragments so no source
-line resembles a real credential, while still exercising the scrub path end to
+results and accepted wave records -- with no network and no credential
+values. The pair's only secret-store interaction is ``status``'s single
+launcher-token presence probe: ``client.token_configured()`` asks Hermes's
+``agent.secret_scope.get_secret`` for ``BUNDLEBEES_LAUNCHER_TOKEN`` to fill
+``health.credential_configured``. The probe reads presence only, never a
+value, never emits one, and fails closed when the scope is unavailable.
+The lookalike value below is assembled from fragments so no source line
+resembles a real credential, while still exercising the scrub path end to
 end in the output assertions.
 """
 
@@ -236,6 +241,22 @@ def test_attempts_scrub_a_lookalike_before_printing(tmp_path: Path, capsys):
     assert set(rows) == {"att-clean", "att-marked"}
     assert rows["att-clean"]["project"] == "proj-clean"
     assert rows["att-marked"]["project"] == "[redacted]"
+
+
+def test_a_secret_shaped_attempt_id_keeps_its_scrubbed_form(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, LOOKALIKE, now=CREATED_A, branch="feat/lookalike-id")
+    _lease(state, "att-clean", now=CREATED_B)
+
+    rc = _invoke(_ctx(), ["attempts", "--state-dir", str(state)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert LOOKALIKE not in out
+    rows = {row["attempt_id"]: row for row in json.loads(out)["attempts"]}
+    assert set(rows) == {"[redacted]", "att-clean"}
+    assert rows["[redacted]"]["state"] == "dispatched"
+    assert rows["[redacted]"]["branch"] == "feat/lookalike-id"
 
 
 def test_a_tampered_lease_is_skipped_without_failing_the_view(tmp_path: Path, capsys):

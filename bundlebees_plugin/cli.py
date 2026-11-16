@@ -16,10 +16,15 @@ setup prompt by default and only reaches a host when the user passes
 touch the network and never need a configured credential.
 
 All child processes receive ``security.child_env`` rather than the ambient
-environment. Nothing here reads credentials from the environment; the
+environment. Nothing here reads credentials from the environment. The
 ``doctor`` command asks Hermes's ``agent.secret_scope.get_secret`` whether a
-token is configured and never prints its value. Settings come from
-``ctx.get_config``; state lives in ``plugin_data_dir("bundlebees")``.
+token is configured and never prints its value. ``status`` performs exactly
+one secret-store read: the launcher-token presence probe --
+``client.token_configured()`` calls ``get_secret(BUNDLEBEES_LAUNCHER_TOKEN)``
+to fill ``health.credential_configured``. The probe reads presence only,
+never a value, never emits one, and fails closed when the secret scope is
+unavailable. Settings come from ``ctx.get_config``; state lives in
+``plugin_data_dir("bundlebees")``.
 """
 
 from __future__ import annotations
@@ -421,8 +426,10 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
     The state comes from the coordinator's own records -- an accepted wave
     record first, then the verify result -- so the view never asks the launcher
     and never widens what the lease recorded. Every value passes through
-    ``scrub`` before it can reach the output; a validated attempt id survives
-    because it is evidence, not a credential.
+    ``scrub`` before it can reach the output. A validated attempt id survives
+    the scrub as evidence, not a credential -- unless it is itself
+    secret-shaped: then the scrubbed form always wins and the raw id is never
+    re-inserted into the row.
     """
     from . import verify_local
 
@@ -455,7 +462,11 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             ),
         }
         clean = scrub(row)
-        if _ATTEMPT_ID_RE.fullmatch(attempt_id) and ".." not in attempt_id:
+        if (
+            _ATTEMPT_ID_RE.fullmatch(attempt_id)
+            and ".." not in attempt_id
+            and not looks_like_secret(attempt_id)
+        ):
             clean["attempt_id"] = attempt_id
         rows.append(clean)
     return rows
