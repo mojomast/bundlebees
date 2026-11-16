@@ -241,8 +241,15 @@ def _build_parser(parser: Any) -> Any:
 
     doctor = subparsers.add_parser(
         "doctor",
-        help="Report token configured/not, adapter reachability, and schema size.",
+        help="Report stack parity and health; never prints a credential value.",
     )
+    doctor.add_argument("--json", action="store_true", help="Print the machine-readable doctor report.")
+    doctor.add_argument(
+        "--check-parity",
+        action="store_true",
+        help="Exit nonzero when installed, loaded or deployed revisions diverge from reviewed main.",
+    )
+    doctor.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     doctor.set_defaults(command="doctor")
 
     attempts_cmd = subparsers.add_parser(
@@ -2216,52 +2223,7 @@ def _measure_schema_tokens() -> int | None:
 
 
 def _cmd_doctor(ctx: Any, args: Any) -> int:
-    _print("bundlebees doctor")
-    configured = _token_configured(ctx)
-    # Fixed text, never a value: printed directly so scrub() does not mask
-    # the word after "token:" (0.1.0 printed "token: [redacted] configured").
-    print(f"token: {'configured' if configured else 'not configured'}")
+    """The rizzstack doctor: read-only stack parity and health diagnostic."""
+    from . import doctor
 
-    reachable = False
-    detail = "not checked"
-    client = getattr(ctx, "bundlebees_client", None)
-    if client is None:
-        try:
-            client = _client_for(ctx, args)
-        except CliError:
-            client = None
-    health = getattr(client, "health", None) if client is not None else None
-    if callable(health):
-        try:
-            data = health()
-        except Exception:
-            detail = "unreachable"
-        else:
-            reachable = bool(data.get("ok", True)) if isinstance(data, Mapping) else True
-            detail = "reachable" if reachable else "reported not ok"
-    else:
-        detail = "unavailable"
-    _print(f"adapter: {detail}")
-
-    options = _sandbox_options(_config(ctx))
-    try:
-        backend = sandbox.detect_backend(options["backend"], allow_weak=options["allow_weak"])
-    except ValueError:
-        backend = None
-    if backend in sandbox.WEAK_BACKENDS:
-        _print(f"sandbox: {backend} (WEAK override on: coordinator filesystem stays readable)")
-    elif backend:
-        _print(f"sandbox: {backend}")
-    elif options["backend"] in sandbox.WEAK_BACKENDS:
-        _print("sandbox: none (verify_isolation=unshare refused without the weak override)")
-    elif options["allow_unsafe_local"]:
-        _print("sandbox: none (verify_allow_unsafe_local=true: tests run UNISOLATED)")
-    else:
-        _print("sandbox: none (verify and integrate will refuse; install bubblewrap)")
-
-    measured = _measure_schema_tokens()
-    if measured is None:
-        _print("schema_tokens: unavailable (install tiktoken to measure)")
-    else:
-        _print(f"schema_tokens: {measured} (budget 900 o200k)")
-    return 0
+    return doctor.run(ctx, args)
