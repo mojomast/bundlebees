@@ -136,9 +136,11 @@ def require_sandbox_interpreter(preferred: str = "auto") -> None:
 
     from bundlebees_plugin import sandbox
 
-    # Backend availability decides first: without one, run_in_sandbox refuses before any interpreter
-    # question matters, so skipping on a configured interpreter alone would turn those hosts into
-    # errors. Only then does interpreter reachability matter, and staging makes it satisfiable.
+    # Backend detection runs first, before any interpreter question matters. A backend-less host is
+    # refused by run_in_sandbox — but only without verify_allow_unsafe_local; with that override it
+    # still runs unsandboxed (backend "none-unsafe-local"). This helper skips on such hosts so the
+    # unsafe-local path is never exercised accidentally by tests that mean to test a real jail. On
+    # a strong backend, interpreter reachability matters next, and staging makes it satisfiable.
     backend = sandbox.detect_backend(preferred)
     if backend is None:
         pytest.skip("no strong sandbox backend is usable on this host")
