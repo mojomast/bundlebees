@@ -539,3 +539,49 @@ def test_an_unknown_campaign_is_a_named_refusal(tmp_path: Path):
     with pytest.raises(campaign.CampaignError) as caught:
         git_observer.observe_campaign(tmp_path, "missing")
     assert caught.value.code == "campaign_missing"
+
+
+# ---------------------------------------------------------------------------
+# Real gh shapes and scrub coverage (independent-review follow-ups on #45)
+# ---------------------------------------------------------------------------
+
+
+def test_real_gh_uppercase_states_are_normalized_not_false_drift():
+    world = GitWorld(local=HEAD, remote=HEAD)
+
+    open_report = git_observer.observe(
+        _record(), repo="/work", git=world, pull_requests=PRWorld(view=_view(state="OPEN")), now=T0
+    )
+    assert open_report["clean"] is True and open_report["drift"] == []
+    assert open_report["actual"]["pull_request"]["state"] == "open"
+
+    merged_report = git_observer.observe(
+        _record(), repo="/work", git=world, pull_requests=PRWorld(view=_view(state="MERGED")), now=T0
+    )
+    entry = next(item for item in merged_report["drift"] if item["kind"] == "pr_merged")
+    assert entry["actual"] == {"pull_request": 7, "state": "merged"}
+
+    closed_report = git_observer.observe(
+        _record(), repo="/work", git=world, pull_requests=PRWorld(view=_view(state="CLOSED")), now=T0
+    )
+    assert [item["kind"] for item in closed_report["drift"]] == ["pr_closed"]
+    assert closed_report["actual"]["pull_request"]["state"] == "closed"
+
+
+def test_drift_facts_and_observed_at_never_carry_world_secrets():
+    marker = "ghp_" + "A" * 36  # assembled at runtime so the scanners see no value
+    hostile_state = "MERGED " + marker + " https://" + "git.corp.invalid/x"
+    hostile_now = marker + " https://" + "scan.invalid/" + "now"
+
+    report = git_observer.observe(
+        _record(), repo="/work", git=GitWorld(local=HEAD, remote=HEAD),
+        pull_requests=PRWorld(view=_view(state=hostile_state)), now=hostile_now,
+    )
+
+    blob = json.dumps(report)
+    assert marker not in blob and "git.corp.invalid" not in blob and "scan.invalid" not in blob
+    entry = report["drift"][0]
+    assert marker not in json.dumps(entry["actual"]) and "git.corp.invalid" not in json.dumps(entry["actual"])
+    assert "[redacted]" in json.dumps(entry["actual"])
+    assert marker not in report["observed_at"] and "scan.invalid" not in report["observed_at"]
+    assert report["observed_at"] != hostile_now

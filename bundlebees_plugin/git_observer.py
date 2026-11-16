@@ -123,6 +123,30 @@ def _text(value: Any) -> str:
     return scrub(value) if isinstance(value, str) else ""
 
 
+def _pr_state(view: Any) -> str:
+    """The PR state, normalized to the checkpoint's lowercase spelling.
+
+    gh emits the GraphQL enum (OPEN / MERGED / CLOSED); the campaign records
+    lowercase states, so the comparison normalizes once, at the source, and
+    every report field carries the same normalized value.
+    """
+
+    state = view.get("state") if isinstance(view, Mapping) else None
+    return _text(state.strip().lower()) if isinstance(state, str) else ""
+
+
+def _fact_value(value: Any) -> Any:
+    """One drift fact: digests byte-exact, every other string scrubbed."""
+
+    if isinstance(value, str):
+        return value if _SHA_RE.fullmatch(value.strip().lower()) else _text(value)
+    if isinstance(value, Mapping):
+        return {key: _fact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fact_value(item) for item in value]
+    return value
+
+
 def _clip(text: str) -> str:
     return text[:_MAX_ERROR_TEXT]
 
@@ -384,8 +408,8 @@ def _drift(
 ) -> dict[str, Any]:
     return {
         "kind": kind,
-        "expected": dict(expected),
-        "actual": dict(actual),
+        "expected": _fact_value(dict(expected)),
+        "actual": _fact_value(dict(actual)),
         "detail": _clip(scrub(detail)),
     }
 
@@ -443,8 +467,7 @@ def _pr_drift(
                 )
             )
         else:
-            state = view.get("state")
-            state = state if isinstance(state, str) else ""
+            state = _pr_state(view)
             if state and state != "open":
                 kind = "pr_merged" if state == "merged" else "pr_closed"
                 drift.append(
@@ -508,7 +531,9 @@ def observe(
 
     facts = _checkpoint_facts(record)
     slug, branch, number = facts["repo"], facts["branch"], facts["pull_request"]
-    observed_at = now or _now()
+    observed_at = _text(now) if now else _now()
+    if not observed_at:
+        observed_at = _now()
     git_runner: GitRunner | None = git if git is not None else _default_git
     worktree: Path | None = Path(repo) if repo is not None else None
     git_seen = _observe_git(git_runner, worktree, facts["base_rev"], branch)
@@ -553,7 +578,7 @@ def observe(
             "pull_request": (
                 {
                     "number": int(number),
-                    "state": _text(view.get("state")),
+                    "state": _pr_state(view),
                     "head_branch": _text(view.get("headRefName")),
                     "head_oid": _sha(view.get("headRefOid")),
                 }
