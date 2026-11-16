@@ -30,6 +30,15 @@ composed through the private label constant and :func:`_credential_line`, so
 the emitted bytes stay identical to the historical format while no source
 line carries the flagged literal shape.
 
+The launcher-identity check reports the running launcher's build identity in
+three evidence tiers — receipt-backed, version-string-only, unavailable — and
+classifies one read-only GET of ``/v1/provision/capabilities`` through the
+already-authenticated launcher client. Reads ride authorized channels only:
+no subprocess, no credential in any argument vector, no secret printed. A
+version string without a deployment receipt is always flagged (a version
+string is not deployment evidence), and a capabilities outcome never upgrades
+the identity tier.
+
 Free text is scrubbed once, at creation (:class:`Finding`). Revisions are
 validated separately and emitted without scrubbing, because a 40-character
 hex digest is evidence, not a secret-shaped string; the same applies to
@@ -52,6 +61,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import execution, metrics, sandbox
+from .provisioning import CAPABILITY_PATH, Capabilities, ProvisionIncompatible
 from .security import UnsafeURLError, child_env, config_flag, scrub, validate_url
 
 STATES: tuple[str, ...] = ("healthy", "stale", "unavailable", "inaccessible", "unknown", "incompatible")
@@ -114,6 +124,16 @@ _GATEWAY_FIX = (
 _DEPLOYED_FIX = "redeploy the reviewed launcher release at a quiet boundary; never restart a busy launcher"
 _CREDENTIAL_FIX = "set BUNDLEBEES_LAUNCHER_TOKEN in Hermes secrets; never paste the value into chat"
 
+# The launcher-identity check: the health/admin payload key that may carry a
+# deployment receipt, the owner-directed flag for version-string-only
+# evidence, and the exact safe step attached to that flag.
+_LAUNCHER_RECEIPT_KEY = "deployment_receipt"
+_IDENTITY_FLAG = "a version string is not deployment evidence"
+_IDENTITY_FIX = (
+    "confirm the deployed build through the launcher's deployment receipt via the "
+    "reviewed admin channel; a version string alone never satisfies the release pin"
+)
+
 ASPECT_LABELS = {
     "checkout": "checkout",
     "origin_main": "origin main",
@@ -137,6 +157,7 @@ _CHECK_ROWS: tuple[str, ...] = (
     "usage_accounting",
     "observatory",
     "hermes_api_floor",
+    "launcher_identity",
 )
 
 _ASPECT_CHECKERS: dict[tuple[str, str], str] = {
@@ -611,6 +632,18 @@ def _bundlebees_gateway_check(context: Context) -> Finding:
     )
 
 
+def _health_version(data: Any) -> str | None:
+    """The validated version string a launcher health payload reports, if any."""
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("version")
+    if isinstance(raw, str):
+        candidate = raw.strip()
+        if len(candidate) <= 40 and _VERSION_RE.fullmatch(candidate):
+            return candidate
+    return None
+
+
 def _launcher_deployed_check(context: Context) -> Finding:
     outcome, data = context.health_outcome()
     if outcome == "unavailable":
@@ -621,13 +654,7 @@ def _launcher_deployed_check(context: Context) -> Finding:
             "the launcher did not answer its health endpoint",
             line="adapter: unreachable",
         )
-    version = None
-    if isinstance(data, Mapping):
-        raw = data.get("version")
-        if isinstance(raw, str):
-            candidate = raw.strip()
-            if len(candidate) <= 40 and _VERSION_RE.fullmatch(candidate):
-                version = candidate
+    version = _health_version(data)
     note = "" if outcome == "ok" else "the launcher reported not ok"
     line = "adapter: " + ("reachable" if outcome == "ok" else "reported not ok")
     if version is None:
@@ -642,6 +669,161 @@ def _launcher_deployed_check(context: Context) -> Finding:
     if note:
         detail += f"; {note}"
     return Finding("stale", detail, fix=_DEPLOYED_FIX, rev=version, line=line)
+
+
+def _receipt_identity(receipt: Any) -> tuple[str, str] | None:
+    """``(identity, kind)`` from a deployment-receipt mapping, or None.
+
+    A receipt is deployment evidence only when it carries both a non-empty
+    ``deployed_at`` marker and a validated build identity: a dotted
+    ``version``, or a 40/64-character hex ``rev`` / ``revision`` /
+    ``source_rev``. Anything else is present but unusable, and the caller
+    says so instead of treating it as evidence.
+    """
+    if not isinstance(receipt, Mapping):
+        return None
+    if not str(receipt.get("deployed_at") or "").strip():
+        return None
+    version = str(receipt.get("version") or "").strip()
+    if version and len(version) <= 40 and _VERSION_RE.fullmatch(version):
+        return version, "version"
+    for key in ("rev", "revision", "source_rev"):
+        rev = str(receipt.get(key) or "").strip()
+        if rev and _HEX_RE.fullmatch(rev):
+            return rev, "rev"
+    return None
+
+
+def _identity_finding(context: Context) -> Finding:
+    """The build-identity half of the check, before capabilities text is joined."""
+    if context.client() is None:
+        return Finding(
+            "unavailable",
+            "no launcher adapter is configured; the running launcher's build identity "
+            "is not observable here",
+        )
+    outcome, data = context.health_outcome()
+    if outcome == "unreachable":
+        return Finding(
+            "inaccessible",
+            "the launcher did not answer its health endpoint; no build identity "
+            "evidence is available",
+        )
+    if outcome == "unavailable":
+        return Finding(
+            "unknown",
+            "the launcher adapter exposes no health read; the build identity is not "
+            "observable here",
+        )
+    version = _health_version(data)
+    receipt_raw = data.get(_LAUNCHER_RECEIPT_KEY) if isinstance(data, Mapping) else None
+    receipt = _receipt_identity(receipt_raw)
+    notes = []
+    if outcome == "not_ok":
+        notes.append("the launcher reported not ok")
+    if receipt is None and receipt_raw is not None:
+        notes.append("the deployment receipt could not be validated")
+    suffix = "".join(f"; {part}" for part in notes)
+    if receipt is not None:
+        identity_value, kind = receipt
+        if kind == "version" and version is not None and version != identity_value:
+            return Finding(
+                "unknown",
+                f"the running launcher reports {version} but its deployment receipt names "
+                f"{identity_value}; the identity evidence disagrees{suffix}",
+                rev=version,
+            )
+        if kind == "rev":
+            return Finding(
+                "unknown",
+                f"the deployment receipt names revision {identity_value[:12]}; the reviewed "
+                f"release pin is a version, so the deployed build is not comparable to it{suffix}",
+                rev=identity_value,
+            )
+        if identity_value == LAUNCHER_PIN:
+            return Finding(
+                "healthy",
+                f"launcher {identity_value} matches the reviewed release pin {LAUNCHER_PIN}; "
+                f"deployment receipt confirms the build{suffix}",
+                rev=identity_value,
+            )
+        return Finding(
+            "stale",
+            f"launcher reports {identity_value}; the reviewed release pin is {LAUNCHER_PIN}; "
+            f"deployment receipt confirms the build{suffix}",
+            fix=_DEPLOYED_FIX,
+            rev=identity_value,
+        )
+    if version is None:
+        return Finding("unknown", f"the launcher reported no usable build identity{suffix}")
+    return Finding(
+        "unknown",
+        f"launcher reports {version} (the reviewed release pin is {LAUNCHER_PIN}); "
+        f"{_IDENTITY_FLAG}{suffix}",
+        fix=_IDENTITY_FIX,
+        rev=version,
+    )
+
+
+def _capabilities_finding(context: Context) -> tuple[str, str]:
+    """``(classification, human fragment)`` for GET /v1/provision/capabilities.
+
+    The read rides the already-authenticated launcher client: the token stays
+    inside the client's credential provider, never in an argument vector and
+    never in output. Classifications: ``ok``, ``disabled``, ``incompatible``,
+    ``not advertised``, ``refused``, ``answered <status>`` and ``unreadable``.
+    The result is report text only — it never upgrades the identity tier.
+    """
+    client = context.client()
+    if client is None:
+        return "unreadable", "capabilities: unreadable (no authenticated launcher client is available)"
+    request = getattr(client, "request_json", None)
+    if not callable(request):
+        return "unreadable", "capabilities: unreadable (the launcher adapter exposes no request channel)"
+    try:
+        body = request("GET", CAPABILITY_PATH, None)
+    except Exception as exc:  # noqa: BLE001 - every failure mode is classified, none is hidden
+        status = getattr(exc, "status", None)
+        if status == 404:
+            return "not advertised", "capabilities: not advertised (the launcher answered 404)"
+        if status in (401, 403):
+            return "refused", f"capabilities: refused (the launcher answered {status})"
+        if isinstance(status, int) and status:
+            return f"answered {status}", f"capabilities: answered {status}"
+        if getattr(exc, "code", "") == "not_configured":
+            return "unreadable", "capabilities: unreadable (no launcher credential is configured)"
+        source = str(getattr(exc, "code", "") or type(exc).__name__)
+        return "unreadable", f"capabilities: unreadable ({_clip(source)})"
+    if not isinstance(body, Mapping):
+        return "unreadable", "capabilities: unreadable (the capabilities response is not an object)"
+    try:
+        caps = Capabilities.parse(body)
+    except ProvisionIncompatible as exc:
+        return "incompatible", f"capabilities: incompatible ({_clip(exc.message)})"
+    except Exception as exc:  # noqa: BLE001 - an unparseable advertisement stays unreadable
+        return "unreadable", f"capabilities: unreadable ({type(exc).__name__})"
+    if not caps.enabled:
+        return "disabled", "capabilities: disabled (the host advertises provisioning as disabled)"
+    return "ok", f"capabilities: ok ({caps.schema}, backend {caps.backend})"
+
+
+def _launcher_identity_check(context: Context) -> Finding:
+    """The running launcher's build identity plus its capabilities advertisement.
+
+    Evidence tiers for the identity: receipt-backed (judged against the
+    reviewed release pin), version-string-only (always flagged: a version
+    string is not deployment evidence) and unavailable (never read as
+    healthy). The capabilities classification is appended as report text and
+    never changes the identity tier. Strictly read-only: two GETs at most,
+    through the authenticated client; the launcher is never restarted, edited
+    or unpaused.
+    """
+    identity = _identity_finding(context)
+    _classification, fragment = _capabilities_finding(context)
+    detail = identity.detail
+    if fragment:
+        detail = f"{detail}; {fragment}"
+    return Finding(identity.state, detail, fix=identity.fix, rev=identity.rev)
 
 
 # Aspects the doctor deliberately does not probe for a repo stay explicitly
@@ -1066,6 +1248,7 @@ class Checkers:
     hyvv_checkout: Probe
     hyvv_origin_main: Probe
     launcher_deployed_runtime: Probe
+    launcher_identity: Probe
     credential: Probe
     sandbox: Probe
     schema_tokens: Probe
@@ -1116,6 +1299,7 @@ def default_checkers(
         hyvv_checkout=lambda context: _probe_checkout(context, "hyvv", HYVV_PIN),
         hyvv_origin_main=lambda context: _probe_origin_main(context, "hyvv"),
         launcher_deployed_runtime=_launcher_deployed_check,
+        launcher_identity=_launcher_identity_check,
         credential=_credential_check,
         sandbox=_sandbox_check,
         schema_tokens=_schema_tokens_check,

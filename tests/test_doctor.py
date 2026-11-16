@@ -258,6 +258,7 @@ def test_json_report_lists_every_check_once(capsys):
         "usage_accounting",
         "observatory",
         "hermes_api_floor",
+        "launcher_identity",
     }
 
 
