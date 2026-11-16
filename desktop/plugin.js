@@ -23,6 +23,7 @@ const TABS = Object.freeze([
   { id: "projects", label: "Projects" },
   { id: "attempts", label: "Live attempts" },
   { id: "verify-results", label: "Verify results" },
+  { id: "approvals", label: "Approvals" },
   { id: "host-prompt", label: "Remote host" },
 ]);
 
@@ -193,6 +194,12 @@ function createApi(ctx) {
           : { confirm: true, accepted },
       }),
     verifyResults: () => requireRest()("/verify-results"),
+    approvals: () => requireRest()("/approvals"),
+    approvalCard: (id) => {
+      const clean = encodeURIComponent(String(id || "").trim());
+      if (!clean) throw new TypeError("an approval request id is required");
+      return `/api/plugins/bundlebees/approval/${clean}`;
+    },
     hostPromptOptions: () => requireRest()("/host-prompt"),
     hostPrompt: (fields) =>
       requireRest()("/host-prompt", { method: "POST", body: fields }),
@@ -457,6 +464,42 @@ function makeElement(ctx) {
     );
   }
 
+  function ApprovalsView({ data, onOpen }) {
+    const items = (data && data.approvals) || [];
+    return h(
+      "div",
+      null,
+      h(ErrorCard, { payload: data }),
+      h(
+        "div",
+        { className: "bb-card" },
+        h("div", { className: "bb-heading" }, "One-time job approvals"),
+        h("p", { className: "bb-muted" },
+          "Review the exact job, revision, scope, worker and budget in the owner card. Approving starts only that job; it does not accept the final product or authorize a merge, release, deployment or publication."
+        ),
+        items.length
+          ? h("ul", { className: "bb-list" }, items.map((item) =>
+              h("li", { key: item.request_id },
+                h("div", null, h("strong", null, valueText(item.job_id)), " — ", valueText(item.statement)),
+                h(Row, { label: "repository" }, valueText(item.repo)),
+                h(Row, { label: "base revision" }, valueText(item.base_rev)),
+                h(Row, { label: "worker" }, `${valueText(item.worker_project)} · ${valueText(item.worker_profile)}`),
+                h(Row, { label: "expires" }, valueText(item.expires_at)),
+                h("div", { className: "bb-actions" },
+                  h("a", {
+                    className: "bb-button",
+                    href: onOpen(item.request_id),
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                  }, "Review and decide")
+                )
+              )
+            ))
+          : h("span", { className: "bb-muted" }, "No pending approval requests.")
+      )
+    );
+  }
+
   function HostPromptView({ options, result, onSubmit, busy }) {
     const [os, setOs] = React.useState("linux");
     const [reach, setReach] = React.useState("same-machine");
@@ -587,6 +630,7 @@ function makeElement(ctx) {
           else if (tab === "projects") data = await api.projects();
           else if (tab === "attempts") data = await api.attempts();
           else if (tab === "verify-results") data = await api.verifyResults();
+          else if (tab === "approvals") data = await api.approvals();
           else data = await api.hostPromptOptions();
           if (alive) setState((current) => ({ ...current, [tab]: data }));
         } catch (error) {
@@ -687,6 +731,11 @@ function makeElement(ctx) {
       });
     else if (tab === "verify-results")
       content = h(VerifyView, { data: state["verify-results"] });
+    else if (tab === "approvals")
+      content = h(ApprovalsView, {
+        data: state.approvals,
+        onOpen: (id) => api.approvalCard(id),
+      });
     else
       content = h(HostPromptView, {
         options: state["host-prompt"],
@@ -762,7 +811,7 @@ const plugin = {
   id: PLUGIN_ID,
   name: TITLE,
   description:
-    "Launcher health, containers, models, concurrency, projects, attempts, verify results, and the host prompt.",
+    "Launcher health, containers, models, concurrency, projects, attempts, verify results, one-time owner approvals, and the host prompt.",
   register: registerBundlebees,
 };
 

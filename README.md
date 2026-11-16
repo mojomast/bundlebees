@@ -156,7 +156,9 @@ format, the state machine or the evidence.
 ### Operating it
 
 State lives under the plugin data directory, or `--state-dir DIR` on every command when no Hermes host is
-present. Use one terminal for `authorize`; it refuses without a TTY by design.
+present. Use one terminal for `authorize`; it refuses without a TTY by design. An owner who is away from the
+keyboard can instead approve a one-time receipt through the trusted application (see
+[One-time owner approval](#one-time-owner-approval)).
 
 ```bash
 # 1. Record the human authorization once. The statement is stored verbatim.
@@ -217,6 +219,31 @@ hermes bundlebees repo revoke --repo mojomast/rizzstack-smoke
 After a grant exists, `job create` auto-authorizes a matching job and records
 the grant id, statement and approval time in its evidence. Missing, expired,
 revoked, malformed or tampered grants fail closed.
+
+### One-time owner approval
+
+When the owner is not at a keyboard, `job authorize` can accept a one-time
+receipt signed by the trusted application instead of a TTY. The owner reviews
+the exact binding in plain language and clicks **Approve** once; after that the
+agent may run:
+
+```bash
+hermes bundlebees job authorize --job-id job_a \
+  --approval-receipt /path/to/receipt.json --tasks tasks.json
+```
+
+The receipt binds the job id, repository and base revision, statement, scope,
+the exact normalised task set, budgets, worker project/profile, Bundlebees
+code revision, planned coordinator stop/restart, gates and recovery ceiling,
+and expires (900 s default). It is accepted only when its HMAC verifies, it is
+unexpired and unused, and its binding equals the authorization fields exactly.
+The sealed authorization records `authority: owner-approval` and the receipt
+identity and digest. The signing secret `BUNDLEBEES_APPROVAL_SECRET` is read
+only through `agent.secret_scope.get_secret`; without it the path fails closed
+with a named installation requirement, and a decision call without the
+per-request owner capability is refused. This authorises one trial run only:
+no acceptance, merge, release or deploy. See
+[docs/job-approval.md](docs/job-approval.md).
 
 Add `contract_path` and `contract_sha256` to run a task under a frozen `acdd/1` contract; a task that
 declares a contract refuses to dispatch if the file is missing or its hash changed.

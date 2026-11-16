@@ -1321,11 +1321,7 @@ def _manifest(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict
     gate: Mapping[str, Any] = gate_value if isinstance(gate_value, Mapping) else {}
     authority_doc: Mapping[str, Any] = authorization if isinstance(authorization, Mapping) else {}
     gates = [str(item) for item in (gate.get("gates") or authority_doc.get("gates") or [])]
-    pending = []
-    for name in gates:
-        path = state / jobs.APPROVALS_DIR / f"{jid}.{jobs._slug(name)}.json"
-        if not path.exists():
-            pending.append(name)
+    pending = pending_gate_approvals(state, jid, gates, limitations)
 
     if not waves:
         unrun.append("accepted integration wave")
@@ -1625,6 +1621,37 @@ def render(manifest: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
+
+
+def pending_gate_approvals(
+    state_dir: Path,
+    job_id: str,
+    gates: Sequence[Any],
+    limitations: list[str] | None = None,
+) -> list[str]:
+    """The human gates that still lack a verified, granted decision.
+
+    A file's presence is not an approval. The sealed record must verify, name
+    this job and this gate, and say ``granted``. A forged ``{}``, a copied
+    record or a ``refused`` verdict stays pending, and the refusal code is
+    reported as a limitation rather than hidden.
+    """
+
+    pending: list[str] = []
+    for raw in gates:
+        name = str(raw)
+        try:
+            verdict = jobs.gate_decision(state_dir, job_id, name)
+        except jobs.JobError as exc:
+            pending.append(name)
+            if limitations is not None:
+                limitations.append(
+                    f"gate {name} has a decision record that does not verify ({exc.code}); it is not consent"
+                )
+            continue
+        if verdict != "granted":
+            pending.append(name)
+    return sorted(dict.fromkeys(pending))
 
 
 def build(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict[str, Any]:

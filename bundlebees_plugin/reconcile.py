@@ -36,10 +36,14 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from . import agent_work as work_queue
+from . import campaign as campaign_state
 from . import git_observer
 from . import job as jobs
+from . import queue as queue_mod
 from . import recovery as recoveries
+from . import work_scheduler
 from .brief import BriefError, validate_brief
+from .security import scrub
 
 DEFAULT_GRACE_S = 60.0
 DEFAULT_MAX_UNCERTAIN_TICKS = 5
@@ -505,14 +509,25 @@ def tick(
     max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
     stale_lock_s: float = DEFAULT_STALE_LOCK_S,
     binder: Callable[[str, Mapping[str, Any]], None] | None = None,
+    git_evidence: Mapping[str, Any] | None = None,
 ) -> TickResult:
-    """Run one reconciler tick. See the module docstring for the rules."""
+    """Run one reconciler tick. See the module docstring for the rules.
+
+    ``git_evidence`` is an optional git-observer report (workflow-F3). When it
+    proves the recorded PR's work is already integrated (``integrated_not_pr_merged``
+    or ``pr_merged``) or otherwise disagrees with the recorded world, the tick
+    never calls the integrator: a duplicate integration attempt is exactly the
+    failure the evidence exists to prevent. Instead it returns a
+    ``record_disposition`` action when the wait for the PR can end, or blocks
+    for a human when the disagreement needs one.
+    """
 
     if grace_s < 0:
         raise ReconcileError("grace_invalid", "grace_s must not be negative", "Pass a non-negative grace period.")
     job_id = _safe_id(job_id, "job_id")
     adapter = _Adapter(launcher)
     clock = _clock(now)
+    decision = git_evidence_decision(git_evidence) if git_evidence is not None else None
 
     lock = _acquire_lock(Path(state_dir), job_id, clock, stale_lock_s)
     if lock is None:
@@ -529,7 +544,7 @@ def tick(
         except Exception as exc:  # noqa: BLE001 - publication must not block the tick
             work_error = str(getattr(exc, "code", None) or type(exc).__name__)
         result = _run(
-            Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder
+            Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder, decision
         )
         try:
             published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
@@ -571,6 +586,7 @@ def _run(
     verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
     binder: Callable[[str, Mapping[str, Any]], None] | None = None,
+    evidence_decision: Mapping[str, Any] | None = None,
 ) -> TickResult:
     attempts = adapter.list_attempts()
     transitions: list[str] = []
@@ -610,6 +626,29 @@ def _run(
         and not any(t.get("state") in in_flight for t in job["tasks"])
     )
     if wave_ready and integrator is not None and not integration.get("terminal"):
+        if evidence_decision is not None and not evidence_decision.get("integration_permitted", True):
+            # Git evidence says the world already disagrees with the checkpoint.
+            # Integrating again would duplicate work that is provably done (or
+            # build on a moved world), so the integrator is never called here.
+            if changed or transitions:
+                jobs.save_job(state_dir, job)
+            evidence = str(evidence_decision.get("evidence") or "")
+            reason = str(evidence_decision.get("reason") or "")
+            if evidence_decision.get("stop_waiting"):
+                return TickResult(
+                    status="ok",
+                    transitions=tuple(transitions),
+                    action="record_disposition",
+                    detail=f"git evidence {evidence}: {reason} — record the disposition and stop waiting",
+                    evidence=evidence,
+                )
+            return TickResult(
+                status="blocked",
+                transitions=tuple(transitions),
+                action="needs_human",
+                detail=f"git evidence {evidence}: {reason}",
+                evidence=evidence,
+            )
         stalled = [t["task_id"] for t in job["tasks"] if t.get("state") in {"failed", "rejected"}]
         if stalled and not job.get("allow_partial_wave"):
             result = _stop_wave(
@@ -1316,17 +1355,22 @@ def campaign_git_drift(
     git: git_observer.GitRunner | None = None,
     pull_requests: git_observer.PullRequestSource | None = None,
     now: str | None = None,
+    main_ref: str | None = None,
 ) -> dict[str, Any]:
     """Observe a campaign checkpoint against real git refs and open PR heads.
 
     Read-only and report-only (workflow-F3): the checkpoint's recorded base
     revision, branch and pull request are compared with the actual refs in
     ``repo`` and the open PR heads ``gh`` reports, and the difference is
-    returned as drift with the exact expected-vs-actual values. Nothing is
-    resolved, reset, pushed, merged or rewritten here, and no checkpoint is
-    modified; a caller decides what, if anything, to do about drift. An
-    unobservable world raises :class:`git_observer.GitObserverError` — an
-    observation failure is never reported as drift.
+    returned as drift with the exact expected-vs-actual values. ``main_ref``
+    names the authoritative main branch; when given, the recorded PR's exact
+    head is also classified against it (``integrated_not_pr_merged`` when the
+    head is already an ancestor of main while GitHub still reports the PR
+    unmerged — the orbitdesktop #34 class). Nothing is resolved, reset, pushed,
+    merged or rewritten here, and no checkpoint is modified; a caller decides
+    what, if anything, to do about drift. An unobservable world raises
+    :class:`git_observer.GitObserverError` — an observation failure is never
+    reported as drift.
     """
 
     return git_observer.observe_campaign(
@@ -1336,6 +1380,7 @@ def campaign_git_drift(
         git=git,
         pull_requests=pull_requests,
         now=now,
+        main_ref=main_ref,
     )
 
 
@@ -1352,3 +1397,461 @@ def _intent_for(state_dir: Path, job: Mapping[str, Any], task: Mapping[str, Any]
         if intent is not None:
             return intent
     return None
+
+
+# ---------------------------------------------------------------------------
+# Git evidence: the scheduler's consumer of the read-only observer report
+# ---------------------------------------------------------------------------
+
+
+#: The evidence code for the orbitdesktop #34 class: the PR's exact head is
+#: already an ancestor of the authoritative main branch while GitHub still
+#: reports the PR unmerged. The work is integrated; the pull request was not.
+GIT_EVIDENCE_INTEGRATED = "integrated_not_pr_merged"
+GIT_EVIDENCE_MERGED = "pr_merged"
+GIT_EVIDENCE_EQUIVALENT = "equivalent_content_unverified"
+
+
+def git_evidence_decision(
+    report: Mapping[str, Any],
+    proposed: str | None = None,
+) -> dict[str, Any]:
+    """Turn one git-observer report into the scheduler's next action.
+
+    The observer is read-only; this function is the decision half that consumes
+    its evidence. Rules, in priority order:
+
+    * ``integrated_not_pr_merged`` — the work is provably on main while GitHub
+      still reports the PR unmerged. Integration is **not permitted** (a second
+      integration attempt would duplicate work that is already integrated), the
+      wait for the PR merge ends, and the next action is to record the
+      disposition. A proposed ``integrate…`` next action is suppressed and
+      named in ``suppressed_next_action``.
+    * ``pr_merged`` — GitHub reports the merge. The same disposition rule
+      applies: adopt the external merge, never integrate again.
+    * ``equivalent_content_unverified`` — main carries a patch-equivalent of
+      the PR's commits, but equivalence is not proof of a merge. Integration is
+      not permitted and the wait does **not** end: a verifier must confirm the
+      content before any disposition is recorded.
+    * any other drift — the world disagrees with the checkpoint; integration is
+      not permitted and the disagreement is a human decision.
+    * no drift and no anomaly — integration proceeds exactly as before.
+    """
+
+    if not isinstance(report, Mapping) or not isinstance(report.get("drift"), list):
+        raise ReconcileError(
+            "git_evidence_invalid",
+            "the git observation report is not a valid observer report",
+            "Pass the mapping git_observer.observe() returned; nothing is dispatched from a guess.",
+        )
+    drift_kinds = sorted(
+        {
+            str(item.get("kind") or "")
+            for item in report["drift"]
+            if isinstance(item, Mapping) and str(item.get("kind") or "")
+        }
+    )
+    actual = report.get("actual")
+    actual = actual if isinstance(actual, Mapping) else {}
+    integration = actual.get("integration")
+    integration = integration if isinstance(integration, Mapping) else {}
+    verdict = str(integration.get("verdict") or "")
+
+    def decision(
+        evidence: str,
+        *,
+        permitted: bool,
+        stop_waiting: bool,
+        next_action: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        suppressed = ""
+        if (
+            proposed
+            and isinstance(proposed, str)
+            and not permitted
+            and (proposed == "integrate" or proposed.startswith("integrate:"))
+        ):
+            suppressed = proposed
+        return {
+            "evidence": evidence,
+            "disposition": evidence,
+            "integration_permitted": permitted,
+            "stop_waiting": stop_waiting,
+            "next_action": next_action,
+            "suppressed_next_action": suppressed,
+            "reason": reason,
+        }
+
+    if verdict == GIT_EVIDENCE_INTEGRATED or GIT_EVIDENCE_INTEGRATED in drift_kinds:
+        return decision(
+            GIT_EVIDENCE_INTEGRATED,
+            permitted=False,
+            stop_waiting=True,
+            next_action="record_disposition:integrated_not_pr_merged",
+            reason=(
+                "the PR's exact head is already an ancestor of the authoritative main branch while GitHub "
+                "still reports the PR unmerged; the work is integrated, so record the disposition and stop "
+                "waiting instead of integrating again"
+            ),
+        )
+    if verdict == GIT_EVIDENCE_MERGED or GIT_EVIDENCE_MERGED in drift_kinds:
+        return decision(
+            GIT_EVIDENCE_MERGED,
+            permitted=False,
+            stop_waiting=True,
+            next_action="record_disposition:pr_merged",
+            reason="GitHub reports the PR merged; adopt the external merge and stop waiting instead of integrating again",
+        )
+    if verdict == GIT_EVIDENCE_EQUIVALENT or GIT_EVIDENCE_EQUIVALENT in drift_kinds:
+        return decision(
+            GIT_EVIDENCE_EQUIVALENT,
+            permitted=False,
+            stop_waiting=False,
+            next_action="verify_integrated_content",
+            reason=(
+                "main carries patch-equivalent content but the PR's exact head is not an ancestor of main; "
+                "equivalent content is not proof of a merge, so a verifier must confirm it first"
+            ),
+        )
+    if drift_kinds:
+        return decision(
+            ",".join(drift_kinds),
+            permitted=False,
+            stop_waiting=False,
+            next_action="needs_human:" + ",".join(drift_kinds),
+            reason="the world disagrees with the recorded checkpoint; the disagreement needs a human decision",
+        )
+    return decision(
+        "clean",
+        permitted=True,
+        stop_waiting=False,
+        next_action=None,
+        reason="the observed world matches the recorded checkpoint",
+    )
+
+
+# ---------------------------------------------------------------------------
+# The reconciliation report: making the owner invariant measurable
+# ---------------------------------------------------------------------------
+
+
+RECONCILIATION_SCHEMA = "rizzstack.reconciliation-report/1"
+
+#: Task states that close a unit of work. Superseded rows are terminal by
+#: replacement — they are blocked work, not outstanding work.
+_TERMINAL_TASK_STATES = frozenset({"accepted"})
+_SUPERSEDED_TASK_STATE = "superseded"
+#: Tasks a worker holds: claimed (sent, not yet running) through verifying.
+_WORKER_IN_FLIGHT = frozenset({"dispatching", "dispatched", "running", "verifying"})
+#: Tasks whose verified patch awaits an integration wave.
+_INTEGRATION_WAITING = frozenset({"verified", "integrating"})
+#: Task transitions that are automatic progression when a coordinator performs
+#: them; a rejection or supersession is a stop, not a progression.
+_AUTOMATIC_PROGRESS_STATES = frozenset(
+    {"dispatching", "dispatched", "running", "verifying", "verified", "integrating", "accepted"}
+)
+#: The worker-completion marker: the durable event the reconciler writes when a
+#: worker's result is reaped.
+_WORKER_COMPLETED_SUFFIX = "->verifying"
+
+_DEPLOYMENT_GATE = "deploy"
+
+
+def reconciliation_report(
+    state_dir: Path | str,
+    *,
+    capacity: int | None = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Measure whether authorized+eligible work plus capacity advances alone.
+
+    Read-only: every source is opened for reading (sealed job documents,
+    approval records, campaign checkpoints, the scheduler queue and feature
+    claims) and nothing is written, unlocked, adopted or resolved. The metrics
+    are the owner's §7 set:
+
+    * ``outstanding`` — total/ready/claimed/active-workers task counts;
+    * ``ready_waiting_despite_capacity`` — ready work sitting while slots are
+      free and nothing genuinely requires the owner (the invariant's violation
+      counter; zero when a human approval or a blocker legitimately gates it);
+    * ``awaiting`` — verification / review / integration / deployment waits;
+    * ``blocked`` — every blocked unit with its exact reason;
+    * ``human_approvals_required`` — gates with no recorded decision (a gate
+      decision is a create-only TTY record, so only a human can produce one);
+    * ``last_successful_automatic_progression`` — the latest automatic forward
+      transition any coordinator recorded;
+    * ``worker_completion_to_next_action`` — the latency from a worker's
+      completion being reaped to the next coordinator action on the same job.
+
+    ``capacity`` is the scheduler's slot budget; it defaults to
+    :data:`bundlebees_plugin.work_scheduler.MAX_ACTIVE`.
+    """
+
+    state = Path(state_dir)
+    stamp = _iso(_clock(now))
+    try:
+        max_active = work_scheduler.MAX_ACTIVE if capacity is None else int(capacity)
+    except (TypeError, ValueError) as exc:
+        raise ReconcileError(
+            "capacity_invalid",
+            f"capacity {capacity!r} is not an integer slot budget",
+            "Pass the scheduler's active-slot budget as an integer.",
+        ) from exc
+    if max_active < 0:
+        raise ReconcileError("capacity_invalid", "capacity must not be negative", "Pass a non-negative slot budget.")
+
+    blocked: list[dict[str, str]] = []
+    approvals: list[dict[str, str]] = []
+    awaiting = {"verification": 0, "review": 0, "integration": 0, "deployment": 0}
+    outstanding = {"total": 0, "ready": 0, "claimed": 0, "active_workers": 0}
+    progression: dict[str, Any] | None = None
+    progression_at: float | None = None
+    latencies: list[dict[str, Any]] = []
+
+    jobs_root = state / jobs.JOBS_DIR
+    if jobs_root.is_dir():
+        for path in sorted(jobs_root.glob("*.json")):
+            if path.name.startswith(".") or not path.is_file():
+                continue
+            job_id = path.stem
+            try:
+                job = jobs.load_job(state, job_id)
+            except jobs.JobError as exc:
+                blocked.append({"id": f"job:{job_id}", "reason": _reason(f"job unreadable: {exc.code}")})
+                continue
+            progression_new, latency_rows = _absorb_job(
+                state, job, blocked=blocked, approvals=approvals, awaiting=awaiting, outstanding=outstanding
+            )
+            if progression_new is not None and (progression_at is None or progression_new[0] >= progression_at):
+                progression_at, progression = progression_new
+            latencies.extend(latency_rows)
+
+    _absorb_campaigns(state, blocked=blocked, awaiting=awaiting)
+    scheduler = _scheduler_block(state, blocked=blocked)
+    features = _feature_block(state, blocked=blocked)
+
+    in_use = outstanding["claimed"] + outstanding["active_workers"] + awaiting["verification"]
+    available = max(0, max_active - in_use)
+    owner_messages = len(approvals) + len(blocked)
+    advancement_expected = bool(outstanding["ready"]) and available > 0 and owner_messages == 0
+
+    latency_block: dict[str, Any] | None = None
+    if latencies:
+        ordered = sorted(
+            latencies,
+            key=lambda item: (_epoch(item["completed_at"]) or 0.0, str(item["completed_at"])),
+        )
+        latest = ordered[-1]
+        latency_block = {
+            "samples": len(ordered),
+            "max_s": max(float(item["latency_s"]) for item in ordered),
+            "latest_s": float(latest["latency_s"]),
+            "latest_next_action": str(latest["next_action"]),
+        }
+
+    return {
+        "schema": RECONCILIATION_SCHEMA,
+        "generated_at": stamp,
+        "capacity": {"max_active": max_active, "in_use": in_use, "available": available},
+        "outstanding": outstanding,
+        "ready_waiting_despite_capacity": outstanding["ready"] if advancement_expected else 0,
+        "awaiting": awaiting,
+        "blocked": blocked,
+        "human_approvals_required": approvals,
+        "last_successful_automatic_progression": progression,
+        "worker_completion_to_next_action": latency_block,
+        "scheduler": scheduler,
+        "features": features,
+        "invariant": {
+            "advancement_expected_without_owner_messages": advancement_expected,
+            "owner_messages_required": owner_messages,
+        },
+    }
+
+
+def _reason(text: str) -> str:
+    return _clip_reason(scrub(text))
+
+
+def _clip_reason(text: str) -> str:
+    return str(text)[:300]
+
+
+def _absorb_job(
+    state: Path,
+    job: Mapping[str, Any],
+    *,
+    blocked: list[dict[str, str]],
+    approvals: list[dict[str, str]],
+    awaiting: dict[str, int],
+    outstanding: dict[str, int],
+) -> tuple[tuple[float, dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Fold one job's durable state into the report accumulators. Read-only."""
+
+    job_id = str(job.get("job_id") or "")
+    tasks = [task for task in (job.get("tasks") or []) if isinstance(task, Mapping)]
+    states = {str(task.get("task_id") or ""): str(task.get("state") or "pending") for task in tasks}
+    outstanding_recovery: Mapping[str, Any] | None = None
+    try:
+        outstanding_recovery = recoveries.outstanding(state, job)
+    except recoveries.RecoveryError as exc:
+        blocked.append({"id": f"job:{job_id}", "reason": _reason(f"recovery records are not canonical: {exc.code}")})
+    except jobs.JobError as exc:
+        blocked.append({"id": f"job:{job_id}", "reason": _reason(f"recovery state unreadable: {exc.code}")})
+
+    ready_ids: list[str] = []
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        state_name = states.get(task_id, "pending")
+        if state_name == "accepted":
+            continue
+        if state_name == _SUPERSEDED_TASK_STATE:
+            blocked.append(
+                {
+                    "id": f"{job_id}:{task_id}",
+                    "reason": _reason(f"task {task_id} superseded; re-plan or a new authorization is required"),
+                }
+            )
+            continue
+        outstanding["total"] += 1
+        if state_name in {"rejected", "failed"}:
+            reason = f"task {task_id} {state_name}; a recovery or human decision is required"
+            if (
+                isinstance(outstanding_recovery, Mapping)
+                and str(outstanding_recovery.get("task_id") or "") == task_id
+            ):
+                reason = (
+                    f"task {task_id} {state_name}; recovery request "
+                    f"{outstanding_recovery.get('request_id')} awaits a validated decision"
+                )
+            blocked.append({"id": f"{job_id}:{task_id}", "reason": _reason(reason)})
+            continue
+        if state_name == "pending":
+            dependencies = [str(dep) for dep in (task.get("depends_on") or [])]
+            if all(states.get(dep) == "accepted" for dep in dependencies):
+                attempts = task.get("attempts") or []
+                intent = task.get("intent")
+                intent_status = str(intent.get("status") or "") if isinstance(intent, Mapping) else ""
+                if not attempts and intent_status in {"", "not_sent"}:
+                    ready_ids.append(task_id)
+            continue
+        if state_name in {"dispatching", "dispatched"}:
+            outstanding["claimed"] += 1
+            continue
+        if state_name == "running":
+            outstanding["active_workers"] += 1
+            continue
+        if state_name == "verifying":
+            awaiting["verification"] += 1
+            continue
+        if state_name in _INTEGRATION_WAITING:
+            awaiting["integration"] += 1
+            continue
+        blocked.append({"id": f"{job_id}:{task_id}", "reason": _reason(f"task {task_id} has unknown state {state_name!r}")})
+    outstanding["ready"] += len(ready_ids)
+
+    integration = job.get("integration")
+    integration = integration if isinstance(integration, Mapping) else {}
+    if integration.get("terminal"):
+        evidence = str(integration.get("evidence") or integration.get("stopped") or "integration stopped")
+        blocked.append({"id": f"job:{job_id}", "reason": _reason(f"integration_terminal: {evidence}")})
+    elif tasks and all(states.get(str(task.get("task_id") or "")) == "accepted" for task in tasks):
+        try:
+            reasons = queue_mod.job_accepted_reasons(state, job_id)
+        except Exception as exc:  # noqa: BLE001 - an unreadable evidence check is a blocker, not a crash
+            reasons = [f"job acceptance evidence could not be checked: {type(exc).__name__}"]
+        if reasons:
+            blocked.append({"id": f"job:{job_id}", "reason": _reason("job_evidence_incomplete: " + "; ".join(reasons[:4]))})
+
+    gate_value = job.get("approval_gate")
+    gate = gate_value if isinstance(gate_value, Mapping) else {}
+    for name in [str(item) for item in (gate.get("gates") or [])]:
+        path = state / jobs.APPROVALS_DIR / f"{job_id}.{jobs._slug(name)}.json"
+        if not path.exists():
+            approvals.append({"job_id": job_id, "gate": name})
+            if jobs._slug(name) == _DEPLOYMENT_GATE:
+                awaiting["deployment"] += 1
+
+    events = [event for event in (job.get("events") or []) if isinstance(event, Mapping)]
+    progression: tuple[float, dict[str, Any]] | None = None
+    latencies: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        transition = str(event.get("transition") or "")
+        at = _epoch(event.get("at"))
+        if at is not None and transition.rsplit("->", 1)[-1] in _AUTOMATIC_PROGRESS_STATES:
+            candidate = (at, {
+                "at": str(event.get("at") or ""),
+                "job_id": job_id,
+                "task_id": str(event.get("task_id") or ""),
+                "transition": transition,
+            })
+            if progression is None or candidate[0] >= progression[0]:
+                progression = candidate
+        if transition.endswith(_WORKER_COMPLETED_SUFFIX) and index + 1 < len(events):
+            following = events[index + 1]
+            completed_at = _epoch(event.get("at"))
+            next_at = _epoch(following.get("at"))
+            if completed_at is not None and next_at is not None:
+                latencies.append(
+                    {
+                        "job_id": job_id,
+                        "task_id": str(event.get("task_id") or ""),
+                        "completed_at": str(event.get("at") or ""),
+                        "next_action": str(following.get("transition") or ""),
+                        "latency_s": next_at - completed_at,
+                    }
+                )
+    return progression, latencies
+
+
+def _absorb_campaigns(
+    state: Path,
+    *,
+    blocked: list[dict[str, str]],
+    awaiting: dict[str, int],
+) -> None:
+    root = state / campaign_state.CAMPAIGN_DIR
+    if not root.is_dir():
+        return
+    for path in sorted(root.glob("*.json")):
+        if path.name.startswith(".") or not path.is_file():
+            continue
+        try:
+            record = campaign_state.load_campaign(state, path.stem)
+        except campaign_state.CampaignError as exc:
+            blocked.append({"id": f"campaign:{path.stem}", "reason": _reason(f"campaign checkpoint unreadable: {exc.code}")})
+            continue
+        phase = str(record.get("phase") or "")
+        if phase == "ready_for_review":
+            awaiting["review"] += 1
+        blocker = record.get("blocker")
+        if phase == "blocked" and isinstance(blocker, Mapping):
+            code = str(blocker.get("code") or "blocked")
+            detail = str(blocker.get("detail") or "")
+            blocked.append({"id": f"campaign:{record.get('campaign_id') or path.stem}", "reason": _reason(f"{code}: {detail}")})
+
+
+def _scheduler_block(state: Path, *, blocked: list[dict[str, str]]) -> dict[str, int]:
+    try:
+        items = work_scheduler.list_items(state)
+    except work_scheduler.SchedulerError as exc:
+        blocked.append({"id": "scheduler:queue", "reason": _reason(f"scheduler queue unreadable: {exc.code}")})
+        return {"items": 0, "pending": 0, "claimed": 0, "blocked": 0, "done": 0}
+    counts = {"items": len(items), "pending": 0, "claimed": 0, "blocked": 0, "done": 0}
+    for item in items:
+        status = str(item.get("status") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _feature_block(state: Path, *, blocked: list[dict[str, str]]) -> dict[str, int]:
+    if not (state / "queue").is_dir():
+        return {"active_claims": 0}
+    try:
+        claims = queue_mod.QueueStore(state).active()
+    except queue_mod.QueueError as exc:
+        blocked.append({"id": "queue:claims", "reason": _reason(f"feature queue state unreadable: {exc.code}")})
+        return {"active_claims": 0}
+    return {"active_claims": len(claims)}
