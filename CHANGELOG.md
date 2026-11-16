@@ -75,6 +75,29 @@ one pull request.
   the workflow cold-start acceptance on CI). The key is now written to a
   private temporary file and published with `os.link`, so readers only ever
   see a complete key. Regression test written first and seen failing.
+- **Provision reconcile recovery: one idempotent re-POST on a
+  host-confirmed `receipt_unknown`.** When the read-only receipt lookup
+  itself answers `receipt_unknown` while the `attempts <= 3` guard holds,
+  `provision_bind.advance` re-POSTs the identical request exactly once,
+  relying on host idempotency; a resulting `ProvisionUncertain` keeps the
+  read-only lookup and never re-POSTs blindly. A definitive re-POST refusal
+  is terminal `denied` with the host error recorded
+  (`re-POST refused: <code>: <message>`), and later passes never re-POST
+  it. A first-POST refusal detail is persisted to the job before the error
+  is re-raised, so a restart cannot lose the refusal.
+- **Verifier/session reliability: one configured runner over the existing sandbox.**
+  `job tick`, queue ticks, the programmatic factory adapter and integration
+  run local verification through one configured runner
+  (`execution.SandboxRunner`); test receipt identity now covers the full
+  execution policy: interpreter executable bytes, dependency manifests
+  (`pyvenv.cfg`, `*.dist-info/RECORD`) and tiktoken cache bytes. A bare
+  Python name is resolved through `PATH`. Scanner discovery follows the
+  declared setting first (`gitleaks_path`, then environment, then `PATH`),
+  and a scanner-less `job tick` stops before launcher access. The
+  programmatic factory adapter still requires scanning. Repeated `--tests`
+  flags are appended. Definite provisioning refusals keep their structured CLI errors.
+  The approver's sealed recovery ceiling is exposed through interactive
+  `job authorize` CLI flags.
 
 ### Security
 
