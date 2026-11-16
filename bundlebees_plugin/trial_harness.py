@@ -734,6 +734,9 @@ def default_contexts(*, rehearsal: bool, coordinator_python: str | None = None,
 # ---------------------------------------------------------------------------
 
 
+FACTORY_DRIVER_MODULE = "bundlebees_plugin.factory_driver"
+SIMULATED_DRIVER_MODULE = "bundlebees_plugin.trial_simulated_driver"
+SIMULATED_DRIVER_SCRIPT = "trial_simulated_driver.py"
 SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd.exe", "powershell"})
 PIPELINE_TOKENS = frozenset({"|", "||", "&&", ";", ">", ">>", "<", "tee", "xargs"})
 
@@ -741,13 +744,18 @@ PIPELINE_TOKENS = frozenset({"|", "||", "&&", ";", ">", ">>", "<", "tee", "xargs
 def validate_driver_argv(
     argv: Sequence[str],
     *,
-    allowed_modules: Sequence[str] = ("bundlebees_plugin.factory_driver",),
+    allowed_modules: Sequence[str] = (FACTORY_DRIVER_MODULE,),
+    rehearsal: bool = False,
 ) -> tuple[str, ...]:
     """Refuse a wrapper, a shell or a pipeline as the coordinator command.
 
     ``allowed_modules`` is the set of ``-m`` modules that may be the driver. The
-    default is the real coordinator; the offline rehearsal adds its clearly
-    named simulated driver and nothing else.
+    default is the real coordinator. With ``rehearsal=True`` the allowlist is
+    not widened: the argv must name exactly the simulated driver
+    (``bundlebees_plugin.trial_simulated_driver``) via ``-m`` — any other module
+    is refused, and any ``.py`` script must be exactly
+    ``trial_simulated_driver.py``. A rehearsal never starts the real factory
+    driver.
     """
 
     items = [str(item) for item in argv]
@@ -771,6 +779,33 @@ def validate_driver_argv(
             )
     modules = [items[i + 1] for i, item in enumerate(items[:-1]) if item == "-m"]
     scripts = [item for item in items if item.endswith(".py")]
+    if rehearsal:
+        if not modules or set(modules) != {SIMULATED_DRIVER_MODULE}:
+            raise TrialRefused(
+                "rehearsal_requires_simulated_driver",
+                (
+                    "a rehearsal trial may only start the simulated driver "
+                    f"{SIMULATED_DRIVER_MODULE}; its driver argv names {sorted(set(modules))!r}"
+                ),
+                (
+                    "Use rehearsal_driver_argv() or the rehearse CLI; a rehearsal never "
+                    "starts the real factory driver."
+                ),
+            )
+        if scripts and {Path(item).name for item in scripts} != {SIMULATED_DRIVER_SCRIPT}:
+            raise TrialRefused(
+                "rehearsal_requires_simulated_driver",
+                (
+                    "a rehearsal trial may only run the simulated driver script "
+                    f"{SIMULATED_DRIVER_SCRIPT!r}; its driver argv names "
+                    f"{sorted({Path(item).name for item in scripts})!r}"
+                ),
+                (
+                    "Use rehearsal_driver_argv() or the rehearse CLI; a rehearsal never "
+                    "starts the real factory driver."
+                ),
+            )
+        return tuple(items)
     if scripts:
         names = {Path(item).name for item in scripts}
         if names != {"factory_driver.py"}:
@@ -843,8 +878,9 @@ def start_driver(
     env: Mapping[str, str],
     log_path: Path,
     clock: Clock,
-    allowed_modules: Sequence[str] = ("bundlebees_plugin.factory_driver",),
+    allowed_modules: Sequence[str] = (FACTORY_DRIVER_MODULE,),
     validate_argv: bool = True,
+    rehearsal: bool = False,
 ) -> DriverProcess:
     """Start the coordinator directly and prove the recorded PID is the driver.
 
@@ -852,11 +888,12 @@ def start_driver(
     the child exactly the program named in ``argv``; there is no wrapping shell
     or tee in between. ``/proc/<pid>/cmdline`` is compared with the argv we
     started, so a swapped or wrapped process is a named refusal before anything
-    is signalled.
+    is signalled. ``rehearsal=True`` refuses every driver module except the
+    simulated one before any process is started.
     """
 
     items = (
-        validate_driver_argv(argv, allowed_modules=allowed_modules)
+        validate_driver_argv(argv, allowed_modules=allowed_modules, rehearsal=rehearsal)
         if validate_argv
         else tuple(str(item) for item in argv)
     )
@@ -2255,8 +2292,16 @@ class RestartTrial:
                     "Run from the pinned Bundlebees checkout or pass an exact --code-rev.",
                 )
         self._step("code_rev_recorded", code_rev=self.code_rev)
-        argv = validate_driver_argv(self.plan.driver_argv, allowed_modules=self._driver_modules())
-        restart_argv = validate_driver_argv(self.plan.restart_argv, allowed_modules=self._driver_modules())
+        argv = validate_driver_argv(
+            self.plan.driver_argv,
+            allowed_modules=self._driver_modules(),
+            rehearsal=self.plan.rehearsal,
+        )
+        restart_argv = validate_driver_argv(
+            self.plan.restart_argv,
+            allowed_modules=self._driver_modules(),
+            rehearsal=self.plan.rehearsal,
+        )
         suite: dict[str, Any] | None = None
         if not self.plan.rehearsal:
             suite = self.plan.checkout.assert_suite_command(argv, self.plan.suite_command)
@@ -2352,10 +2397,9 @@ class RestartTrial:
         return self.deadline
 
     def _driver_modules(self) -> tuple[str, ...]:
-        modules = ["bundlebees_plugin.factory_driver"]
         if self.plan.rehearsal:
-            modules.append("bundlebees_plugin.trial_simulated_driver")
-        return tuple(modules)
+            return (SIMULATED_DRIVER_MODULE,)
+        return (FACTORY_DRIVER_MODULE,)
 
     def _start_run(self, run: int) -> DriverProcess:
         argv = self.plan.driver_argv if run == 1 else self.plan.restart_argv
@@ -2369,6 +2413,7 @@ class RestartTrial:
             log_path=log_path,
             clock=self.clock,
             allowed_modules=self._driver_modules(),
+            rehearsal=self.plan.rehearsal,
         )
         self._drivers.append(record)
         self._driver_reports.append(record.to_dict())

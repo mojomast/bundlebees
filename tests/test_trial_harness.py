@@ -1226,6 +1226,35 @@ class Preflight:
         assert caught.value.code == "trial_requires_single_task"
         assert caught.value.report["drivers"] == []
 
+    def test_a_rehearsal_plan_refuses_the_real_factory_driver_before_start_driver(
+        self, tmp_path, monkeypatch
+    ):
+        trial = rehearsal_trial(
+            tmp_path,
+            driver_argv=(PY, "-m", "bundlebees_plugin.factory_driver", "--once"),
+            restart_argv=(PY, "-m", "bundlebees_plugin.factory_driver", "--once"),
+        )
+        started: list[tuple[str, ...]] = []
+
+        def spy(argv, **_kwargs):
+            started.append(tuple(str(item) for item in argv))
+            raise th.TrialRefused(
+                "rehearsal_started_a_driver",
+                "start_driver was reached; a rehearsal factory-driver argv must be refused in preflight",
+                "Refuse the real factory driver in preflight before any driver starts.",
+            )
+
+        monkeypatch.setattr(th, "start_driver", spy)
+        with pytest.raises(th.TrialRefused) as caught:
+            trial.run()
+        assert started == [], (
+            "a rehearsal=True plan whose driver argv targets bundlebees_plugin.factory_driver "
+            f"reached start_driver with argv {started[0]!r}; preflight must refuse it first"
+        )
+        assert caught.value.code == "rehearsal_requires_simulated_driver"
+        assert "bundlebees_plugin.trial_simulated_driver" in caught.value.message
+        assert "rehearsal" in caught.value.message
+
 
 # ---------------------------------------------------------------------------
 # Local rehearsal: process stop, downtime completion, restart adoption, closeout
