@@ -87,9 +87,53 @@ one pull request.
 - **Route preview:** `bundlebees_route_preview` previews the model and
   credential route a dispatch would take, starting no attempt (the fifth
   registered tool).
+- **Completion events drive the coordinator action queue.** The landing event
+  consumer now composes the durable bee-landed terminal signal with the
+  coordinator action queue: `consume_completions` subscribes a
+  `coordinator-actions` subscriber, classifies each delivered event, and
+  translates every terminal completion (`landed`, `succeeded`, `failed`,
+  `cancelled`) into create-only action items keyed by the idempotent keys
+  `verify:<attempt>` (for a result-carrying landing) and
+  `process-completion:<attempt>`, recording one accepted decision per
+  `(attempt_id, state)` in a completion ledger. Exactly once is layered:
+  per-event acknowledgements, create-only idempotent keys and the ledger give
+  zero duplicate actions across duplicate delivery, explicit replay and
+  coordinator restart; action claims are fenced, and a stale consumer's
+  fencing token is refused (`stale_fence`). Failure modes are bounded: an
+  unavailable queue releases the event into its durable inbox record with a
+  30 s backoff and `COMPLETION_MAX_ATTEMPTS` claims (an exhausted delivery is
+  recoverable through the explicit `requeue_failed`), and malformed or
+  non-terminal events are skipped with a counted reason instead of retrying.
+  The consumer is additive: the mechanical tick, the Hermes wake path and the
+  10-minute heartbeat remain the backstop, so a worker completion advances
+  the pipeline without polling and without Hermes being awake. Item shapes
+  and the queue seam are documented in `docs/event-consumer.md`. Built
+  test-first (`tests/test_event_consumer_actions.py`).
 
 - **Launcher build-identity evidence tiers:** the doctor's launcher build-identity check reports the running launcher's identity in three evidence tiers — receipt-backed, version-string-only, unavailable — and classifies one read-only `GET /v1/provision/capabilities` through the already-authenticated client. A version string without a deployment receipt is always flagged as not deployment evidence (owner directive, 2026-11-14); the capabilities classification never upgrades the identity tier. See `docs/doctor.md`.
 ### Fixed
+
+- **The landing-event composition no longer collides with the coordinator
+  action queue.** The composed consumer (`consume_completions`) wrote its own
+  `rizzstack.coordinator-action/1` items into `coordinator/actions` — the
+  directory the merged coordinator action queue owns — so a single composed
+  item made `coordinator_actions.list_actions`/`enqueue` fail with
+  `state_corrupt`, the merged queue's id grammar refused the `<kind>:<attempt>`
+  keys, and the two stores' differing lock files and fence counters allowed a
+  fenced bypass across stores. The composition's items now live in their own
+  directory, `coordinator/completion-actions/`, behind the same API, and the
+  explicit `coordinator_actions_enqueue` adapter at the `enqueue` seam
+  publishes conformant `bundlebees.coordinator-actions/1` records through the
+  merged queue (the idempotent key as `action_key`, a colon-free queue id, the
+  completion facts in `payload`, `fence_seq` fencing, `status: "queued"`). A
+  coexistence test proves both stores work in one state directory without
+  corrupting each other. `complete_action`/`fail_action` now refuse an item
+  that is not currently claimed (`not_claimed`), closing the gap where a stale
+  owner could complete or fail an unclaimed, released or failed item; store
+  I/O failures surface as `ActionQueueError` with code `queue_unavailable`
+  instead of a bare `OSError`; and `docs/event-consumer.md` states the actual
+  integration contract instead of claiming that any queue keeping the same
+  keys can replace the bundled store without touching the consumer.
 
 - **`attempts`/`status`: a secret-shaped attempt id keeps its scrubbed form.** The read-only views re-inserted a validated attempt id after scrubbing, so an id that itself looked like a credential (e.g. an `sk-`-prefixed string that passed the attempt-id grammar) was scrubbed to `[redacted]` and then put back raw — a narrow scrub bypass. The re-insertion now requires the id not to look like a secret, so the scrub result always wins for a secret-shaped id; ordinary validated attempt ids are unchanged. Found by an external reviewer and closed with a regression test written first against the unfixed tree.
 - `return_report.pending_approvals` treated the mere presence of

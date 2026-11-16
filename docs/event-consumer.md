@@ -153,3 +153,195 @@ header.
 `runner(url, *, headers, body, timeout_s) -> (status, body)`. Tests use it for
 transport-level timeouts; most tests use a loopback HTTP server to prove the
 wire format without touching an external service.
+
+## Coordinator action queue: terminal completions to actions
+
+`consume_completions` composes the durable inbox with the coordinator action
+queue: a terminal launcher bee-landed event (W6) becomes coordinator-action
+items (F6) in the composition's bundled store — or, through the explicit
+adapter described below, conformant records in the merged F6 queue — so a
+worker completion advances the pipeline without the
+coordinator polling the launcher and without Hermes being awake. The
+composition is **additive**: the mechanical queue tick, the Hermes wake path
+and the 10-minute heartbeat are unchanged and remain the backstop for any
+completion this consumer has not seen yet.
+
+### Subscription
+
+```python
+bee_events.subscribe(state, {"identity": "coordinator-actions", "file": "coordinator-actions"})
+result = event_consumer.consume_completions(state)
+```
+
+The subscriber is a normal file subscriber. `record_landing` +
+`deliver_pending` put each canonical `rizzstack.bee.landed.v1` event in
+`events/inbox/coordinator-actions/<event_id>.json`; `consume_completions`
+claims one, classifies it and either enqueues actions or skips it.
+
+### Classification
+
+`classify_completion(event)` accepts the canonical CloudEvents envelope
+(facts under `data`) or a flat mapping, and returns either completion facts
+(`attempt_id`, `state`, `event_id`, `job_id`, `task_id`, `source_rev`,
+`result_available`, `result_reference`, `lease_files`) or a skip. Terminal
+states are `landed`, `succeeded`, `failed` and `cancelled`; anything else is
+skipped as `not_terminal`. Malformed deliveries (missing or unsafe
+`attempt_id`, missing `state`) are skipped with a `malformed_*` reason. Every
+skip is acked — a malformed event is a decision, not a retry — and counted
+durably in `coordinator/completion-actions/.skipped.json`; read the counter
+with `skipped_events(state)`. Load-bearing identifiers are validated strictly;
+advisory copies (`source_rev`, `result_reference`, `lease_files`) drop unsafe
+values instead of refusing the event.
+
+### Two stores in one state directory
+
+The merged coordinator action queue (`bundlebees_plugin.coordinator_actions`,
+PR #54) owns `coordinator/actions` exclusively: its
+`bundlebees.coordinator-actions/1` records, its durable `fence.seq` counter
+and its `actions.lock`. Its readers refuse any record they did not write
+(`state_corrupt`), so the composition keeps its own bundled item store in a
+separate directory — never a shared one:
+
+```
+coordinator/actions/                            # the merged #54 queue (not ours)
+coordinator/completion-actions/<action_id>.json        # the composition item
+coordinator/completion-actions/.locks/<action_id>.lock # claim serialisation
+coordinator/completion-actions/.skipped.json           # the skip counter
+coordinator/completions/<attempt>:<state>.json         # the accepted decision
+```
+
+Both stores work in one state directory without corrupting each other; the
+coexistence test in `tests/test_event_consumer_actions.py` proves it
+(`test_the_bundled_store_and_the_merged_queue_coexist_in_one_state_dir`).
+
+### Action-queue item shape
+
+One durable file per idempotent key under the composition's own directory
+(`coordinator/completion-actions/`); `action_path(state_dir, action_id)`
+builds its path.
+
+`action_id` is the F6 idempotent key `<kind>:<attempt_id>` with kind `verify`
+or `process-completion`; `action_id_for(kind, attempt_id)` builds it:
+
+```json
+{
+  "schema": "rizzstack.coordinator-action/1",
+  "action_id": "verify:att-bee-1",
+  "kind": "verify",
+  "attempt_id": "att-bee-1",
+  "job_id": "job-1",
+  "task_id": "task-1",
+  "event_id": "urn:rizzstack:bee-landed:…",
+  "event_state": "landed",
+  "dedupe_key": "att-bee-1:landed",
+  "source_rev": "…",
+  "lease_files": ["src/a.py"],
+  "result_available": true,
+  "result_reference": "refs/heads/feat/bee-events",
+  "status": "pending",
+  "attempts": 0,
+  "fence": 0,
+  "claimed_by": "",
+  "claimed_at": "",
+  "claim_pid": 0,
+  "claim_expires_at": "",
+  "next_attempt_at": "",
+  "result": null,
+  "error": "",
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+A `landed`/`succeeded` completion enqueues `verify:<attempt>` (the coordinator
+should verify the patch) and `process-completion:<attempt>`; a
+`failed`/`cancelled` completion enqueues only `process-completion:<attempt>`.
+
+### Exactly once, three layers
+
+* **Event level** — `consume_once` acks each `(subscriber, event_id)` once, so
+  duplicate delivery never reaches the handler again.
+* **Effect level** — `record_completion` writes one `rizzstack.completion-ledger/1`
+  record per `(attempt_id, state)`, create-only; `enqueue_action` publishes
+  items create-only under their idempotent key (same key → `created: False`,
+  different attempt or kind under a live key → `action_conflict`, a `done`
+  item is never resurrected). A crash after the effects but before the ack
+  replays into the same items and the recorded decision — zero duplicate
+  actions across duplicate delivery, replay and coordinator restart.
+* **Claim level** — `claim_action(state, action_id, consumer=…)` claims under
+  `flock`, counts one attempt, and returns a fencing token (`fence`) that
+  increments on every claim. `complete_action` / `fail_action` require the
+  current fence *and* a currently claimed item: a stale consumer's token is
+  refused with `stale_fence`, an unclaimed, released or failed item is
+  refused with `not_claimed` (no stale owner can mark unclaimed work done),
+  a live second claim gets `busy`, and a dead or expired claim is adopted
+  with a new fence. `attempts >= MAX_ACTION_ATTEMPTS` (2) marks the item
+  `failed`; `actions_summary(state)` counts the composition's items by
+  status.
+
+### Failure modes
+
+* **Queue unavailable** — the handler's `enqueue` seam raises
+  `ActionQueueError`; the event is released into its durable inbox record
+  with `next_attempt_at` backoff (default 30 s, `COMPLETION_MAX_ATTEMPTS`
+  claims in total) and the outbox event is never deleted. When the queue
+  returns, the next pass processes the buffered event once. A store `OSError`
+  (an unwritable or unreadable state directory) surfaces as the same typed
+  error with code `queue_unavailable`, never as a bare exception class name.
+* **Exhausted retries** — the delivery is marked `failed` and never claimed
+  silently again; `requeue_failed(state, subscriber, event_id)` is the
+  explicit operator reset back to `retryable`.
+* **Already processed** — a second event for the same `(attempt_id, state)`
+  (for example a different transition of the same landing) is acked as
+  `completion_already_processed` without enqueueing anything.
+
+### The `enqueue` seam: the actual integration contract
+
+The `enqueue` seam is a call signature, not a queue contract:
+
+```python
+enqueue_fn(state_dir, action_id, *, kind, attempt_id, event_id="",
+           event_state="", job_id="", task_id="", source_rev="",
+           lease_files=(), result_available=None, result_reference="",
+           dedupe_key="", now=None)
+```
+
+The merged coordinator action queue **cannot** be dropped into this seam
+directly. `coordinator_actions.enqueue` has a different signature (it takes
+`action_key`, not `attempt_id`) — the swap fails with `TypeError` on the
+first event — and its record contract differs from the bundled store's in
+every load-bearing dimension:
+
+| | bundled composition store | merged coordinator action queue |
+| --- | --- | --- |
+| directory | `coordinator/completion-actions/` | `coordinator/actions/` |
+| record schema | `rizzstack.coordinator-action/1` | `bundlebees.coordinator-actions/1` |
+| action id | the idempotent key `<kind>:<attempt_id>` | colon-free (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) |
+| fencing | per-item `fence` integer under `.locks/<id>.lock` | durable `fence.seq` counter under `actions.lock` |
+| claim lifecycle | attempts budget, backoff, `failed` status | claim / adopt / renew / complete |
+
+The integration point is the explicit adapter
+`event_consumer.coordinator_actions_enqueue`, which has exactly the seam's
+signature and writes a conformant record through the merged queue's own API
+(`coordinator_actions.enqueue`): the idempotent key becomes the record's
+`action_key`, the queue id is the colon-free form of the key
+(`verify:att-bee-1` → `verify_att-bee-1`), the completion facts travel in
+`payload`, and the item is queued with `fence_seq` fencing and
+`status: "queued"`. A merged-queue refusal (for example an id outside its
+grammar, or two keys that collapse onto one colon-free id) is re-raised as
+`ActionQueueError` with the queue's own code, so the event is buffered and
+the failure is precise.
+
+```python
+result = event_consumer.consume_completions(
+    state, enqueue=event_consumer.coordinator_actions_enqueue
+)
+```
+
+Passing the adapter is opt-in: the bundled store remains the default, and the
+two stores never share files, locks or fence counters.
+
+Run the suite:
+
+```bash
+python3 -m pytest tests/test_event_consumer_actions.py -q
+```
