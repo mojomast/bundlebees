@@ -218,6 +218,87 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "requeue_failed",
         ),
     },
+    {
+        # feat/lease-payload-pinned-sources: the staging half - payload sources
+        # copied into the sandbox under .bundlebees-payload/ with relative
+        # naming, env transport, byte identity; masking skip is measurement-gated.
+        "pr": 59,
+        "name": "lease payload staging for sandboxes",
+        "keywords": (
+            "byte identity",
+            ".bundlebees-payload",
+            "measurement-gated",
+        ),
+    },
+    {
+        # feat/gate-watcher-planned-to-queued: backlog-driven gate watcher -
+        # planned-to-queued transitions with gate evidence, lane budget clamp,
+        # owner-gated slices never auto-dispatched, stale gates block.
+        "pr": 61,
+        "name": "gate-watcher planned-to-queued",
+        "keywords": (
+            "bundlebees.gate-backlog/1",
+            "planned-to-queued",
+            "owner-gated",
+            "5-7 lanes",
+        ),
+    },
+    {
+        # fix/attempt-reconciliation-sweep: first-class beat reconciliation over
+        # terminal attempts; durable ledger, skips.json, last-sweep.json.
+        "pr": 62,
+        "name": "attempt reconciliation sweep",
+        "keywords": (
+            "attempt-reconciliation/1",
+            "skips.json",
+            "last-sweep.json",
+        ),
+    },
+    {
+        # feat/graceful-recovery: graceful/ state directory - stream, digest,
+        # resume brief; durable coordinator claim with TTL, lock, release log.
+        "pr": 63,
+        "name": "graceful recovery records",
+        "keywords": (
+            "stream.jsonl",
+            "resume.json",
+            "beat.claim.json",
+        ),
+    },
+    {
+        # feat/verify-workers-shadow: parallel verify workers behind the
+        # durable verify_workers setting - in-beat (default), shadow, on.
+        "pr": 64,
+        "name": "parallel verify workers (shadow first)",
+        "keywords": (
+            "verify_workers",
+            "verify-workers-shadow/1",
+            "in-beat",
+        ),
+    },
+    {
+        # feat/contract-gate (supersedes #60): the require_contract dispatch
+        # gate in contract_gate.py - durable settings, ContractRefusal.
+        "pr": 65,
+        "name": "require-contract dispatch gate",
+        "keywords": (
+            "contract_gate.py",
+            "ContractRefusal",
+            "require_contract",
+        ),
+    },
+    {
+        # feat/serve-lease-payload: the payload digest manifest the coordinator
+        # serves is recorded into the brief at dispatch and bound by verify
+        # byte for byte; every runner-driven sandbox run serves the payload.
+        "pr": 66,
+        "name": "lease payload served on every run",
+        "keywords": (
+            "payload digest",
+            "PayloadError",
+            "--commit-local",
+        ),
+    },
 )
 
 
