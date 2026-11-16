@@ -41,9 +41,13 @@ because nobody else holds a higher one.
 
 Per-repo serialization is deliberately narrow. Only ``merge`` and ``deploy``
 actions hold repo leases, and only overlapping ones — same repository and
-compatible targets — refuse a second live claim. Everything else, including
-two actions in different repositories or on different targets, proceeds in
-parallel; the queue records, it does not arbitrate more than asked.
+compatible targets — refuse a second live claim. The gate runs wherever a
+lease could become live — at :func:`claim`, at :func:`adopt` and equally at
+:func:`renew` — so a lapsed lease is never extended across an overlapping
+live claim and two live overlapping leases on one repository can never
+exist. Everything else, including two actions in different repositories or
+on different targets, proceeds in parallel; the queue records, it does not
+arbitrate more than asked.
 
 Replay is idempotent by ``action_key``: re-enqueueing an existing action id
 with its original key and shape returns the stored record untouched — no new
@@ -685,7 +689,16 @@ def renew(
     ttl_s: float = DEFAULT_TTL_S,
     now: Any = None,
 ) -> dict[str, Any]:
-    """Extend the lease; only the current fenced owner may renew."""
+    """Extend the lease; only the current fenced owner may renew.
+
+    The per-repo gate runs here too: a renewal that would make a lapsed
+    lease live again across an overlapping live merge or deploy lease on
+    the same repository is refused with ``lease_conflict`` and extends
+    nothing, so two live overlapping leases on one repository can never
+    exist. With no overlapping claim live, a lapsed lease renews on its
+    still-current fence; adoption remains the route back when a newer
+    owner holds a higher fence.
+    """
 
     action_id = _action_id(action_id)
     fence = _fence(fence_seq)
@@ -703,6 +716,7 @@ def renew(
                 "Claim the action first.",
             )
         _require_current_fence(record, fence)
+        _refuse_overlapping_leases(state, record, epoch)
         record["lease_expires_at"] = epoch + ttl
         record["updated_at"] = _iso(epoch)
         _write_json(action_path(state, action_id), record)

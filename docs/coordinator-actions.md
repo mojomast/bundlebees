@@ -119,7 +119,11 @@ item that was never claimed (`nothing_to_adopt`). Adoption mints a higher
 moment the previous owner's mutations are refused as `stale_fence`.
 
 `renew(state, action_id, fence_seq, ttl_s=900.0, now=None)` extends the lease
-for the current fenced owner only.
+for the current fenced owner only. It runs the per-repo gate too: a renewal
+that would make a lapsed lease live again across an overlapping live merge or
+deploy lease on the same repository is refused with `lease_conflict` and
+extends nothing. With no overlapping claim live, a lapsed lease renews on its
+still-current fence.
 
 ## Per-repo serialization
 
@@ -141,6 +145,12 @@ two non-empty targets overlap only when they are equal. Concretely:
 A conflicting claim is refused with `lease_conflict`, naming the blocking
 action, its kind, its owner and the expiry, and it burns no fencing value.
 
+The gate runs wherever a lease could become live: at `claim`, at `adopt` and
+at `renew` alike. A renewal that would extend a lapsed lease across an
+overlapping live claim is refused with `lease_conflict` and extends nothing —
+the expired owner's route back is adoption, which mints a higher fence — so
+two live overlapping leases on one repository can never exist.
+
 ## Refusals
 
 | Code | Meaning |
@@ -151,7 +161,7 @@ action, its kind, its owner and the expiry, and it burns no fencing value.
 | `claim_active` | Another owner holds an unexpired claim; the message names it. |
 | `claim_expired` | The claim lapsed; adoption, not a fresh claim, is the takeover. |
 | `nothing_to_adopt` | Adoption needs an expired claim to take over. |
-| `lease_conflict` | An overlapping merge or deploy lease is live on the repo. |
+| `lease_conflict` | An overlapping merge or deploy lease is live on the repo; checked at claim, adoption and renewal. |
 | `stale_fence` | The presented fencing value was superseded; the message names the current one and its owner. |
 | `fence_mismatch` | The presented fencing value is not the current one in any direction. |
 | `fence_invalid` | The presented fencing value is not an int. |

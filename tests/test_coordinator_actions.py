@@ -478,6 +478,44 @@ def test_an_expired_claim_holds_no_repo_lease(tmp_path: Path) -> None:
     assert ca.claim(tmp_path, "act_deploy", "bee-b", now=BASE + 61.0)["status"] == "claimed"
 
 
+@pytest.mark.parametrize("second_kind", ["merge", "deploy"])
+def test_renew_refuses_to_extend_a_lapsed_lease_past_an_overlapping_live_claim(
+    tmp_path: Path, second_kind: str
+) -> None:
+    enqueue(tmp_path, "act_first", kind="merge", repo="org/a")
+    enqueue(tmp_path, "act_second", kind=second_kind, repo="org/a")
+    first = claim(tmp_path, "act_first", owner="bee-a", ttl_s=60.0)
+
+    second = ca.claim(tmp_path, "act_second", "bee-b", ttl_s=900.0, now=BASE + 61.0)
+    assert second["status"] == "claimed"
+
+    exc = error_of(
+        lambda: ca.renew(tmp_path, "act_first", fence_seq=first["fence_seq"], ttl_s=900.0, now=BASE + 62.0)
+    )
+    assert exc.code == "lease_conflict"
+    assert "act_second" in exc.message
+
+    after_second = stored(tmp_path, "act_second")
+    assert after_second["owner"] == "bee-b"
+    assert after_second["fence_seq"] == second["fence_seq"]
+    assert after_second["lease_expires_at"] == BASE + 61.0 + 900.0
+
+    after_first = stored(tmp_path, "act_first")
+    assert after_first["lease_expires_at"] == BASE + 60.0
+    assert after_first["owner"] == "bee-a"
+
+
+def test_a_lapsed_lease_renews_again_once_no_overlapping_claim_is_live(tmp_path: Path) -> None:
+    enqueue(tmp_path, "act_merge", kind="merge", repo="org/a")
+    enqueue(tmp_path, "act_deploy", kind="deploy", repo="org/a")
+    first = claim(tmp_path, "act_merge", owner="bee-a", ttl_s=60.0)
+    ca.claim(tmp_path, "act_deploy", "bee-b", ttl_s=60.0, now=BASE + 61.0)
+
+    renewed = ca.renew(tmp_path, "act_merge", fence_seq=first["fence_seq"], ttl_s=300.0, now=BASE + 200.0)
+    assert renewed["lease_expires_at"] == BASE + 200.0 + 300.0
+    assert renewed["owner"] == "bee-a"
+
+
 # ---------------------------------------------------------------------------
 # the queue never executes anything
 # ---------------------------------------------------------------------------
