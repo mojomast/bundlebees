@@ -266,7 +266,7 @@ def test_bad_contracts_are_refused_with_a_reason(make, code):
 
 
 def test_packet_provenance_must_be_the_pinned_workflow_revision(pinned_checkout):
-    from bundlebees_plugin import contracts, dispatch
+    from bundlebees_plugin import contracts, contract_gate as dispatch
 
     _, head = pinned_checkout
     frozen = _frozen()
@@ -493,7 +493,7 @@ def test_scaffold_generates_a_valid_contract_and_a_packet_skeleton():
 
 
 def test_scaffold_output_passes_the_enabled_gate(pinned_checkout):
-    from bundlebees_plugin import contracts, dispatch
+    from bundlebees_plugin import contracts, contract_gate as dispatch
 
     _, head = pinned_checkout
     built = contracts.scaffold(
