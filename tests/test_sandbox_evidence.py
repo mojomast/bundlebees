@@ -8,13 +8,21 @@ collection failure that looked like a bad patch.
 
 The same law applies to ``TIKTOKEN_CACHE_DIR``: ``--private-tmp`` masks ``/tmp`` and ``/var/tmp`` (and the
 private home mount masks the coordinator home), so a cache there must be staged into the sandbox copy and
-named relative to the child's cwd — exactly like a staged interpreter.
+named relative to the child's cwd — exactly like a staged interpreter. And since such a cache can only be
+used by staging it, ``_resolve_tiktoken_cache`` refuses one under a masked root outright: staging it would
+copy a piece of (or all of) a masked root into the disposable sandbox.
+
+The real-firejail child test reports the cache path letter-pair encoded on purpose: ``_output_tail`` scrubs
+every tail through ``security.scrub``, whose ``_LONG_KEY_RE`` redacts any 32+ char ``[A-Za-z0-9+/=_-]`` run
+holding a digit and a letter — a cache path matches, so a raw-path assert parses scrubbed text and is
+structurally unpassable regardless of product behavior.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -153,10 +161,23 @@ class TestTiktokenCachePath:
         monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
         self.work = tmp_path / "work"
         (self.work / "tests").mkdir(parents=True)
-        # Under the system tmp, so firejail --private-tmp masks it — the case that was broken.
         self.cache = tmp_path / "tiktoken-cache"
         self.cache.mkdir()
         (self.cache / "fd9f0f3d3f6f4fe9").write_text("cached-encoding", encoding="utf-8")
+        # Hermetic against the host layout (the #35 review finding): when TMPDIR is a directory under
+        # the account home, tmp_path — and with it the cache — lives inside the real home and
+        # _resolve_tiktoken_cache refused every run in this class. Pin what the code calls "home" to a
+        # sibling of the cache, and empty the masked roots so the tmp_path cache is not refused as
+        # living under /tmp (the refusal itself is pinned by TestResolveRefusesMaskedRoots against the
+        # real roots). Which verdict _cache_masked_in_sandbox returns is pinned per test too, because
+        # no real location is masked and resolve-approved at the same time any more; the verdict logic
+        # itself stays pinned by TestMaskedCachePredicate against the real roots and home.
+        monkeypatch.setenv("HOME", str(tmp_path / "sandbox-home"))
+        monkeypatch.setattr(sandbox, "_MASKED_TMP_ROOTS", ())
+        self.cache_masked = True
+        monkeypatch.setattr(
+            sandbox, "_cache_masked_in_sandbox", lambda _cache: self.cache_masked
+        )
 
     def _run(self, backend: str, **kw):
         return sandbox.run_in_sandbox(
@@ -198,10 +219,11 @@ class TestTiktokenCachePath:
         assert self.seen[0]["files"] == ["fd9f0f3d3f6f4fe9"], self.seen
         assert str(self.cache) not in " ".join(self.calls[0]), self.calls[0]
 
-    def test_a_genuinely_visible_cache_is_left_as_is(self, monkeypatch):
-        # No writable location outside /tmp, /var/tmp and home is assumed on every host, so the masked
-        # roots are narrowed here; the predicate itself pins the real-world visible cases above.
-        monkeypatch.setattr(sandbox, "_MASKED_TMP_ROOTS", ())
+    def test_a_genuinely_visible_cache_is_left_as_is(self):
+        # The verdict is pinned instead of derived from the host layout, so the passthrough case does
+        # not depend on this host offering a writable directory outside /tmp, /var/tmp and home; the
+        # predicate's own real-world verdicts stay pinned by TestMaskedCachePredicate.
+        self.cache_masked = False
         self._run("firejail")
         assert self.envs[0]["TIKTOKEN_CACHE_DIR"] == str(self.cache)
         assert self.seen[0]["exists"] is False, "nothing is staged for a visible cache"
@@ -221,6 +243,25 @@ class TestTiktokenCachePath:
     def test_unshare_keeps_the_host_path(self):
         self._run("unshare", allow_weak=True)
         assert self.envs[0]["TIKTOKEN_CACHE_DIR"] == str(self.cache)
+
+
+class TestResolveRefusesMaskedRoots:
+    """``_resolve_tiktoken_cache`` must refuse a cache under a masked root outright.
+
+    ``firejail --private-tmp`` replaces ``/tmp`` and ``/var/tmp`` with fresh tmpfs, so a cache there
+    can only be used by staging it into the sandbox copy — which would copy a piece of (or all of) a
+    masked root into the disposable sandbox. Refuse the location instead of silently staging it.
+    """
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ["/tmp", "/var/tmp", "/tmp/bundlebees-cache-sub", "/var/tmp/bundlebees-cache-sub"],
+    )
+    def test_a_cache_under_a_masked_root_is_refused(self, candidate: str):
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            sandbox._resolve_tiktoken_cache(candidate)
+        assert excinfo.value.code == "unsafe_cache_dir"
+        assert "must not live under" in excinfo.value.error, excinfo.value.error
 
 
 class TestRealFirejailWritesTheManifest:
@@ -256,28 +297,123 @@ class TestRealFirejailTiktokenCache:
         from tests.fakes import require_sandbox_interpreter
 
         require_sandbox_interpreter("firejail")
+        shm = Path("/dev/shm")
+        if not shm.is_dir():
+            pytest.skip("/dev/shm is not available on this host")
         work = Path(tempfile.mkdtemp(prefix="bb-tiktoken-real-"))
-        # Under the system tmp: --private-tmp masks it, so the child can only see it staged.
-        cache = Path(tempfile.mkdtemp(prefix="bb-tiktoken-real-cache-"))
+        # Hermetic cache outside every masked root (/tmp, /var/tmp, the coordinator home), so the
+        # jail genuinely sees it and the child's TIKTOKEN_CACHE_DIR must be the passthrough host path.
+        cache = Path(tempfile.mkdtemp(prefix="bb-tiktoken-real-cache-", dir=str(shm)))
         (cache / "fd9f0f3d3f6f4fe9").write_text("cached-encoding", encoding="utf-8")
         script = (
             "import json, os\n"
             "d = os.environ.get('TIKTOKEN_CACHE_DIR', '')\n"
-            "print(json.dumps({'dir': d, 'isdir': os.path.isdir(d), "
-            "'files': sorted(os.listdir(d)) if d and os.path.isdir(d) else []}))\n"
+            # The path is reported as two lowercase letters per character because _output_tail scrubs
+            # every tail through security.scrub: _LONG_KEY_RE redacts any 32+ char
+            # [A-Za-z0-9+/=_-] run holding a digit and a letter — the /dev/shm cache path matches
+            # (measured: base64 is redacted too), so a raw path cannot survive the observation
+            # channel. Lowercase a-z carries no digit, so the encoded value is left untouched.
+            "enc = ''.join(chr(97 + ord(c) // 26) + chr(97 + ord(c) % 26) for c in d)\n"
+            "print(json.dumps({'isdir': os.path.isdir(d), "
+            "'files': sorted(os.listdir(d)) if d and os.path.isdir(d) else [], "
+            "'dir_enc': enc}))\n"
         )
-        result = sandbox.run_in_sandbox(
-            work,
-            [sys.executable, "-c", script],
-            backend="firejail",
-            tiktoken_cache=cache,
-            timeout=120,
-        )
+        try:
+            result = sandbox.run_in_sandbox(
+                work,
+                [sys.executable, "-c", script],
+                backend="firejail",
+                tiktoken_cache=cache,
+                timeout=120,
+            )
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
         assert result.get("exit_code") == 0, (result.get("exit_code"), result.get("output_tail"))
         line = [ln for ln in result["output_tail"].splitlines() if ln.startswith("{")][-1]
         out = json.loads(line)
         assert out["isdir"] is True, out
         assert out["files"] == ["fd9f0f3d3f6f4fe9"], out
-        # The relative staged path (this cache is masked) or a genuinely visible host path — and the
-        # directory it names exists, which isdir already proved above.
-        assert out["dir"] in ("./.bundlebees-tiktoken", str(cache)), out
+        # Decode the letter pairs back to the exact path and demand the passthrough value: a /dev/shm
+        # cache is outside every masked root, so the child's TIKTOKEN_CACHE_DIR must equal the host
+        # path exactly — compared only after decoding, since raw-path asserts cannot survive the
+        # output scrubber.
+        encoded = out["dir_enc"]
+        decoded = "".join(
+            chr(26 * (ord(encoded[i]) - 97) + (ord(encoded[i + 1]) - 97))
+            for i in range(0, len(encoded), 2)
+        )
+        assert decoded == str(cache), out
+
+
+class TestResolveMaskedRootsAreBackendScoped:
+    """The masked-root refusal in ``_resolve_tiktoken_cache`` is scoped to the backend that masks.
+
+    ``firejail --private-tmp`` replaces ``/tmp`` and ``/var/tmp`` with fresh tmpfs, so a cache under
+    either is unusable there and stays refused outright for that backend. bwrap ro-binds the
+    individual cache directory at a fixed inside path and masks nothing, and unshare masks nothing
+    at all, so for those backends the cache's host path stays legal and resolves unchanged. A call
+    that names no backend keeps refusing: fail closed, exactly like the blanket refusal this scopes.
+    """
+
+    @staticmethod
+    def _resolve(value: str, backend: str | None = None) -> Path | None:
+        """Thread *backend* into the resolver only when the resolver accepts it.
+
+        At the base revision the resolver took no backend argument and refused masked roots for
+        every backend. Omitting the keyword there reproduces exactly that blanket refusal, so the
+        accept cases fail RED with the refusal itself instead of a TypeError, and the refusal
+        cases pin preserved behavior both before and after the change.
+        """
+        import inspect
+
+        resolver = sandbox._resolve_tiktoken_cache
+        if backend is not None and "backend" in inspect.signature(resolver).parameters:
+            return resolver(value, backend=backend)
+        return resolver(value)
+
+    @pytest.fixture(autouse=True)
+    def _home_outside_the_masked_roots(self, monkeypatch, tmp_path: Path):
+        # Pin what the code calls "home" away from the masked roots (hermetic against a TMPDIR
+        # under the account home): the home refusal is unconditional and must not swallow the
+        # masked-root verdict under test here.
+        monkeypatch.setenv("HOME", str(tmp_path / "sandbox-home"))
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ["/tmp", "/var/tmp", "/tmp/bundlebees-scoped-cache", "/var/tmp/bundlebees-scoped-cache"],
+    )
+    def test_a_masked_root_cache_is_refused_for_the_masking_backend(self, candidate: str):
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate, backend="firejail")
+        assert excinfo.value.code == "unsafe_cache_dir"
+        assert "must not live under" in excinfo.value.error, excinfo.value.error
+
+    @pytest.mark.parametrize("root", ["/tmp", "/var/tmp"])
+    @pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+    def test_a_masked_root_cache_is_accepted_for_a_non_masking_backend(
+        self, root: str, backend: str
+    ):
+        cache = Path(tempfile.mkdtemp(prefix="bb-scoped-cache-", dir=root))
+        try:
+            resolved = self._resolve(str(cache), backend=backend)
+            assert resolved == Path(cache).resolve(), resolved
+            assert resolved.is_dir()
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ["/tmp", "/var/tmp", "/tmp/bundlebees-scoped-cache", "/var/tmp/bundlebees-scoped-cache"],
+    )
+    def test_a_direct_call_without_a_backend_still_refuses(self, candidate: str):
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate)
+        assert excinfo.value.code == "unsafe_cache_dir"
+
+    @pytest.mark.parametrize("candidate", ["/tmp", "/var/tmp"])
+    def test_auto_is_not_a_backend_and_still_refuses(self, candidate: str):
+        # "auto" is a selection policy, not a backend id: it may still pick the masking backend,
+        # so a cache under a masked root fails closed for it too.
+        with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+            self._resolve(candidate, backend="auto")
+        assert excinfo.value.code == "unsafe_cache_dir"
