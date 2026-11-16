@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import sys
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -65,7 +66,7 @@ class CmdJobWiringTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(job_cli, "tick", original))
 
         with TemporaryDirectory() as tmp:
-            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=None,
+            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=sys.executable,
                              state_dir=tmp, note=None)
             sentinel = object()
             code = job_cli.cmd_job(None, args, state_dir=Path(tmp), client_factory=lambda: FakeClient(),
@@ -85,7 +86,7 @@ class CmdJobWiringTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(job_cli, "tick", original))
 
         with TemporaryDirectory() as tmp:
-            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=None,
+            args = Namespace(command="job", job_handler="tick", job_id="j", repo=str(Path(tmp)), gitleaks=sys.executable,
                              state_dir=tmp, note=None)
             job_cli.cmd_job(None, args, state_dir=Path(tmp), client_factory=lambda: FakeClient())
         self.assertIsNone(captured.get("provisioner"))

@@ -43,6 +43,10 @@ requires_env:
       Configure it in Hermes secrets. Never paste the value into chat.
     secret: true
 config_schema:
+  gitleaks_path:
+    type: str
+    default: ''
+    description: Path to the Gitleaks executable used by verification and job ticks.
   adapter:
     type: str
     default: orbit-loopback

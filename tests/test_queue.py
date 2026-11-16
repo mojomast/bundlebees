@@ -180,7 +180,7 @@ class QueueTests(unittest.TestCase):
             args = type("A", (), {"command": "queue", "queue_handler": "run", "once": True, "repo": tmp,
                                   "state_dir": tmp, "backend": "json", "gitleaks": None})()
             ctx = type("C", (), {"config": {}})()
-            with mock.patch("shutil.which", lambda name: None):
+            with mock.patch("shutil.which", lambda name: None), mock.patch.dict("os.environ", {"GITLEAKS": ""}):
                 code = job_cli.cmd_queue(ctx, args, state_dir=Path(tmp), client_factory=lambda: None)
         self.assertEqual(code, 2)
 

@@ -184,6 +184,7 @@ _CODE_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     # environment: the worker host lacked a tool, dependency or route
     ("environment", "toolchain_missing", (
         "toolchain_missing", "security_tool_missing", "tool_missing", "python_missing",
+        "sandbox_interpreter_hidden", "unsafe_cache_dir",
         "git_error", "permission_denied",
     )),
     ("environment", "dependency_unavailable", (

@@ -147,6 +147,13 @@ def _advance_locked(
         prior_state = str(intent.get("state") or "requested")
         receipt = None
 
+        if prior_state == "denied":
+            raise ProvisionBindError(
+                str(intent.get("error_code") or "provision_denied"),
+                str(intent.get("detail") or "provisioning was refused"),
+                "Inspect the recorded refusal and host policy; do not replay a denied request.",
+            )
+
         if prior_state in ("preparing", "uncertain", "ready"):
             # The POST may already have landed. Reconcile read-only; never re-POST.
             intent["state"] = "uncertain" if prior_state != "ready" else "ready"
@@ -185,6 +192,14 @@ def _advance_locked(
                     jobs.save_job(state_dir, job)
                     outcomes.append({"task_id": task["task_id"], "state": "uncertain", "detail": intent["detail"]})
                     continue
+            except P.ProvisionError as exc:
+                # A received refusal is different from a lost acknowledgement.
+                # Leaving preparing here made the next tick search forever for
+                # a receipt for a request the host had explicitly refused.
+                intent.update(state="denied", error_code=exc.code,
+                              detail=f"{exc.code}: {exc.message}")
+                jobs.save_job(state_dir, job)
+                raise
 
         binding = P.Binding(
             repo=spec["repo"], source_rev=spec["source_rev"], host=spec["host"] or receipt.host,
@@ -194,7 +209,7 @@ def _advance_locked(
         try:
             binding.validate(receipt, contract_sha256=spec["contract_sha256"])
         except P.ProvisionError as exc:
-            intent.update(state="denied", detail=f"{exc.code}: {exc.message}")
+            intent.update(state="denied", error_code=exc.code, detail=f"{exc.code}: {exc.message}")
             jobs.save_job(state_dir, job)
             raise ProvisionBindError("binding_refused", f"{exc.code}: {exc.message}", "Do not dispatch; inspect the host.") from exc
 

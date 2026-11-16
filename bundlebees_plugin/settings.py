@@ -26,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "deploy_host_alias": "",
     "verify_isolation": "auto",
     "verify_python": "",
+    "gitleaks_path": "",
     "sandbox_tiktoken_cache": "",
     "provisioning_enabled": False,
     "provisioning_host": "",

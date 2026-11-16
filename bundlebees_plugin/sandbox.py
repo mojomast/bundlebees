@@ -602,7 +602,11 @@ def _is_coordinator_interpreter(path: str) -> bool:
     if not path:
         return False
     try:
-        return os.path.realpath(path) == os.path.realpath(sys.executable)
+        # realpath("python3") resolves a file in cwd, not a PATH entry.
+        # Only substitute a bare name when it resolves to this interpreter;
+        # another venv or an arbitrary executable must retain its identity.
+        resolved = path if os.path.dirname(path) else shutil.which(path)
+        return bool(resolved) and os.path.realpath(resolved) == os.path.realpath(sys.executable)
     except OSError:
         return False
 
