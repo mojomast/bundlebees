@@ -191,6 +191,33 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "provision/capabilities",
         ),
     },
+    {
+        # fix/cli-attempt-scrub-bypass-and-probe-docs: a secret-shaped attempt
+        # id keeps its scrubbed form (narrow scrub bypass closed with a
+        # regression test); the status token probe is documented as exactly one
+        # presence-only secret-store read.
+        "pr": 55,
+        "name": "CLI scrub-bypass fix + status token probe docs",
+        "keywords": (
+            "scrubbed form",
+            "scrub bypass",
+            "launcher-token presence probe",
+        ),
+    },
+    {
+        # feat/event-consumer-actions-r2: the landing-event consumer composes
+        # the coordinator action queue through an explicit adapter seam at an
+        # isolated directory; exactly-once via acks, create-only keys and a
+        # completion ledger; fenced claims, bounded failure modes.
+        "pr": 58,
+        "name": "completion events drive the coordinator action queue",
+        "keywords": (
+            "consume_completions",
+            "completion ledger",
+            "stale_fence",
+            "requeue_failed",
+        ),
+    },
 )
 
 
