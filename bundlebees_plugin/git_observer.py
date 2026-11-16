@@ -129,10 +129,12 @@ def _pr_state(view: Any) -> str:
     gh emits the GraphQL enum (OPEN / MERGED / CLOSED); the campaign records
     lowercase states, so the comparison normalizes once, at the source, and
     every report field carries the same normalized value.
+    Scrubbing runs before case normalization: lowering first would defeat
+    case-sensitive secret patterns (the AKIA access-key id class).
     """
 
     state = view.get("state") if isinstance(view, Mapping) else None
-    return _text(state.strip().lower()) if isinstance(state, str) else ""
+    return _text(state.strip()).lower() if isinstance(state, str) else ""
 
 
 def _fact_value(value: Any) -> Any:

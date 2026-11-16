@@ -585,3 +585,49 @@ def test_drift_facts_and_observed_at_never_carry_world_secrets():
     assert "[redacted]" in json.dumps(entry["actual"])
     assert marker not in report["observed_at"] and "scan.invalid" not in report["observed_at"]
     assert report["observed_at"] != hostile_now
+
+
+def test_pr_state_scrubs_before_normalizing_case():
+    # r2 blocker 1: _pr_state lowercased before scrubbing, which defeats the
+    # case-sensitive AKIA[0-9A-Z]{16} pattern (20 chars also evades the
+    # long-key fallback), so a world-derived state reached actual/drift/detail
+    # unredacted. Scrub first, then normalize case.
+    awsish = "AKIA" + "B" * 16  # assembled at runtime so the scanners see no value
+    hostile_state = "MERGED " + awsish
+
+    report = git_observer.observe(
+        _record(), repo="/work", git=GitWorld(local=HEAD, remote=HEAD),
+        pull_requests=PRWorld(view=_view(state=hostile_state)), now=T0,
+    )
+
+    blob = json.dumps(report)
+    assert awsish not in blob and awsish.lower() not in blob
+    assert "[redacted]" in blob
+    assert report["actual"]["pull_request"]["state"] == "merged [redacted]"
+    entry = next(item for item in report["drift"] if item["kind"] == "pr_closed")  # a garbled state is not classified merged; see follow-up: unknown-state kind
+    assert entry["actual"]["state"] == "merged [redacted]"
+    assert awsish.lower() not in entry["detail"]
+
+
+def test_drift_routes_every_fact_value_through_the_scrubber():
+    # r2 blocker 2: pin the _fact_value routing inside _drift directly; the
+    # observe-level scrub test cannot distinguish routed from unrouted forms
+    # because every current call site pre-scrubs its world text.
+    marker = "ghp_" + "A" * 36  # assembled at runtime so the scanners see no value
+    base = "a" * 40
+    head = "b" * 40
+
+    entry = git_observer._drift(
+        "branch_moved",
+        {"base_rev": base, "note": marker + " https://git.corp.invalid/x"},
+        {"head": head, "state": marker},
+        "hostile " + marker,
+    )
+
+    blob = json.dumps(entry)
+    assert marker not in blob and "git.corp.invalid" not in blob
+    assert entry["expected"]["base_rev"] == base  # digests survive byte-exact
+    assert entry["actual"]["head"] == head
+    assert entry["expected"]["note"] == "[redacted] [redacted-url]"
+    assert entry["actual"]["state"] == "[redacted]"
+    assert "[redacted]" in entry["detail"] and "hostile" in entry["detail"]
