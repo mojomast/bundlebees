@@ -109,6 +109,20 @@ def test_a_hand_edited_authorization_is_refused(tmp_path):
     assert exc.value.code == "authorization_tampered"
 
 
+def test_an_authorization_copied_to_another_job_is_refused(tmp_path):
+    authorize(tmp_path)
+    source = jobs.authorization_path(tmp_path, "job_a")
+    target = jobs.authorization_path(tmp_path, "job_b")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source.read_bytes())
+
+    with pytest.raises(JobError) as exc:
+        jobs.load_authorization(tmp_path, "job_b")
+    assert exc.value.code == "authorization_job_mismatch"
+    with pytest.raises(JobError):
+        jobs.create_job(tmp_path, job_id="job_b", tasks=two_tasks())
+
+
 # AC-003 -------------------------------------------------------------------
 
 

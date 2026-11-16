@@ -24,6 +24,17 @@ hermes bundlebees job authorize \
 hermes bundlebees job create --job-id job_a --tasks tasks.json
 ```
 
+When the owner is not at a keyboard, a one-time receipt written by the trusted
+application replaces the typed authorization (the receipt is verified,
+unexpired, unused and exactly bound; see
+[docs/job-approval.md](job-approval.md)):
+
+```bash
+hermes bundlebees job authorize --job-id job_a \
+  --approval-receipt "$STATE/job-approvals/receipts/apr_....json" \
+  --tasks tasks.json
+```
+
 ```json
 {
   "feature-a": {
