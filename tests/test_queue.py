@@ -9,6 +9,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from bundlebees_plugin import job_cli
+from bundlebees_plugin import provision_bind as B
+from bundlebees_plugin import provisioning as P
 from bundlebees_plugin import queue as Q
 
 
@@ -310,6 +312,75 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["action"], "observation_only")
         self.assertIsNone(Q.QueueStore(self.tmp).read("f1"))
         self.assertEqual(self.queue.get("f1").status, "queued")
+
+    # -- a typed provisioning refusal blocks the card instead of crashing ---
+
+    def test_a_provisioning_refusal_on_a_new_card_reports_and_blocks_it(self):
+        # Branch 2 (fresh admission): the tick refuses with the host's typed
+        # quota denial; the run must report it and block the card, not crash.
+        patcher = mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def refuse(job_id):
+            raise P.ProvisionDenied("quota_exhausted", "profile smoke already holds 5 provisioned projects (max 5)",
+                                    "Inspect existing provisioned workspaces.")
+
+        result = Q.run_once(self.tmp, self.queue, tick=refuse)
+
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["job"], "job_1")
+        self.assertEqual(result["code"], "quota_exhausted")
+        self.assertIn("quota_exhausted", result["detail"])
+        self.assertIn("max 5", result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        record = Q.QueueStore(self.tmp).read("f1")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["evidence"]["error"], "quota_exhausted")
+
+    def test_a_provisioning_refusal_on_an_active_card_reports_and_blocks_it(self):
+        # Branch 1 (already claimed): the same refusal must not escape run_once.
+        def refuse(job_id):
+            raise P.ProvisionError("provision_conflict", "conflicting provisioning request",
+                                   "Inspect the journal; do not retry with the same key.")
+
+        store, result = self._claimed(refuse)
+
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["code"], "provision_conflict")
+        self.assertIn("conflicting provisioning request", result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+        self.assertEqual(store.read("f1")["evidence"]["error"], "provision_conflict")
+
+    def test_a_denied_provisioning_state_short_circuits_the_queue_run(self):
+        # A refusal ends the pass where the job CLI's exit does: nothing else
+        # is admitted behind it, and the refused card is visibly blocked.
+        self.path.write_text(json.dumps({
+            "f1": card("f1"),
+            "f2": card("f2", job_id="job_2"),
+        }))
+        patcher = mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        calls = []
+
+        def refuse(job_id):
+            calls.append(job_id)
+            raise B.ProvisionBindError("binding_refused", "receipt_revision: the checkout is not at the pinned revision",
+                                       "Do not dispatch; inspect the host.")
+
+        result = Q.run_once(self.tmp, self.queue, tick=refuse)
+
+        self.assertEqual(calls, ["job_1"], "the run must stop at the refusal, not admit the next card")
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["code"], "binding_refused")
+        self.assertIn("not at the pinned revision", result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(self.queue.get("f2").status, "queued")
+        self.assertEqual(Q.QueueStore(self.tmp).read("f1")["state"], "blocked")
 
 
 if __name__ == "__main__":

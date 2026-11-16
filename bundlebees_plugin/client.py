@@ -574,7 +574,13 @@ class _BaseClient:
         else:
             code, fix = "launcher_error", _FIX_LAUNCHER
         err = ClientError(message, code, fix, status=status)
-        upstream = payload.get("code") if isinstance(payload, dict) else None
+        # The host's typed refusal code may arrive as ``code`` (the launcher
+        # contract) or as ``error`` (the provisioning host's 409 body, e.g.
+        # quota_exhausted). Only a bare lowercase identifier is a code; a
+        # human-readable ``error`` string stays a message.
+        upstream = None
+        if isinstance(payload, dict):
+            upstream = payload.get("code") or payload.get("error")
         if isinstance(upstream, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", upstream):
             err.upstream_code = upstream
         return err

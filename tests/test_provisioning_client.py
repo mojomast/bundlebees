@@ -107,6 +107,36 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "quota_exhausted")
         self.assertIn("max 5", caught.exception.message)
 
+    def test_authenticated_transport_parses_the_host_quota_body_end_to_end(self):
+        """The real client path: a host 409 body {'error': 'quota_exhausted'}.
+
+        No upstream_code is set by hand. The 409 must survive the
+        authenticated transport's error parsing (which reads the body's
+        ``error`` as the typed code) so the provisioner's transport can hand
+        the host's own denial back to the contract instead of degrading it
+        into a generic ``no_result_yet`` conflict.
+        """
+        from bundlebees_plugin.client import ClientError, LauncherClient
+
+        fixture = self.fixture(provision_status=409, provision_error={
+            "error": "quota_exhausted", "message": "profile smoke already holds 5 provisioned projects (max 5)"})
+        client = LauncherClient(fixture.url, token_provider=lambda: "coordinator-token")
+        try:
+            client.request_json("POST", P.PROVISION_PATH, self.request())
+        except ClientError as exc:
+            # The transport's own parse: status and typed code from the body.
+            self.assertEqual(exc.status, 409)
+            self.assertEqual(exc.upstream_code, "quota_exhausted")
+        else:
+            self.fail("a 409 quota body must raise a typed client error")
+
+        provisioner = P.from_client({"provisioning_enabled": True}, client)
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            provisioner.provision(self.request())
+        self.assertEqual(caught.exception.code, "quota_exhausted")
+        self.assertTrue(any(r[0] == "POST" and r[1] == P.PROVISION_PATH for r in fixture.requests),
+                        "the request must have travelled the real HTTP path")
+
     def fixture(self, **kwargs):
         fixture = Fixture(**kwargs)
         self.addCleanup(fixture.close)
