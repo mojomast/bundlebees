@@ -180,6 +180,13 @@ def from_client(config: Mapping[str, Any] | None, client: Any) -> "HyvvProvision
     behaviour for jobs that never asked for it.
     """
     block = (config or {}).get("provisioning") or {}
+    # Declared flat settings keys: ``settings_from_ctx`` only returns declared
+    # keys, so without these the installed CLI could never enable provisioning.
+    if not block.get("enabled"):
+        block = {
+            "enabled": bool((config or {}).get("provisioning_enabled", False)),
+            "host": (config or {}).get("provisioning_host") or "",
+        }
     if not block.get("enabled"):
         return None
 
@@ -188,7 +195,8 @@ def from_client(config: Mapping[str, Any] | None, client: Any) -> "HyvvProvision
             return 200, client.request_json(method, path, body)
         except Exception as exc:  # noqa: BLE001 - mapped to the contract's status space
             status = getattr(exc, "status", None) or getattr(exc, "http_status", None)
-            return int(status or 502), {"error": getattr(exc, "code", "client_error"), "message": str(exc)}
+            upstream = getattr(exc, "upstream_code", None) or getattr(exc, "code", "client_error")
+            return int(status or 502), {"error": upstream, "message": str(exc)}
 
     return HyvvProvisioner(transport, expect_host=block.get("host") or None)
 
@@ -248,6 +256,9 @@ class HyvvProvisioner:
         if status in (500, 502, 503, 504):
             raise ProvisionUncertain("provision_uncertain", f"the host answered {status}; the request may have been applied", "Reconcile the receipt; never re-POST blindly.")
         if status == 409:
+            if isinstance(body, Mapping) and body.get("error") == "quota_exhausted":
+                raise ProvisionDenied("quota_exhausted", body.get("message") or "the host provisioning quota is full",
+                                      "Inspect existing provisioned workspaces; cleanup or a limit increase requires its own authority.")
             raise ProvisionError("provision_conflict", (body or {}).get("message", "conflicting provisioning request"), "Inspect the journal; do not retry with the same key.")
         if status != 200 or not isinstance(body, Mapping):
             raise ProvisionError("provision_failed", f"the host refused provisioning with {status}: {(body or {}).get('error', '')}", "Fix the request or the host policy.")

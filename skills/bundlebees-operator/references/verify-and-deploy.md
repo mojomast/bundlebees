@@ -23,7 +23,7 @@ Flags:
 |---|---|
 | positional `attempt_id` | The attempt returned by `bundlebees_dispatch`. |
 | `--workdir <path>` | Existing clean worktree to use. Confined; no path escape. |
-| `--tests <name>` | Run only this named test. Repeat for more than one. |
+| `--tests <name> ...` | Run these named tests. Repeated flags append their targets. |
 | `--dry-run` | Apply the patch and run tests, then stop before any push. |
 | `--kanban-comment <text>` | Opt-in: after a green run, suggest or post a comment through the public kanban CLI. |
 

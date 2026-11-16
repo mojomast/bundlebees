@@ -118,3 +118,41 @@ def secret_scope(values: Mapping[str, str | None] | None = None, *, raises: bool
                 sys.modules.pop(key, None)
             else:
                 sys.modules[key] = value
+
+
+def require_sandbox_interpreter(preferred: str = "auto") -> None:
+    """Skip the caller when the sandbox cannot exec this coordinator's interpreter.
+
+    ``firejail --private=<copy>`` masks the coordinator home, and ``--private-tmp`` masks ``/tmp``
+    and ``/var/tmp``, so a pytest/Hermes interpreter living in either is unreachable inside the
+    jail. ``sandbox.run_in_sandbox`` refuses that case with ``sandbox_interpreter_hidden`` and asks
+    for ``verify_python``; tests that need a real python child skip here instead of asserting on a
+    wrapper error that never started their script.
+    """
+
+    import shutil
+
+    import pytest
+
+    from bundlebees_plugin import sandbox
+
+    # Backend detection runs first, before any interpreter question matters. A backend-less host is
+    # refused by run_in_sandbox — but only without verify_allow_unsafe_local; with that override it
+    # still runs unsandboxed (backend "none-unsafe-local"). This helper skips on such hosts so the
+    # unsafe-local path is never exercised accidentally by tests that mean to test a real jail. On
+    # a strong backend, interpreter reachability matters next, and staging makes it satisfiable.
+    backend = sandbox.detect_backend(preferred)
+    if backend is None:
+        pytest.skip("no strong sandbox backend is usable on this host")
+    if backend not in sandbox.HOME_HIDING_BACKENDS:
+        return
+    if sandbox.resolve_sandbox_python(""):
+        return
+    work = Path(tempfile.mkdtemp(prefix="bb-interp-probe-"))
+    try:
+        (work / "tmp").mkdir(parents=True, exist_ok=True)
+        env = sandbox.sandbox_env(work, work / "tmp")
+        if not sandbox.interpreter_visible_in_sandbox(backend, work, work, sys.executable, env):
+            pytest.skip("the sandbox cannot exec the coordinator interpreter; set verify_python")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

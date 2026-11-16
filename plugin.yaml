@@ -4,7 +4,9 @@ version: "0.2.0"
 description: >-
   Orchestrate CUA bees from Hermes: check launcher health, dispatch leased
   briefs, watch attempts, and generate a paste-ready host setup prompt.
-  Disclosure — talks to a local or user-configured worker launcher (loopback
+  bundlebees_route_preview previews the model and credential route a
+  dispatch would take without starting an attempt. Disclosure — talks to a
+  local or user-configured worker launcher (loopback
   by default; a private or LAN launcher URL requires allow_private=true in
   plugin settings); dispatching a bee can spend model budget on that worker
   machine; secrets are read only through Hermes get_secret; the user-run CLI
@@ -31,6 +33,7 @@ provides_tools:
   - bundlebees_dispatch
   - bundlebees_attempt
   - bundlebees_host_prompt
+  - bundlebees_route_preview
 provides_hooks:
   - pre_tool_call
 requires_env:
@@ -40,6 +43,10 @@ requires_env:
       Configure it in Hermes secrets. Never paste the value into chat.
     secret: true
 config_schema:
+  gitleaks_path:
+    type: str
+    default: ''
+    description: Path to the Gitleaks executable used by verification and job ticks.
   adapter:
     type: str
     default: orbit-loopback
@@ -98,6 +105,17 @@ config_schema:
       (bwrap, then firejail; never unshare), or one of bwrap, firejail,
       unshare. unshare also needs verify_allow_weak_unshare. Verify fails
       closed when none is usable.
+  verify_python:
+    type: str
+    default: ""
+    description: >-
+      Absolute interpreter path the sandbox starts for pytest and the ACDD
+      collector, for hosts where the Hermes interpreter lives inside the
+      coordinator home (firejail --private hides that home, so the jail
+      cannot exec it). It must exist OUTSIDE the home and have pytest
+      installed. Empty uses the coordinator's own interpreter, which is
+      right for bwrap and refused with sandbox_interpreter_hidden when a
+      home-hiding backend is chosen. BUNDLEBEES_VERIFY_PYTHON does the same.
   integrate_suite:
     type: str
     default: ""
@@ -144,6 +162,17 @@ config_schema:
     type: int
     default: 900
     description: Wall-clock limit in seconds for one sandboxed test run.
+  provisioning_enabled:
+    type: bool
+    default: false
+    description: >-
+      Enable job provisioning through the launcher when ticking jobs whose
+      tasks declare a provision spec. Off keeps the bare CLI behaviour.
+  provisioning_host:
+    type: str
+    default: ''
+    description: >-
+      Optional expected workspace host validated by the provisioner.
   sandbox_tiktoken_cache:
     type: str
     default: ''

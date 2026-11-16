@@ -1915,13 +1915,14 @@ def make_job_tick(
     suite_command: Sequence[str] | None = None,
     provisioner: Any = None,
     expect_host: str | None = None,
+    runner: Any = None,
 ) -> Any:
     """Bind the real ``job_cli.tick`` signature to the driver's ``tick(job_id)``."""
     from pathlib import Path as _Path
 
     state = _Path(state_dir)
     repo_path = _Path(repo)
-    suite = tuple(suite_command or ("python", "-m", "pytest", "-q"))
+    suite = tuple(suite_command or (sys.executable, "-m", "pytest", "-q"))
 
     def tick(job_id: str) -> dict[str, Any]:
         return job_cli.tick(
@@ -1930,8 +1931,9 @@ def make_job_tick(
             client=client,
             repo=repo_path,
             gitleaks=gitleaks,
-            require_gitleaks=gitleaks is not None,
+            require_gitleaks=True,
             suite_command=suite,
+            runner=runner,
             provisioner=provisioner,
             expect_host=expect_host,
         )
@@ -2004,7 +2006,12 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("BUNDLEBEES_LAUNCHER_TOKEN is required for --launcher-url")
         client = LauncherClient(launcher_url, token=token)
     if tick is None and client is not None and repo_arg:
-        if not args.gitleaks:
+        from .execution import SandboxRunner, scanner
+        from .settings import settings_from_hermes_config
+
+        config = settings_from_hermes_config()
+        scanner_path = scanner(config, args.gitleaks)
+        if not scanner_path:
             raise SystemExit("--gitleaks or GITLEAKS is required for a real tick")
         provisioner = None
         if args.provisioning:
@@ -2018,8 +2025,9 @@ def main(argv: list[str] | None = None) -> int:
             state,
             client=client,
             repo=Path(repo_arg),
-            gitleaks=args.gitleaks,
+            gitleaks=scanner_path,
             suite_command=args.suite_command,
+            runner=SandboxRunner(config),
             provisioner=provisioner,
         )
     if tick is None:

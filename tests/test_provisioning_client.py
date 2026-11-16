@@ -16,12 +16,13 @@ SHA = "dde2aa42d09c05e43895b3120cb3312f765eb876"
 class Fixture:
     def __init__(self, *, capabilities=True, schema=P.CAPABILITY_SCHEMA, receipt_sha=SHA,
                  provision_status=200, profiles=("smoke",), enabled=True, lookup=True,
-                 lookup_status=200, expired=False):
+                 lookup_status=200, expired=False, provision_error=None):
         self.requests: list[tuple[str, str, dict]] = []
         self.enabled, self.lookup, self.lookup_status, self.expired = enabled, lookup, lookup_status, expired
         self.stored: dict[str, dict] = {}
         self.capabilities, self.schema, self.receipt_sha = capabilities, schema, receipt_sha
         self.provision_status, self.profiles = provision_status, list(profiles)
+        self.provision_error = provision_error
         self.handler = self._make_handler()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -81,7 +82,7 @@ class Fixture:
                 if self.path == P.CLEANUP_PATH:
                     return self._send(200, {"state": "cleaned", "project": body.get("project")})
                 if fixture.provision_status != 200:
-                    return self._send(fixture.provision_status, {"error": "host failure"})
+                    return self._send(fixture.provision_status, fixture.provision_error or {"error": "host failure"})
                 receipt = {
                     "schema": P.CAPABILITY_SCHEMA, "status": "ready", "project": body.get("project", "rizzstack-smoke"),
                     "expires_at": "2000-01-01T00:00:00Z" if fixture.expired else "2099-01-01T00:00:00Z",
@@ -97,6 +98,45 @@ class Fixture:
 
 
 class ClientTests(unittest.TestCase):
+    def test_host_quota_refusal_is_not_a_generic_conflict(self):
+        fixture = self.fixture(provision_status=409, provision_error={
+            "error": "quota_exhausted", "message": "profile smoke already holds 5 provisioned projects (max 5)"})
+        client = P.HyvvProvisioner(fixture.transport)
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            client.provision(self.request())
+        self.assertEqual(caught.exception.code, "quota_exhausted")
+        self.assertIn("max 5", caught.exception.message)
+
+    def test_authenticated_transport_parses_the_host_quota_body_end_to_end(self):
+        """The real client path: a host 409 body {'error': 'quota_exhausted'}.
+
+        No upstream_code is set by hand. The 409 must survive the
+        authenticated transport's error parsing (which reads the body's
+        ``error`` as the typed code) so the provisioner's transport can hand
+        the host's own denial back to the contract instead of degrading it
+        into a generic ``no_result_yet`` conflict.
+        """
+        from bundlebees_plugin.client import ClientError, LauncherClient
+
+        fixture = self.fixture(provision_status=409, provision_error={
+            "error": "quota_exhausted", "message": "profile smoke already holds 5 provisioned projects (max 5)"})
+        client = LauncherClient(fixture.url, token_provider=lambda: "coordinator-token")
+        try:
+            client.request_json("POST", P.PROVISION_PATH, self.request())
+        except ClientError as exc:
+            # The transport's own parse: status and typed code from the body.
+            self.assertEqual(exc.status, 409)
+            self.assertEqual(exc.upstream_code, "quota_exhausted")
+        else:
+            self.fail("a 409 quota body must raise a typed client error")
+
+        provisioner = P.from_client({"provisioning_enabled": True}, client)
+        with self.assertRaises(P.ProvisionDenied) as caught:
+            provisioner.provision(self.request())
+        self.assertEqual(caught.exception.code, "quota_exhausted")
+        self.assertTrue(any(r[0] == "POST" and r[1] == P.PROVISION_PATH for r in fixture.requests),
+                        "the request must have travelled the real HTTP path")
+
     def fixture(self, **kwargs):
         fixture = Fixture(**kwargs)
         self.addCleanup(fixture.close)

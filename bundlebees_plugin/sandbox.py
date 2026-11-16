@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import site
 import subprocess
@@ -285,8 +286,17 @@ def _python_prefixes() -> list[str]:
     return prefixes
 
 
-def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
-    """Resolve an operator tiktoken cache, refusing unsafe locations."""
+def _resolve_tiktoken_cache(
+    value: Path | str | None, *, backend: str | None = None
+) -> Path | None:
+    """Resolve an operator tiktoken cache, refusing unsafe locations.
+
+    The masked-root refusal is backend-scoped: only a backend whose wrapper replaces the masked
+    tmp roots (firejail ``--private-tmp``) makes a cache under them unusable, so only such a
+    backend -- and, failing closed, a call that names no known backend id -- is refused one.
+    bwrap ro-binds the individual cache directory and unshare masks nothing, so both accept the
+    cache's host path.
+    """
     if value is None:
         return None
     raw = os.fspath(value)
@@ -300,6 +310,19 @@ def _resolve_tiktoken_cache(value: Path | str | None) -> Path | None:
             _FIX_CACHE_DIR,
             code="unsafe_cache_dir",
         )
+    if backend is None or backend not in BACKENDS or backend in _TMP_MASKING_BACKENDS:
+        # Fail closed without a backend id, for an unknown id, and for ``auto`` (a selection
+        # policy, not a backend id: it may still pick the masking backend); only a known
+        # non-masking backend accepts a cache under the masked roots.
+        for root in _MASKED_TMP_ROOTS:
+            masked = Path(root)
+            if cache == masked or masked in cache.parents:
+                raise SandboxUnavailable(
+                    f"sandbox_tiktoken_cache must not live under {root}: a backend that masks "
+                    "that root would stage a copy of the whole masked root into the sandbox copy",
+                    _FIX_CACHE_DIR,
+                    code="unsafe_cache_dir",
+                )
     if not cache.is_dir():
         raise SandboxUnavailable(
             "sandbox_tiktoken_cache is not an existing directory",
@@ -431,6 +454,163 @@ def build_command(
     ]
 
 
+#: Environment override for the interpreter the sandbox starts (same meaning as ``verify_python``).
+PYTHON_ENV = "BUNDLEBEES_VERIFY_PYTHON"
+#: Where a staged interpreter lives inside the sandbox copy.
+_SANDBOX_PYTHON_DIR = ".bundlebees-python"
+#: Where a staged tiktoken cache lives inside the sandbox copy.
+_SANDBOX_TIKTOKEN_DIR = ".bundlebees-tiktoken"
+#: Backends whose wrapper remaps ``$HOME``, so a path inside the coordinator home does not exist.
+HOME_HIDING_BACKENDS: tuple[str, ...] = ("firejail",)
+#: Filesystem roots ``firejail --private-tmp`` replaces with a fresh tmpfs.
+_MASKED_TMP_ROOTS: tuple[str, ...] = ("/tmp", "/var/tmp")
+#: Backends whose wrapper replaces the masked tmp roots; only these refuse a cache under one.
+_TMP_MASKING_BACKENDS: frozenset[str] = frozenset({"firejail"})
+_FIX_PYTHON = (
+    "Set verify_python (or BUNDLEBEES_VERIFY_PYTHON) to an absolute interpreter path outside the "
+    "coordinator home that has pytest installed (for example a venv under /var/tmp), or use "
+    "verify_isolation=bwrap on a host that allows unprivileged user namespaces."
+)
+
+
+def resolve_sandbox_python(python: str | None = None) -> str | None:
+    """Validated ``verify_python`` interpreter, or None to start the coordinator's own.
+
+    ``verify_python`` / ``BUNDLEBEES_VERIFY_PYTHON`` names the interpreter the sandbox runs.
+    Whether it can be reached is a property of the chosen backend, so ``run_in_sandbox`` probes
+    it there instead of guessing from the path.
+    """
+    explicit = str(python or os.environ.get(PYTHON_ENV) or "").strip()
+    if not explicit:
+        return None
+    path = Path(explicit).expanduser()
+    if not path.is_absolute():
+        raise SandboxUnavailable(
+            f"verify_python must be an absolute path, got {explicit!r}",
+            _FIX_PYTHON,
+            code="invalid_argument",
+        )
+    if not path.is_file() or not os.access(str(path), os.X_OK):
+        raise SandboxUnavailable(
+            f"verify_python is not an executable file: {path}",
+            _FIX_PYTHON,
+            code="invalid_argument",
+        )
+    return str(path)
+
+
+def interpreter_visible_in_sandbox(
+    backend: str,
+    copy_dir: Path,
+    home: Path,
+    interpreter: str,
+    env: dict[str, str],
+) -> bool:
+    """Probe the real backend for one thing: can the sandbox exec *interpreter*?
+
+    A path heuristic cannot answer this. ``firejail --private=<copy>`` masks the coordinator home
+    but leaves separate mounts under it reachable, so ``~/.hermes/tools/python-*`` vanishes while
+    ``~/.cache/uv/...`` does not -- and ``--private-tmp`` masks ``/tmp`` and ``/var/tmp`` as well.
+    Ask the wrapper instead.
+    """
+    probe = ["/bin/sh", "-c", f"test -x {shlex.quote(str(interpreter))}"]
+    try:
+        proc = subprocess.run(
+            build_command(backend, copy_dir, home, probe),
+            cwd=str(copy_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def stage_interpreter(copy_dir: Path, host_python: str) -> str:
+    """Copy *host_python*'s install tree into the sandbox copy; return the sandbox-visible path.
+
+    The returned path is **relative** (``./.bundlebees-python/bin/python``): a wrapper that remaps
+    the home mounts the copy over ``$HOME`` and may not expose the copy's host path at all, while
+    the child's cwd is always the copy. ``firejail --private=<copy>`` behaves exactly that way
+    (a host path under the copy answers ENOENT inside the jail, the same file answers fine as
+    ``./…`` or ``$HOME/…``).
+
+    The copy is disposable, a venv's ``bin/python`` symlink still resolves to the visible base
+    interpreter, and ``python -m pytest`` never depends on installed console-script shebangs.
+    """
+    host = Path(host_python).expanduser()
+    root = host.parent.parent  # <venv>/bin/python -> <venv>
+    destination = Path(copy_dir) / _SANDBOX_PYTHON_DIR
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(root, destination, symlinks=True)
+    staged = destination / host.relative_to(root)
+    if not staged.is_symlink():
+        # A venv's bin/python is usually a symlink to the base interpreter; chmod would follow it
+        # and fail with EPERM on a root-owned target. Only a regular file needs the execute bit.
+        staged.chmod(staged.stat().st_mode | 0o500)
+    return f"./{_SANDBOX_PYTHON_DIR}/{host.relative_to(root).as_posix()}"
+
+
+def swap_interpreter(argv: list[str], interpreter: str | None) -> list[str]:
+    """Return a copy of *argv* whose interpreter position is *interpreter* when one was resolved."""
+    argv = list(argv)
+    if not interpreter or not argv:
+        return argv
+    if not _is_coordinator_interpreter(argv[0]):
+        return argv
+    return [interpreter, *argv[1:]]
+
+
+def _cache_masked_in_sandbox(cache: Path) -> bool:
+    """True when the firejail wrapper masks *cache*, so its host path is ENOENT inside the jail.
+
+    ``--private-tmp`` mounts a fresh tmpfs over ``/tmp`` and ``/var/tmp``, and ``--private=<copy>``
+    mounts the copy over the coordinator's home; a cache under either cannot be addressed by its
+    host path inside the jail and tiktoken would silently rebuild (or fail offline).
+    """
+    resolved = Path(cache).resolve()
+    for root in _MASKED_TMP_ROOTS:
+        masked = Path(root)
+        if resolved == masked or masked in resolved.parents:
+            return True
+    real_home = Path.home().resolve()
+    return resolved == real_home or real_home in resolved.parents
+
+
+def stage_tiktoken_cache(copy_dir: Path, cache: Path) -> str:
+    """Copy an operator cache into the sandbox copy; return the sandbox-visible relative path.
+
+    Mirrors :func:`stage_interpreter`: the returned path is **relative** because the jail's cwd is
+    the copy while the copy's host path does not exist inside the jail. The copy is disposable and
+    deleted with the rest of the sandbox; symlinks are copied, never followed.
+    """
+    destination = Path(copy_dir) / _SANDBOX_TIKTOKEN_DIR
+    if destination.is_symlink() or destination.is_file():
+        destination.unlink()
+    elif destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(cache, destination, symlinks=True)
+    return f"./{_SANDBOX_TIKTOKEN_DIR}"
+
+
+def _is_coordinator_interpreter(path: str) -> bool:
+    """True when *path* is the interpreter this coordinator runs (a hidden one needs a substitute)."""
+    if not path:
+        return False
+    try:
+        # realpath("python3") resolves a file in cwd, not a PATH entry.
+        # Only substitute a bare name when it resolves to this interpreter;
+        # another venv or an arbitrary executable must retain its identity.
+        resolved = path if os.path.dirname(path) else shutil.which(path)
+        return bool(resolved) and os.path.realpath(resolved) == os.path.realpath(sys.executable)
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Evidence and execution
 # ---------------------------------------------------------------------------
@@ -546,6 +726,7 @@ def run_in_sandbox(
     probe: Probe | None = None,
     tiktoken_cache: Path | str | None = None,
     collect_file: str | None = None,
+    python: str | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
@@ -557,10 +738,15 @@ def run_in_sandbox(
     copy is always deleted, even on timeout or an unavailable backend.
     ``allow_weak`` (or ``BUNDLEBEES_ALLOW_WEAK_UNSHARE=1``) is required before an
     explicitly requested ``unshare`` backend runs; ``auto`` never picks it.
-    ``tiktoken_cache`` names an operator-owned cache bound read-only and exposed
-    as ``TIKTOKEN_CACHE_DIR``; it must be an existing directory outside home.
+    ``tiktoken_cache`` names an operator-owned cache exposed as ``TIKTOKEN_CACHE_DIR``; it must be
+    an existing directory outside home. bwrap binds it read-only at a fixed inside path; a backend
+    that masks its host path (firejail's ``--private-tmp`` over ``/tmp`` and ``/var/tmp``, or the
+    private home mount) stages a copy of it into the sandbox copy and names the relative path.
+    ``python`` (``verify_python``) starts the child with an interpreter that
+    exists inside the sandbox; a backend that hides the coordinator home refuses
+    an interpreter living in it instead of failing inside the wrapper.
     """
-    cache = _resolve_tiktoken_cache(tiktoken_cache)
+    cache = _resolve_tiktoken_cache(tiktoken_cache, backend=backend)
     weak_ok = weak_override_enabled(allow_weak)
     source = Path(workdir)
     root = Path(tempfile.mkdtemp(prefix="bundlebees-verify-"))
@@ -609,10 +795,23 @@ def run_in_sandbox(
                 extra_ro.append((str(cache), _TIKTOKEN_CACHE_INSIDE))
                 env["TIKTOKEN_CACHE_DIR"] = _TIKTOKEN_CACHE_INSIDE
         elif chosen == "firejail":
-            evidence_inside = str(evidence_host)
-            env = sandbox_env(copy_dir, Path("/tmp"))
+            # firejail --private=<copy> mounts the copy OVER $HOME, so the copy's host path does not
+            # exist inside the jail even though the same directory is the child's cwd. Evidence must be
+            # addressed relatively, exactly like a staged interpreter.
+            evidence_inside = f"./{_EVIDENCE_NAME}"
+            # The copy is mounted OVER the coordinator's home, so the jail-visible home is the real
+            # home path, not the copy's host path (which does not exist inside).
+            env = sandbox_env(Path.home(), Path("/tmp"))
             if cache is not None:
-                env["TIKTOKEN_CACHE_DIR"] = str(cache)
+                if _cache_masked_in_sandbox(cache):
+                    # --private-tmp replaces /tmp and /var/tmp (and the private mount replaces the
+                    # coordinator home), so the cache's host path is ENOENT inside the jail; stage it
+                    # into the sandbox copy and name it relative to the child's cwd, exactly like a
+                    # staged interpreter. The copy is disposable and deleted with the sandbox.
+                    env["TIKTOKEN_CACHE_DIR"] = stage_tiktoken_cache(copy_dir, cache)
+                else:
+                    # A cache outside the masked roots is genuinely visible inside the jail.
+                    env["TIKTOKEN_CACHE_DIR"] = str(cache)
         else:
             evidence_inside = str(evidence_host)
             env = sandbox_env(home, tmp)
@@ -620,6 +819,30 @@ def run_in_sandbox(
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
 
         command_argv = _replace_evidence(argv, evidence_inside)
+        if command_argv and _is_coordinator_interpreter(command_argv[0]):
+            configured = resolve_sandbox_python(python)
+            target = configured or sys.executable
+            if chosen in HOME_HIDING_BACKENDS and not interpreter_visible_in_sandbox(
+                chosen, copy_dir, home, target, env
+            ):
+                if not configured:
+                    raise SandboxUnavailable(
+                        f"{chosen} hides {target} from the sandbox, so the worker's tests cannot "
+                        "start; the wrapper only says 'no suitable ... executable found'",
+                        _FIX_PYTHON,
+                        code="sandbox_interpreter_hidden",
+                    )
+                staged = stage_interpreter(copy_dir, configured)
+                if not interpreter_visible_in_sandbox(chosen, copy_dir, home, staged, env):
+                    raise SandboxUnavailable(
+                        f"{chosen} hides {configured} even after staging it inside the sandbox "
+                        "copy; point verify_python at a self-contained interpreter",
+                        _FIX_PYTHON,
+                        code="sandbox_interpreter_hidden",
+                    )
+                command_argv = swap_interpreter(command_argv, staged)
+            elif configured:
+                command_argv = swap_interpreter(command_argv, configured)
         if chosen is None:
             label = "none-unsafe-local"
             command = command_argv

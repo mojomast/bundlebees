@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -418,13 +419,15 @@ def tick(
     tests_for_task=None,
     gitleaks: str | None = None,
     require_gitleaks: bool = True,
-    suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
+    suite_command: Sequence[str] | None = None,
+    runner: Any = None,
     now: Any = None,
     provisioner: Any = None,
     expect_host: str | None = None,
 ) -> dict[str, Any]:
     """One mechanical tick: provisioning phase, then ordinary reconcile."""
 
+    suite_command = tuple(suite_command or (sys.executable, "-m", "pytest", "-q"))
     binder = LeaseBinder(state_dir)
     job = jobs.load_job(state_dir, job_id, recover=False)
     # The crash window between "wave accepted and published" and "job saved" is
@@ -547,6 +550,7 @@ def tick(
                 suite_command=list(suite_command),
                 gitleaks=gitleaks,
                 require_gitleaks=require_gitleaks,
+                runner=runner,
                 expected_patch_sha256=expected_sha,
                 acdd_preflight=preflight,
                 contract_declared=declared,
@@ -562,6 +566,7 @@ def tick(
                 job_doc,
                 repo,
                 suite_command=suite_command,
+                runner=runner,
             )
         except (integrate_job.IntegrateError, Exception) as exc:  # noqa: BLE001 - reported as a failed wave
             return {"ok": False, "evidence": f"integration error: {exc}"}
@@ -752,6 +757,12 @@ def add_parsers(subparsers: Any) -> None:
                       help="A signed owner-approval receipt; enables the non-TTY path after verification.")
     auth.add_argument("--tasks", default=None,
                       help="Optional task-list JSON to prove it is the exact set the owner approved.")
+    auth.add_argument("--max-attempts-per-task", type=int, default=None)
+    auth.add_argument("--contract-corrections-allowed", type=int, choices=(0, 1), default=None)
+    auth.add_argument("--corrected-test-allowed", action="append", default=None)
+    auth.add_argument("--recovery-file-scope", action="append", default=None)
+    auth.add_argument("--recovery-test-scope", action="append", default=None)
+    auth.add_argument("--recovery-gate", action="append", default=None)
     auth.add_argument("--state-dir", default=None)
     auth.set_defaults(command="job", job_handler="authorize")
 
@@ -872,12 +883,14 @@ def add_parsers(subparsers: Any) -> None:
 
 
 def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
-    from . import queue as queue_mod
+    from . import queue as queue_mod, execution, settings
 
     config = {}
     getter = getattr(ctx, "config", None)
     if isinstance(getter, Mapping):
         config = dict(getter)
+    if callable(getattr(ctx, "get_config", None)):
+        config.update(settings.settings_from_ctx(ctx))
     queue_file = Path((config.get("queue") or {}).get("file") or (Path(state_dir) / "queue.json"))
     backend_name = getattr(args, "backend", "json")
     if backend_name == "kanban":
@@ -921,11 +934,7 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
             return 2
         client = client_factory()
         provisioner = provisioner_factory() if provisioner_factory is not None else None
-        scanner = getattr(args, "gitleaks", None) or (config.get("queue") or {}).get("gitleaks")
-        if not scanner:
-            import shutil
-
-            scanner = shutil.which("gitleaks")
+        scanner = execution.scanner(config, getattr(args, "gitleaks", None))
         if not scanner:
             # Verification requires the scanner; refuse before claiming anything.
             print(json.dumps({"error": "gitleaks_unavailable",
@@ -934,7 +943,7 @@ def cmd_queue(ctx: Any, args: Any, *, state_dir: Path, client_factory, provision
 
         def one_tick(job_id: str):
             return tick(state_dir, job_id, client=client, repo=Path(args.repo), provisioner=provisioner,
-                        gitleaks=scanner)
+                        gitleaks=scanner, runner=execution.SandboxRunner(config))
 
         handoff_context = None
         mirror = (config.get("transport") or {}).get("mirror")
@@ -1089,6 +1098,46 @@ def cmd_repo(ctx: Any, args: Any, *, state_dir: Path) -> int:
         return 1
 
 
+def _recovery_ceiling(args: Any, binding: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The recovery ceiling an authorization may carry.
+
+    Explicit flags win: they become the ceiling the owner is asked to approve.
+    On the receipt path the receipt binding covers the recovery ceiling, so an
+    owner-approved bound ceiling is reused when no flags are given, and any
+    explicit flag that disagrees with the bound envelope is refused: a receipt
+    never silently grows permissions it does not carry.
+    """
+    explicit = {
+        key: value
+        for key, value in (
+            ("max_attempts_per_task", getattr(args, "max_attempts_per_task", None)),
+            ("contract_corrections_allowed", getattr(args, "contract_corrections_allowed", None)),
+            ("corrected_tests_allowed", getattr(args, "corrected_test_allowed", None)),
+            ("file_scope", getattr(args, "recovery_file_scope", None)),
+            ("test_scope", getattr(args, "recovery_test_scope", None)),
+            ("gates", getattr(args, "recovery_gate", None)),
+        )
+        if value is not None
+    }
+    bound = binding.get("recovery") if isinstance(binding, Mapping) else None
+    bound = dict(bound) if isinstance(bound, Mapping) else None
+    if explicit and bound is None:
+        raise JobCliError(
+            "approval_scope_changed",
+            "recovery flags are set but the approval receipt carries no bound recovery ceiling",
+            "Authorize without recovery flags, or obtain a new owner approval that binds them.",
+        )
+    if explicit and bound is not None:
+        for key, value in explicit.items():
+            if bound.get(key) != value:
+                raise JobCliError(
+                    "approval_scope_changed",
+                    f"recovery.{key} disagrees with the owner-approved receipt",
+                    "Authorize with the receipt's bound ceiling, or obtain a new owner approval.",
+                )
+    return explicit or bound
+
+
 def _authorize_from_receipt(state_dir: Path, job_id: str, args: Any) -> dict[str, Any]:
     """Turn a signed owner receipt into a sealed authorization without a TTY.
 
@@ -1147,10 +1196,17 @@ def _authorize_from_receipt(state_dir: Path, job_id: str, args: Any) -> dict[str
         interactive=False,
         approval_receipt=receipt,
         tasks=tasks,
+        recovery=_recovery_ceiling(args, binding),
     )
 
 
 def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner_factory=None) -> int:
+    from . import execution, settings, provisioning, provision_bind
+
+    raw_config = getattr(ctx, "config", None)
+    config = dict(raw_config) if isinstance(raw_config, Mapping) else {}
+    if callable(getattr(ctx, "get_config", None)):
+        config.update(settings.settings_from_ctx(ctx))
     handler = getattr(args, "job_handler", None)
     if handler == "project":
         return cmd_project(ctx, args, state_dir=state_dir)
@@ -1185,6 +1241,15 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                     "Pass the authorization fields and run it at a terminal, or use "
                     "--approval-receipt with an owner decision.",
                 )
+            recovery_fields = {
+                "max_attempts_per_task": getattr(args, "max_attempts_per_task", None),
+                "contract_corrections_allowed": getattr(args, "contract_corrections_allowed", None),
+                "corrected_tests_allowed": getattr(args, "corrected_test_allowed", None),
+                "file_scope": getattr(args, "recovery_file_scope", None),
+                "test_scope": getattr(args, "recovery_test_scope", None),
+                "gates": getattr(args, "recovery_gate", None),
+            }
+            recovery_ceiling = {key: value for key, value in recovery_fields.items() if value is not None}
             record = jobs.record_authorization(
                 state_dir,
                 job_id=job_id,
@@ -1194,6 +1259,7 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
                 scope=args.scope,
                 bees=args.bees if args.bees is not None else 3,
                 wall_clock_s=args.wall_clock if args.wall_clock is not None else 3600,
+                recovery=recovery_ceiling or None,
             )
             print(json.dumps({"authorized": record["job_id"], "auth_id": record["auth_id"]}, indent=2))
             return 0
@@ -1210,10 +1276,17 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
             return 0
 
         if handler == "tick":
+            scanner = execution.scanner(config, args.gitleaks)
+            if not scanner:
+                raise JobCliError(
+                    "gitleaks_unavailable", "job tick requires gitleaks before dispatch",
+                    "Set gitleaks_path, GITLEAKS, or --gitleaks; no worker has been dispatched.",
+                )
             client = client_factory()
             provisioner = provisioner_factory() if provisioner_factory is not None else None
-            result = tick(state_dir, job_id, client=client, repo=Path(args.repo), gitleaks=args.gitleaks,
-                          provisioner=provisioner)
+            result = tick(state_dir, job_id, client=client, repo=Path(args.repo),
+                          gitleaks=scanner,
+                          runner=execution.SandboxRunner(config), provisioner=provisioner)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
@@ -1255,7 +1328,8 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")
     except (JobCliError, jobs.JobError, reconcile.ReconcileError, recovery.RecoveryError,
-            verify_local.VerifyError, return_report.ReturnError) as exc:
+            verify_local.VerifyError, return_report.ReturnError,
+            provisioning.ProvisionError, provision_bind.ProvisionBindError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc)}, indent=2))
         return 1
 

@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from . import job as jobs
+from . import provision_bind
+from . import provisioning
 from . import verify_local
 
 
@@ -395,6 +397,24 @@ def _settle(
     return {"action": "blocked", "status": status, "detail": message}
 
 
+def _provision_refusal(exc: Exception) -> dict[str, str]:
+    """One typed provisioning refusal: code, fix and a reportable detail line.
+
+    Both refusal types carry ``code``/``message``/``fix``; this keeps the
+    reportable shape in one place instead of branching per exception class.
+    """
+    code = str(getattr(exc, "code", "") or "provision_error")
+    message = str(exc) or code
+    fix = str(getattr(exc, "fix", "") or "")
+    detail = f"{code}: {message}"
+    if fix:
+        detail = f"{detail}; fix: {fix}"
+    refusal = {"error": code, "message": message, "detail": detail}
+    if fix:
+        refusal["fix"] = fix
+    return refusal
+
+
 def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None,
              handoff_context: Mapping[str, Any] | None = None,
              admit: bool = True) -> dict[str, Any]:
@@ -459,7 +479,19 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             store.write(feature_id, dict(record, state="needs_approval", detail="claimed job does not exist", pid=os.getpid()))
             return {"action": "blocked", "feature": feature_id, "job": item.job_id,
                     "detail": "a claim exists but its job does not; recreate the authorized job, then re-run"}
-        result = tick(item.job_id)
+        try:
+            result = tick(item.job_id)
+        except (provisioning.ProvisionError, provision_bind.ProvisionBindError) as exc:
+            # A typed provisioning refusal short-circuits this pass the way it
+            # short-circuits the job CLI: report the refusal, block the card,
+            # and admit nothing else. Card first, then the record, so a failed
+            # card write leaves an active claim the next pass can retry.
+            refusal = _provision_refusal(exc)
+            queue.set_status(feature_id, "blocked", {"detail": refusal["detail"][:400]})
+            store.write(feature_id, dict(record, state="blocked", evidence=refusal,
+                                          detail=refusal["detail"], pid=os.getpid()))
+            return {"action": "blocked", "feature": feature_id, "job": item.job_id,
+                    "code": refusal["error"], "detail": refusal["detail"]}
         settled = _settle(state_dir, queue, store, feature_id, item.job_id, record, result)
         payload = {"action": settled["action"], "feature": feature_id, "job": item.job_id,
                    "status": settled.get("status", "")}
@@ -502,7 +534,17 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         return {"action": "blocked", "feature": item.feature_id, "job": item.job_id,
                 "detail": "claimed, but the authorized job does not exist"}
 
-    result = tick(item.job_id)
+    try:
+        result = tick(item.job_id)
+    except (provisioning.ProvisionError, provision_bind.ProvisionBindError) as exc:
+        # Same rule as the active pass above: a typed provisioning refusal is
+        # reported and the freshly claimed card is blocked, not left running.
+        refusal = _provision_refusal(exc)
+        queue.set_status(item.feature_id, "blocked", {"detail": refusal["detail"][:400]})
+        store.write(item.feature_id, dict(record, state="blocked", evidence=refusal,
+                                          detail=refusal["detail"], pid=os.getpid()))
+        return {"action": "blocked", "feature": item.feature_id, "job": item.job_id,
+                "code": refusal["error"], "detail": refusal["detail"]}
     settled = _settle(state_dir, queue, store, item.feature_id, item.job_id, record, result)
     action = settled["action"]
 

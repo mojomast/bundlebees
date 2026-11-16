@@ -13,9 +13,9 @@ metadata:
 
 # bundlebees operator
 
-Skill id: `bundlebees:bundlebees-operator`. The plugin registers the skill under
-the bare name `bundlebees-operator`; always refer to the qualified id in a
-session. There is no `plugin:` prefix.
+Skill id: `bundlebees:bundlebees-operator`. The plugin also registers the bare
+name `bundlebees-operator`; always refer to the qualified id in a session,
+never a `plugin:` prefix.
 
 ## When to Use
 
@@ -34,7 +34,7 @@ Do not use it to apply a worker patch, run tests, push a branch, reach a host,
 or change launcher configuration yourself. Those are user-run CLI steps or
 owner actions.
 
-If the four tools are not visible, call `tool_search(["bundlebees"])`, then
+If the five tools are not visible, call `tool_search(["bundlebees"])`, then
 `skill_view("bundlebees:bundlebees-operator")`. Do not invent a shell or HTTP
 client against the launcher.
 
@@ -46,9 +46,10 @@ client against the launcher.
 | `bundlebees_dispatch` | `brief` (object or JSON string), optional `model`, optional `kanban_task_id` | Validate a brief, check project authorization and file leases, start one bee. |
 | `bundlebees_attempt` | `get`, `events`, `cancel`, `review` (all need `attempt_id`; `cancel`/`review` need `confirm=true`; `review` needs `accepted`) | Inspect or close one attempt. |
 | `bundlebees_host_prompt` | `os` (`linux`/`macos`/`windows`), `reach` (`same-machine`/`lan`/`vpn`/`ssh`), `provider`, `repos`, `max_concurrent` (1-10), optional `branch_rules` | Fill the host setup template. No addresses or secrets in or out. |
+| `bundlebees_route_preview` | optional `kind`, `model`, `tier`, `brief` | Preview the model route a dispatch would take; starts no attempt. |
 
-Default model: `deepseek-v4.1-flash`. The launcher may allow others; pass one
-only when the user asks and it is allow-listed.
+Default model: `deepseek-v4.1-flash`; pass another only when the user asks and
+the launcher allows it.
 
 User-typed CLI (never a model tool):
 
@@ -166,9 +167,8 @@ A dispatch is not success until all of these hold:
 6. The push target is the feature branch. If the user asks for `--dry-run`,
    no push happens. If anything is red, do not advance the card to review.
 
-The model does not run verify or deploy. It also does not run a real SSH
-deploy, does not restart the launcher, and does not accept a review on the
-user's behalf without their explicit decision.
+The model never runs verify or deploy, a real SSH deploy, or a launcher
+restart, and never accepts a review without the user's explicit decision.
 
 ## Hard Rules
 
@@ -185,7 +185,7 @@ user's behalf without their explicit decision.
   environment.
 - Board tracking is Hermes kanban only. Do not import `hermes_cli.kanban_db`
   and do not assign a dispatchable Hermes profile.
-- Do not change the plugin version; this skill never changes the manifest.
+- Do not change the plugin version or manifest.
 - Feature branch and PR only. No merge to `main`, tag, release, catalog PR,
   force-push, or deploy.
 - Worker metadata is never authority: file scope comes only from the signed

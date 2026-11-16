@@ -1,4 +1,4 @@
-"""The four model-facing bundlebees tools.
+"""The five model-facing bundlebees tools.
 
 Every handler returns ``json.dumps(envelope)`` on success, validation failure,
 and exception. Settings come from ``ctx.get_config(key, default)``; the token
@@ -16,10 +16,10 @@ from typing import Any, Callable, Mapping
 
 from .brief import BriefError, validate_brief
 from .client import (
-    DEFAULT_MODEL,
     ClientError,
     client_from_config,
     public_result,
+    public_route,
 )
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
@@ -40,6 +40,7 @@ TOOL_NAMES = (
     "bundlebees_dispatch",
     "bundlebees_attempt",
     "bundlebees_host_prompt",
+    "bundlebees_route_preview",
 )
 
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -412,21 +413,26 @@ def _dispatch(
             "checks are best-effort against live attempts.",
         )
 
-    model = args.get("model") or DEFAULT_MODEL
-    if not isinstance(model, str) or not model.strip():
-        return _err("invalid_argument", "model must be a non-empty string", "Use a launcher-allowed model id.")
-    model = model.strip()
-    try:
-        health = client.health()
-    except Exception:
-        health = {}
-    allowed_models = health.get("models") if isinstance(health, Mapping) else None
-    if isinstance(allowed_models, list) and allowed_models and model not in allowed_models:
-        return _err(
-            "model_not_allowed",
-            "model is not allow-listed on the launcher",
-            "Use one of: " + ", ".join(str(item) for item in allowed_models),
-        )
+    # No model means "the launcher decides": its default is the cheapest usable route on that host
+    # (Zoo's free pass when a zoo key is readable, else the host's configured model). Substituting a
+    # plugin-side default here silently overrides that preference for every dispatch.
+    model = args.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            return _err("invalid_argument", "model must be a non-empty string",
+                        "Use a launcher-allowed model id, or omit it to let the launcher choose.")
+        model = model.strip()
+        try:
+            health = client.health()
+        except Exception:
+            health = {}
+        allowed_models = health.get("models") if isinstance(health, Mapping) else None
+        if isinstance(allowed_models, list) and allowed_models and model not in allowed_models:
+            return _err(
+                "model_not_allowed",
+                "model is not allow-listed on the launcher",
+                "Use one of: " + ", ".join(str(item) for item in allowed_models),
+            )
 
     kanban_task_id = args.get("kanban_task_id")
     if kanban_task_id is not None and not isinstance(kanban_task_id, str):
@@ -538,6 +544,69 @@ def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None
     out = {"op": op, "attempt_id": attempt_id, "accepted": accepted}
     out.update(_unwrap_attempt(data))
     return _ok(**out)
+
+
+# ---------------------------------------------------------------------------
+# route preview
+# ---------------------------------------------------------------------------
+
+
+def _route_preview(client: Any, args: Mapping[str, Any]) -> str:
+    """Ask the launcher which route a dispatch would take, starting nothing.
+
+    Type validation mirrors dispatch: ``invalid_argument`` envelopes, and the
+    client is never touched for a bad argument. The brief is reduced to the
+    only fields the route decision reads (kind, priority, model) before it is
+    sent.
+    """
+    model = args.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            return _err(
+                "invalid_argument",
+                "model must be a non-empty string",
+                "Use a launcher-allowed model id, or omit it to let the launcher choose.",
+            )
+        model = model.strip()
+    tier = args.get("tier")
+    if tier is not None and not isinstance(tier, str):
+        return _err(
+            "invalid_argument",
+            "tier must be a string",
+            "Pass a launcher-supported tier name, or omit it.",
+        )
+    kind = args.get("kind")
+    if kind is not None and not isinstance(kind, str):
+        return _err(
+            "invalid_argument",
+            "kind must be a string",
+            "Pass the route kind as a string, or omit it.",
+        )
+    raw_brief = args.get("brief")
+    if isinstance(raw_brief, str):
+        try:
+            raw_brief = json.loads(raw_brief)
+        except json.JSONDecodeError:
+            return _err(
+                "invalid_argument",
+                "brief is not valid JSON",
+                "Pass a JSON object with optional kind, priority and model keys, or omit brief.",
+            )
+    if raw_brief is not None and not isinstance(raw_brief, Mapping):
+        return _err(
+            "invalid_argument",
+            "brief must be an object",
+            "Pass an object with optional kind, priority and model keys, or omit brief.",
+        )
+    brief: dict[str, Any] | None = None
+    if raw_brief is not None:
+        brief = {
+            key: raw_brief[key] for key in ("kind", "priority", "model") if key in raw_brief
+        }
+    # Model-visible: always reduce to the public view so no client can leak a
+    # credential value, a base URL or effective.key here.
+    route = public_route(client.route_preview(kind=kind, model=model, tier=tier, brief=brief))
+    return _ok(op="route_preview", route=route)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +764,7 @@ _DISPATCH_SCHEMA = _schema(
             },
             "model": {
                 "type": "string",
-                "description": "Launcher-allowed model id; defaults to deepseek-v4.1-flash.",
+                "description": "Launcher-allowed model id; omit to use the launcher's preferred route.",
             },
             "kanban_task_id": {
                 "type": "string",
@@ -763,11 +832,30 @@ _HOST_PROMPT_SCHEMA = _schema(
     },
 )
 
+_ROUTE_PREVIEW_SCHEMA = _schema(
+    "bundlebees_route_preview",
+    "Preview the model and credential route a brief would take. Starts no attempt.",
+    {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "description": "Route kind."},
+            "model": {"type": "string", "description": "Model id to preview."},
+            "tier": {"type": "string", "description": "Launcher tier."},
+            "brief": {
+                "type": "object",
+                "description": "Only kind, priority and model are sent.",
+            },
+        },
+        "additionalProperties": False,
+    },
+)
+
 _SCHEMAS: tuple[tuple[str, dict[str, Any]], ...] = (
     (_STATUS_SCHEMA["name"], _STATUS_SCHEMA),
     (_DISPATCH_SCHEMA["name"], _DISPATCH_SCHEMA),
     (_ATTEMPT_SCHEMA["name"], _ATTEMPT_SCHEMA),
     (_HOST_PROMPT_SCHEMA["name"], _HOST_PROMPT_SCHEMA),
+    (_ROUTE_PREVIEW_SCHEMA["name"], _ROUTE_PREVIEW_SCHEMA),
 )
 
 _DESCRIPTIONS = {name: schema["description"] for name, schema in _SCHEMAS}
@@ -790,6 +878,8 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
                     _state_dir_for(ctx),
                     require_contract=_require_contract(ctx),
                 )
+            if tool_name == "bundlebees_route_preview":
+                return _route_preview(client, data)
             return _attempt(client, data, _state_dir_for(ctx))
         except ClientError as exc:
             return json.dumps(exc.as_envelope())
