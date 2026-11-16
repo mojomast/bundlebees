@@ -40,6 +40,7 @@ FIRST_COVERED_PR = 43
 #: both the registry and this mapping is a test failure.
 EXCLUDED_PRS: dict[int, str] = {
     46: "docs/changelog-43-44 — the changelog update itself, not a campaign feature",
+    50: "docs/changelog-post46 - the changelog update itself, not a campaign feature",
 }
 
 #: The merge numbers verified against main's first-parent history
