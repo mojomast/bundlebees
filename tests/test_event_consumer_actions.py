@@ -16,7 +16,10 @@ is not needed. They prove the properties the composition exists for:
 * malformed events are skipped with a counted reason and never enqueue;
 * action items are claimed under a fencing token; a stale token is refused;
 * the pipeline advances without Hermes being awake: the wake path is never
-  touched.
+  touched;
+* the composition's bundled store and the merged coordinator action queue
+  (#54) coexist in one state directory without corrupting each other, and the
+  explicit adapter publishes conformant records into the merged queue.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from bundlebees_plugin import bee_events
+from bundlebees_plugin import coordinator_actions as ca
 from bundlebees_plugin import event_consumer as consumer
 from bundlebees_plugin import hermes_adapter as adapter
 
@@ -75,7 +79,9 @@ def land(state: Path, event: dict, *, identity: str = SUBSCRIBER) -> dict:
 
 
 def action_path(state: Path, action_id: str) -> Path:
-    return state / "coordinator" / "actions" / f"{action_id}.json"
+    """The composition's bundled item store, beside the merged queue's directory."""
+
+    return state / "coordinator" / "completion-actions" / f"{action_id}.json"
 
 
 def read_action(state: Path, action_id: str) -> dict:
@@ -94,7 +100,11 @@ def inbox_records(state: Path) -> list[dict]:
 
 def test_a_landed_completion_enqueues_verify_and_process_completion(tmp_path):
     state = tmp_path / "state"
-    event = land(state, canonical_event())
+    event = canonical_event()
+    # An older producer may attach arbitrary fields to the event it delivers;
+    # the fixture supplies one so the projection assertion below is load-bearing.
+    delivered = {**event, "worker_note": "left the bench notes in the run log"}
+    consumer.publish_event(state, delivered, subscriber=SUBSCRIBER)
 
     result = consumer.consume_completions(state, now=T0)
 
@@ -139,7 +149,9 @@ def test_a_landed_completion_enqueues_verify_and_process_completion(tmp_path):
     )
     assert ack["result"]["accepted"] is True
 
-    # Only allowlisted completion facts are copied; arbitrary event fields are not.
+    # Only allowlisted completion facts are copied: the event carried
+    # worker_note, the stored item must not.
+    assert "worker_note" in delivered
     assert "worker_note" not in verify
 
 
@@ -536,3 +548,334 @@ def test_actions_summary_counts_by_status(tmp_path):
     summary = consumer.actions_summary(state)
     assert summary["counts"] == {"total": 2, "pending": 1, "claimed": 0, "done": 1,
                                  "failed": 0}
+
+
+# ---------------------------------------------------------------------------
+# Coexistence: the bundled store and the merged #54 queue in one state dir
+# ---------------------------------------------------------------------------
+
+
+def test_the_bundled_store_and_the_merged_queue_coexist_in_one_state_dir(tmp_path):
+    state = tmp_path / "state"
+
+    # The merged coordinator action queue (#54) writes its own records into
+    # coordinator/actions; nothing else may live there.
+    merged = ca.enqueue(
+        state, "act_merge_1", action_key="merge-1", kind="merge", repo="org/a",
+        now=T0,
+    )
+    assert merged["schema"] == "bundlebees.coordinator-actions/1"
+    assert merged["status"] == "queued"
+
+    # The composition's bundled store writes its own shape beside it.
+    created = consumer.enqueue_action(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1",
+        event_state="landed", now=T0,
+    )
+    assert created["created"] is True
+    stored = read_action(state, "verify:att-bee-1")
+    assert stored["schema"] == "rizzstack.coordinator-action/1"
+    assert stored["status"] == "pending"
+
+    # Each store reads exactly its own records: the merged queue's reader
+    # refuses foreign records, so a composition item in its directory would
+    # corrupt it — the separate directories keep both readable.
+    assert [record["action_id"] for record in ca.list_actions(state)] == ["act_merge_1"]
+    assert consumer.actions_summary(state)["counts"]["total"] == 1
+
+    # Both entry points claim and complete their own item without interference.
+    merged_claim = ca.claim(state, "act_merge_1", owner="bee-a", now=T0 + 1)
+    composed_claim = consumer.claim_action(
+        state, "verify:att-bee-1", consumer="turn-1", now=T0 + 1
+    )
+    assert merged_claim["fence_seq"] == 1
+    assert composed_claim["fence"] == 1
+
+    ca.complete(state, "act_merge_1", merged_claim["fence_seq"], now=T0 + 2)
+    consumer.complete_action(
+        state, "verify:att-bee-1", fence=composed_claim["fence"], now=T0 + 2
+    )
+
+    assert ca.load(state, "act_merge_1")["status"] == "done"
+    assert read_action(state, "verify:att-bee-1")["status"] == "done"
+
+    # The fence counters never cross: the composition's claims mint nothing in
+    # the merged queue's durable counter, and its locks are its own.
+    assert ca.fence_value(state) == 1
+    assert consumer.actions_summary(state)["counts"] == {
+        "total": 1, "pending": 0, "claimed": 0, "done": 1, "failed": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The explicit adapter: conformant records through the merged queue
+# ---------------------------------------------------------------------------
+
+
+def test_the_adapter_enqueues_conformant_records_into_the_merged_queue(tmp_path):
+    state = tmp_path / "state"
+
+    outcome = consumer.coordinator_actions_enqueue(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1",
+        event_id="evt-1", event_state="landed", job_id="job-1", task_id="task-1",
+        dedupe_key="att-bee-1:landed", now=T0,
+    )
+    assert outcome["created"] is True
+    assert outcome["action_id"] == "verify_att-bee-1"  # colon-free: the queue's grammar
+    assert outcome["action_key"] == "verify:att-bee-1"  # the key is kept verbatim
+
+    record = ca.load(state, "verify_att-bee-1")
+    assert record["schema"] == "bundlebees.coordinator-actions/1"
+    assert record["action_id"] == "verify_att-bee-1"
+    assert record["action_key"] == "verify:att-bee-1"
+    assert record["kind"] == "verify"
+    assert record["status"] == "queued"
+    assert record["fence_seq"] == 0
+    assert record["workflow_ref"] == ""  # the legacy unpinned shape, field present
+    assert record["payload"]["attempt_id"] == "att-bee-1"
+    assert record["payload"]["dedupe_key"] == "att-bee-1:landed"
+
+    replay = consumer.coordinator_actions_enqueue(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1", now=T0 + 1
+    )
+    assert replay["created"] is False
+    assert replay["duplicate"] is True
+    assert replay["item"] == record  # the first decision stands
+
+    # The merged queue's own machinery claims and completes the adapted item.
+    claim = ca.claim(state, "verify_att-bee-1", owner="turn-1", now=T0 + 2)
+    assert claim["fence_seq"] == 1
+    done = ca.complete(state, "verify_att-bee-1", claim["fence_seq"], now=T0 + 3)
+    assert done["status"] == "done"
+
+    resurrect = consumer.coordinator_actions_enqueue(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1", now=T0 + 4
+    )
+    assert resurrect["created"] is False
+    assert resurrect["item"]["status"] == "done"  # done work is never resurrected
+
+    with pytest.raises(consumer.ActionQueueError) as mismatch:
+        consumer.coordinator_actions_enqueue(
+            state, "verify:someone-else", kind="verify", attempt_id="att-bee-1",
+            now=T0 + 5,
+        )
+    assert mismatch.value.code == "action_id_mismatch"
+
+
+def test_the_handler_runs_end_to_end_through_the_merged_queue_adapter(tmp_path):
+    state = tmp_path / "state"
+    land(state, canonical_event())
+
+    result = consumer.consume_completions(
+        state, now=T0, enqueue=consumer.coordinator_actions_enqueue
+    )
+    assert result["state"] == "acked"
+    assert result["result"]["actions"] == [
+        "verify_att-bee-1",
+        "process-completion_att-bee-1",
+    ]
+
+    # The merged queue reads exactly two conformant records of its own schema.
+    records = ca.list_actions(state)
+    assert [record["action_id"] for record in records] == [
+        "process-completion_att-bee-1",
+        "verify_att-bee-1",
+    ]
+    assert all(record["schema"] == "bundlebees.coordinator-actions/1" for record in records)
+    assert all(record["status"] == "queued" for record in records)
+    assert all(record["action_key"].startswith(("verify:", "process-completion:")) for record in records)
+
+    ledger = json.loads(
+        (state / "coordinator" / "completions" / "att-bee-1:landed.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ledger["actions"] == ["verify_att-bee-1", "process-completion_att-bee-1"]
+
+    # A duplicate delivery replays the recorded decision, not new items.
+    again = consumer.consume_completions(
+        state, now=T0 + 1, enqueue=consumer.coordinator_actions_enqueue
+    )
+    assert again["state"] == "duplicate"
+    assert again["result"]["actions"] == [
+        "verify_att-bee-1",
+        "process-completion_att-bee-1",
+    ]
+    assert len(ca.list_actions(state)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Claim-state discipline: an unclaimed or failed item cannot be completed
+# ---------------------------------------------------------------------------
+
+
+def test_complete_and_fail_refuse_an_item_that_is_not_claimed(tmp_path):
+    state = tmp_path / "state"
+    consumer.enqueue_action(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1",
+        event_state="landed", now=T0,
+    )
+
+    # A pending (never claimed) item: even the trivially matching fence 0
+    # completes or fails nothing.
+    with pytest.raises(consumer.ActionQueueError) as pending_complete:
+        consumer.complete_action(state, "verify:att-bee-1", fence=0, now=T0)
+    assert pending_complete.value.code == "not_claimed"
+
+    with pytest.raises(consumer.ActionQueueError) as pending_fail:
+        consumer.fail_action(state, "verify:att-bee-1", fence=0, error="premature", now=T0)
+    assert pending_fail.value.code == "not_claimed"
+    assert read_action(state, "verify:att-bee-1")["status"] == "pending"
+
+    # A released item: the former owner's still-current fence completes nothing.
+    claim = consumer.claim_action(state, "verify:att-bee-1", consumer="turn-1", now=T0)
+    released = consumer.fail_action(
+        state, "verify:att-bee-1", fence=claim["fence"], error="coordinator busy",
+        now=T0, retry_backoff_s=0.0,
+    )
+    assert released["status"] == "pending"
+    with pytest.raises(consumer.ActionQueueError) as released_complete:
+        consumer.complete_action(
+            state, "verify:att-bee-1", fence=claim["fence"], now=T0 + 1
+        )
+    assert released_complete.value.code == "not_claimed"
+
+    # A terminally failed item: no owner can resurrect it through completion.
+    second = consumer.claim_action(state, "verify:att-bee-1", consumer="turn-2", now=T0 + 2)
+    exhausted = consumer.fail_action(
+        state, "verify:att-bee-1", fence=second["fence"], error="still busy", now=T0 + 2
+    )
+    assert exhausted["status"] == "failed"
+    with pytest.raises(consumer.ActionQueueError) as failed_complete:
+        consumer.complete_action(
+            state, "verify:att-bee-1", fence=second["fence"], now=T0 + 3
+        )
+    assert failed_complete.value.code == "not_claimed"
+    assert read_action(state, "verify:att-bee-1")["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Store outages surface as the queue's typed error
+# ---------------------------------------------------------------------------
+
+
+def test_a_store_outage_surfaces_as_the_queue_error(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+
+    def disk_full(path, value):
+        raise OSError(28, "No space left on device")
+
+    # The create-only publish inside enqueue_action fails as the queue's error.
+    with monkeypatch.context() as mp:
+        mp.setattr(consumer, "_create_only_json", disk_full)
+        with pytest.raises(consumer.ActionQueueError) as enqueue_exc:
+            consumer.enqueue_action(
+                state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1",
+                event_state="landed", now=T0,
+            )
+        assert enqueue_exc.value.code == "queue_unavailable"
+    assert not action_path(state, "verify:att-bee-1").exists()
+
+    # The completion's rewrite fails as the queue's error while the store is
+    # unwritable; the claim itself succeeded before the outage.
+    consumer.enqueue_action(
+        state, "verify:att-bee-1", kind="verify", attempt_id="att-bee-1",
+        event_state="landed", now=T0,
+    )
+    claim = consumer.claim_action(state, "verify:att-bee-1", consumer="turn-1", now=T0)
+    assert claim["status"] == "claimed"
+    with monkeypatch.context() as mp:
+        mp.setattr(consumer, "_write_json", disk_full)
+        with pytest.raises(consumer.ActionQueueError) as complete_exc:
+            consumer.complete_action(
+                state, "verify:att-bee-1", fence=claim["fence"], now=T0 + 1
+            )
+        assert complete_exc.value.code == "queue_unavailable"
+
+    # Once the store is writable again the same completion succeeds.
+    done = consumer.complete_action(
+        state, "verify:att-bee-1", fence=claim["fence"], now=T0 + 2
+    )
+    assert done["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Narrow crash windows inside the handler
+# ---------------------------------------------------------------------------
+
+
+def test_a_crash_between_the_two_enqueues_still_yields_one_action_set(tmp_path):
+    state = tmp_path / "state"
+    land(state, canonical_event())
+
+    def crashing_after_verify(event_payload):
+        classified = consumer.classify_completion(event_payload)
+        attempt = str(classified["attempt_id"])
+        consumer.enqueue_action(
+            state, consumer.action_id_for("verify", attempt), kind="verify",
+            attempt_id=attempt, event_state=str(classified["state"]), now=T0,
+        )
+        raise RuntimeError("coordinator died between the two enqueues")
+
+    first = consumer.consume_completions(
+        state, now=T0, handler=crashing_after_verify, max_attempts=2, retry_backoff_s=0
+    )
+    assert first["state"] == "retryable"
+    assert action_path(state, "verify:att-bee-1").exists()
+    assert not action_path(state, "process-completion:att-bee-1").exists()
+
+    second = consumer.consume_completions(state, now=T0 + 1, max_attempts=2, retry_backoff_s=0)
+    assert second["state"] == "acked"
+    assert second["result"]["duplicate"] is False
+    # The first effect is reused, not duplicated; the missing one is created.
+    assert second["result"]["actions"] == [
+        "verify:att-bee-1",
+        "process-completion:att-bee-1",
+    ]
+
+    summary = consumer.actions_summary(state)
+    assert summary["counts"] == {"total": 2, "pending": 2, "claimed": 0, "done": 0,
+                                 "failed": 0}
+    assert len(list((state / "coordinator" / "completions").glob("*.json"))) == 1
+
+
+def test_a_crash_before_the_ledger_still_yields_one_action_set(tmp_path):
+    state = tmp_path / "state"
+    land(state, canonical_event())
+
+    def effects_then_crash(event_payload):
+        classified = consumer.classify_completion(event_payload)
+        attempt = str(classified["attempt_id"])
+        state_name = str(classified["state"])
+        kinds = (
+            ["verify", "process-completion"]
+            if state_name in consumer.VERIFY_ELIGIBLE_STATES
+            else ["process-completion"]
+        )
+        for kind in kinds:
+            consumer.enqueue_action(
+                state, consumer.action_id_for(kind, attempt), kind=kind,
+                attempt_id=attempt, event_state=state_name, now=T0,
+            )
+        raise RuntimeError("coordinator died before the ledger")
+
+    first = consumer.consume_completions(
+        state, now=T0, handler=effects_then_crash, max_attempts=2, retry_backoff_s=0
+    )
+    assert first["state"] == "retryable"
+    # Both effects are durable; the accepted decision is not recorded yet.
+    assert len(list((state / "coordinator" / "completions").glob("*.json"))) == 0
+
+    second = consumer.consume_completions(state, now=T0 + 1, max_attempts=2, retry_backoff_s=0)
+    assert second["state"] == "acked"
+    assert second["result"]["duplicate"] is False
+    assert second["result"]["completion_created"] is True
+    assert second["result"]["actions"] == [
+        "verify:att-bee-1",
+        "process-completion:att-bee-1",
+    ]
+
+    summary = consumer.actions_summary(state)
+    assert summary["counts"] == {"total": 2, "pending": 2, "claimed": 0, "done": 0,
+                                 "failed": 0}
+    assert len(list((state / "coordinator" / "completions").glob("*.json"))) == 1

@@ -112,6 +112,28 @@ one pull request.
 
 ### Fixed
 
+- **The landing-event composition no longer collides with the coordinator
+  action queue.** The composed consumer (`consume_completions`) wrote its own
+  `rizzstack.coordinator-action/1` items into `coordinator/actions` — the
+  directory the merged coordinator action queue owns — so a single composed
+  item made `coordinator_actions.list_actions`/`enqueue` fail with
+  `state_corrupt`, the merged queue's id grammar refused the `<kind>:<attempt>`
+  keys, and the two stores' differing lock files and fence counters allowed a
+  fenced bypass across stores. The composition's items now live in their own
+  directory, `coordinator/completion-actions/`, behind the same API, and the
+  explicit `coordinator_actions_enqueue` adapter at the `enqueue` seam
+  publishes conformant `bundlebees.coordinator-actions/1` records through the
+  merged queue (the idempotent key as `action_key`, a colon-free queue id, the
+  completion facts in `payload`, `fence_seq` fencing, `status: "queued"`). A
+  coexistence test proves both stores work in one state directory without
+  corrupting each other. `complete_action`/`fail_action` now refuse an item
+  that is not currently claimed (`not_claimed`), closing the gap where a stale
+  owner could complete or fail an unclaimed, released or failed item; store
+  I/O failures surface as `ActionQueueError` with code `queue_unavailable`
+  instead of a bare `OSError`; and `docs/event-consumer.md` states the actual
+  integration contract instead of claiming that any queue keeping the same
+  keys can replace the bundled store without touching the consumer.
+
 - **`attempts`/`status`: a secret-shaped attempt id keeps its scrubbed form.** The read-only views re-inserted a validated attempt id after scrubbing, so an id that itself looked like a credential (e.g. an `sk-`-prefixed string that passed the attempt-id grammar) was scrubbed to `[redacted]` and then put back raw — a narrow scrub bypass. The re-insertion now requires the id not to look like a secret, so the scrub result always wins for a secret-shaped id; ordinary validated attempt ids are unchanged. Found by an external reviewer and closed with a regression test written first against the unfixed tree.
 - `return_report.pending_approvals` treated the mere presence of
   `approvals/<job>.<gate>.json` as an approval. A hand-written `{}` cleared a

@@ -43,6 +43,8 @@ try:  # POSIX advisory locks; bundlebees targets Linux and CI is ubuntu
 except ImportError:  # pragma: no cover - a platform without flock cannot prove one claim
     fcntl = None  # type: ignore[assignment]
 
+from . import coordinator_actions
+
 SCHEMA = "rizzstack.landing-event/1"
 DELIVERY_SCHEMA = "rizzstack.event-delivery/1"
 ACK_SCHEMA = "rizzstack.event-ack/1"
@@ -1127,15 +1129,33 @@ def inbox_summary(state_dir: Path, subscriber: str | None = None) -> dict[str, A
 #
 # W6 landed the durable completion signal: a bee's terminal landing event is
 # recorded once in the outbox and delivered to every subscriber. F6 (the
-# coordinator action queue, PR #54) names *what* the coordinator should do
-# next as durable items with idempotent keys. This section is the composition:
-# a consumer that subscribes to the landing events and translates each
-# terminal completion into two action-queue items, so worker completions
-# advance the pipeline without polling and without Hermes being awake.
+# coordinator action queue, PR #54, :mod:`bundlebees_plugin.coordinator_actions`)
+# names *what* the coordinator should do next as durable items with idempotent
+# keys. This section is the composition: a consumer that subscribes to the
+# landing events and translates each terminal completion into two action-queue
+# items, so worker completions advance the pipeline without polling and without
+# Hermes being awake.
 #
 # The composition is additive. The mechanical tick, the Hermes wake path and
 # the 10-minute heartbeat remain exactly what they were; a completion that the
 # consumer has not seen yet is still picked up by the heartbeat as before.
+#
+# Two stores, never one shared directory. The merged F6 queue owns
+# ``coordinator/actions`` exclusively — its ``bundlebees.coordinator-actions/1``
+# records, its durable ``fence.seq`` counter and its ``actions.lock``. The
+# composition's bundled item store keeps its own records, locks and skip
+# counter in ``coordinator/completion-actions/``: a different record shape
+# (``rizzstack.coordinator-action/1``, the idempotent key ``<kind>:<attempt>``
+# as the file name), a per-item fence, and an attempts budget with backoff.
+# The merged queue's reader refuses any record it did not write
+# (``state_corrupt``), so a composition item inside its directory would break
+# it; the separate directories keep both stores readable in one state
+# directory. To publish the same logical actions into the merged queue instead,
+# pass :func:`coordinator_actions_enqueue` as the handler's ``enqueue`` seam —
+# the explicit adapter that writes conformant records through
+# ``coordinator_actions.enqueue`` (colon-free queue id, the idempotent key as
+# ``action_key``, the completion facts in ``payload``, ``fence_seq`` fencing,
+# ``status: "queued"``).
 #
 # Exactly-once is layered, not promised by one mechanism:
 #
@@ -1148,16 +1168,24 @@ def inbox_summary(state_dir: Path, subscriber: str | None = None) -> dict[str, A
 # * claim level: action items are claimed under ``flock`` with a fencing
 #   token that increments on every claim; a stale consumer's token is refused.
 #
-# Failure modes: a queue that cannot be written raises ``ActionQueueError``,
-# which releases the event for a bounded backoff inside its still-durable
-# inbox record (the outbox event is never deleted); a malformed or
-# non-terminal event is skipped with a counted reason and never enqueued; a
+# Failure modes: a queue that cannot be written or read raises
+# ``ActionQueueError`` (a store ``OSError`` is wrapped as ``queue_unavailable``,
+# so an outage surfaces as the queue's typed error, never a bare exception
+# class name), which releases the event for a bounded backoff inside its
+# still-durable inbox record (the outbox event is never deleted); a malformed
+# or non-terminal event is skipped with a counted reason and never enqueued; a
 # completion that was already processed is a no-op.
 
 ACTION_SCHEMA = "rizzstack.coordinator-action/1"
 ACTION_SUMMARY_SCHEMA = "rizzstack.coordinator-action-summary/1"
 COMPLETION_SCHEMA = "rizzstack.completion-ledger/1"
 SKIPS_SCHEMA = "rizzstack.completion-skips/1"
+
+#: The directory of the composition's bundled item store, under the
+#: coordinator state directory. The merged coordinator action queue
+#: (:mod:`bundlebees_plugin.coordinator_actions`) owns ``coordinator/actions``;
+#: this store must never share that directory with it.
+COMPLETION_ACTIONS_DIR = "completion-actions"
 
 #: The kinds of coordinator action this composition enqueues, and the
 #: idempotent-key prefix each one uses.
@@ -1188,8 +1216,9 @@ MAX_ACTION_ATTEMPTS = 2
 COMPLETION_MAX_ATTEMPTS = 4
 
 ACTION_FIX = (
-    "Inspect coordinator/actions and coordinator/completions; an action item or "
-    "a completion decision is never overwritten to hide a second decision."
+    "Inspect coordinator/completion-actions and coordinator/completions; an "
+    "action item or a completion decision is never overwritten to hide a "
+    "second decision."
 )
 
 
@@ -1206,8 +1235,43 @@ class ActionQueueError(Exception):
         return {"error": self.code, "message": self.message, "fix": self.fix}
 
 
-def actions_dir(state_dir: Path) -> Path:
-    return Path(state_dir) / "coordinator" / "actions"
+@contextmanager
+def _queue_store(operation: str) -> Iterator[None]:
+    """Surface store I/O failures as the queue's typed error.
+
+    Every queue read-modify-write runs inside this guard: an ``OSError`` from
+    the store (and the ``event_unreadable`` wrapper the shared reader raises
+    for one) becomes ``ActionQueueError("queue_unavailable", ...)``, so an
+    outage reaches the caller as the queue's error code instead of a bare
+    exception class name. Queue refusals and corrupt-record reports pass
+    through untouched — they are decisions, not outages.
+    """
+
+    try:
+        yield
+    except ActionQueueError:
+        raise
+    except EventConsumerError as exc:
+        if str(exc.code) != "event_unreadable":
+            raise
+        raise ActionQueueError(
+            "queue_unavailable",
+            f"the action-queue store could not be {operation}: {exc.message}",
+            "Retry when the coordinator state directory is readable again.",
+        ) from exc
+    except OSError as exc:
+        raise ActionQueueError(
+            "queue_unavailable",
+            f"the action-queue store could not be {operation}: {exc}",
+            "Retry when the coordinator state directory is writable again.",
+        ) from exc
+
+
+def completion_actions_dir(state_dir: Path) -> Path:
+    """The composition's bundled item store, beside — never inside — the
+    merged coordinator action queue's ``coordinator/actions`` directory."""
+
+    return Path(state_dir) / "coordinator" / COMPLETION_ACTIONS_DIR
 
 
 def completions_dir(state_dir: Path) -> Path:
@@ -1215,12 +1279,12 @@ def completions_dir(state_dir: Path) -> Path:
 
 
 def action_path(state_dir: Path, action_id: str) -> Path:
-    return actions_dir(state_dir) / f"{_safe_id(action_id, 'action_id')}.json"
+    return completion_actions_dir(state_dir) / f"{_safe_id(action_id, 'action_id')}.json"
 
 
 def _action_lock_path(state_dir: Path, action_id: str) -> Path:
     return (
-        actions_dir(state_dir)
+        completion_actions_dir(state_dir)
         / ".locks"
         / f"{_safe_id(action_id, 'action_id')}.lock"
     )
@@ -1237,7 +1301,7 @@ def _completion_lock_path(state_dir: Path, attempt_id: str, state: str) -> Path:
 
 
 def _skips_path(state_dir: Path) -> Path:
-    return actions_dir(state_dir) / ".skipped.json"
+    return completion_actions_dir(state_dir) / ".skipped.json"
 
 
 def _safe_attempt(value: Any) -> str | None:
@@ -1412,7 +1476,7 @@ def enqueue_action(
     expected = f"{kind}:{attempt}"
     path = action_path(state_dir, action_id)
     stamp = _iso(_clock(now))
-    with _locked(_action_lock_path(state_dir, action_id)):
+    with _queue_store("written"), _locked(_action_lock_path(state_dir, action_id)):
         stored = _read_json(path)
         if stored is not None:
             if (
@@ -1481,6 +1545,109 @@ def enqueue_action(
         }
 
 
+def coordinator_actions_enqueue(
+    state_dir: Path,
+    action_id: str,
+    *,
+    kind: str,
+    attempt_id: str,
+    event_id: str = "",
+    event_state: str = "",
+    job_id: str = "",
+    task_id: str = "",
+    source_rev: str = "",
+    lease_files: Any = (),
+    result_available: bool | None = None,
+    result_reference: str = "",
+    dedupe_key: str = "",
+    now: Any = None,
+) -> dict[str, Any]:
+    """The explicit adapter at the ``enqueue`` seam: publish one composition
+    action through the merged coordinator action queue.
+
+    This function has exactly the ``enqueue`` signature the composed handler
+    calls, so it can be passed as ``enqueue=`` to :func:`action_queue_handler`
+    or :func:`consume_completions` when the merged F6 queue
+    (:mod:`bundlebees_plugin.coordinator_actions`) is the system of record.
+    The translation it performs — and the reason a bare
+    ``coordinator_actions.enqueue`` cannot sit at the seam — is:
+
+    * the idempotent key ``<kind>:<attempt_id>`` (colons are part of the
+      composition's key grammar) becomes the merged queue's colon-free
+      action id, ``<kind>_<attempt_id>`` — the key itself is stored as the
+      record's ``action_key``;
+    * the completion facts travel in ``payload`` instead of top-level
+      record fields;
+    * the item is enqueued with the merged queue's own fencing (``fence_seq``
+      minted at claim) and ``status: "queued"``; the composition declares no
+      workflow protocol commit, so the record carries the legacy empty
+      ``workflow_ref`` rather than an invented pin.
+
+    A merged-queue refusal is re-raised as ``ActionQueueError`` with the
+    queue's own code (``invalid_action_id``, ``action_id_conflict``, ...), so
+    an unusable id or a collided key surfaces precisely and the event is
+    buffered, never silently dropped. Two different keys that collapse onto
+    the same colon-free id are refused as ``action_id_conflict`` — a precise
+    failure, never a silent merge of two logical actions. The ``created``
+    flag is derived from the record's existence just before the create-only
+    enqueue; under a race both callers may report ``created`` for one new
+    record — the completion ledger, not this flag, is what deduplicates the
+    effect.
+    """
+
+    if kind not in ACTION_KINDS:
+        raise ActionQueueError(
+            "action_kind_invalid",
+            f"kind {kind!r} is not one of {', '.join(ACTION_KINDS)}",
+        )
+    attempt = _safe_attempt(attempt_id)
+    if attempt is None:
+        raise ActionQueueError(
+            "action_attempt_invalid",
+            f"attempt id {attempt_id!r} is not a safe identifier",
+        )
+    key = action_id_for(kind, attempt)
+    if str(action_id or "").strip() != key:
+        raise ActionQueueError(
+            "action_id_mismatch",
+            f"action_id {action_id!r} must be the idempotent key {key!r}",
+        )
+    queue_id = key.replace(":", "_")
+    payload = {
+        "attempt_id": attempt,
+        "event_id": _advisory_text(event_id, 160),
+        "event_state": _safe_attempt(event_state) or "",
+        "job_id": _safe_attempt(job_id) or "",
+        "task_id": _safe_attempt(task_id) or "",
+        "dedupe_key": _safe_attempt(dedupe_key) or "",
+        "source_rev": _advisory_text(source_rev),
+        "lease_files": _advisory_files(lease_files),
+        "result_available": result_available,
+        "result_reference": _advisory_path(result_reference),
+    }
+    with _queue_store("written"):
+        try:
+            before = coordinator_actions.load(state_dir, queue_id)
+            record = coordinator_actions.enqueue(
+                state_dir,
+                queue_id,
+                action_key=key,
+                kind=kind,
+                payload=payload,
+                now=now,
+            )
+        except coordinator_actions.ActionError as exc:
+            raise ActionQueueError(exc.code, exc.message, exc.fix) from exc
+    return {
+        "action_id": queue_id,
+        "action_key": key,
+        "created": before is None,
+        "duplicate": before is not None,
+        "status": str(record.get("status") or ""),
+        "item": record,
+    }
+
+
 def _clear_claim(item: dict[str, Any]) -> None:
     item["claimed_by"] = ""
     item["claimed_at"] = ""
@@ -1513,7 +1680,7 @@ def claim_action(
         raise ActionQueueError("ttl_invalid", "the claim TTL must be positive")
     path = action_path(state_dir, action_id)
     stamp = _iso(clock)
-    with _locked(_action_lock_path(state_dir, action_id)):
+    with _queue_store("written"), _locked(_action_lock_path(state_dir, action_id)):
         item = _read_json(path)
         if item is None:
             raise ActionQueueError(
@@ -1592,13 +1759,27 @@ def complete_action(
     result: Mapping[str, Any] | None = None,
     now: Any = None,
 ) -> dict[str, Any]:
-    """Complete a claimed action item; the current fence proves ownership."""
+    """Complete a claimed action item; the current fence proves ownership.
+
+    Only an item that is *currently claimed* can be completed: a pending
+    (never claimed or released), failed or otherwise unclaimed item is
+    refused with ``not_claimed``, so a stale owner can never mark work done
+    that no live claim owns. Re-completing an already ``done`` item is the
+    idempotent duplicate decision and changes nothing.
+    """
 
     stamp = _iso(_clock(now))
-    with _locked(_action_lock_path(state_dir, action_id)):
+    with _queue_store("written"), _locked(_action_lock_path(state_dir, action_id)):
         item = _fenced_item(state_dir, action_id, fence)
-        if str(item.get("status") or "") == "done":
+        status = str(item.get("status") or "")
+        if status == "done":
             return {"status": "done", "duplicate": True, "item": item}
+        if status != "claimed":
+            raise ActionQueueError(
+                "not_claimed",
+                f"action {action_id} is {status}; completing requires the current claim",
+                "Claim the action first; an unclaimed or failed item cannot be completed.",
+            )
         item.update(
             status="done",
             result=dict(result) if isinstance(result, Mapping) else {},
@@ -1623,16 +1804,26 @@ def fail_action(
     """Release a claimed item for one bounded retry, or mark it failed.
 
     The fence must be current: a stale consumer cannot release an item a
-    newer claim owns. ``attempts`` is already counted by the claim, so the
-    second failure of one item is terminal.
+    newer claim owns. Only an item that is *currently claimed* can be
+    released — a pending (never claimed or already released) or failed item
+    is refused with ``not_claimed``, so a stale owner can never fail or
+    resurrect work no live claim owns. ``attempts`` is already counted by the
+    claim, so the second failure of one item is terminal.
     """
 
     clock = _clock(now)
     stamp = _iso(clock)
-    with _locked(_action_lock_path(state_dir, action_id)):
+    with _queue_store("written"), _locked(_action_lock_path(state_dir, action_id)):
         item = _fenced_item(state_dir, action_id, fence)
-        if str(item.get("status") or "") == "done":
+        status = str(item.get("status") or "")
+        if status == "done":
             return {"status": "done", "duplicate": True, "item": item}
+        if status != "claimed":
+            raise ActionQueueError(
+                "not_claimed",
+                f"action {action_id} is {status}; failing requires the current claim",
+                "Claim the action first; an unclaimed or failed item cannot be released.",
+            )
         attempts = int(item.get("attempts") or 0)
         exhausted = attempts >= MAX_ACTION_ATTEMPTS
         try:
@@ -1662,9 +1853,14 @@ def fail_action(
 
 
 def actions_summary(state_dir: Path) -> dict[str, Any]:
-    """Count action items by status."""
+    """Count the composition's own action items by status.
 
-    root = actions_dir(state_dir)
+    This summarises the bundled store in ``coordinator/completion-actions``
+    only; the merged coordinator action queue keeps its own records, leases
+    and counters in ``coordinator/actions`` and is never read here.
+    """
+
+    root = completion_actions_dir(state_dir)
     counts = {"total": 0, "pending": 0, "claimed": 0, "done": 0, "failed": 0}
     if root.is_dir():
         for path in sorted(root.iterdir(), key=lambda item: item.name):
@@ -1682,7 +1878,9 @@ def _bump_skip(state_dir: Path, reason: str, *, now: Any = None) -> dict[str, An
 
     path = _skips_path(state_dir)
     stamp = _iso(_clock(now))
-    with _locked(actions_dir(state_dir) / ".locks" / "skips.lock"):
+    with _queue_store("written"), _locked(
+        completion_actions_dir(state_dir) / ".locks" / "skips.lock"
+    ):
         record = _read_json(path) or {"schema": SKIPS_SCHEMA, "counts": {}}
         counts = record.get("counts") if isinstance(record.get("counts"), dict) else {}
         counts[str(reason)] = int(counts.get(str(reason)) or 0) + 1
@@ -1730,7 +1928,7 @@ def record_completion(
         raise ActionQueueError("state_invalid", f"state {state!r} is not a safe identifier")
     path = completion_path(state_dir, attempt, state_name)
     stamp = _iso(_clock(now))
-    with _locked(_completion_lock_path(state_dir, attempt, state_name)):
+    with _queue_store("written"), _locked(_completion_lock_path(state_dir, attempt, state_name)):
         stored = _read_json(path)
         if stored is not None:
             return {"created": False, "duplicate": True, "record": stored}
@@ -1759,7 +1957,8 @@ def completion_record(
     state_name = _safe_attempt(state)
     if attempt is None or state_name is None:
         return None
-    return _read_json(completion_path(state_dir, attempt, state_name))
+    with _queue_store("read"):
+        return _read_json(completion_path(state_dir, attempt, state_name))
 
 
 def action_queue_handler(
@@ -1827,9 +2026,12 @@ def action_queue_handler(
                 dedupe_key=dedupe_key,
                 now=now,
             )
+            # The backend names the id it actually stored: the bundled store
+            # keeps the idempotent key, the merged-queue adapter returns its
+            # colon-free queue id. The ledger records that id.
             outcomes.append(
                 {
-                    "action_id": action_id,
+                    "action_id": str(outcome.get("action_id") or action_id),
                     "kind": kind,
                     "created": bool(outcome.get("created")),
                     "duplicate": bool(outcome.get("duplicate")),
@@ -1969,6 +2171,7 @@ __all__ = [
     "ACTION_SCHEMA",
     "ACTION_STATUSES",
     "ACTION_SUMMARY_SCHEMA",
+    "COMPLETION_ACTIONS_DIR",
     "COMPLETION_MAX_ATTEMPTS",
     "COMPLETION_SCHEMA",
     "DEFAULT_ACTION_CONSUMER",
@@ -1990,11 +2193,12 @@ __all__ = [
     "action_id_for",
     "action_path",
     "action_queue_handler",
-    "actions_dir",
     "actions_summary",
     "claim_action",
     "classify_completion",
+    "coordinator_actions_enqueue",
     "complete_action",
+    "completion_actions_dir",
     "completion_path",
     "completion_record",
     "completions_dir",
