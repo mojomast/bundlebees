@@ -17,7 +17,7 @@ one pull request.
 
 - **Coordinator action queue:** a durable per-item coordinator action queue over the existing state dir with atomic per-item claims, monotonically increasing durable fencing values (`fence`/`fence_seq`), precise stale refusals, idempotent replay by action key, stale-owner adoption, and per-repo serialization only for overlapping merge and deploy leases; an AST guard proves the queue only records, claims and fences and never executes anything.
 - **rizzstack doctor:** `hermes bundlebees doctor` reports four-repo revision parity (checkout, origin main, installed package, gateway-loaded plugin, deployed runtime) with explicit per-component states (healthy, stale, unavailable, inaccessible, unknown, incompatible), launcher/gateway contract-incompatibility detection, executable / sandbox / pinned-source / credential-presence checks, `--json` output, and `--check-parity` exit semantics that exit nonzero on any divergence, all strictly read-only.
-- **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin existing attempt store with no credentials required.
+- **attempts and status CLI:** two read-only subcommands, `hermes bundlebees attempts` (live attempt list as JSON) and `hermes bundlebees status` (in-flight count, bee cap, and launcher health fields), backed by the plugin's existing attempt store. `status` performs exactly one secret-store read: the launcher-token presence probe — `client.token_configured()` calls Hermes's `agent.secret_scope.get_secret(BUNDLEBEES_LAUNCHER_TOKEN)` to fill `health.credential_configured`; it reads presence only, never a value, never emits one, and fails closed. No credential value is required or read for either view.
 - **integrated_not_pr_merged detection:** the read-only Git/PR observer now
   classifies a PR whose exact head is already an ancestor of authoritative main
   while the PR metadata still reports open, and the reconciliation report stops
@@ -90,6 +90,7 @@ one pull request.
 
 ### Fixed
 
+- **`attempts`/`status`: a secret-shaped attempt id keeps its scrubbed form.** The read-only views re-inserted a validated attempt id after scrubbing, so an id that itself looked like a credential (e.g. an `sk-`-prefixed string that passed the attempt-id grammar) was scrubbed to `[redacted]` and then put back raw — a narrow scrub bypass. The re-insertion now requires the id not to look like a secret, so the scrub result always wins for a secret-shaped id; ordinary validated attempt ids are unchanged. Found by an external reviewer and closed with a regression test written first against the unfixed tree.
 - `return_report.pending_approvals` treated the mere presence of
   `approvals/<job>.<gate>.json` as an approval. A hand-written `{}` cleared a
   gate, and so did a recorded `refused` verdict. Gate decisions are now loaded
