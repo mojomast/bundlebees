@@ -1118,7 +1118,14 @@ class ApprovalBinding:
         assert caught.value.code == "approval_receipt_code_rev_mismatch"
         assert approval.verified == [] and approval.consumed == []
 
-    def test_a_live_trial_without_the_approval_lane_refuses(self, tmp_path):
+    def test_a_live_trial_without_the_approval_lane_refuses(self, tmp_path, monkeypatch):
+        # The test pins the lane-ABSENT refusal (approval_unavailable). Once the
+        # #26 approval lane is importable - which is the normal state on main
+        # and on CI, which checks out the PR merge ref - resolve_approval_adapter
+        # binds it and a live no-receipt trial correctly refuses
+        # approval_receipt_missing first. Force the lane absent so this test
+        # keeps testing the lane-absent branch on any tree.
+        monkeypatch.setitem(sys.modules, "bundlebees_plugin.approval", None)
         fixture = make_job(tmp_path / "state")
         state = fixture["state"]
         suite = th.direct_test_runner_command("/usr/bin/python3", "tests.test_smoke", "test_answer_is_42")
