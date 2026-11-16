@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import sandbox
+from .dispatch import collect_payload, payload_digest
 from .security import config_flag
 
 
@@ -21,7 +22,7 @@ def sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
         timeout = int(config.get("verify_timeout_s") or 900)
     except (TypeError, ValueError):
         timeout = 900
-    return {
+    options: dict[str, Any] = {
         "backend": str(config.get("verify_isolation") or "auto").strip().lower(),
         "allow_unsafe_local": config_flag(config.get("verify_allow_unsafe_local"), False),
         "allow_weak": sandbox.weak_override_enabled(
@@ -30,6 +31,15 @@ def sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
         "tiktoken_cache": str(config.get("sandbox_tiktoken_cache") or "").strip() or None,
         "python": str(config.get("verify_python") or "").strip() or None,
     }
+    # Serve the lease payload on every runner-driven sandbox run: the sources
+    # this coordinator collects now are staged into the disposable copy and
+    # the child env names them relatively only. With no pins configured the
+    # key stays absent (never an empty payload); a set-but-unusable pin fails
+    # closed with the named dispatch.PayloadError.
+    payload = collect_payload()
+    if payload:
+        options["payload"] = payload
+    return options
 
 
 def scanner(config: Mapping[str, Any], explicit: str | None = None) -> str | None:
@@ -82,4 +92,9 @@ class SandboxRunner:
             root = sandbox._resolve_tiktoken_cache(cache, backend=self.options["backend"])
             identity["cache"] = {p.relative_to(root).as_posix(): _content_digest(p)
                                   for p in sorted(root.rglob("*")) if p.is_file()}
+        payload = self.options.get("payload")
+        if payload:
+            # Additive only when the payload is served: with no pins the
+            # identity above stays byte-identical to the base record.
+            identity["payload"] = payload_digest(payload)
         return identity

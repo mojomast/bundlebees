@@ -8,11 +8,13 @@ or real credentials.
 from __future__ import annotations
 
 import json
+import re
 import stat
 from pathlib import Path
 
 import pytest
 
+from bundlebees_plugin import sandbox
 from bundlebees_plugin.leases import (
     LeaseError,
     ignored_worker_claims,
@@ -49,6 +51,20 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def _same_brief_modulo_payload(record_brief, brief):
+    """The recorded brief equals the dispatched brief, plus at most the optional
+    coordinator-recorded payload manifest (a well-formed name-to-digest map
+    recorded by ``record_lease`` when the coordinator serves pinned sources).
+    """
+    manifest = record_brief.get("payload")
+    body = {k: v for k, v in record_brief.items() if k != "payload"}
+    if manifest is not None:
+        assert isinstance(manifest, dict) and manifest, "never an empty manifest"
+        assert all(sandbox.PAYLOAD_NAME_RE.fullmatch(name) for name in manifest)
+        assert all(re.fullmatch(r"[0-9a-f]{64}", d) for d in manifest.values())
+    return body == brief
+
+
 def test_round_trip_preserves_record_and_fields(tmp_path: Path):
     brief = _brief()
     record = record_lease(tmp_path, "att-1", brief, now="2026-01-02T03:04:05Z")
@@ -64,7 +80,7 @@ def test_round_trip_preserves_record_and_fields(tmp_path: Path):
     assert record["run_id"] == "run-1"
     assert record["wave"] == 2
     assert record["retry_of"] == "att-0"
-    assert record["brief"] == brief
+    assert _same_brief_modulo_payload(record["brief"], brief)
     assert len(record["brief_sha256"]) == 64
     assert len(record["mac"]) == 64
 

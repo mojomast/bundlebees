@@ -43,7 +43,7 @@ from typing import Any, Iterable, Mapping
 from . import brief as _brief_mod
 from . import campaign_cli
 from . import job_cli
-from . import acdd_cli, adapters, leases, metrics, revision, sandbox
+from . import acdd_cli, adapters, dispatch, leases, metrics, revision, sandbox
 from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
@@ -1270,7 +1270,10 @@ def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) 
 def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
     from .execution import sandbox_options
 
-    return sandbox_options(config)
+    try:
+        return sandbox_options(config)
+    except dispatch.PayloadError as exc:
+        raise _as_cli_error(exc) from exc
 
 
 def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
@@ -1563,6 +1566,14 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
     gitleaks = scanner(config)
 
     try:
+        # --commit-local serves the payload from the environment without
+        # binding a lease manifest (no lease exists on this path); the
+        # disclosure lives in docs/pinned-sources.md.
+        runner = SandboxRunner(config)
+    except dispatch.PayloadError as exc:
+        raise _as_cli_error(exc) from exc
+
+    try:
         record = verify_local.verify_and_commit(
             state_dir,
             workdir,
@@ -1572,7 +1583,7 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
             base_rev=source,
             tests=tests,
             gitleaks=gitleaks,
-            runner=SandboxRunner(config),
+            runner=runner,
         )
     except verify_local.VerifyError as exc:
         raise CliError(exc.code, exc.message, exc.fix) from exc
@@ -1607,6 +1618,15 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         run_id = str(record.get("run_id") or "default")
         source_rev = str(record.get("source_rev") or "")
         evidence["source_rev"] = source_rev
+
+        # Lease-payload binding, before any test runs: the manifest recorded at
+        # dispatch must match what this coordinator serves now, byte for byte.
+        # A stale pin is a refusal, never a softened fallback; a lease without
+        # a recorded manifest binds nothing.
+        try:
+            dispatch.lease_payload(record)
+        except dispatch.PayloadError as exc:
+            raise _as_cli_error(exc) from exc
 
         client = _client_for(ctx, args)
         if callable(getattr(client, "artifact", None)):
@@ -1857,7 +1877,7 @@ def _cmd_lease(ctx: Any, args: Any) -> int:
     try:
         brief = _brief_mod.validate_brief(data)
         record = leases.record_lease(state_dir, attempt_id, brief)
-    except (_brief_mod.BriefError, leases.LeaseError) as exc:
+    except (_brief_mod.BriefError, leases.LeaseError, dispatch.PayloadError) as exc:
         raise _as_cli_error(exc) from exc
     _metric(state_dir, str(record.get("run_id") or "default"), "dispatch", attempt_id=attempt_id)
     _print("bundlebees lease")
