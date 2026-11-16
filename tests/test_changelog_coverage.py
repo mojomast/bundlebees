@@ -150,6 +150,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "bee cap",
         ),
     },
+    {
+        # feat/rizzstack-doctor: the rizzstack doctor subcommand - stack parity
+        # and health diagnostic across checkout, origin main, installed package,
+        # gateway-loaded plugin and deployed runtime revisions.
+        "pr": 53,
+        "name": "rizzstack doctor",
+        "keywords": (
+            "rizzstack doctor",
+            "check-parity",
+            "gateway-loaded plugin",
+            "incompatible",
+        ),
+    },
 )
 
 
