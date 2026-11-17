@@ -140,6 +140,36 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
+# Additive rule identity, parallel to ``_SECRET_PATTERNS``: rule i names the
+# pattern family of pattern i. Purely a read-only view for evidence reporting;
+# no predicate's matching behavior depends on it.
+_SECRET_RULE_IDS: tuple[str, ...] = (
+    "bearer",
+    "assignment",
+    "openai_key",
+    "github_token",
+    "github_pat",
+    "slack_token",
+    "aws_access_key",
+    "google_api_key",
+    "jwt",
+)
+
+
+def first_secret_rule(text: Any) -> str | None:
+    """Return the rule id of the first secret pattern family matching *text*.
+
+    Same iteration over the same patterns as :func:`looks_like_secret`, so the
+    first matching family is exactly the one that flags the text. Returns
+    ``None`` when nothing matches or the input is not a string.
+    """
+    if not isinstance(text, str):
+        return None
+    for rule_id, (pattern, _) in zip(_SECRET_RULE_IDS, _SECRET_PATTERNS):
+        if pattern.search(text):
+            return rule_id
+    return None
+
 _URL_RE = re.compile(r"(?i)\b(?:https?|ssh|git|ftp)://[^\s\"'<>]+")
 _SCP_RE = re.compile(r"\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\S+)?")
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
