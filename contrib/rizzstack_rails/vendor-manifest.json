@@ -21,19 +21,19 @@
       "sha256": "23a78cfa8ebbf9e54d77484d582033ca9ae6c2d5879c5beda53e294a5fd15b45"
     },
     {
-      "bytes": 17677,
+      "bytes": 18186,
       "path": "contrib/rizzstack_rails/feedback.py",
-      "sha256": "00cb88101176ccb658dcfc0d4695155e4685c68973f841db00ecf732195af567"
+      "sha256": "453cebecccf7965672419cfee03f5cbc0d2cc4fc8e66c1f281486a339e1cef82"
     },
     {
-      "bytes": 13222,
+      "bytes": 13330,
       "path": "contrib/rizzstack_rails/importer.py",
-      "sha256": "1cc3e03e2ecaf4425b897e920d610957e32d44dce8374c5953a263d124b7bbc7"
+      "sha256": "526c2968234857474fd61620f15eb859f9079744448923d8388b97e8453c6607"
     },
     {
-      "bytes": 41331,
+      "bytes": 42148,
       "path": "contrib/rizzstack_rails/ledger.py",
-      "sha256": "5d76253b94f3d251e50add6c66436da9421d1f6c17e8d0e2ac031ddeec7408ce"
+      "sha256": "4a540490863edcc94595f6efd452dd11ac08682561ebcf56cc2154036b0e4fe6"
     },
     {
       "bytes": 1147,
@@ -46,14 +46,14 @@
       "sha256": "598d247ee1457b4d918c2d6c1c2a730719075af04039db0fe4d6dc8de0890ebe"
     },
     {
-      "bytes": 16718,
+      "bytes": 17138,
       "path": "contrib/rizzstack_rails/projection.py",
-      "sha256": "076cea17e471e364c030019878c6f157a698a5f9042a0bef438ac583615d5a19"
+      "sha256": "0485a49dc35099037e1483df645908c78044bf17b06ca7a4e97c09423404ee10"
     },
     {
-      "bytes": 13676,
+      "bytes": 15420,
       "path": "contrib/rizzstack_rails/query.py",
-      "sha256": "f40348eb646a0ccc006caff576b13dbecfa1b6d25bb7d53edb69f9feef8b9a71"
+      "sha256": "5ca35743e84bf98606460390ff4f7a97cc31a87ef1631da879cee82e7a66f03a"
     },
     {
       "bytes": 1311,
@@ -66,7 +66,7 @@
       "sha256": "b45bccc973ad5721c6c337c7447abf96b92da8905bba066c6298c340d82a7ddb"
     }
   ],
-  "pin_label": "e176ec25986b5932e4ac5c57098690682b52f88b",
+  "pin_label": "f54bb7e976929b5ffe73a568a46a289459e3337c",
   "schema": "rizzstack.vendor-manifest/1",
   "source_package": "contrib/rizzstack_rails"
 }
