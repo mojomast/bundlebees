@@ -757,6 +757,30 @@ class TestRefusals:
 
 
 class TestHonesty:
+    def test_dry_run_green_at_baseline_cannot_pass_progress_without_candidate(self, tmp_path):
+        state = tmp_path / 'state'
+        state.mkdir()
+        repo, base = _make_repo(tmp_path)
+        source, test = 'smoke/answer.py', 'tests/test_smoke.py'
+        frozen, digest = _frozen(base, contract_id='DRY', statement='answer returns 42', assigned=source,
+                                 test_file=test, test_id=test + '::test_answer_is_42')
+        jobs.record_authorization(state, job_id='job_dry', statement='Verify answer', repo=REPO, base_rev=base,
+                                  scope=[source], bees=1, wall_clock_s=1800, require_tty=False, interactive=False,
+                                  by='reviewer')
+        jobs.create_job(state, job_id='job_dry', tasks=[dict(task_id='T1', objective='answer', lease=[source],
+                                                            contract=frozen, contract_sha256=digest)])
+        # The dry-run writer signs a real successful run on an uncommitted patch using HEAD's revision.
+        brief = dict(contract=frozen, source_rev=base, assigned_files=[source])
+        preflight = acdd_cli.verify_preflight({'brief': brief}, state, [source])
+        (repo / source).write_text('def answer():\n    return 42\n')
+        run = sandbox.run_in_sandbox(repo, sandbox.pytest_argv([test]), allow_unsafe_local=True, timeout=60)
+        acdd_cli.record_green(state, preflight, repo, run, base, note='patch applied on source_rev, not committed')
+
+        report = return_report.build(state, 'job_dry', repo=repo)
+        assert report['schema'] == 'bundlebees.job-report/1' and not report['verification']['commit']
+        assert report['acceptance'][0]['status'] == 'UNVERIFIED'
+        assert report['acceptance'][0]['evidence'] == []
+
     def test_a_fabricated_signed_record_never_produces_a_pass(self, exact_env, tmp_path):
         state = _copy_state(exact_env, tmp_path)
         # Without coverage the executed regression suite alone cannot PASS.
