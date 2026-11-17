@@ -230,6 +230,20 @@ one pull request.
   refuses with that exact code before a journal entry is written.
 
 ### Security
+- **Verify worktree integrity:** every git worktree-add site in `verify`
+  (main verify, identity-for-commit, commit-contains-patch) now forces a
+  **full checkout** (worktree-scoped `git sparse-checkout disable` with a
+  shared-config fallback) and fails closed (`worktree_incomplete`) when
+  `bundlebees_plugin/schemas/brief.schema.json` is missing from a tree that
+  carries it, so a narrowed sparse checkout can never silently pass
+  verification against an incomplete tree; the host checkout's sparse state
+  is never mutated. A missing git context on the tests-gate failure path
+  appends a **git-context hint** pointing at the doctor note, and the doctor
+  sandbox row states the no-git-context constraint in every state. Pinned by
+  RED-first probes with byte-identical restores, fail-closed audits at all
+  three worktree-add sites, and the 48-test two-file gate including the
+  newly collected `GitContextGap` class (its `__test__` marker and the
+  GREEN-run stub fix landed in this PR's repair rounds).
 - **Gate-watcher landed-delivery gate:** dependency and attempt-success gates
   in the planned-to-queued gate watcher now clear only on terminal attempt
   success AND an origin-verified landed delivery (branch on origin or merged

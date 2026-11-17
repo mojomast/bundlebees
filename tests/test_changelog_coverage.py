@@ -368,6 +368,18 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "gate-watcher landed-delivery gate",
         "keywords": ("landed-delivery", "origin_landed", "fail-closed"),
     },
+    {
+        # fix/verify-full-checkout-sparse: verify worktree integrity
+        # (att_17f6b893 + review repair rounds r1/r2) - all three
+        # worktree-add sites force a full checkout (worktree-scoped sparse
+        # disable with config fallback), fail closed on a missing schema,
+        # doctor no-git-context note + tests-gate git-context hint;
+        # GitContextGap collected via __test__ = True with the GREEN-run
+        # stub fix so the asserted suite_failed path is reachable.
+        "pr": 75,
+        "name": "verify worktree integrity",
+        "keywords": ("full checkout", "git-context hint", "GitContextGap"),
+    },
  )
 
 
