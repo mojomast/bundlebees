@@ -44,7 +44,7 @@ from . import brief as _brief_mod
 from . import campaign_cli
 from . import job_cli
 from . import acdd_cli, adapters, dispatch, leases, metrics, revision, sandbox
-from .security import child_env, config_flag, contain_path, looks_like_secret, scrub
+from .security import child_env, config_flag, contain_path, first_secret_rule, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
 BRANCH_BUDGET_NOTE = "no merge, tag, force-push, or hook skip"
@@ -1218,19 +1218,118 @@ def _apply_patch(workdir: Path, patch: str, assigned: list[str]) -> list[str]:
 
 def _added_lines(patch: str) -> dict[str, str]:
     """Lines each file gains in a unified diff, keyed by its new path."""
-    added: dict[str, list[str]] = {}
+    return {path: text for path, (text, _) in _added_lines_detail(patch).items()}
+
+
+def _added_lines_detail(patch: str) -> dict[str, tuple[str, list[int]]]:
+    """Lines each file gains in a unified diff, keyed by its new path, paired
+    with each line's 1-based line number in the new file (from ``@@`` hunk
+    headers; a diff without them falls back to numbering within the added
+    lines). The text is exactly what :func:`_added_lines` returns.
+    """
+    lines_by_path: dict[str, list[str]] = {}
+    numbers_by_path: dict[str, list[int]] = {}
     current: str | None = None
+    new_line = 1
     for line in patch.splitlines():
-        if line.startswith("+++ "):
+        if line.startswith("diff --git "):
+            current = None
+        elif line.startswith("+++ "):
             target = line[4:].strip().split("\t", 1)[0]
             current = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
             if current is not None:
-                added.setdefault(current, [])
-        elif line.startswith("diff --git "):
-            current = None
+                lines_by_path.setdefault(current, [])
+                numbers_by_path.setdefault(current, [])
+                new_line = 1
+        elif line.startswith("@@"):
+            match = re.search(r"\+(\d+)", line)
+            if match:
+                new_line = int(match.group(1))
         elif current is not None and line.startswith("+"):
-            added[current].append(line[1:])
-    return {path: "\n".join(lines) for path, lines in added.items()}
+            lines_by_path[current].append(line[1:])
+            numbers_by_path[current].append(new_line)
+            new_line += 1
+        elif current is not None and not line.startswith("-") and not line.startswith("\\"):
+            # Context (or hunk padding): only the new-file numbering moves.
+            new_line += 1
+    return {
+        path: ("\n".join(lines_by_path[path]), numbers_by_path[path])
+        for path in lines_by_path
+    }
+
+
+def _mask_excerpt(line: str | None, limit: int = 240) -> str | None:
+    """Mask every secret-shaped span in *line* with the fixed ``[redacted]``
+    placeholder (the scrubber's own predicate does the masking, so a span that
+    trips the scan can never survive into the refusal evidence)."""
+    if line is None:
+        return None
+    return scrub(line)[:limit]
+
+
+def _secret_trips(workdir: Path, files: Iterable[str], patch: str | None = None) -> list[dict[str, Any]]:
+    """Structured secret-scan trips: ``file``, 1-based ``line_no``, ``rule``
+    id, masked ``excerpt``. Flags exactly the files :func:`_secret_scan` flags;
+    evidence is enrichment on top of the same decision, never a separate one.
+    """
+    trips: list[dict[str, Any]] = []
+    added = _added_lines_detail(patch) if patch else {}
+    for rel in files:
+        if rel in added:
+            text, line_numbers = added[rel]
+            if len(text.encode("utf-8", errors="replace")) > _MAX_SCAN_BYTES:
+                trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                continue
+        else:
+            path = Path(contain_path(rel, str(workdir)))
+            try:
+                if path.stat().st_size > _MAX_SCAN_BYTES:
+                    trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            line_numbers = None
+        if _PRIVATE_KEY_RE.search(text):
+            numbered = (
+                list(zip(line_numbers, text.splitlines()))
+                if line_numbers is not None
+                else list(enumerate(text.splitlines(), start=1))
+            )
+            match = next(((no, line) for no, line in numbered if _PRIVATE_KEY_RE.search(line)), None)
+            trips.append(
+                {
+                    "file": rel,
+                    "line_no": match[0] if match else None,
+                    "rule": "private_key",
+                    "excerpt": _mask_excerpt(match[1]) if match else None,
+                }
+            )
+            continue
+        for index, line in enumerate(text.splitlines()):
+            rule = first_secret_rule(line)
+            if rule:
+                line_no = line_numbers[index] if line_numbers else index + 1
+                trips.append({"file": rel, "line_no": line_no, "rule": rule, "excerpt": _mask_excerpt(line)})
+                break
+    return trips
+
+
+def _secret_refusal(flagged: list[str], trips: list[dict[str, Any]]) -> str:
+    """Refusal text: the original file list plus one diagnosable entry per trip."""
+    parts: list[str] = []
+    for trip in trips:
+        detail = trip["file"]
+        if trip["line_no"] is not None:
+            detail += f" line={trip['line_no']}"
+        if trip["rule"]:
+            detail += f" rule={trip['rule']}"
+        if trip["excerpt"] is not None:
+            detail += f' excerpt="{trip["excerpt"]}"'
+        if trip["line_no"] is None and not trip["rule"] and trip["excerpt"] is None:
+            detail += " (no line evidence: file exceeds the scan size limit)"
+        parts.append(detail)
+    return "secret scan found secret-like content in: " + ", ".join(flagged) + "; trips: " + "; ".join(parts)
 
 
 def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) -> list[str]:
@@ -1240,31 +1339,7 @@ def _secret_scan(workdir: Path, files: Iterable[str], patch: str | None = None) 
     not the worker's output (and bundlebees' own sources mention tokens by design). A
     file the diff does not describe line by line is scanned whole (fail closed).
     """
-    flagged: list[str] = []
-    added = _added_lines(patch) if patch else {}
-    for rel in files:
-        if rel in added:
-            text = added[rel]
-            if len(text.encode("utf-8", errors="replace")) > _MAX_SCAN_BYTES:
-                flagged.append(rel)
-                continue
-        else:
-            path = Path(contain_path(rel, str(workdir)))
-            try:
-                if path.stat().st_size > _MAX_SCAN_BYTES:
-                    flagged.append(rel)
-                    continue
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-        if _PRIVATE_KEY_RE.search(text):
-            flagged.append(rel)
-            continue
-        for line in text.splitlines():
-            if looks_like_secret(line):
-                flagged.append(rel)
-                break
-    return sorted(set(flagged))
+    return sorted({trip["file"] for trip in _secret_trips(workdir, files, patch)})
 
 
 def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -1717,12 +1792,13 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         changed = _apply_patch(workdir, patch, files)
         files = changed
 
-        flagged = _secret_scan(workdir, files, patch)
+        trips = _secret_trips(workdir, files, patch)
+        flagged = sorted({trip["file"] for trip in trips})
         if flagged:
             _reset_patch(workdir)
             raise CliError(
                 "secret_detected",
-                "secret scan found secret-like content in: " + ", ".join(flagged),
+                _secret_refusal(flagged, trips),
                 "Remove secrets from the worker output; nothing was committed or pushed.",
             )
 
