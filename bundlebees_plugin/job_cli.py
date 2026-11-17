@@ -670,7 +670,8 @@ def status(state_dir: Path, job_id: str) -> dict[str, Any]:
     }
 
 
-def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False) -> dict[str, Any]:
+def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False,
+           rails_db=None, rails_anchors=None) -> dict[str, Any]:
     """Write and print the job acceptance report, bound to a RETURN packet.
 
     The shallow report at ``jobs/<job>.report.json`` keeps its keys and gains a
@@ -685,7 +686,7 @@ def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bo
     """
 
     if verify:
-        return return_report.verify(state_dir, job_id, repo=repo)
+        return return_report.verify(state_dir, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
 
     job = jobs.load_job(state_dir, job_id)
     rows = []
@@ -701,7 +702,7 @@ def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bo
                 "verified": bool((record or {}).get("ok")),
             }
         )
-    manifest = return_report.build(state_dir, job_id, repo=repo)
+    manifest = return_report.build(state_dir, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
     payload = {
         "job_id": job_id,
         "goal": job.get("goal", {}),
@@ -854,6 +855,9 @@ def add_parsers(subparsers: Any) -> None:
                      help="Repository used to prove every recorded verification commit exists.")
     rep.add_argument("--verify", action="store_true",
                      help="Rebuild the RETURN from durable state and compare evidence_digest; writes nothing.")
+    rep.add_argument('--rails-anchors', type=Path, metavar='FILE',
+                     help='Attach/verify Rails evidence using independently enrolled heads and criterion selections '
+                          'from FILE against the configured local rails_db.')
     rep.set_defaults(command="job", job_handler="report")
 
     repo = subparsers.add_parser(
@@ -1319,11 +1323,16 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
 
         if handler == "report":
             repo = Path(args.repo) if getattr(args, "repo", None) else None
-            if getattr(args, "verify", False):
-                result = report(state_dir, job_id, repo=repo, verify=True)
-                print(json.dumps(result, indent=2, sort_keys=True))
-                return 0 if result.get("ok") else 1
-            print(json.dumps(report(state_dir, job_id, repo=repo), indent=2, sort_keys=True))
+            anchors = getattr(args, 'rails_anchors', None)
+            opts = {}
+            if anchors is not None:
+                setting = getattr(ctx, 'get_config', lambda key, default: config.get(key, default))
+                if setting('rails_read_scope', None):
+                    raise JobCliError('rails_evidence_refused', 'This profile restricts Rails reads.',
+                                      'Use the coordinator reporting profile to verify full chains.')
+                opts.update(rails_anchors=anchors, rails_db=setting('rails_db', None))
+            result = report(state_dir, job_id, repo=repo, verify=getattr(args, 'verify', False), **opts)
+            print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")

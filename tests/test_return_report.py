@@ -61,6 +61,26 @@ def _need_workflow() -> None:
         pytest.fail("GITLEAKS must point at the gitleaks scanner when REQUIRE_WORKFLOW=1")
 
 
+@pytest.mark.parametrize(("suite", "accepted"), [(None, False), ({}, False), ({"exit_code": False}, False),
+    ({"exit_code": 0, "timed_out": True}, False), ({"exit_code": 0, "blocking": ["contract"]}, False),
+    ({"exit_code": 0}, True)])
+def test_wave_requires_affirmative_suite_evidence(tmp_path, suite, accepted):
+    sha = "a" * 40
+    entry = {"wave": 1, "commit": sha, "attempts": ["a1"]}
+    job = {"job_id": "job_a", "tasks": [{"state": "accepted", "attempts": ["a1"]}],
+           "integration": {"accepted_waves": [entry]}}
+    waves = tmp_path / "waves"
+    waves.mkdir()
+    wave = {"wave_id": "job_a.w1", "head_sha": sha, "accepted": True, "attempts": ["a1"], "suite": suite}
+    (waves / "job_a.w1.json").write_text(json.dumps(wave))
+    if accepted:
+        assert return_report._waves(tmp_path, job)[0]["head"] == sha
+    else:
+        with pytest.raises(return_report.ReturnError) as caught:
+            return_report._waves(tmp_path, job)
+        assert caught.value.code == "wave_mismatch"
+
+
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------

@@ -577,6 +577,10 @@ Please keep the combined tool schemas at or under **900** o200k tokens, stay on 
 
 Design notes: [docs/RESEARCH.md](docs/RESEARCH.md) and [docs/tasks/BB00_CONTRACTS.md](docs/tasks/BB00_CONTRACTS.md). The banner source is [docs/assets/banner.html](docs/assets/banner.html).
 
+## Rails activity history
+
+For read-only attempt history, bounded source imports, and the fenced owner retry handoff, see [Rails on the coordinator](docs/RAILS.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 mojomast.

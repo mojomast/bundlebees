@@ -231,13 +231,11 @@ def _suite_evidence(
             "the suite runner returned no evidence",
             "Check the sandbox runner and retry.",
         )
-    try:
-        exit_code = int(evidence.get("exit_code"))
-    except (TypeError, ValueError):
-        exit_code = 1
+    exit_code = evidence.get("exit_code")
     return {
-        "exit_code": exit_code,
+        "exit_code": exit_code if type(exit_code) is int else 1,
         "timed_out": bool(evidence.get("timed_out")),
+        "blocking": bool(evidence.get("blocking")),
         "tail": str(evidence.get("output_tail") or evidence.get("tail") or "").strip()[-300:],
         "junit": evidence.get("junit"),
         "backend": evidence.get("backend"),
@@ -393,14 +391,13 @@ def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
             "the stored suite receipt has no complete result",
             "Remove the corrupt receipt only by intending to rerun the suite.",
         )
-    try:
-        exit_code = int(result.get("exit_code"))
-    except (TypeError, ValueError) as exc:
+    exit_code = result.get("exit_code")
+    if type(exit_code) is not int:
         raise IntegrateError(
             "receipt_corrupt",
-            "the stored suite receipt has no exit code",
+            "the stored suite receipt has no integer exit code",
             "Remove the corrupt receipt only by intending to rerun the suite.",
-        ) from exc
+        )
     timed_out = result.get("timed_out", False)
     if not isinstance(timed_out, bool):
         raise IntegrateError(
@@ -420,6 +417,7 @@ def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "blocking": bool(result.get("blocking")),
         "tail": tail,
         "junit": result.get("junit"),
         "backend": result.get("backend"),
@@ -638,16 +636,11 @@ def integrate(
 
     wave = wave_id or job_wave_id(job)
     attempts = verified_attempts(job)
+    request_key = _integration_request_lock(
+        job, wave=wave, attempts=attempts, suite_command=suite_command
+    )
     try:
-        claim = receipts.claim_key(
-            state_dir,
-            _integration_request_lock(
-                job,
-                wave=wave,
-                attempts=attempts,
-                suite_command=suite_command,
-            ),
-        )
+        claim = receipts.claim_key(state_dir, request_key)
     except receipts.ReceiptError as exc:
         raise IntegrateError(exc.code, exc.error, exc.fix) from exc
     try:
@@ -655,6 +648,7 @@ def integrate(
             state_dir,
             job,
             repo,
+            request_key=request_key,
             suite_command=suite_command,
             worktree_root=worktree_root,
             wave_id=wave,
@@ -675,6 +669,7 @@ def _integrate_locked(
     job: Mapping[str, Any],
     repo: Path,
     *,
+    request_key: str,
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     worktree_root: Path | None = None,
     wave_id: str | None = None,
@@ -766,7 +761,10 @@ def _integrate_locked(
     start_rev = ref_check.stdout.strip() if ref_check.returncode == 0 else base_rev
 
     root = Path(worktree_root) if worktree_root else repo.parent / ".bb-integrate"
-    worktree = root / "wt"
+    # Only the owner of this request lock may reclaim its abandoned checkout.
+    # Independent state stores hold independent locks, even for identical keys.
+    namespace = json.dumps([str(state_dir.resolve()), str(repo.resolve()), request_key])
+    worktree = root.resolve() / ("wt-" + hashlib.sha256(namespace.encode()).hexdigest())
     if worktree.exists():
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
     root.mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import statistics
@@ -443,7 +444,7 @@ def _timestamp(value: Any) -> _dt.datetime | None:
     return parsed
 
 
-def _rate(numerator: int, denominator: int) -> float | None:
+def _rate(numerator: float, denominator: int) -> float | None:
     return None if denominator == 0 else numerator / denominator
 
 
@@ -512,6 +513,59 @@ def _ids(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str) and item]
 
 
+def _cost_summary(events: Iterable[Mapping[str, Any]], accepted: int) -> dict[str, Any]:
+    """Run spend includes unsuccessful attempts. A wave-level report cannot cover its members."""
+    attempts: set[str] = set()
+    reported: dict[str, float] = {}
+    anonymous_dispatches = 0
+    unattributed_events = 0
+    for event in events:
+        name = event.get("event")
+        ids = _event_attempts(event)
+        valid_ids = {ref for ref in ids if _ID_RE.fullmatch(ref)}
+        attempts.update(valid_ids)
+        retry_of = event.get("retry_of")
+        if isinstance(retry_of, str) and _ID_RE.fullmatch(retry_of):
+            attempts.add(retry_of)
+
+        attempt_id = event.get("attempt_id")
+        identified = isinstance(attempt_id, str) and attempt_id in valid_ids
+        # Scrubbed references cannot establish coverage or a reliable rate denominator.
+        if (
+            len(ids) != len(valid_ids)
+            or (isinstance(retry_of, str) and not _ID_RE.fullmatch(retry_of))
+            or (not valid_ids and name in ("verify", "integrate"))
+            or (not identified and event.get("cost_usd") is not None)
+        ):
+            unattributed_events += 1
+        if not identified:
+            if name == "dispatch":
+                anonymous_dispatches += 1
+            # An unkeyed cost may cover work already reported for a named attempt.
+            continue
+        try:
+            cost = _number(event.get("cost_usd"))
+        except OverflowError:  # an out-of-range integer is not a representable USD amount
+            continue
+        if cost is not None and math.isfinite(cost) and cost >= 0:
+            reported[attempt_id] = cost  # last valid cumulative report, including zero
+
+    missing = len(attempts) - len(reported) + anonymous_dispatches
+    subtotal = sum(reported.values()) if reported else None
+    if subtotal is not None and not math.isfinite(subtotal):
+        subtotal = None
+    total = subtotal if not missing and not unattributed_events else None
+    return {
+        "cost_usd_known_subtotal": subtotal,
+        "cost_coverage": {
+            "attempts_with_cost": len(reported), "attempts_without_cost": missing,
+            "unattributed_events": unattributed_events,
+        },
+        "cost_usd_total": total,
+        "cost_per_accepted": _rate(total, accepted) if total is not None else None,
+    }
+
+
 def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate a run's verified events into outcome metrics.
 
@@ -519,6 +573,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     failures are counted apart from regressions. Missing usage is ``None``, never 0. Per-attempt
     usage is cumulative (the last report per attempt counts). First-pass rates carry their
     denominator and exclusions. Historical events without test ids are reported as legacy.
+    Cost totals require complete attempt coverage; partial cost is a separate subtotal.
 
     Dispatch counting publishes three numbers: ``attempts_dispatched`` is the number of unique
     attempts dispatched, counting each distinct string ``attempt_id`` once plus one for every
@@ -539,11 +594,8 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     non_verdict: dict[str, str] = {}
     accepted_ids: set[str] = set()
     tokens_by_attempt: dict[str, float] = {}
-    cost_by_attempt: dict[str, float] = {}
     loose_tokens = 0.0
-    loose_cost = 0.0
     loose_tokens_known = False
-    loose_cost_known = False
     usage_attempts: set[str] = set()
     interventions = 0
     regression_ids: set[str] = set()
@@ -561,21 +613,14 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         attempt_id = event.get("attempt_id")
         attempt_key = attempt_id if isinstance(attempt_id, str) else None
         tokens = _number(event.get("tokens"))
-        cost = _number(event.get("cost_usd"))
         if attempt_key is not None:
             if name in ("dispatch", "verify"):
                 usage_attempts.add(attempt_key)
             if tokens is not None:
                 tokens_by_attempt[attempt_key] = tokens  # cumulative per attempt: last report wins
-            if cost is not None:
-                cost_by_attempt[attempt_key] = cost
-        else:
-            if tokens is not None:
-                loose_tokens += tokens
-                loose_tokens_known = True
-            if cost is not None:
-                loose_cost += cost
-                loose_cost_known = True
+        elif tokens is not None:
+            loose_tokens += tokens
+            loose_tokens_known = True
 
         if name == "dispatch":
             dispatch_events += 1
@@ -627,9 +672,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     first_pass = sum(1 for ok in first_verdict.values() if ok)
     accepted = len(accepted_ids)
     tokens_known = bool(tokens_by_attempt) or loose_tokens_known
-    cost_known = bool(cost_by_attempt) or loose_cost_known
     tokens_total = (sum(tokens_by_attempt.values()) + loose_tokens) if tokens_known else None
-    cost_total = (sum(cost_by_attempt.values()) + loose_cost) if cost_known else None
     with_tokens = len([a for a in usage_attempts if a in tokens_by_attempt] + [a for a in tokens_by_attempt if a not in usage_attempts])
 
     return {
@@ -644,8 +687,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         "accepted_changes": accepted,
         "tokens_total": _tidy(tokens_total) if tokens_total is not None else None,
         "tokens_per_accepted": _rate(tokens_total, accepted) if tokens_total is not None else None,
-        "cost_usd_total": cost_total,
-        "cost_per_accepted": _rate(cost_total, accepted) if cost_total is not None else None,
+        **_cost_summary(ordered, accepted),
         "usage": {
             "attempts_with_tokens": with_tokens,
             "attempts_without_tokens": len([a for a in usage_attempts if a not in tokens_by_attempt]),
@@ -685,6 +727,8 @@ def format_summary(summary: Mapping[str, Any]) -> str:
         f"accepted_changes: {render(summary.get('accepted_changes'))}",
         f"tokens_total: {render(summary.get('tokens_total'))}",
         f"tokens_per_accepted: {render(summary.get('tokens_per_accepted'))}",
+        f"cost_usd_known_subtotal: {render(summary.get('cost_usd_known_subtotal'))}",
+        f"cost_coverage: {json.dumps(summary.get('cost_coverage'), sort_keys=True)}",
         f"cost_usd_total: {render(summary.get('cost_usd_total'))}",
         f"cost_per_accepted: {render(summary.get('cost_per_accepted'))}",
         f"human_interventions: {render(summary.get('human_interventions'))}",

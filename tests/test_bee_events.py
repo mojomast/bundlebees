@@ -51,6 +51,37 @@ def _event(**over):
     return events.build_event(_attempt(), **kwargs)
 
 
+def _hyvv_event():
+    """Wire fixture from Hyvv build_landed_event with a local result receipt."""
+    return {
+        "specversion": "1.0",
+        "id": "urn:rizzstack:bee-landed:e4f6fec72a50a4382886994e43a147aa",
+        "source": "hyvv://worker-1",
+        "type": "rizzstack.bee.landed.v1",
+        "time": "1970-01-01T00:01:40.000000Z",
+        "subject": "att_landing0001",
+        "datacontenttype": "application/json",
+        "dataschema": "https://rizstack.dev/schemas/bee-landed/v1",
+        "data": {
+            "schema": "rizzstack.bee-landed/1", "feature_id": "feat_1", "job_id": "job_1",
+            "task_id": "task_1", "attempt_id": "att_landing0001", "state": "succeeded",
+            "coordinator": {"identity": "orbit", "session": "sess_1"},
+            "backend": {"harness": "opencode", "model": "zoo:glm-5.3-flash"},
+            "source_rev": SOURCE_REV, "lease": {"sha256": LEASE, "assigned_files": ["src/a.py"]},
+            "result": {
+                "available": True,
+                "artifact_sha256": "1b0c620c782e81f58aaea1cd575989fc1d3879c129e14d8a43ef2afb780d7e51",
+                "reference": "hyvv://attempts/att_landing0001/result",
+            },
+        },
+        "rizzstackusage": {
+            "input": 120, "output": 45, "cache_read": 30, "cache_write": 12,
+            "reasoning": 8, "thinking": 5, "total": 195, "tool_calls": 7,
+            "stop_reason": "end_turn", "model": "zoo:glm-5.3-flash", "route": "zoo",
+        },
+    }
+
+
 def _outbox(state: Path):
     return Path(state) / "events" / "outbox"
 
@@ -144,6 +175,9 @@ def _write_pinned_schema(root: Path) -> Path:
             "source": {"type": "string", "minLength": 1},
             "type": {"const": events.EVENT_TYPE},
             "time": {"type": "string"},
+            "subject": {"type": "string"},
+            "dataschema": {"type": "string"},
+            "rizzstackusage": {"type": "object"},
             "datacontenttype": {"const": "application/json"},
             "data": data_schema,
         },
@@ -363,6 +397,82 @@ def test_validate_event_lets_the_pinned_schema_reject_a_null_source_rev(tmp_path
     with pytest.raises(events.EventError) as exc:
         events.validate_event(event)
     assert _code(exc) == "event_schema_invalid"
+
+
+def test_hyvv_usage_survives_validation_recording_and_duplicate_delivery(tmp_path, monkeypatch):
+    _write_pinned_schema(tmp_path)
+    monkeypatch.setenv("WORKFLOW_SRC", str(tmp_path))
+    event = _hyvv_event()
+    body = json.dumps(event).encode()
+    assert events.validate_event(body)
+    first = events.record_landing(tmp_path, event)
+    assert first.pop("created") is True
+    assert first == event
+    first["rizzstackusage"]["input"] = 0
+    assert event == json.loads(body)
+    assert events.record_landing(tmp_path, body)["created"] is False
+
+    events.subscribe(tmp_path, {"identity": "usage", "file": "inbox.jsonl"})
+    delivery = events.deliver_pending(tmp_path)
+    assert delivery["delivered"] == 1
+    assert delivery["deliveries"][0]["event"] == event
+    assert events.deliver_pending(tmp_path)["skipped"] == 1
+
+    event["rizzstackusage"]["input"] += 1
+    with pytest.raises(events.EventError) as exc:
+        events.record_landing(tmp_path, event)
+    assert _code(exc) == "event_conflict"
+    assert _read(_outbox(tmp_path) / f"{event['id']}.json") == json.loads(body)
+
+
+@pytest.mark.parametrize("usage", [
+    {"input": 0}, {"thinking": 999_999_999, "stop_reason": "turn ended"},
+    {"cache_read": 0, "model": "deepseek-v4.1-flash", "route": "go", "tool_calls": 0},
+])
+def test_sparse_usage_keeps_only_reported_fields(tmp_path, usage):
+    event = {**_event(), "rizzstackusage": usage}
+    assert events.record_landing(tmp_path, event)["rizzstackusage"] == usage
+
+
+@pytest.mark.parametrize("usage", [
+    None, [], {}, {"tool_calls": 1}, {"model": "example"}, {"input": True}, {"input": -1},
+    {"total": 1_000_000_000}, {"input": 1.0}, {"input": "1"}, {"input": 1, "tool_calls": False},
+    {"input": 1, "input_tokens": 2}, {"output": 1, "accepted": True}, {"input": {"verified": True}},
+    {"input": 1, "route": ["go"]}, {"input": 0, "route": "custom"}, {"output": 0, "stop_reason": None},
+    {"input": 1, "model": "v1." * 43}, {"input": 1, "stop_reason": "r" * 65},
+])
+def test_malformed_usage_is_refused_before_recording(tmp_path, usage):
+    with pytest.raises(events.EventError) as exc:
+        events.record_landing(tmp_path, {**_event(), "rizzstackusage": usage})
+    assert _code(exc) == "event_invalid"
+    assert not _outbox(tmp_path).exists()
+
+
+@pytest.mark.parametrize(("key", "text"), [
+    ("model", "worker.example.org"), ("model", "zoo:worker.local"), ("stop_reason", "worker:80"),
+    ("model", "https://example.invalid/v1"), ("stop_reason", "logs/receipt"),
+    ("model", "2001:db8::1"), ("model", "a free form message"),
+    ("stop_reason", SECRET), ("model", "ghs_" + "a" * 24), ("route", "private.example"),
+    ("private.example", "unknown field"),
+])
+def test_private_usage_is_refused_without_echoing_input(tmp_path, key, text):
+    event = {**_event(), "rizzstackusage": {"input": 1, key: text}}
+    with pytest.raises(events.EventError) as exc:
+        events.record_landing(tmp_path, event)
+    message = json.dumps(exc.value.to_dict())
+    assert text not in message and "private.example" not in message
+    assert not _outbox(tmp_path).exists()
+
+
+def test_usage_permission_does_not_extend_to_data_or_other_root_attributes(tmp_path):
+    event = _hyvv_event()
+    for obj, key in ((event["data"], "rizzstackusage"), (event, "usage"), (event, "verified")):
+        obj[key] = event["rizzstackusage"]
+        with pytest.raises(events.EventError) as exc:
+            events.record_landing(tmp_path, event)
+        assert _code(exc) == "event_invalid"
+        del obj[key]
+    assert not _outbox(tmp_path).exists()
 
 
 # ---------------------------------------------------------------------------

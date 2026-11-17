@@ -29,6 +29,9 @@ _NAME_FRAGMENTS = (
     ("access", "_key"),
     ("client", "_secret"),
     ("credential",),
+    ("token",),
+    ("access", "_token"),
+    ("refresh", "_token"),
 )
 
 _NAMES = tuple("".join(parts) for parts in _NAME_FRAGMENTS)
@@ -53,6 +56,34 @@ _SHAPE_RULES = (
 
 _NAME_SET = frozenset(_NAMES)
 
+# Prose is bounded and structured by the caller/closed kind schema. Refuse
+# wire imports requiring even one change: sanitizing and rehashing them would
+# no longer preserve origin evidence.
+_PRIVATE_DETAIL = re.compile(
+    r'(?i)(?:\b[a-z][a-z0-9+.-]{0,15}://[^\s]+|(?:^|\s)(?:[a-z]:[\\/]|\\\\|~/|/)[^\s]*'
+    r'|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[\w.-]{1,253}\.(?:local|internal|lan)\b)'
+)
+_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+# An untrusted peer can't attest that an arbitrary prose string is a safe
+# summary rather than copied prompt/output. The worker transport accepts only
+# public labels and known observation templates in free-text slots. Additional
+# producers must project their own text to a safe label before hashing it.
+_PUBLIC_LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}')
+_WORKER_TEXT = frozenset((
+    '', REDACTED, 'Tool call observed', 'Tool completion observed', 'Tool result observed',
+    'Named test command started', 'Named test command completed',
+    'No passing evidence for this criterion.',
+))
+
+
+def safe_origin_text(payload):
+    for field in ('summary', 'decision', 'command_family', 'reason', 'basis', 'cursor', 'note'):
+        value = payload.get(field)
+        if isinstance(value, str) and value not in _WORKER_TEXT and not _PUBLIC_LABEL.fullmatch(value):
+            return False
+    return True
+
 
 def scrub_text(text):
     if not isinstance(text, str):
@@ -61,7 +92,7 @@ def scrub_text(text):
     out = _CARRIER_RULE.sub(REDACTED, out)
     for rule in _SHAPE_RULES:
         out = rule.sub(REDACTED, out)
-    return out
+    return _CONTROL.sub(' ', _PRIVATE_DETAIL.sub(REDACTED, out))
 
 
 def scrub_structure(value):
@@ -70,7 +101,7 @@ def scrub_structure(value):
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
-            if isinstance(key, str) and key in _NAME_SET:
+            if isinstance(key, str) and key.casefold() in _NAME_SET:
                 out[key] = REDACTED
             else:
                 out[key] = scrub_structure(item)
@@ -94,6 +125,8 @@ def scrub_record_id(value):
 
 
 def scrub_source(source):
+    if not isinstance(source, dict):
+        return source
     scrubbed = dict(source)
     scrubbed["record_id"] = scrub_record_id(scrubbed.get("record_id"))
     for key, value in list(scrubbed.items()):

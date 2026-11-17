@@ -15,11 +15,14 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import PurePosixPath
+import re
 import subprocess
 import sys
+import tempfile
 
 MANIFEST_SCHEMA = "rizzstack.vendor-manifest/1"
-PACKAGE_REL = os.path.join("contrib", "rizzstack_rails")
+PACKAGE_REL = "contrib/rizzstack_rails"  # manifest names use POSIX spelling on every host
 MANIFEST_NAME = "vendor-manifest.json"
 
 
@@ -40,8 +43,14 @@ def load_manifest(root):
     if not os.path.exists(path):
         print("vendor: manifest missing at %s" % path, file=sys.stderr)
         return None
-    with open(path, "rb") as handle:
-        manifest = json.loads(handle.read().decode("utf-8"))
+    try:
+        with open(path, "rb") as handle:
+            manifest = json.load(handle)
+        if not isinstance(manifest, dict) or manifest.get('source_package') != PACKAGE_REL:
+            raise ValueError('unexpected source package')
+    except (ValueError, OSError):
+        print('vendor: invalid or unreadable package manifest', file=sys.stderr)
+        return None
     if manifest.get("schema") != MANIFEST_SCHEMA:
         print("vendor: unsupported manifest schema %r" % (manifest.get("schema"),), file=sys.stderr)
         return None
@@ -49,25 +58,32 @@ def load_manifest(root):
     if not isinstance(entries, list) or not entries:
         print("vendor: manifest carries no files", file=sys.stderr)
         return None
+    if not all(isinstance(entry, dict) for entry in entries):
+        print("vendor: invalid file entry", file=sys.stderr)
+        return None
     names = [entry.get("path") for entry in entries]
-    if len(set(names)) != len(names) or any(not isinstance(n, str) for n in names):
+    if any(not isinstance(n, str) for n in names) or len(set(names)) != len(names):
         print("vendor: manifest file paths must be unique strings", file=sys.stderr)
         return None
     for entry in entries:
-        if not entry["path"].startswith(PACKAGE_REL + os.sep):
-            print("vendor: path outside package: %s" % entry["path"], file=sys.stderr)
+        if not re.fullmatch(r"contrib/rizzstack_rails/[A-Za-z_][A-Za-z_0-9]*\.py", entry['path']):
+            print("vendor: expected a Python module directly inside the package", file=sys.stderr)
             return None
-        if set(entry) - {"path", "sha256", "bytes"}:
-            print("vendor: unexpected manifest keys in %s" % entry["path"], file=sys.stderr)
+        if (set(entry) != {"path", "sha256", "bytes"} or not isinstance(entry['sha256'], str)
+                or not re.fullmatch(r'[0-9a-f]{64}', entry['sha256']) or type(entry['bytes']) is not int or entry['bytes'] < 0):
+            print("vendor: invalid manifest entry: %s" % entry["path"], file=sys.stderr)
             return None
     return manifest
 
 
 def verify_against_manifest(root, manifest):
     problems = []
+    covered = {PurePosixPath(entry['path']).name for entry in manifest['files']}
+    if covered != set(package_files(root)):
+        problems.append('package modules differ from the manifest; regenerate and review the pins')
     for entry in manifest["files"]:
         path = os.path.join(root, entry["path"])
-        if not os.path.exists(path):
+        if os.path.islink(path) or not os.path.isfile(path):
             problems.append("missing: " + entry["path"])
             continue
         with open(path, "rb") as handle:
@@ -94,7 +110,7 @@ def package_files(root):
 def write_manifest(root, pin_label):
     entries = []
     for name in package_files(root):
-        rel = os.path.join(PACKAGE_REL, name)
+        rel = PACKAGE_REL + '/' + name
         with open(os.path.join(root, rel), "rb") as handle:
             data = handle.read()
         entries.append({"path": rel, "sha256": sha256_bytes(data), "bytes": len(data)})
@@ -105,17 +121,31 @@ def write_manifest(root, pin_label):
         "pin_label": pin_label,
         "files": entries,
     }
-    with open(manifest_path(root), "wb") as handle:
-        handle.write(
-            (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
-        )
+    atomic_write(manifest_path(root), (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8"))
     return manifest
+
+
+def atomic_write(path, data):
+    fd, tmp = tempfile.mkstemp(prefix='.rails-vendor-', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def vendor_to_dest(root, manifest, dest):
     problems = verify_against_manifest(root, manifest)
     if problems:
         return problems, 0
+    package = os.path.join(dest, PACKAGE_REL)
+    if any(os.path.islink(p) for p in (dest, os.path.join(dest, 'contrib'), package)):
+        return ['refusing symlink in destination package path'], 0
+    if any(os.path.islink(os.path.join(dest, entry['path'])) for entry in manifest['files']):
+        return ['refusing linked destination module'], 0
     written = 0
     for entry in manifest["files"]:
         target = os.path.join(dest, entry["path"])
@@ -127,8 +157,7 @@ def vendor_to_dest(root, manifest, dest):
             with open(target, "rb") as handle:
                 needs_write = handle.read() != data
         if needs_write:
-            with open(target, "wb") as handle:
-                handle.write(data)
+            atomic_write(target, data)
             written += 1
         with open(target, "rb") as handle:
             copied = handle.read()
@@ -147,7 +176,10 @@ def git_pin_label(root):
             timeout=30,
         )
         if out.returncode == 0:
-            return out.stdout.strip()
+            status = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=all', '--', PACKAGE_REL],
+                                    cwd=root, capture_output=True, timeout=30)
+            if status.returncode == 0:
+                return 'unreviewed-working-tree' if status.stdout.strip() else out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
     return "unpinned"

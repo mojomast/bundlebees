@@ -1070,3 +1070,8 @@ def register_tools(ctx: Any) -> None:
             description=_DESCRIPTIONS[name],
             emoji="🐝",
         )
+    # A profile must opt in to exposing its local history to Hermes. No
+    # database is opened and no launcher capability is loaded at registration.
+    if getattr(ctx, 'get_config', lambda k, d: d)('rails_db', ''):
+        from . import rails_tool
+        rails_tool.register_tools(ctx)

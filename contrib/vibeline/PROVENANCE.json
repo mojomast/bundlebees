@@ -1,0 +1,14 @@
+{
+  "repo": "https://github.com/listeningpost/vibeline",
+  "pin": "d5d0f425a64906ae1a50c1222314a5420da404d5",
+  "license": "MIT; Copyright (c) 2026 ListeningPost",
+  "method": "Exact git archive members at the pin. Inert reference files only; no upstream runtime imports, hooks, home discovery, or session enumeration.",
+  "wrapper": "bundlebees_plugin/rails_hermes_source.py uses an explicit database and session allowlist, mode=ro/query_only transactions, bounded repeatable scans, and a closed vocabulary of projected fields. No content or result text is selected. Optional swarm database input is not enabled.",
+  "sha256": {
+    "LICENSE": "df20bdb784e05921868c9249e3eba938825da7391fc5985673833c78e24bf6a7",
+    "paths.py": "270155aa8a9597dba7cff92b4dcd68495b90cc2fad5bf17ded783620d307ff4c",
+    "sessions.py": "fe35d767de9d7920003a9be4b0691f7431c613f5ccc58d64b3de260e4da2c80b",
+    "swarm.py": "b4fb4fd5c64e908eb4424003fbccb71e3b420fc7ce66449e1aa636ff2ed87480",
+    "shell.py": "ee516e76b5f6476b3da3756bd877a7a4ec8667901aa478af829f1e21aa8bc47b"
+  }
+}

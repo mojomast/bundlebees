@@ -21,6 +21,39 @@ hermes bundlebees doctor --state-dir DIR  # plugin data directory override
 pure reporting and exits 0 (the historical behavior); with it, the exit code
 is the parity verdict described below.
 
+### Pre-rollout: check a copy of old wave records offline
+
+From the BundleBees checkout, point the standalone checker at an operator-supplied
+snapshot. Use **one** of these commands; neither discovers a default state directory:
+
+```sh
+python3 -B -m bundlebees_plugin.wave_compat --waves-dir /path/to/copied-waves
+python3 -B -m bundlebees_plugin.wave_compat --state-dir /path/to/copied-state
+```
+
+Both inspect only the immediate `*.json` entries in the waves directory
+(`copied-state/waves/` in the second form). For a record marked `accepted: true`,
+the checker uses RETURN's `revision.suite_passed` rule: integer `exit_code: 0`
+and no truthy `timed_out` or `blocking`. `accepted: false` records are counted
+separately and do not need a passing suite.
+
+| JSON `status` | Exit | Meaning |
+|---|---:|---|
+| `suite_compatible` | 0 | All accepted records inspected have passing suite evidence. |
+| `no_accepted_waves` | 0 | The directory was scanned and is empty of wave records or contains only non-accepted records. |
+| `needs_review` | 1 | At least one accepted suite result is missing, malformed, nonzero, timed out or blocked, or a record could not be classified. |
+| `directory_missing` / `directory_unreadable` | 1 | The scan could not be completed. Check the supplied snapshot path. |
+| `platform_unsupported` | 1 | Safe directory-relative, no-follow reads are unavailable. Inspect the copy on a supported POSIX host. |
+
+`counts` covers every inspected entry, with one category per record. `findings`
+lists at most 50 problem IDs from filenames (at most 64 characters; withheld IDs
+are `null`). Links, special files, invalid record names, and files over 4 MiB
+are findings rather than silently skipped records. Record contents are never
+printed. On a finding, review the original evidence before rollout; do not fill
+in missing results. This read-only check addresses **suite evidence only**. It
+does not run a suite, repair records, cross-check jobs/commits, or certify a
+complete RETURN.
+
 ## The six states
 
 Every probe reports exactly one state; states are never folded and missing

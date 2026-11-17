@@ -1,10 +1,7 @@
-"""Frozen contract layer for the rizzstack rails ledger (schema rizzstack.rails/1).
+"""Stdlib wire contract for Workflow's frozen event.schema + per-kind payload.schema.
 
-Canonicalization, hash formulas, envelope value rules, the closed kind list
-for /1, trust roster and per-kind payload rules originate here. The legacy
-vibeline hash formula is pinned exactly as upstream (default separators,
-default ensure_ascii, default=str, keys in LEGACY_CHAIN_KEYS order via
-sort_keys).
+Only producer *inputs* get the R02 spelling conversions. New envelopes are
+closed; origin bytes and both hash formulas are independent of normalization.
 """
 
 import hashlib
@@ -13,225 +10,134 @@ import re
 import time
 from datetime import datetime, timezone
 
-SCHEMA = "rizzstack.rails/1"
+SCHEMA = 'rizzstack.rails/1'
+GENESIS = 'genesis'
+INT_LIMIT = 2**53 - 1
+MAX_RECORD = 65536
+MAX_PAGE = 1048576
+MAX_RECORDS = 500
+POLICY = 'rails-safe/1'
+OLD_POLICY = {'mode': 'structured_safe', 'path_detail': 'omitted'}
 
-GENESIS = "genesis"
-
-INT_LIMIT = 2 ** 53 - 1
-
-KINDS = frozenset(
-    {
-        "lane.open",
-        "lane.spawn",
-        "lane.close",
-        "tool.start",
-        "tool.finish",
-        "decision.recorded",
-        "attempt.state",
-        "job.state",
-        "queue.transition",
-        "lease.recorded",
-        "verification.result",
-        "review.result",
-        "integration.result",
-        "merge.result",
-        "acceptance.result",
-        "usage.observed",
-        "feedback.recorded",
-        "intervention.requested",
-        "intervention.result",
-        "history.superseded",
-        "source.gap",
-        "source.checkpoint",
-        "source.error",
-    }
-)
-
-AUTHORITIES = (
-    "worker_report",
-    "coordinator_record",
-    "verifier_record",
-    "reviewer_record",
-    "owner_record",
-    "imported_observation",
-)
-
-TIMING_QUALITY = ("monotonic_measured", "reported", "unknown")
-
-OUTCOMES = ("pending", "ok", "failed", "cancelled", "unknown")
-
-VERDICTS = ("PASS", "FAIL", "NOT_RUN", "BLOCKED", "UNVERIFIED", "EXPECTED_RED")
-
-PHASES = ("red", "green", "refactor", "integration")
-
-USAGE_BASES = ("delta", "cumulative", "final")
-
+AUTHORITIES = ('worker_report', 'coordinator_record', 'verifier_record', 'reviewer_record',
+               'owner_record', 'imported_observation')
+TIMING_QUALITY = ('measured', 'estimated', 'unknown')
+OUTCOMES = ('pending', 'ok', 'failed', 'cancelled', 'unknown')
+VERDICTS = ('PASS', 'FAIL', 'NOT_RUN', 'BLOCKED', 'UNVERIFIED', 'EXPECTED_RED')
+PHASES = ('red', 'green', 'refactor', 'integration')
+USAGE_BASES = ('delta', 'cumulative', 'final')
 FEEDBACK_RATINGS = (-1, 0, 1, None)
-
-FEEDBACK_CATEGORIES = ("quality", "intervention", "both")
-
+FEEDBACK_CATEGORIES = ('quality', 'intervention', 'both')
 FEEDBACK_NOTE_MAX = 2000
-
-INTERVENTION_OPERATIONS = ("retry", "rewind_retry")
-
-INTERVENTION_DECISIONS = ("pending", "approved", "declined", "blocked", "completed", "failed")
-
-REDACTION_MODES = ("structured_safe",)
-
-SOURCE_FIELDS = ("adapter", "instance", "record_id", "revision")
-
-SCOPE_FIELDS = (
-    "repo_slug",
-    "campaign_id",
-    "job_id",
-    "task_id",
-    "attempt_id",
-    "session_id",
-    "action_id",
-    "contract_sha256",
-    "code_rev",
-)
-
-GROUPING_IDS = (
-    "repo_slug",
-    "campaign_id",
-    "job_id",
-    "task_id",
-    "attempt_id",
-    "session_id",
-    "action_id",
-)
-
-LANE_FIELDS = ("lane_id", "parent_lane_id", "parent_event_id")
-
-RAW_FIELDS = (
-    "raw_prompt",
-    "raw_response",
-    "raw_tool_output",
-    "reasoning_transcript",
-    "transcript_blob",
-    "tool_argv",
-)
-
-REDACTION_FIELDS = ("mode", "path_detail", "notes")
-
-LEGACY_CHAIN_KEYS = (
-    "ts",
-    "task_id",
-    "actor",
-    "parent",
-    "kind",
-    "ac_id",
-    "result",
-    "why",
-    "tokens_in",
-    "tokens_out",
-    "sha",
-    "prev_hash",
-)
-
-RAILS_HASH_PREFIX = b"rizzstack.rails/1\n"
-
-SERVER_ASSIGNED_KEYS = ("event_id", "seq", "recorded_at", "prev_hash", "hash")
-
-STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
-
-HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
-
-EVENT_ID_RE = re.compile(r"^.+:\d+$")
+INTERVENTION_OPERATIONS = ('retry', 'rewind_retry')
+INTERVENTION_DECISIONS = ('pending', 'approved', 'declined', 'blocked', 'completed', 'failed')
+SOURCE_FIELDS = ('adapter', 'instance', 'record_id', 'revision')
+GROUPING_IDS = ('campaign_id', 'job_id', 'task_id', 'attempt_id', 'session_id', 'action_id')
+SCOPE_FIELDS = ('repo', *GROUPING_IDS, 'contract_sha256', 'code_rev')
+LANE_FIELDS = ('lane_id', 'parent_lane_id', 'parent_event_id')
+RAW_FIELDS = frozenset('raw_prompt raw_response raw_tool_output reasoning_transcript '
+                       'transcript_blob tool_argv prompt response transcript stdout stderr '
+                       'tool_output argv raw_command_line'.split())
+LEGACY_CHAIN_KEYS = ('ts', 'task_id', 'actor', 'parent', 'kind', 'ac_id', 'result', 'why',
+                     'tokens_in', 'tokens_out', 'sha', 'prev_hash')
+RAILS_HASH_PREFIX = b'rizzstack.rails/1\n'
+SERVER_ASSIGNED_KEYS = ('event_id', 'seq', 'recorded_at', 'prev_hash', 'hash')
+STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$', re.ASCII)
+HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
+EVENT_ID_RE = re.compile(r'^.+:\d+$')
+ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,191}')
+REV_RE = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})')
+REPO_RE = re.compile(r'[A-Za-z0-9._-]+/[A-Za-z0-9._-]+')
 
 
 class RailsRefusal(Exception):
     status_code = 400
 
-    def __init__(self, message, code="refused"):
+    def __init__(self, message, code='refused'):
         super().__init__(message)
         self.code = code
 
 
 class CanonicalBytesRefusal(RailsRefusal):
     def __init__(self, message):
-        super().__init__(message, code="canonical_bytes")
+        super().__init__(message, code='canonical_bytes')
 
 
 class PayloadRefusal(RailsRefusal):
-    def __init__(self, message, code="payload"):
+    def __init__(self, message, code='payload'):
         super().__init__(message, code=code)
 
 
-def validate_canonical_value(value, where="value"):
+def validate_canonical_value(value, where='value'):
     if value is None or isinstance(value, bool):
         return
     if isinstance(value, str):
         try:
-            value.encode("utf-8")
+            value.encode('utf-8')
         except UnicodeEncodeError:
-            raise CanonicalBytesRefusal("lone surrogate string at " + where)
+            raise CanonicalBytesRefusal('lone surrogate string') from None
         return
-    if isinstance(value, int):
-        if not (-INT_LIMIT <= value <= INT_LIMIT):
-            raise CanonicalBytesRefusal("integer outside 2^53-1 at " + where)
+    if isinstance(value, int) and -INT_LIMIT <= value <= INT_LIMIT:
         return
     if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            validate_canonical_value(item, where + "." + str(index))
+        for item in value:
+            validate_canonical_value(item)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise CanonicalBytesRefusal("non-string object key at " + where)
-            validate_canonical_value(item, where + "." + key)
+                raise CanonicalBytesRefusal('non-string object key')
+            validate_canonical_value(key)
+            validate_canonical_value(item)
         return
-    raise CanonicalBytesRefusal("unsupported type %r at %s" % (type(value).__name__, where))
+    raise CanonicalBytesRefusal('unsupported canonical value')
 
 
 def canonicalize(obj):
-    validate_canonical_value(obj)
-    return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-    ).encode("ascii")
+    try:
+        validate_canonical_value(obj)
+        return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+                          allow_nan=False).encode('ascii')
+    except RecursionError:
+        raise CanonicalBytesRefusal('excessive nesting') from None
 
 
 def _pairs_without_duplicates(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise CanonicalBytesRefusal("duplicate JSON key %r" % (key,))
-        seen.add(key)
-    return dict(pairs)
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise CanonicalBytesRefusal('duplicate JSON key')
+    return obj
+
+
+def parse_text(text):
+    try:
+        return json.loads(text, object_pairs_hook=_pairs_without_duplicates)
+    except (ValueError, RecursionError):
+        raise CanonicalBytesRefusal('invalid JSON') from None
 
 
 def canonicalize_text(text):
-    try:
-        parsed = json.loads(text, object_pairs_hook=_pairs_without_duplicates)
-    except CanonicalBytesRefusal:
-        raise
-    except ValueError as exc:
-        raise CanonicalBytesRefusal("unparsable JSON: %s" % (exc,))
-    return canonicalize(parsed)
+    return canonicalize(parse_text(text))
 
 
 def validate_prev_hash(prev_hash):
-    if prev_hash == GENESIS:
-        return
-    if not isinstance(prev_hash, str) or not HEX64_RE.match(prev_hash):
-        raise RailsRefusal("prev_hash must be 'genesis' or 64 lowercase hex", code="hash")
+    if prev_hash != GENESIS and not _matches(HEX64_RE, prev_hash):
+        raise RailsRefusal("prev_hash must be 'genesis' or 64 lowercase hex", code='hash')
 
 
 def rails_hash(prev_hash, envelope):
     if not isinstance(envelope, dict):
-        raise CanonicalBytesRefusal("rails hash input must be an object")
-    if "hash" in envelope:
-        raise RailsRefusal("envelope passed to rails_hash must not already carry a hash", code="hash")
+        raise CanonicalBytesRefusal('rails hash input must be an object')
+    if 'hash' in envelope:
+        raise RailsRefusal('hash present in its own preimage', code='hash')
     validate_prev_hash(prev_hash)
-    blob = canonicalize(envelope)
-    return hashlib.sha256(RAILS_HASH_PREFIX + prev_hash.encode("ascii") + b"\n" + blob).hexdigest()
+    return hashlib.sha256(RAILS_HASH_PREFIX + prev_hash.encode('ascii') + b'\n' +
+                          canonicalize(envelope)).hexdigest()
 
 
 def legacy_hash(prev_hash, row):
-    blob = json.dumps(
-        {key: row.get(key) for key in LEGACY_CHAIN_KEYS}, sort_keys=True, default=str
-    ).encode()
+    blob = json.dumps({key: row.get(key) for key in LEGACY_CHAIN_KEYS},
+                      sort_keys=True, default=str).encode()
     return hashlib.sha256(prev_hash.encode() + blob).hexdigest()
 
 
@@ -241,262 +147,241 @@ def semantic_digest(envelope):
 
 
 def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
 
 
 def monotonic_span(start_monotonic):
-    return int(round((time.monotonic() - start_monotonic) * 1000)), "monotonic_measured"
+    return int(round((time.monotonic() - start_monotonic) * 1000)), 'monotonic_measured'
 
 
-def _require_nonempty_str(payload, key, kind):
-    value = payload.get(key)
-    if not isinstance(value, str) or not value:
-        raise PayloadRefusal("%s requires nonempty string %r" % (kind, key))
-    return value
-
-
-def _require_str_or_none(payload, key, kind):
-    value = payload.get(key)
-    if value is not None and not isinstance(value, str):
-        raise PayloadRefusal("%s field %r must be a string or null" % (kind, key))
-    return value
-
-
-def _require_evidence_ref(payload, kind):
-    value = payload.get("evidence_ref")
-    if isinstance(value, list):
-        if not value or not all(isinstance(item, str) and item for item in value):
-            raise PayloadRefusal("%s evidence_ref list must be nonempty strings" % kind)
-        return
-    _require_nonempty_str(payload, "evidence_ref", kind)
-
-
-def _check_tool(payload, kind):
-    if kind == "tool.finish" and payload.get("outcome") == "pending":
-        raise PayloadRefusal("tool.finish outcome must not be pending")
-    for key in ("call_id", "tool_name", "command_family", "summary"):
-        _require_nonempty_str(payload, key, kind)
-    if payload.get("outcome") not in OUTCOMES:
-        raise PayloadRefusal("%s outcome must be one of %s" % (kind, ", ".join(OUTCOMES)))
-    _require_evidence_ref(payload, kind)
-
-
-def _check_verification(payload, kind):
-    for key in ("ac_id", "run_id"):
-        _require_nonempty_str(payload, key, kind)
-    digest = payload.get("contract_sha256")
-    if not isinstance(digest, str) or not HEX64_RE.match(digest):
-        raise PayloadRefusal("%s contract_sha256 must be 64 lowercase hex" % kind)
-    _require_nonempty_str(payload, "code_rev", kind)
-    if payload.get("phase") not in PHASES:
-        raise PayloadRefusal("%s phase must be one of %s" % (kind, ", ".join(PHASES)))
-    verdict = payload.get("verdict")
-    if verdict not in VERDICTS:
-        raise PayloadRefusal("%s verdict must be one of %s" % (kind, ", ".join(VERDICTS)))
-    refs = payload.get("evidence_refs")
-    if not isinstance(refs, list) or not all(isinstance(item, str) and item for item in refs):
-        raise PayloadRefusal("%s evidence_refs must be a list of strings" % kind)
-    if verdict == "PASS" and not refs:
-        raise PayloadRefusal("%s PASS requires nonempty evidence_refs" % kind)
-    if verdict != "PASS":
-        _require_nonempty_str(payload, "reason", kind)
-    if verdict == "EXPECTED_RED" and not payload.get("frozen_test_intent"):
-        raise PayloadRefusal("%s EXPECTED_RED requires frozen test intent" % kind)
-
-
-def _check_review(payload, kind):
-    for key in ("review_id", "reviewer", "author", "reviewed_head", "verdict", "basis"):
-        _require_nonempty_str(payload, key, kind)
-    if not isinstance(payload.get("independent"), bool):
-        raise PayloadRefusal("%s independent must be a boolean" % kind)
-
-
-def _check_state(payload, kind, require_states=True):
-    _require_nonempty_str(payload, "operation_id", kind)
-    epoch = payload.get("fencing_epoch")
-    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
-        raise PayloadRefusal("%s fencing_epoch must be a nonnegative integer" % kind)
-    _require_nonempty_str(payload, "code", kind)
-    _require_evidence_ref(payload, kind)
-    if require_states:
-        _require_nonempty_str(payload, "from_state", kind)
-        _require_nonempty_str(payload, "to_state", kind)
-
-
-def _check_usage(payload, kind):
-    _require_nonempty_str(payload, "usage_record_id", kind)
-    _require_nonempty_str(payload, "metric_scope", kind)
-    _require_nonempty_str(payload, "provider", kind)
-    _require_nonempty_str(payload, "model", kind)
-    if payload.get("basis") not in USAGE_BASES:
-        raise PayloadRefusal("%s basis must be one of %s" % (kind, ", ".join(USAGE_BASES)))
-    for key in ("tokens_in", "tokens_out", "tokens_thinking"):
-        value = payload.get(key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            raise PayloadRefusal("%s %s must be an integer or null" % (kind, key))
-
-
-def _check_feedback(payload, kind):
-    _require_nonempty_str(payload, "target_event_id", kind)
-    rating = payload.get("rating", None)
-    if rating is not None:
-        if isinstance(rating, bool) or not isinstance(rating, int) or rating not in (-1, 0, 1):
-            raise PayloadRefusal("%s rating must be -1, 0, 1 or null" % kind)
-    note = payload.get("note")
-    if note is not None:
-        if not isinstance(note, str):
-            raise PayloadRefusal("%s note must be a string" % kind)
-        if len(note) > FEEDBACK_NOTE_MAX:
-            raise PayloadRefusal("%s note must be at most %d characters" % (kind, FEEDBACK_NOTE_MAX))
-    if payload.get("category") not in FEEDBACK_CATEGORIES:
-        raise PayloadRefusal("%s category must be one of %s" % (kind, ", ".join(FEEDBACK_CATEGORIES)))
-    _require_str_or_none(payload, "supersedes_event_id", kind)
-
-
-def _check_intervention(payload, kind):
-    for key in ("request_id", "target_event_id", "reason", "authority_ref"):
-        _require_nonempty_str(payload, key, kind)
-    if payload.get("operation") not in INTERVENTION_OPERATIONS:
-        raise PayloadRefusal("%s operation must be one of %s" % (kind, ", ".join(INTERVENTION_OPERATIONS)))
-    if payload.get("decision") not in INTERVENTION_DECISIONS:
-        raise PayloadRefusal("%s decision must be one of %s" % (kind, ", ".join(INTERVENTION_DECISIONS)))
-    _require_str_or_none(payload, "queue_action_id", kind)
-
-
-def _check_history(payload, kind):
-    old_ids = payload.get("old_event_ids")
-    if not isinstance(old_ids, list) or not old_ids or not all(
-        isinstance(item, str) and item for item in old_ids
-    ):
-        raise PayloadRefusal("%s old_event_ids must be a nonempty list of strings" % kind)
-    for key in ("replacement_lane_id", "replacement_event_id", "operation_ref"):
-        _require_nonempty_str(payload, key, kind)
-
-
-def _check_lane(payload, kind):
-    _require_nonempty_str(payload, "lane_id", kind)
-    if kind == "lane.spawn":
-        _require_nonempty_str(payload, "parent_lane_id", kind)
-        _require_nonempty_str(payload, "parent_event_id", kind)
-
-
-def _check_source(payload, kind):
-    span = payload.get("range")
-    if (
-        not isinstance(span, (list, tuple))
-        or len(span) != 2
-        or any(isinstance(item, bool) or not isinstance(item, int) for item in span)
-    ):
-        raise PayloadRefusal("%s range must be a two-integer list" % kind)
-    cursor = payload.get("cursor")
-    if cursor is not None and (isinstance(cursor, bool) or not isinstance(cursor, int)):
-        raise PayloadRefusal("%s cursor must be an integer or null" % kind)
-    _require_nonempty_str(payload, "code", kind)
-    count = payload.get("count")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        raise PayloadRefusal("%s count must be a nonnegative integer" % kind)
-    _require_nonempty_str(payload, "digest", kind)
-
-
-def _check_decision(payload, kind):
-    _require_nonempty_str(payload, "decision", kind)
-
-
-_KIND_RULES = {
-    "tool.start": lambda payload, kind: _check_tool(payload, kind),
-    "tool.finish": lambda payload, kind: _check_tool(payload, kind),
-    "verification.result": _check_verification,
-    "acceptance.result": _check_verification,
-    "review.result": _check_review,
-    "queue.transition": lambda payload, kind: _check_state(payload, kind, require_states=True),
-    "job.state": lambda payload, kind: _check_state(payload, kind, require_states=True),
-    "attempt.state": lambda payload, kind: _check_state(payload, kind, require_states=True),
-    "lease.recorded": lambda payload, kind: _check_state(payload, kind, require_states=False),
-    "usage.observed": _check_usage,
-    "feedback.recorded": _check_feedback,
-    "intervention.requested": _check_intervention,
-    "intervention.result": _check_intervention,
-    "history.superseded": _check_history,
-    "lane.open": _check_lane,
-    "lane.spawn": _check_lane,
-    "lane.close": _check_lane,
-    "source.gap": _check_source,
-    "source.checkpoint": _check_source,
-    "source.error": _check_source,
-    "decision.recorded": _check_decision,
-    "integration.result": lambda payload, kind: _require_nonempty_str(payload, "result", kind),
-    "merge.result": lambda payload, kind: _require_nonempty_str(payload, "result", kind),
+# One closed field set per kind, with shared value rules below. Optional
+# properties aren't blanket extensions to every event with the same spelling.
+_TOOL = 'call_id tool_name command_family outcome summary evidence_ref'
+_STATE = 'from_state to_state operation_id fencing_epoch code evidence_ref'
+_VERIFICATION = 'ac_id contract_sha256 code_rev run_id phase verdict evidence_refs reason'
+_INTERVENTION = 'request_id target_event_id operation queue_action_id decision reason authority_ref'
+_SOURCE = 'source_id cursor range_start range_end code count digest'
+_REQUIRED = {
+    'lane.open': 'status', 'lane.close': 'status', 'lane.spawn': 'child_lane_id',
+    'decision.recorded': 'summary', 'tool.start': _TOOL, 'tool.finish': _TOOL,
+    'attempt.state': _STATE, 'job.state': _STATE, 'queue.transition': _STATE,
+    'lease.recorded': _STATE, 'verification.result': _VERIFICATION,
+    'acceptance.result': _VERIFICATION,
+    'review.result': 'review_id reviewer author reviewed_head review_verdict independent basis',
+    'integration.result': 'status summary', 'merge.result': 'status summary',
+    'usage.observed': 'usage_record_id metric_scope input_tokens output_tokens thinking_tokens '
+                      'usage_basis provider model',
+    'feedback.recorded': 'target_event_id rating note category actor supersedes_event_id',
+    'intervention.requested': _INTERVENTION, 'intervention.result': _INTERVENTION,
+    'history.superseded': 'old_event_ids replacement_event_id replacement_lane_id operation_id',
+    'source.gap': _SOURCE, 'source.error': _SOURCE, 'source.checkpoint': _SOURCE,
 }
+KINDS = frozenset(_REQUIRED)
+_OPTIONAL = {'verification.result': ('expected_intent_ref',), 'acceptance.result': ('expected_intent_ref',),
+             'integration.result': ('reason', 'evidence_refs'), 'merge.result': ('reason', 'evidence_refs')}
+_TEXT = {'command_family': 80, 'summary': 1000, 'reason': 1000, 'basis': 200,
+         'note': FEEDBACK_NOTE_MAX, 'cursor': 1024}
+_NULLABLE = frozenset('command_family evidence_ref from_state input_tokens output_tokens '
+                      'thinking_tokens provider model supersedes_event_id queue_action_id authority_ref '
+                      'replacement_event_id replacement_lane_id cursor range_start range_end digest'.split())
+_COUNTERS = frozenset('range_start range_end count fencing_epoch input_tokens output_tokens thinking_tokens'.split())
+_ENUMS = dict(outcome=OUTCOMES, verdict=VERDICTS, phase=PHASES, operation=INTERVENTION_OPERATIONS,
+              decision=INTERVENTION_DECISIONS, category=FEEDBACK_CATEGORIES, usage_basis=USAGE_BASES,
+              review_verdict=('approve', 'approve_with_followups', 'changes_requested', 'not_run'))
 
 
-def _scan_raw_fields(value, where):
+def _matches(pattern, value):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def require_id(value, field):
+    if not _matches(ID_RE, value):
+        raise PayloadRefusal('expected bounded public ID: ' + field, code=field)
+
+
+def _scan_raw_fields(value, where='value', depth=0):
+    """Shared import/append guard; exceptions never contain source text."""
+    if depth > 16:
+        raise PayloadRefusal('record exceeds nesting limit', code='raw_ingestion')
     if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str) and key in RAW_FIELDS:
-                raise PayloadRefusal("raw ingestion field %r is refused at %s" % (key, where))
-            _scan_raw_fields(item, where + "." + str(key))
+        if any(isinstance(k, str) and k.casefold() in RAW_FIELDS for k in value):
+            raise PayloadRefusal('raw content field refused', code='raw_ingestion')
+        children = value.values()
     elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _scan_raw_fields(item, where + "." + str(index))
+        children = value
+    else:
+        return
+    for child in children:
+        _scan_raw_fields(child, where, depth + 1)
 
 
-def validate_event(
-    kind,
-    source,
-    scope,
-    payload,
-    authority,
-    lane,
-    occurred_at,
-    duration_ms,
-    timing_quality,
-    redaction_policy,
-):
-    if kind not in KINDS:
-        raise PayloadRefusal("unknown kind %r; /1 kinds are closed" % (kind,), code="kind")
+def _field_ok(key, v):
+    if v is None and key in _NULLABLE:
+        return True
+    if key in _TEXT:
+        return isinstance(v, str) and len(v) <= _TEXT[key]
+    if key in _ENUMS:
+        return isinstance(v, str) and v in _ENUMS[key]
+    if key in _COUNTERS:
+        return type(v) is int and 0 <= v <= INT_LIMIT
+    if key in ('contract_sha256', 'digest'):
+        return _matches(HEX64_RE, v)
+    if key in ('code_rev', 'reviewed_head'):
+        return _matches(REV_RE, v)
+    if key == 'independent':
+        return isinstance(v, bool)
+    if key == 'rating':
+        return v is None or type(v) is int and v in (-1, 0, 1)
+    if key in ('evidence_refs', 'old_event_ids'):
+        lo, hi = (1, 500) if key == 'old_event_ids' else (0, 100)
+        return isinstance(v, list) and lo <= len(v) <= hi and all(_matches(ID_RE, x) for x in v)
+    return _matches(ID_RE, v)
+
+
+def _validate_payload(kind, payload):
+    required = set(_REQUIRED[kind].split())
+    if not required <= payload.keys() <= required.union(_OPTIONAL.get(kind, ())):
+        raise PayloadRefusal('missing or unexpected fields for ' + kind)
+    for key, value in payload.items():
+        if not _field_ok(key, value):
+            raise PayloadRefusal('invalid ' + kind + ' field: ' + key)
+    if kind.startswith('tool.') and (kind == 'tool.start') != (payload['outcome'] == 'pending'):
+        raise PayloadRefusal('only tool.start has pending outcome')
+    if kind in ('verification.result', 'acceptance.result'):
+        verdict = payload['verdict']
+        if verdict == 'PASS' and not payload['evidence_refs'] or verdict != 'PASS' and not payload['reason']:
+            raise PayloadRefusal('verdict lacks required evidence or reason')
+        if verdict == 'EXPECTED_RED' and not payload.get('expected_intent_ref'):
+            raise PayloadRefusal('EXPECTED_RED requires frozen test intent reference')
+    if kind == 'review.result' and payload['independent'] and not payload['basis']:
+        raise PayloadRefusal('independent review requires a basis')
+
+
+def _rename(obj, old, new):
+    if old in obj:
+        if new in obj and obj[old] != obj[new]:
+            raise PayloadRefusal('conflicting legacy and canonical ' + new)
+        obj[new] = obj.pop(old)
+
+
+def _producer_payload(kind, p, source, scope, lane, authority):
+    """Compatibility at append, never a repair of an origin's signed bytes."""
+    if kind == 'decision.recorded' and 'decision' in p:
+        summary = p.pop('decision')
+        if not isinstance(summary, str):
+            raise PayloadRefusal('invalid legacy decision')
+        if 'summary' in p and p['summary'] != summary:
+            if not isinstance(p['summary'], str):
+                raise PayloadRefusal('invalid summary')
+            summary += ': ' + p['summary']
+        p['summary'] = summary
+    elif kind.startswith('lane.'):
+        for field in LANE_FIELDS:
+            if field in p:
+                if lane.get(field) is not None and lane[field] != p[field]:
+                    raise PayloadRefusal('conflicting lane topology', code='lane')
+                lane[field] = p.pop(field)
+        if kind == 'lane.spawn' and lane.get('lane_id'):
+            p.setdefault('child_lane_id', lane['lane_id'])
+        elif kind != 'lane.spawn':
+            p.setdefault('status', 'open' if kind == 'lane.open' else 'closed')
+    elif kind == 'usage.observed':
+        for old, new in (('basis', 'usage_basis'), ('tokens_in', 'input_tokens'),
+                         ('tokens_out', 'output_tokens'), ('tokens_thinking', 'thinking_tokens')):
+            _rename(p, old, new)
+            if new != 'usage_basis':
+                p.setdefault(new, None)
+    elif kind == 'history.superseded':
+        _rename(p, 'operation_ref', 'operation_id')
+    elif kind in ('acceptance.result', 'verification.result'):
+        _rename(p, 'frozen_test_intent', 'expected_intent_ref')
+        if p.get('verdict') == 'PASS' and p.get('reason') is None:
+            p['reason'] = ''
+    elif kind == 'review.result' and 'verdict' in p:
+        _rename(p, 'verdict', 'review_verdict')
+        legacy = {'PASS': 'approve', 'FAIL': 'changes_requested', 'NOT_RUN': 'not_run', 'UNVERIFIED': 'not_run'}
+        if isinstance(p['review_verdict'], str):
+            p['review_verdict'] = legacy.get(p['review_verdict'], p['review_verdict'])
+    elif kind in ('merge.result', 'integration.result'):
+        _rename(p, 'result', 'status')
+        p.setdefault('summary', p.get('status'))
+        # Old wave drafts repeated these already-bound scope IDs in the payload.
+        for key, bound in [('wave_id', 'task_id'), ('head_sha', 'code_rev')]:
+            if key in p and p[key] == scope.get(bound):
+                del p[key]
+    elif kind.startswith('source.') and 'range' in p:
+        span = p.pop('range')
+        if not isinstance(span, (list, tuple)) or len(span) != 2 or 'range_start' in p or 'range_end' in p:
+            raise PayloadRefusal('invalid legacy source range')
+        p['range_start'], p['range_end'] = span
+        if type(p.get('cursor')) is int:
+            p['cursor'] = str(p['cursor'])
+        p.setdefault('source_id', source['adapter'])
+    elif kind == 'feedback.recorded':
+        p.setdefault('actor', authority)
+        p.setdefault('rating', None)
+        p.setdefault('supersedes_event_id', None)
+        if p.get('note') is None:
+            p['note'] = ''
+    if isinstance(p.get('evidence_ref'), list) and len(p['evidence_ref']) == 1:
+        p['evidence_ref'] = p['evidence_ref'][0]
+
+
+def event_body(kind, source, scope, payload, authority, lane, occurred_at, duration_ms,
+               timing_quality, redaction_policy):
+    if not isinstance(kind, str) or kind not in KINDS:
+        raise PayloadRefusal('unknown /1 kind', code='kind')
     if authority not in AUTHORITIES:
-        raise PayloadRefusal("authority %r is not on the trust roster" % (authority,), code="authority")
-    if not isinstance(source, dict) or set(source) - set(SOURCE_FIELDS) or set(source) != set(SOURCE_FIELDS):
-        raise PayloadRefusal("source must carry exactly %s" % (", ".join(SOURCE_FIELDS)), code="source")
-    for key in SOURCE_FIELDS:
-        value = source.get(key)
-        if not isinstance(value, str) or not value:
-            raise PayloadRefusal("source.%s must be a nonempty string" % key, code="source")
-    if not isinstance(scope, dict) or set(scope) - set(SCOPE_FIELDS):
-        raise PayloadRefusal("scope keys must be a subset of %s" % (", ".join(SCOPE_FIELDS)), code="scope")
-    for key in scope:
-        value = scope[key]
-        if value is not None and not isinstance(value, str):
-            raise PayloadRefusal("scope.%s must be a string or null" % key, code="scope")
-    if not any(scope.get(key) for key in GROUPING_IDS):
-        raise PayloadRefusal("scope needs at least one grouping id", code="scope")
-    if lane is None:
-        lane = {}
-    if not isinstance(lane, dict) or set(lane) - set(LANE_FIELDS):
-        raise PayloadRefusal("lane keys must be a subset of %s" % (", ".join(LANE_FIELDS)), code="lane")
-    for key in lane:
-        value = lane[key]
-        if value is not None and not isinstance(value, str):
-            raise PayloadRefusal("lane.%s must be a string or null" % key, code="lane")
-    if occurred_at is not None:
-        if not isinstance(occurred_at, str) or not STAMP_RE.match(occurred_at):
-            raise PayloadRefusal("occurred_at must be null or YYYY-MM-DDTHH:MM:SS.ffffffZ", code="timestamp")
-    if duration_ms is not None:
-        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
-            raise PayloadRefusal("duration_ms must be a nonnegative integer or null", code="duration")
-    if timing_quality not in TIMING_QUALITY:
-        raise PayloadRefusal("timing_quality must be one of %s" % ", ".join(TIMING_QUALITY), code="timing")
-    if redaction_policy is None:
-        redaction_policy = {}
-    if not isinstance(redaction_policy, dict) or set(redaction_policy) - set(REDACTION_FIELDS):
-        raise PayloadRefusal(
-            "redaction_policy keys must be a subset of %s" % ", ".join(REDACTION_FIELDS), code="redaction"
-        )
-    if "mode" in redaction_policy and redaction_policy["mode"] not in REDACTION_MODES:
-        raise PayloadRefusal("redaction_policy mode must be one of %s" % ", ".join(REDACTION_MODES), code="redaction")
+        raise PayloadRefusal('unknown producer authority', code='authority')
+    if not isinstance(source, dict) or set(source) != set(SOURCE_FIELDS):
+        raise PayloadRefusal('invalid source fields', code='source')
+    for field in SOURCE_FIELDS:
+        require_id(source[field], 'source.' + field)
+    if not isinstance(scope, dict):
+        raise PayloadRefusal('invalid scope', code='scope')
+    scope = dict(scope)
+    _rename(scope, 'repo_slug', 'repo')
+    if set(scope).difference(SCOPE_FIELDS) or not any(scope.get(k) for k in GROUPING_IDS):
+        raise PayloadRefusal('invalid scope fields or no grouping ID', code='scope')
+    scope = {k: scope.get(k) for k in SCOPE_FIELDS}
+    for k, v in scope.items():
+        if v is not None and not _matches({'repo': REPO_RE, 'code_rev': REV_RE,
+                                          'contract_sha256': HEX64_RE}.get(k, ID_RE), v):
+            raise PayloadRefusal('invalid scope.' + k, code='scope')
+    if lane is not None and (not isinstance(lane, dict) or set(lane).difference(LANE_FIELDS)):
+        raise PayloadRefusal('invalid lane fields', code='lane')
+    lane = {k: (lane or {}).get(k) for k in LANE_FIELDS}
     if not isinstance(payload, dict):
-        raise PayloadRefusal("payload must be an object", code="payload")
-    _scan_raw_fields(payload, "payload")
-    rule = _KIND_RULES.get(kind)
-    if rule is not None:
-        rule(payload, kind)
+        raise PayloadRefusal('payload must be an object')
+    p = dict(payload)
+    _producer_payload(kind, p, source, scope, lane, authority)
+    _validate_payload(kind, p)
+    if lane['lane_id'] is None:
+        # No explicit topology: stable lane per producer and grouping. Hash
+        # public IDs only; never infer a parent, or pair unrelated tool calls.
+        identity = [source['adapter'], source['instance'], scope]
+        lane['lane_id'] = 'lane:' + hashlib.sha256(canonicalize(identity)).hexdigest()
+    for k, v in lane.items():
+        if v is not None:
+            require_id(v, k)
+    if occurred_at is not None and not _matches(STAMP_RE, occurred_at):
+        raise PayloadRefusal('invalid occurred_at', code='timestamp')
+    if duration_ms is not None and (type(duration_ms) is not int or not 0 <= duration_ms <= INT_LIMIT):
+        raise PayloadRefusal('invalid duration', code='duration')
+    if timing_quality == 'monotonic_measured':
+        timing_quality = 'measured'
+    elif timing_quality == 'reported':
+        timing_quality = 'estimated'
+    if timing_quality not in TIMING_QUALITY:
+        raise PayloadRefusal('invalid timing_quality', code='timing')
+    if redaction_policy not in (None, POLICY, OLD_POLICY, {'mode': 'structured_safe'}, {}):
+        raise PayloadRefusal('unsupported redaction_policy', code='redaction')
+    return dict(schema=SCHEMA, kind=kind, source=source, scope=scope, authority=authority,
+                payload=p, occurred_at=occurred_at, duration_ms=duration_ms,
+                timing_quality=timing_quality, redaction_policy=POLICY, **lane)
+
+
+def validate_event(kind, source, scope, payload, authority, lane, occurred_at,
+                   duration_ms, timing_quality, redaction_policy):
+    event_body(kind, source, scope, payload, authority, lane, occurred_at,
+               duration_ms, timing_quality, redaction_policy)

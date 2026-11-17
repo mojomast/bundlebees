@@ -296,6 +296,33 @@ class ProcessControl:
             )
         assert caught.value.code == "driver_identity_mismatch"
 
+    def test_parent_argv_during_exec_does_not_identify_the_child(self, tmp_path, monkeypatch):
+        # Some procfs implementations briefly expose the inherited cmdline after
+        # Popen returns. Only an exact later read of the child's argv suffices.
+        actual = th._proc_cmdline
+        parent_pid = os.getpid()
+        inherited = actual(parent_pid)
+        assert inherited
+        child_reads = []
+
+        def during_exec(pid):
+            if pid != parent_pid:
+                child_reads.append(pid)
+                if len(child_reads) == 1:
+                    return inherited
+            return actual(pid)
+
+        monkeypatch.setattr(th, '_proc_cmdline', during_exec)
+        record = th.start_driver(('/bin/sleep', '10'), run=1, cwd=tmp_path, env={},
+                                 log_path=tmp_path/'log', clock=th.SystemClock(), validate_argv=False)
+        try:
+            assert record.identity_verified
+            assert len(child_reads) >= 2 and set(child_reads) == {record.pid}
+        finally:
+            record.proc.kill()
+            record.proc.wait(timeout=2)
+            record.close_log()
+
     def test_cleanup_cannot_outlive_the_deadline_and_escalates_to_sigkill(self, tmp_path):
         pid_file = tmp_path / "pid"
         script = write_script(tmp_path, "stubborn.py", CHILD_IGNORES_SIGTERM)

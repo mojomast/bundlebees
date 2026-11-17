@@ -723,6 +723,7 @@ _ENVELOPE_KEYS = {
     "datacontenttype",
     "subject",
     "dataschema",
+    "rizzstackusage",
     "data",
 }
 _DATA_KEYS = {
@@ -741,6 +742,63 @@ _DATA_KEYS = {
     "causation_id",
 }
 _DATA_REQUIRED = _DATA_KEYS - {"correlation_id", "causation_id"}
+
+# Hyvv's wire names, not the legacy aliases accepted in its input receipts.
+_USAGE_TOKENS = {"input", "output", "cache_read", "cache_write", "reasoning", "thinking", "total"}
+_USAGE_COUNTS = _USAGE_TOKENS | {"tool_calls"}
+_USAGE_KEYS = _USAGE_COUNTS | {"model", "route", "stop_reason"}
+_USAGE_ROUTES = {"zoo", "go", "deepseek", "free", "agy"}
+# A dot introduces a version number; a colon introduces a routed model name.
+# Neither separator permits a general hostname, endpoint or path.
+_USAGE_MODEL_RE = re.compile(
+    r"(?:(?:zoo|go|deepseek):(?=[A-Za-z]))?[A-Za-z0-9][A-Za-z0-9_+-]*(?:\.[0-9][A-Za-z0-9_+-]*)*"
+)
+# Code-like reasons (including provider-specific ones) and Hyvv's plain
+# "turn ended" reason. Do not turn the receipt's stop reason into a log field.
+_USAGE_REASON_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*|turn ended")
+# Hyvv also redacts long opaque identifiers and credential families beyond
+# the shared scrubber's rules. Never retain a redaction marker in the event.
+_USAGE_SECRET_RE = re.compile(
+    r"[A-Za-z0-9_-]{32,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{8,}"
+    r"|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+
+
+def _validated_usage(value: Any) -> dict[str, Any]:
+    """Validate, never normalize, the optional flat Hyvv envelope attribute."""
+
+    if not isinstance(value, Mapping):
+        raise EventError("event_invalid", "rizzstackusage must be an object", _FIX_EVENT)
+    usage = dict(value)
+    if usage.keys() - _USAGE_KEYS:
+        # Unknown keys can themselves be private text. Don't quote them.
+        raise EventError("event_invalid", "rizzstackusage has an unexpected field", _FIX_EVENT)
+    if not _USAGE_TOKENS.intersection(usage):
+        raise EventError("event_invalid", "rizzstackusage needs a token count", _FIX_EVENT)
+    for key in _USAGE_COUNTS.intersection(usage):
+        count = usage[key]
+        if type(count) is not int or not 0 <= count < 1_000_000_000:
+            raise EventError("event_invalid", f"rizzstackusage.{key} is not a bounded integer", _FIX_EVENT)
+
+    if "route" in usage:
+        route = usage["route"]
+        if not isinstance(route, str) or route not in _USAGE_ROUTES or "model" not in usage:
+            raise EventError("event_invalid", "rizzstackusage.route requires a model and a known route", _FIX_EVENT)
+    for key, limit, pattern in (("model", 128, _USAGE_MODEL_RE), ("stop_reason", 64, _USAGE_REASON_RE)):
+        if key not in usage:
+            continue
+        text = usage[key]
+        field = f"rizzstackusage.{key}"
+        if not isinstance(text, str) or not 0 < len(text) <= limit:
+            raise EventError("event_invalid", f"{field} must be bounded text", _FIX_EVENT)
+        if looks_like_secret(text) or _USAGE_SECRET_RE.search(text):
+            raise EventError("event_secret", f"{field} looks like a credential", _FIX_EVENT)
+        if scrub(text) != text:
+            raise EventError("event_private", f"{field} contains private text", _FIX_EVENT)
+        if not pattern.fullmatch(text) or text.rpartition(":")[2].lower() == "localhost":
+            raise EventError("event_invalid", f"{field} is not a safe label", _FIX_EVENT)
+    return usage
 
 
 def _reject_extra(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
@@ -774,6 +832,8 @@ def _validate_event_local(event: Any) -> dict[str, Any]:
     if value.get("datacontenttype") not in (None, "application/json"):
         raise EventError("event_invalid", "datacontenttype must be application/json", _FIX_EVENT)
     _validate_event_time(value.get("time"))
+    if "rizzstackusage" in value:
+        value["rizzstackusage"] = _validated_usage(value["rizzstackusage"])
 
     data = value.get("data")
     if not isinstance(data, Mapping):

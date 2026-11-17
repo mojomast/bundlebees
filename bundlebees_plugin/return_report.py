@@ -476,11 +476,10 @@ def _waves(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
         problems = record.get("problems") or {}
         if isinstance(problems, Mapping) and problems:
             raise ReturnError("wave_mismatch", f"wave record {wave_id} is accepted but records problems: {dict(problems)}")
-        suite = record.get("suite")
-        if isinstance(suite, Mapping) and suite.get("exit_code") not in (0, None):
+        if not revision.suite_passed(record.get("suite")):
             raise ReturnError(
                 "wave_mismatch",
-                f"wave record {wave_id} is accepted but its suite exited {suite.get('exit_code')}",
+                f"wave record {wave_id} is accepted but has no successful, unblocked suite result",
             )
         accepted.append(
             {
@@ -1201,9 +1200,11 @@ def _supersession_view(
 # ---------------------------------------------------------------------------
 
 
-def _manifest(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict[str, Any]:
+def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rails_anchors=None):
     state = Path(state_dir)
-    job = jobs.load_job(state, job_id)
+    if rails_anchors is None and (return_dir(state, job_id) / 'rails-evidence.json').exists():
+        raise ReturnError('rails_evidence_refused', 'This packet has a Rails attachment. Supply its independent anchors.')
+    job = jobs.load_job(state, job_id, recover=False)
     jid = str(job.get("job_id") or "")
     goal = job.get("goal") or {}
     authorization = jobs.load_authorization(state, jid)
@@ -1414,10 +1415,22 @@ def _manifest(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict
                 "a task is rejected and its recovery request has no validated decision yet; "
                 "no corrective attempt is dispatched until one is recorded"
             )
-    manifest["evidence_digest"] = evidence_digest(manifest)
-
     _refuse_uncovered(job, waves, criteria, task_rows)
-    return manifest
+    attachment = None
+    if rails_anchors is not None:
+        from . import rails_return
+
+        doc, ac_ids = rails_return.collect(state, manifest, task_rows, anchors=rails_anchors, database=rails_db)
+        attachment = document_bytes(doc)
+        rails_return.require(len(attachment) <= rails_return.MAX_FILE, 'Rails attachment exceeds file budget.')
+        # Use the existing evidence column. The fragment commits the exact
+        # companion bytes under the native RETURN digest, without a new field.
+        ref = f'{jobs.JOBS_DIR}/{jid}/{rails_return.FILE}#sha256={hashlib.sha256(attachment).hexdigest()}'
+        for row in manifest['acceptance']:
+            if row['id'] in ac_ids:
+                row['evidence'].append(ref)
+    manifest['evidence_digest'] = evidence_digest(manifest)
+    return manifest, attachment
 
 
 def _refuse_uncovered(
@@ -1654,20 +1667,23 @@ def pending_gate_approvals(
     return sorted(dict.fromkeys(pending))
 
 
-def build(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict[str, Any]:
+def build(state_dir: Path, job_id: str, *, repo: Path | None = None, rails_db=None, rails_anchors=None) -> dict[str, Any]:
     """Validate every relationship, then write ``return.json`` and ``RETURN.md``.
 
     Refuses with a named code instead of writing a plausible-looking report.
     Repeated calls on the same durable snapshot write byte-identical files.
     """
 
-    manifest = _manifest(Path(state_dir), job_id, repo=repo)
-    _atomic_write(return_path(Path(state_dir), job_id), document_bytes(manifest))
+    manifest, attachment = _packet_files(state_dir, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
+    if attachment is not None:
+        from . import rails_return
+        _atomic_write(return_dir(state_dir, job_id) / rails_return.FILE, attachment)
     _atomic_write(render_path(Path(state_dir), job_id), render(manifest).encode("utf-8"))
+    _atomic_write(return_path(Path(state_dir), job_id), document_bytes(manifest))
     return manifest
 
 
-def verify(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict[str, Any]:
+def verify(state_dir: Path, job_id: str, *, repo: Path | None = None, rails_db=None, rails_anchors=None) -> dict[str, Any]:
     """Rebuild from durable state and compare against the on-disk report.
 
     Three independent comparisons: the recorded digest against the digest of the
@@ -1693,7 +1709,11 @@ def verify(state_dir: Path, job_id: str, *, repo: Path | None = None) -> dict[st
             f"body ({body_digest[:12]}); the report was edited after it was written",
         )
 
-    fresh = _manifest(state, job_id, repo=repo)
+    fresh, attachment = _packet_files(state, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
+    if attachment is not None:
+        from . import rails_return
+        if rails_return.read_file(return_dir(state, job_id) / rails_return.FILE) != attachment:
+            raise ReturnError('report_tampered', 'Rails attachment bytes differ from the independently verified snapshot.')
     if not hmac.compare_digest(str(fresh["evidence_digest"]), recorded):
         raise ReturnError(
             "report_tampered",
