@@ -113,7 +113,7 @@ def _patch_new(path: str, body: str) -> str:
 
 
 def _frozen(source_rev: str, *, contract_id: str, statement: str, assigned: str,
-            test_file: str, test_first: bool = False) -> tuple[dict, str]:
+            test_file: str, test_first: bool = False, test_id=None) -> tuple[dict, str]:
     body = {
         "contract_version": "acdd/1",
         "id": contract_id,
@@ -122,7 +122,7 @@ def _frozen(source_rev: str, *, contract_id: str, statement: str, assigned: str,
         "source_rev": source_rev,
         "scope": {"assigned_files": [assigned], "test_files": [test_file]},
         "acceptance_criteria": [
-            {"id": "AC-001", "statement": statement, "tests": [test_file], "verification": "test"}
+            {"id": "AC-001", "statement": statement, "tests": [test_id or test_file], "verification": "test"}
         ],
         "tdd": {"applicable": True, "test_first": test_first,
                 "reason": "the approved test exists and fails at the baseline"},
@@ -144,7 +144,7 @@ def _exact_packet(*, job_id: str, feature_id: str, source_rev: str, frozen: dict
     packet["source_policy"]["revision"] = source_rev
     packet["contract"] = frozen
     packet["contract_sha256"] = contract_sha
-    packet["scope"] = {"lease": [lease], "read_only": [test_file]}
+    packet["scope"] = {"lease": [lease], "read_only": [test_file.split('::')[0]]}
     packet["tests"] = [test_file]
     packet["acceptance_ids"] = ["AC-001"]
     packet["budget"] = {"bees": 1, "wall_clock_s": 1800}
@@ -167,6 +167,29 @@ def _make_repo(base: Path) -> tuple[Path, str]:
     return repo, _git(["rev-parse", "HEAD"], repo)
 
 
+def _case_receipt_fixture(state, repo, attempt, selector):
+    """Supply actual JUnit cases to the test-only detailed suite receipt.
+
+    verify_local's historical on-disk format is aggregate-only. Don't infer
+    these cases from the selector or fake a signed GREEN: execute the selected
+    test in this fixture's verified candidate worktree and preserve its result.
+    """
+    path = verify_local.record_path(state, attempt)
+    rec = json.loads(path.read_bytes())
+    case_tree = state.parent / ('cases-' + attempt)
+    junit = state.parent / (attempt + '-junit.xml')
+    _git(['worktree', 'add', '--detach', str(case_tree), rec['sha']], repo)
+    try:
+        subprocess.run([*SUITE, selector, f'--junitxml={junit}'], cwd=case_tree, check=True,
+                       capture_output=True, timeout=60)
+        cases = tdd.parse_junit_cases(junit)
+        assert [(c['id'], c['outcome']) for c in cases] == [(selector, 'passed')]
+        rec['suite']['cases'] = cases
+        path.write_text(json.dumps(rec))
+    finally:
+        _git(['worktree', 'remove', '--force', str(case_tree)], repo)
+
+
 def _build_exact(base: Path, *, runner=None) -> dict:
     """A packet-native exact job whose verification and wave records are real."""
 
@@ -174,11 +197,12 @@ def _build_exact(base: Path, *, runner=None) -> dict:
     state = base / "state"
     state.mkdir()
     repo, root = _make_repo(base)
+    selector = 'tests/test_smoke.py::test_answer_is_42'
     frozen, contract_sha = _frozen(root, contract_id="SMOKE-A", statement="answer() returns 42",
-                                   assigned="smoke/answer.py", test_file="tests/test_smoke.py")
+                                   assigned="smoke/answer.py", test_file="tests/test_smoke.py", test_id=selector)
     packet = _exact_packet(job_id="job_a", feature_id="feature-a", source_rev=root, frozen=frozen,
                            contract_sha=contract_sha, lease="smoke/answer.py",
-                           test_file="tests/test_smoke.py")
+                           test_file=selector)
     jobs.record_authorization(state, job_id="job_a", statement="Feature A: answer() returns 42", repo=REPO,
                               base_rev=root, scope=["smoke/answer.py"], bees=1, wall_clock_s=1800,
                               require_tty=False, interactive=False, by="reviewer")
@@ -197,6 +221,7 @@ def _build_exact(base: Path, *, runner=None) -> dict:
         declared_files=["smoke/answer.py"], base_rev=root, tests=["tests/test_smoke.py"],
         suite_command=SUITE, gitleaks=GITLEAKS, runner=runner,
     )
+    _case_receipt_fixture(state, repo, 'att_1', selector)
     job = jobs.load_job(state, "job_a")
     job["tasks"][0].update(state="verified", attempts=["att_1"])
     jobs.save_job(state, job)
@@ -264,6 +289,9 @@ def _build_descendant(base: Path) -> dict:
     packet["repository"]["identity"] = REPO
     packet["source_policy"].update(root_revision=root, policy_id="policy-b", dependencies=["feature-a"])
     packet["contract_template"]["source_rev"] = root
+    selector = 'tests/test_double.py::test_double_is_84'
+    packet['contract_template']['acceptance_criteria'][0]['tests'] = [selector]
+    packet['tests'] = [selector]
     packet["budget"] = {"bees": 1, "wall_clock_s": 1800}
 
     handoff.create_approval_key(state)
@@ -289,6 +317,7 @@ def _build_descendant(base: Path) -> dict:
         declared_files=list(task["contract"]["scope"]["assigned_files"]), base_rev=accepted,
         tests=["tests/test_double.py"], suite_command=SUITE, gitleaks=GITLEAKS,
     )
+    _case_receipt_fixture(state, repo, 'att_b', selector)
     job_b = jobs.load_job(state, "job_b")
     job_b["tasks"][0].update(state="verified", attempts=["att_b"])
     jobs.save_job(state, job_b)
@@ -398,7 +427,7 @@ class TestExactManifest:
         assert [item["id"] for item in manifest["acceptance"]] == ["AC-001"]
         criterion = manifest["acceptance"][0]
         assert criterion["status"] == "PASS"
-        assert criterion["tests"] == ["tests/test_smoke.py"]
+        assert criterion["tests"] == ["tests/test_smoke.py::test_answer_is_42"]
         assert criterion["evidence"] == ["verify-results/att_1.json"]
 
         assert manifest["red_green"] == {"test_first": False, "red": None, "green": None}

@@ -348,7 +348,7 @@ def _bound(event, cfg, task, state, manifest, lease_cache, *, native=False):
     )
 
 
-def _native_ref(e, ac, manifest, state):
+def _native_ref(e, ac, manifest, state, task):
     """R05 uses opaque references to actual durable records, not event IDs."""
     if e["source"]["adapter"] != "bundlebees" or e["kind"] != "verification.result":
         return None
@@ -371,7 +371,9 @@ def _native_ref(e, ac, manifest, state):
             'Native verification link conflicts with its source bytes, phase or criterion.')
     if phase == 'red':
         record = wire.parse_text(raw)
-        require(record['criteria'].get(ac) == 'failed'
+        criterion = next(c for c in task['contract']['acceptance_criteria'] if c['id'] == ac)
+        require(criterion['verification'] == 'test' and criterion.get('regression') is not True
+                and record['criteria'].get(ac) == 'failed'
                 and payload.get('expected_intent_ref') == _alias('intent', record['test_fingerprints']),
                 'EXPECTED_RED does not resolve to the frozen test intent and failing criterion.')
     return rid
@@ -406,7 +408,7 @@ def _document(cfg, task, heads, rows, checks, stamp, manifest, state):
     for ac, ids in sorted(cfg["evidence"].items()):
         for eid in ids:
             e = by_id[eid]
-            native = _native_ref(e, ac, manifest, state) if e["chain_id"] == local else None
+            native = _native_ref(e, ac, manifest, state, task) if e["chain_id"] == local else None
             _bound(e, cfg, task, state, manifest, cache, native=native is not None)
             if e["kind"] in ("verification.result", "acceptance.result"):
                 p = e["payload"]

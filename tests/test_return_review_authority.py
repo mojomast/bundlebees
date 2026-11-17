@@ -11,7 +11,7 @@ def test_native_return_separates_test_coverage_from_recorded_review(tmp_path, ro
     base, candidate = 'a' * 40, 'b' * 40
     test_file = 'tests/test_tool.py'
     draft, _ = _frozen(base, contract_id='TOOLS', statement='Tool returns 42', assigned='tools/tool.py',
-                       test_file=test_file)
+                       test_file=test_file, test_id=test_file + '::test_answer')
     del draft['review']
     draft['acceptance_criteria'].append(dict(id='AC-002', statement='Review the tool change', verification='review'))
     draft['evidence_required'].append('review')
@@ -20,7 +20,8 @@ def test_native_return_separates_test_coverage_from_recorded_review(tmp_path, ro
     tasks = return_report._tasks(tmp_path, {'tasks': [dict(task_id='T1', contract=frozen, contract_sha256=digest,
                                                            attempts=['att_fixture'], state='verified')]})
     record = dict(attempt_id='att_fixture', sha=candidate, ok=True, tests=[test_file],
-                  suite={'exit_code': 0}, gitleaks={'exit_code': 0})
+                  suite={'exit_code': 0, 'cases': [dict(id=test_file + '::test_answer', outcome='passed')]},
+                  gitleaks={'exit_code': 0})
     review = tdd.make_record(frozen, digest, phase='review', revision=candidate, test_fingerprints={},
                              command=['review'], result=None, produced_by={'role': role, 'name': 'fixture label'},
                              test_first=False, notes='Coordinator recorded the review outcome.', review_outcome='passed',

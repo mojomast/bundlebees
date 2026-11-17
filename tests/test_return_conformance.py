@@ -60,6 +60,24 @@ def test_exact_native_bytes_validate_and_replay(campaign, tmp_path):
     assert return_report.verify(state, 'job_a', repo=campaign['repo'])['ok']
 
 
+def test_wave_inputs_bind_the_verified_commit_and_tested_tree(campaign, tmp_path):
+    from bundlebees_plugin import job as jobs
+
+    state = _copy_state(campaign, tmp_path)
+    job = jobs.load_job(state, 'job_a', recover=False)
+    wave, = return_report._waves(state, job, prove_inputs_at=campaign['repo'])
+    assert wave['verified_inputs'] == {'att_1': campaign['verified']}
+    # Still a real commit and the right attempt, but not the candidate that
+    # earned this particular sealed integration handoff.
+    path = state / 'wave-identities/job_a.w1.json'
+    receipt = json.loads(path.read_bytes())
+    receipt['identity']['attempts'][0]['sha'] = campaign['root']
+    path.write_text(json.dumps(receipt))
+    with pytest.raises(return_report.ReturnError) as caught:
+        return_report._waves(state, job, prove_inputs_at=campaign['repo'])
+    assert caught.value.code == 'wave_mismatch'
+
+
 @pytest.mark.parametrize('change', ['unrun_scan', 'timeout', 'blocking', 'bool_exit', 'wrong_base', 'resumed', 'wrong_candidate'])
 def test_native_incomplete_or_contradictory_evidence_cannot_publish(campaign, tmp_path, change):
     state = _copy_state(campaign, tmp_path)

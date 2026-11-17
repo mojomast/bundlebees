@@ -5,7 +5,9 @@ import json
 
 from bundlebees_plugin import return_report as report
 from bundlebees_plugin import rails_return
+from bundlebees_plugin import contract as contracts, leases, tdd
 from bundlebees_plugin.rails_bundlebees_source import _alias
+from tests.test_return_report import _frozen
 
 
 @pytest.mark.parametrize('cases,expected', [
@@ -62,3 +64,25 @@ def test_integrated_ac_requires_winning_attempt_and_candidate(tmp_path, winning,
     status, *_ = report._classify(row, task=task, record={'attempt_id': 'att_new', 'sha': 'b'*40},
                                   record_problem='', signed={}, waves=[wave], state_dir=tmp_path)
     assert status == expected
+
+
+@pytest.mark.parametrize('n,expected', [(1, False), (2, True)])
+def test_signed_green_requires_every_frozen_parameter_member(tmp_path, n, expected):
+    file, test = 'tests/test_tool.py', 'tests/test_tool.py::test_score'
+    ids = [test + '[empty]', test + '[full]']
+    base, candidate = 'a'*40, 'b'*40
+    frozen, digest = _frozen(base, contract_id='SCORE', statement='Score each input', assigned='tool.py',
+                             test_file=file, test_id=test)
+    key = leases.evidence_key(tmp_path)
+    fingerprints = {file: 'f'*64}
+    _, collection = tdd.write_collection(tmp_path, dict(collection_version=tdd.COLLECTION_VERSION,
+        contract_id='SCORE', contract_sha256=digest, source_rev=base, collected_ids=ids,
+        test_fingerprints=fingerprints, resolved={'AC-001': {test: ids}}), key)
+    frozen = contracts.freeze_contract(frozen, approved_by='fixture', approved_at='2026-11-17T00:00:00Z',
+        test_collection=dict(manifest_sha256=collection, collected=len(ids), source_rev=base))
+    green = tdd.make_record(frozen, digest, phase='green', revision=candidate, test_first=False,
+        command=['pytest', test], test_fingerprints=fingerprints, produced_by={'role':'verifier', 'name':'test fixture'},
+        result=dict(exit_code=0, tests=n, cases=[dict(id=i, outcome='passed') for i in ids[:n]]))
+    tdd.write_record(tmp_path, green, key)
+    evidence = report._signed_evidence(tmp_path, frozen, digest, candidate)
+    assert bool(evidence['criteria'].get('AC-001') == 'passed') is expected

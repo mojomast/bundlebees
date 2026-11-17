@@ -18,9 +18,10 @@ before a byte is written:
 Acceptance criteria are classified strictly, from evidence rather than state:
 
 ``PASS``
-    A verification record whose ``suite.exit_code`` is ``0`` and whose tests
-    cover the criterion's tests, or a signed ``tdd-evidence/1`` GREEN record
-    that validates and marks the criterion passed. A task or job state of
+    Passing case outcomes for the frozen selection, recorded by the local
+    verifier or an authenticated ``tdd-evidence/1`` GREEN at the candidate.
+    Selector strings and a successful aggregate exit do not prove which
+    cases ran. A task or job state of
     ``accepted`` is never evidence by itself.
 ``FAIL``
     A recorded, executed check failed: the verification record is not ``ok``,
@@ -295,6 +296,27 @@ def _one_covers(ran: str, wanted: str) -> bool:
     return wanted.startswith((ran + "::", ran + "["))
 
 
+def _passed_cases(selectors, cases, collected=None):
+    """Require every frozen member; without a collection only literal node IDs count."""
+    if not selectors or not isinstance(cases, list):
+        return False
+    results = {}
+    for case in cases:
+        if not isinstance(case, dict) or not isinstance(case.get('id'), str) or case['id'] in results:
+            return False
+        results[case['id']] = case.get('outcome')
+    for selector in selectors:
+        if collected is None:
+            if '::' not in selector:
+                return False
+            members = [selector]
+        else:
+            members = [node for node in collected if _one_covers(selector, node)]
+        if not members or any(results.get(node) != 'passed' for node in members):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Evidence collection
 # ---------------------------------------------------------------------------
@@ -456,7 +478,34 @@ def _resolution(state_dir: Path, job: Mapping[str, Any], packet: Mapping[str, An
     }
 
 
-def _waves(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _wave_inputs(state, logical, selected, record, repo, job_id):
+    """Read the sealed integration result, not today's branch or an attempt label."""
+    from . import integrate_job as ij
+
+    try:
+        envelope = ij._read_evidence(state / 'job-wave-proofs' / f'{selected}.json', selected)
+        if envelope is None or repo is None:
+            return {}
+        proof = jobs.open_sealed(envelope, leases._load_key(state), 'integration proof')
+        request = proof['request']
+        if (proof['kind'] != 'job-integration-proof/1' or request['kind'] != 'job-integration-request/1'
+                or request['wave'] != logical or request['selected'] != selected):
+            raise ReturnError('wave_mismatch', 'Integration proof does not name the selected wave.')
+        stored = ij._read_evidence(ij._wave_identity_path(state, selected), selected)
+        identity = (stored or {})['identity']
+        if (identity['job_id'] != job_id or identity['wave'] != logical or proof['binding'] != stored['binding_sha256']
+                or request['identity_digest'] != stored['identity_digest']):
+            raise ReturnError('wave_mismatch', 'Wave inputs differ from the sealed integration proof.')
+        pair = ij._wave_pair(state, repo, selected, identity)
+        if not pair or pair != (record, stored):
+            raise ReturnError('wave_mismatch', 'Integrated tree or tested inputs no longer match the wave.')
+        return {item['attempt_id']: item['sha'] for item in identity['attempts']}
+    except (OSError, TypeError, KeyError, leases.LeaseError, jobs.JobError, ij.IntegrateError,
+            verify_local.VerifyError) as exc:
+        raise ReturnError('wave_mismatch', 'Cannot verify the recorded integration inputs and tested head.') from exc
+
+
+def _waves(state_dir: Path, job: Mapping[str, Any], *, prove_inputs_at=None) -> list[dict[str, Any]]:
     """Match every accepted wave the job names against its durable wave record."""
 
     state = Path(state_dir)
@@ -466,7 +515,14 @@ def _waves(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
     accepted: list[dict[str, Any]] = []
     for entry in entries:
         wave = _wave_number(entry.get("wave"))
-        wave_id = revision.wave_id_for(job_id, wave)
+        logical = revision.wave_id_for(job_id, wave)
+        wave_id = entry.get('wave_id') or logical
+        if wave_id != logical:
+            from . import integrate_job as ij
+            digest = entry.get('request_identity_digest')
+            if (not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)
+                    or wave_id != ij._derived_wave_id(logical, digest)):
+                raise ReturnError('wave_mismatch', 'Selected wave does not match the recorded request identity.')
         try:
             record = revision.read_wave(state, wave_id)
         except revision.RevisionError as exc:
@@ -511,6 +567,8 @@ def _waves(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "wave_id": wave_id,
                 "head": head,
                 "attempts": attempts,
+                "verified_inputs": _wave_inputs(state, logical, wave_id, record, prove_inputs_at, job_id)
+                                   if prove_inputs_at is not None else {},
                 "record": record,
                 "digest": hashlib.sha256(canonical_bytes(record)).hexdigest(),
                 "entry": dict(entry),
@@ -630,6 +688,9 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
     contract_id = str(contract.get("id") or "")
     if not contract_id:
         return out
+    pin = (contract.get('review') or {}).get('test_collection')
+    if pin is not None:
+        out['collected'] = []  # a missing key or invalid collection cannot fall back to a singleton
     try:
         # Read-only: verification must never initialize a key.
         key = hmac.digest(leases._load_key(Path(state_dir)), leases._EVIDENCE_KEY_LABEL, "sha256")
@@ -643,6 +704,22 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
     except tdd.TddError as exc:
         out["tampered"] = f"{exc.code}: {exc.error}"
         return out
+    if pin is not None:
+        # Once the freeze binds a collection, never fall back to a singleton
+        # after a missing/substituted collection or a parameter-family mismatch.
+        try:
+            collection = tdd.load_collection(state_dir, contract_id, contract_sha, key)
+        except tdd.TddError as exc:
+            out['tampered'] = f'{exc.code}: {exc.error}'
+            return out
+        ids = collection.get('collected_ids')
+        if (not isinstance(pin, dict) or tdd.collection_digest(collection) != pin.get('manifest_sha256')
+                or collection['source_rev'] != contract['source_rev'] or pin.get('source_rev') != contract['source_rev']
+                or not isinstance(ids, list) or not all(isinstance(node, str) and '::' in node for node in ids)
+                or len(set(ids)) != len(ids) or pin.get('collected') != len(ids)):
+            out['tampered'] = 'collected test IDs do not match the frozen selection'
+            return out
+        out['collected'] = ids
     if not records:
         return out
     out["available"] = True
@@ -693,6 +770,7 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
                     or not green['command'] or r['exit_code'] != 0 or r['timed_out']
                     or not any(c['outcome'] == 'passed' for c in r.get('cases', []))
                     or r['failures'] or r['errors'] or r['tests'] <= r['skipped']
+                    or (pin is not None and green['test_fingerprints'] != collection.get('test_fingerprints'))
                     or set(green['test_fingerprints']) != set(contract['scope']['test_files'])
                     or any(c['outcome'] in ('failed', 'error') for c in r.get('cases', []))):
                 raise tdd.TddError('green_failed', 'GREEN does not prove this candidate and test sequence')
@@ -700,10 +778,9 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
             out["green_error"] = f"{exc.code}: {exc.error}"
         else:
             out["green"] = green
-            passed = [c['id'] for c in r.get('cases', []) if c['outcome'] == 'passed']
             out['criteria'] = {ac['id']: 'passed' for ac in contract['acceptance_criteria']
-                               if green['criteria'].get(ac['id']) == 'passed' and ac['tests']
-                               and all(any(_one_covers(test, case) for case in passed) for test in ac['tests'])}
+                               if ac.get('verification') == 'test' and green['criteria'].get(ac['id']) == 'passed'
+                               and _passed_cases(ac.get('tests'), r.get('cases'), out.get('collected'))}
     if latest.get('review', {}).get('revision') != candidate:
         latest.pop('review', None)
         out['records'].pop('review', None)
@@ -920,11 +997,15 @@ def _classify(
     verification = str(criterion.get("verification") or "test")
 
     if verification == "integration":
-        applicable = [wave for wave in waves if set(task['attempts']) & set(wave['attempts'])]
+        winning = task['attempts'][-1] if task['attempts'] else None
+        applicable = [wave for wave in waves if winning in wave['attempts']]
         if not applicable:
             unrun.append(f"integration wave for {criterion['id'] or criterion['statement']}")
             return NOT_RUN, evidence, unrun, ""
         wave = applicable[-1]
+        if (not record or record.get('attempt_id') != winning or not record.get('sha')
+                or wave.get('verified_inputs', {}).get(winning) != record['sha']):
+            return UNVERIFIED, [], [], 'accepted wave does not prove integration of the current verified commit'
         evidence.append(_rel(state, revision.wave_path(state, wave["wave_id"])))
         return PASS, evidence, unrun, ""
 
@@ -979,7 +1060,8 @@ def _classify(
         suite = record.get("suite")
         suite_ok = revision.suite_passed(suite) and revision.suite_passed(record.get('gitleaks'))
         covered = _covers(record.get("tests") or [], tests)
-        if suite_ok and covered:
+        signed_pass = signed.get('criteria', {}).get(ac_id) == 'passed'
+        if suite_ok and covered and (signed_pass or _passed_cases(tests, suite.get('cases'), signed.get('collected'))):
             evidence.append(_rel(state, verify_local.record_path(state, str(record.get("attempt_id")))))
             if ac_id and signed.get("criteria", {}).get(ac_id) == "passed":
                 path = str(signed.get("paths", {}).get("green") or "")
@@ -1009,7 +1091,7 @@ def _classify(
             f"the verification record ran {list(record.get('tests') or [])}, "
             f"which does not cover {list(tests)}"
         )
-    return UNVERIFIED, evidence, unrun, limitation
+    return UNVERIFIED, evidence, unrun, limitation or 'no passing case outcomes for the full frozen selection'
 
 
 def _acceptance(
@@ -1270,7 +1352,8 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
             or (packet and not resolution and packet['source_policy']['revision'] != source_rev)):
         raise ReturnError('packet_mismatch', 'Job source does not match its sealed authorization and intent.')
     task_rows = _tasks(state, job, packet, resolution)
-    waves = _waves(state, job)
+    integration_ac = any(c['verification'] == 'integration' for t in task_rows for c in _criteria_rows(t))
+    waves = _waves(state, job, prove_inputs_at=repo if integration_ac else None)
     records = _verifications(state, waves, task_rows, repo)
     receipt = _transport(state, job, waves, authorization, resolution)
     signed_cache: dict[str, dict[str, Any]] = {}

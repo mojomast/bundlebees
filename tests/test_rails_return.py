@@ -34,6 +34,7 @@ def packet(tmp_path, capsys, request):
         statement="Command recorded",
         assigned="tools/a.py",
         test_file="tests/test_a.py",
+        test_id="tests/test_a.py::test_tool",
         test_first=True,
     )
     jobs.record_authorization(
