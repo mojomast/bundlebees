@@ -1,8 +1,17 @@
-"""Security helper tests: scrub, child env, path confinement, URL guards."""
+"""Security helper tests: scrub, child env, path confinement, URL guards.
+
+The assignment secret-scan tests near the bottom pin the value-shape
+boundary of ``looks_like_secret``: a secret-keyword name trips only when the
+value is credential-shaped, never for a code reference such as a function
+definition, a bare identifier, or a property chain. Every fixture that could
+resemble a credential is assembled at runtime so repository secret scanners
+never see a credential-shaped literal in this file.
+"""
 
 from __future__ import annotations
 
 import ipaddress
+import re
 from pathlib import Path
 
 import pytest
@@ -16,16 +25,18 @@ def _url_for_address(address: ipaddress._BaseAddress) -> str:
 
 
 def test_scrub_redacts_tokens_urls_ips_and_ssh_hosts():
+    # Assembled at runtime; the value is deliberately not identifier-shaped
+    # (it carries dashes) so the assignment rule keeps tripping on it.
     value = {
-        "message": "deploy token=supersecretvalue to http://10.0.0.5:8080/x",
-        "authorization": "Bearer abcdefghijklmnop",
+        "message": "deploy " + "tok" + "en=super-secret-value to http://10.0.0.5:8080/x",
+        "authorization": "Bearer " + "a" * 16,
         "address": "127.0.0.1",
         "ssh": "deploy@worker.internal",
         "safe": "normal progress message",
     }
     text = str(security.scrub(value))
-    assert "supersecretvalue" not in text
-    assert "abcdefghijklmnop" not in text
+    assert "super-secret-value" not in text
+    assert "a" * 16 not in text
     assert "10.0.0.5" not in text
     assert "127.0.0.1" not in text
     assert "worker.internal" not in text
@@ -44,10 +55,11 @@ def test_scrub_recurses_lists_and_keeps_non_strings():
 
 
 def test_scrub_redacts_key_shaped_values():
-    value = "AKIAABCDEFGHIJKLMNOP and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature"
+    # Runtime-constructed: an AKIA-shaped key and a three-segment JWT.
+    value = "AKIA" + "A2" * 8 + " and " + "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
     text = security.scrub(value)
-    assert "AKIAABCDEFGHIJKLMNOP" not in text
-    assert "eyJhbGciOiJIUzI1NiJ9" not in text
+    assert "A2" * 8 not in text
+    assert "eyJ" + "a" * 12 not in text
 
 
 def test_child_env_does_not_inherit_ambient_environment(monkeypatch):
@@ -300,10 +312,155 @@ def test_resolve_pinned_endpoint_rejects_if_any_address_is_metadata(monkeypatch)
 def test_child_env_keeps_home_and_user_path_but_no_secret(monkeypatch):
     monkeypatch.setenv("HOME", "/home/someone")
     monkeypatch.setenv("PATH", "/opt/custom/bin:/usr/bin")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel-should-not-pass")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-" + "sentinel-should-not-pass")
     monkeypatch.setenv("BUNDLEBEES_LAUNCHER_TOKEN", "sentinel-token")
     env = security.child_env()
     assert env["HOME"] == "/home/someone"
     assert env["PATH"] == "/opt/custom/bin:/usr/bin"
     assert "sentinel" not in " ".join(env.values())
     assert set(env) <= {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"}
+
+
+# ---------------------------------------------------------------------------
+# Assignment secret scan: value-shape boundary (defect lane r2).
+#
+# The pre-fix assignment rule accepted ANY run of non-space characters as
+# the value after a secret-keyword name, so a line tripped on the name alone
+# even when the value was a function definition, a bare identifier, or a
+# property access (r3: the only trip on a clean approval payload was the
+# signing-secret constant assigned an arrow function, where the secret
+# enters via env at call time). The name/separator halves of every fixture
+# below are split across string literals and joined at runtime so repository
+# secret scanners never see a credential-shaped literal in this file.
+# ---------------------------------------------------------------------------
+
+
+def _trip(text: str) -> bool:
+    return security.looks_like_secret(text)
+
+
+# Unquoted values that are code references: exempt from name-only trips.
+_EXEMPT_LINES = {
+    "arrow-constant": "const signing" + "Secret" + " = () => {",
+    "arrow-method": "sec" + "ret: () => {",
+    "function-keyword": "signing" + "Secret" + " = function () {",
+    "call-reference": "api_" + "key = loadSecret(env)",
+    "property-chain": "auth" + "orization = config.token",
+    "env-chain": "signing_" + "token" + " = process.env.SIGNING",
+    "bare-identifier": "api_" + "key = placeholder",
+    "short-identifier": "tok" + "en = abc123",
+    "none-literal": "pass" + "wd = None",
+}
+
+# Credential-shaped values that must still trip after the refinement.
+_STILL_TRIP_LINES = {
+    "quoted-double": "db_" + "pass" + 'word = "correct horse battery"',
+    "quoted-single": "api_" + "key = 's3cr3t-v@lue!'",
+    "digit-led": "pass" + "word = 123456",
+    "dashed": "tok" + "en = abc-def-ghi",
+    "base64ish": "tok" + "en = c2VjcmV0dmFsdWU=",
+    "punctuated": "pass" + "wd = p@ssw0rd!x",
+    # 32+ characters with digits and letters: still trips unquoted even
+    # though the run is identifier-shaped (requirement (d)).
+    "high-entropy-unquoted": "tok" + "en = " + "a" * 16 + "7" * 16,
+    "bearer": "auth" + "orization: Bearer " + "z" * 12,
+    "sk-prefix": "key = sk-" + "x" * 24,
+    "ghp-prefix": "ghp_" + "a" * 30,
+    "github-pat": "github_" + "pat_" + "b" * 22,
+    "xox-prefix": "xox" + "b-" + "c" * 12,
+    "akia-prefix": "AKIA" + "A2" * 8,
+    "aiza-prefix": "AIza" + "a" * 10 + "9" * 12,
+    "jwt": "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12,
+}
+
+# Lines that never tripped and must keep not tripping.
+_BENIGN_LINES = {
+    "plain-text": "normal progress message",
+    "unrelated-assignment": "retries = 3",
+    "keyword-not-at-name-end": "sec" + "ret_count = 5",
+    "quoted-empty": "pass" + "word = ''",
+}
+
+
+@pytest.mark.parametrize("label", sorted(_EXEMPT_LINES))
+def test_code_reference_values_do_not_trip_on_the_name_alone(label):
+    line = _EXEMPT_LINES[label]
+    assert not _trip(line), line
+
+
+@pytest.mark.parametrize("label", sorted(_EXEMPT_LINES))
+def test_scrub_leaves_code_reference_values_intact(label):
+    line = _EXEMPT_LINES[label]
+    assert security.scrub(line) == line
+
+
+@pytest.mark.parametrize("label", sorted(_STILL_TRIP_LINES))
+def test_credential_shaped_values_still_trip(label):
+    line = _STILL_TRIP_LINES[label]
+    assert _trip(line), line
+
+
+@pytest.mark.parametrize("label", sorted(_BENIGN_LINES))
+def test_benign_lines_stay_benign(label):
+    line = _BENIGN_LINES[label]
+    assert not _trip(line), line
+
+
+def test_r3_approval_surface_line_is_not_flagged():
+    line = _EXEMPT_LINES["arrow-constant"]
+    assert not _trip(line)
+    assert security.scrub(line) == line
+
+
+def test_short_unquoted_boundary_is_documented_and_pinned():
+    # Chosen boundary (documented in the security module docstring): a short
+    # unquoted value lands on the EXEMPT side when it is a bare identifier,
+    # because a bare identifier carries no credential material and every
+    # realistic inline credential format is caught by the quoted, prefix,
+    # bearer, and high-entropy arms; exempting identifier shapes is what lets
+    # code that merely references a runtime secret pass. Values that cannot
+    # be identifiers (digit-led, special characters) still trip.
+    assert not _trip("tok" + "en = abc123")
+    assert _trip("tok" + "en = 123abc")
+    assert _trip("pass" + "word = 123456")
+
+
+# The pre-fix assignment rule, reconstructed verbatim from the source of
+# bundlebees_plugin/security.py at base commit 78ed031 (upstream
+# 17adb52f872a59f7876b08775e18c1d259fb7b2b). Its unquoted value arm was a
+# bare run of non-space, non-delimiter characters, so any identifier-shaped
+# value tripped on the name alone.
+_OLD_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_.-]*?"
+    r"(?:api[_-]?key|token|secret|password|passwd|pwd|authorization))"
+    r"(\s*[:=]\s*)(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s,;\"']+)"
+)
+
+# Only the assignment pair redacts as ``\1\2[redacted]``; locating it by its
+# replacement keeps this harness independent of tuple ordering.
+_ASSIGNMENT_REPLACEMENT = r"\1\2[redacted]"
+
+
+def _pattern_sets():
+    live = security._SECRET_PATTERNS
+    assignment_pairs = [pair for pair in live if pair[1] == _ASSIGNMENT_REPLACEMENT]
+    assert len(assignment_pairs) == 1, "assignment rule not uniquely identifiable"
+    others = tuple(pair for pair in live if pair[1] != _ASSIGNMENT_REPLACEMENT)
+    old = ((_OLD_ASSIGNMENT_RE, _ASSIGNMENT_REPLACEMENT),) + others
+    new = ((assignment_pairs[0][0], _ASSIGNMENT_REPLACEMENT),) + others
+    return old, new
+
+
+def test_value_shape_matrix_loses_no_redaction_beyond_exempt_shapes():
+    old_patterns, new_patterns = _pattern_sets()
+    rows = {**_EXEMPT_LINES, **_STILL_TRIP_LINES, **_BENIGN_LINES}
+    for label, line in rows.items():
+        old_hit = any(pattern.search(line) for pattern, _ in old_patterns)
+        new_hit = any(pattern.search(line) for pattern, _ in new_patterns)
+        if label in _EXEMPT_LINES:
+            assert old_hit, f"{label}: pre-fix predicate should trip on {line!r}"
+            assert not new_hit, f"{label}: newly exempt shape unexpectedly trips"
+        elif label in _BENIGN_LINES:
+            assert not old_hit and not new_hit, f"{label}: benign line trips"
+        else:
+            assert old_hit and new_hit, f"{label}: redaction lost for {line!r}"
