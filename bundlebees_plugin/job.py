@@ -1495,8 +1495,9 @@ def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | No
                 if (live_result.get("ok") is not True or live_result.get("request_identity_digest") != digest
                         or live_result.get("record") != record or live_result.get("integration_ref") != ref):
                     raise ij._reconcile(selected, "live integration result differs from its sealed handoff")
-            elif repo is not None and repair_ref:
-                ij._publish_head(local, ref, selected, stored["materialized"])
+            elif repo is not None:
+                pending = ij._pending_ref(request, stored["binding_sha256"])
+                ij._publish_head(local, ref, selected, stored["materialized"], pending=pending, allow_repair=repair_ref)
             if persist:
                 with ij._hold_tested_head(local, ref, selected, head):
                     _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)

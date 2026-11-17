@@ -557,13 +557,6 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     return payload
 
 
-def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
-    try:
-        return jobs.load_job(state_dir, job_id)
-    except Exception:  # noqa: BLE001 - missing job is a normal crash-recovery state
-        return None
-
-
 def _job_accepted_reasons(state_dir: Path, job_id: str) -> list[str]:
     """Why a job is not reviewable yet (empty list means accepted)."""
     reasons: list[str] = []
@@ -621,7 +614,10 @@ def job_accepted_reasons(state_dir: Path | str, job_id: str) -> list[str]:
 
 
 def _load_job_or_none(state_dir: Path, job_id: str) -> dict[str, Any] | None:
+    """Existence, not acceptance. Let the repo-aware tick finish a pending handoff."""
     try:
-        return jobs.load_job(state_dir, job_id)
-    except Exception:  # noqa: BLE001 - missing job is a normal crash-recovery state
-        return None
+        return jobs.load_job(state_dir, job_id, recover=False)
+    except jobs.JobError as exc:
+        if exc.code == "job_missing":
+            return None
+        raise

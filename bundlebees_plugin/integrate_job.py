@@ -64,11 +64,12 @@ class IntegrateError(Exception):
         self.fix = fix
 
 
-def _git(args: Sequence[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
+def _git(args: Sequence[str], cwd: Path, *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", "-c", "user.name=bundlebees", "-c", "user.email=bees@localhost", *args],
         cwd=str(cwd),
         capture_output=True,
+        input=input_text,
         text=True,
         env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
     )
@@ -392,13 +393,28 @@ def _hold_tested_head(repo: Path, ref: str, wave: str, head: str):
         yield
 
 
-def _publish_head(repo: Path, ref: str, wave: str, result: dict) -> None:
+def _pending_ref(handoff: dict, binding: str) -> str:
+    return "refs/bb/pending-integration/" + _record_digest({"request": handoff, "binding": binding})
+
+
+def _publish_head(repo: Path, ref: str, wave: str, result: dict, *, pending: str | None = None,
+                  allow_repair: bool = True) -> None:
     current = _ref_value(repo, ref, wave)
+    if pending is not None and _ref_value(repo, pending, wave) is not None:
+        head = result["head_sha"]
+        if current not in (head, result["previous_ref"]):
+            raise _reconcile(wave, "integration ref is not at the recorded predecessor")
+        # The intent exists only before publication. Consume it in the *same*
+        # Git transaction: a later deleted ref is not a pending crash repair.
+        txn = f"update {ref} {head} {current or _ZERO}\ndelete {pending} {head}\n"
+        if _git(["update-ref", "--no-deref", "--stdin"], repo, input_text=txn, check=False).returncode:
+            raise _reconcile(wave, "integration ref or pending publication changed")
+        return
     if current == result["head_sha"]:
         return
     # Only finish the precise update interrupted after persistence. In particular
     # an old receipt must never rewind a later wave's integration ref.
-    if ("previous_ref" not in result or current != result["previous_ref"] or
+    if (not allow_repair or "previous_ref" not in result or current != result["previous_ref"] or
             _git(["update-ref", "--no-deref", ref, result["head_sha"], current or _ZERO], repo, check=False).returncode):
         raise _reconcile(wave, "integration ref is not at the recorded predecessor")
 
@@ -831,7 +847,8 @@ def _integrate_locked(
         head = existing["head_sha"]
         if handoff:
             jobs._confirm_integration(state_dir, handoff, stored["binding_sha256"], fresh=False)
-        _publish_head(repo, ref, wave, stored["materialized"])
+        _publish_head(repo, ref, wave, stored["materialized"],
+                      pending=_pending_ref(handoff, stored["binding_sha256"]) if handoff else None)
         if handoff:
             jobs._select_integration(state_dir, handoff)
         return {
@@ -935,10 +952,14 @@ def _integrate_locked(
         )
         if record.get("accepted"):
             head = tested_head
+            pending = None
             if handoff:
                 # The coordinator's live execution is the only proof issuer. The
                 # recovery reader also independently checks the Git and suite gates.
-                jobs._confirm_integration(state_dir, handoff, _binding_digest(identity_digest, materialized), fresh=True)
+                binding = _binding_digest(identity_digest, materialized)
+                pending = _pending_ref(handoff, binding)
+                _git(["update-ref", "--no-deref", pending, head, _ZERO], repo)
+                jobs._confirm_integration(state_dir, handoff, binding, fresh=True)
             # Fault boundary: the accepted wave record is durable, but neither the
             # integration ref nor the job document names it yet. A crash here must
             # be recovered from the record, never by integrating the wave again.
@@ -950,7 +971,7 @@ def _integrate_locked(
             if (not pair or pair[1]["identity_digest"] != identity_digest or pair[1]["materialized"] != materialized
                     or _verified_inputs(state_dir, wave, attempts) != shas):
                 raise _reconcile(wave, "integration evidence changed before publication")
-            _publish_head(repo, ref, wave, materialized)
+            _publish_head(repo, ref, wave, materialized, pending=pending, allow_repair=not handoff)
     finally:
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
 

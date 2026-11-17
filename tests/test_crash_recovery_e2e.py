@@ -649,8 +649,12 @@ class CrashRecoveryTwoFeatures(unittest.TestCase):
         self.assertEqual(len(str(record.get("head_sha") or "")), 40)
         wave_hashes = {name: fx.file_sha256(path) for name, path in waves.items()}
         commit_a = record["head_sha"]
-        # The commit is real and the ref may or may not have been updated yet;
-        # either way the restart must not integrate again.
+        # This checkpoint is before ref publication. Only the one-shot pending
+        # intent distinguishes it from a ref deleted *after* publication.
+        pending = git(["for-each-ref", "--format=%(objectname)", "refs/bb/pending-integration/"], self.work)
+        self.assertEqual(pending.stdout.splitlines(), [commit_a])
+        self.assertNotEqual(git(["rev-parse", "--verify", "--quiet", "refs/bb/integrated/job_a"], self.work,
+                                check=False).returncode, 0)
         self.assertEqual(git(["cat-file", "-e", f"{commit_a}^{{commit}}"], self.work,
                              check=False).returncode, 0, "the accepted wave names a commit that is absent")
         # The job document has not accepted the wave yet: that is the window the
@@ -665,6 +669,7 @@ class CrashRecoveryTwoFeatures(unittest.TestCase):
         self.assertEqual(self.integration_commit(fx.JOB_A), commit_a,
                          "the restart integrated a second time instead of recovering the accepted wave")
         self.assertEqual(git(["rev-parse", "refs/bb/integrated/job_a"], self.work).stdout.strip(), commit_a)
+        self.assertFalse(git(["for-each-ref", "refs/bb/pending-integration/"], self.work).stdout)
         self.assert_intent_untouched()
 
     def test_crash_c_after_publish_reconciles_the_existing_ref(self):

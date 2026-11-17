@@ -557,6 +557,14 @@ class JobRecovery:
             current = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
             assert current == {"missing-ref": "", "moved-ref": base}.get(change, expected["commit"])
         assert len(receipts) == 4 and all(p.read_bytes() == b for p, b in receipts.items())
+        if change == "missing-ref":
+            # Restarting the tick must not turn a post-publication deletion
+            # back into a permitted, interrupted publish.
+            monkeypatch.setattr(integrate_job, "integrate", lambda *a, **kw: pytest.fail("reintegrated"))
+            with pytest.raises(jobs.JobError) as refused:
+                tick()
+            assert refused.value.code == "wave_reconciliation_required"
+            assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0
 
     @pytest.mark.parametrize("change", ["missing-request", "missing-proof", "corrupt-request", "foreign-repo",
                                          "commit", "absent-repo", "changed-command", "changed-runner", "stale-ref"])
