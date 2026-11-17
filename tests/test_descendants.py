@@ -36,7 +36,7 @@ class WaveLimit(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertEqual(a, integrate_job.job_wave_id({"job_id": long_a, "integration": {"wave": "w1"}}))
 
-    def test_a_previous_per_job_record_is_adopted_atomically(self):
+    def test_a_previous_long_per_job_record_requires_reconciliation(self):
         with TemporaryDirectory() as tmp:
             waves = Path(tmp) / "waves"
             waves.mkdir()
@@ -45,10 +45,10 @@ class WaveLimit(unittest.TestCase):
             new = integrate_job.job_wave_id({"job_id": long_id, "integration": {"wave": "w1"}})
             (waves / f"{old}.json").write_text(json.dumps({"attempts": ["att_1"], "head_sha": SHORT}))
 
-            adopted = integrate_job.adopt_legacy_wave(Path(tmp), wave=new, legacy=old, attempts=["att_1"])
-
-            self.assertTrue(adopted)
-            self.assertTrue((waves / f"{new}.json").exists())
+            with self.assertRaises(integrate_job.IntegrateError) as refused:
+                integrate_job.adopt_legacy_wave(Path(tmp), wave=new, legacy=old, attempts=["att_1"])
+            self.assertEqual(refused.exception.code, "wave_reconciliation_required")
+            self.assertFalse((waves / f"{new}.json").exists())
             self.assertTrue((waves / f"{old}.json").exists(), "the old record is preserved")
 
 

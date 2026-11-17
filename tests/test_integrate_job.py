@@ -237,10 +237,12 @@ def test_retry_reclaims_abandoned_checkout_for_its_own_request(tmp_path):
         return {"exit_code": 0 if len(paths) > 1 else 1}
 
     assert not integrate_job.integrate(state, job, repo, runner=suite, cacheable=False)["ok"]
+    rejected = {p.parent.name: p.read_bytes() for p in state.glob("*/job_a.w1.json")}
     # Restore the linked worktree that an interrupted attempt would leave.
     git(repo, "worktree", "add", "--detach", str(paths[0]), base)
     (paths[0] / "stale.txt").write_text("left over")
     assert integrate_job.integrate(state, job, repo, runner=suite, cacheable=False)["ok"]
+    assert {p.stem: p.read_bytes() for p in (state / "wave-history").rglob("*.json")} == rejected
     assert not paths[0].exists()
     assert git(repo, "worktree", "list", "--porcelain").stdout.count("worktree ") == 1
 

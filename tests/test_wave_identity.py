@@ -26,21 +26,19 @@ class WaveIdentity(unittest.TestCase):
         self.assertEqual(integrate_job.job_wave_id(job("job_a", wave=3)), "job_a.w3")
         self.assertEqual(integrate_job.job_wave_id(job("job_a", wave="w2")), "job_a.w2")
 
-    def test_a_legacy_record_is_adopted_only_for_its_own_attempts(self):
+    def test_attempt_names_cannot_authorize_a_legacy_adoption(self):
         with TemporaryDirectory() as tmp:
             waves = Path(tmp) / "waves"
             waves.mkdir()
             (waves / "w1.json").write_text(json.dumps({"attempts": ["att_1"], "head_sha": "a" * 40}))
 
-            adopted = integrate_job.adopt_legacy_wave(Path(tmp), wave="job_a.w1", legacy="w1", attempts=["att_1"])
-            self.assertTrue(adopted)
-            self.assertTrue((waves / "job_a.w1.json").exists())
-            self.assertTrue((waves / "w1.json").exists(), "legacy evidence is preserved")
-
-            # Another job with different attempts must not inherit it.
-            other = integrate_job.adopt_legacy_wave(Path(tmp), wave="job_b.w1", legacy="w1", attempts=["att_2"])
-            self.assertIsNone(other)
-            self.assertFalse((waves / "job_b.w1.json").exists())
+            before = (waves / "w1.json").read_bytes()
+            for job_id, attempt in (("job_a", "att_1"), ("job_b", "att_2")):
+                with self.assertRaises(integrate_job.IntegrateError) as refused:
+                    integrate_job.adopt_legacy_wave(Path(tmp), wave=f"{job_id}.w1", legacy="w1", attempts=[attempt])
+                self.assertEqual(refused.exception.code, "wave_reconciliation_required")
+                self.assertFalse((waves / f"{job_id}.w1.json").exists())
+            self.assertEqual((waves / "w1.json").read_bytes(), before)
 
     def test_an_existing_per_job_record_is_never_overwritten(self):
         with TemporaryDirectory() as tmp:
