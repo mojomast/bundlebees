@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,26 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 class RailsPackagingTests(unittest.TestCase):
+    def test_wheel_layout_refuses_drifted_subset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / 'bundlebees_plugin'
+            plugin.mkdir()
+            shutil.copy(ROOT / 'bundlebees_plugin/__init__.py', plugin)
+            canonical = root / 'rizzstack_rails'
+            shutil.copytree(ROOT / 'contrib/rizzstack_rails', canonical)
+            worker = root / 'contrib/rizzstack_rails'
+            worker.mkdir(parents=True)
+            for name in ('__init__.py', 'contracts.py', 'ledger.py', 'privacy.py'):
+                shutil.copy(canonical / name, worker)
+            with (worker / 'ledger.py').open('ab') as f:
+                f.write(b'\n# different worker pin\n')
+            proc = subprocess.run([sys.executable, '-I', '-c',
+                                   'import sys; sys.path.insert(0,sys.argv[1]); import bundlebees_plugin',
+                                   tmp], cwd=tmp, capture_output=True, text=True)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn('Incompatible Rails runtimes', proc.stderr)
+
     def test_checkout_uses_local_coordinator_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             subprocess.run([sys.executable, '-I', '-c', """
