@@ -16,12 +16,13 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
 from importlib import metadata as _metadata
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from . import leases, sandbox, test_receipts as receipts
 
@@ -35,6 +36,38 @@ _COORDINATOR_ENV_PREFIXES = ("BUNDLEBEES_", "HERMES_")
 #: Tests on hosts without a real isolation backend inject one; production uses
 #: :func:`sandbox_runner` so no child silently inherits the coordinator env.
 TestRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
+
+
+class ReceiptPin(NamedTuple):
+    """Private coordinator commitment to a newly written commit-local receipt."""
+
+    job_id: str
+    task_id: str
+    contract_sha256: str
+    attempt_id: str
+    base_rev: str
+    commit: str
+    sha256: str
+
+
+def _receipt_scope(lease: Mapping[str, Any], preflight: Any) -> tuple[str, str, str]:
+    """Match the verifier's checked contract to the authenticated dispatch."""
+    from . import contract
+
+    brief = lease["brief"]
+    job, task = brief.get("job_id"), brief.get("task_id")
+    digest = brief.get("contract_sha256")
+    if (
+        isinstance(preflight, Mapping) and isinstance(preflight.get("contract"), Mapping)
+        and all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}", v) for v in (job, task))
+    ):
+        try:
+            if contract.check_frozen(preflight["contract"]) == preflight.get("sha") == digest:
+                return job, task, digest
+        except contract.ContractError:
+            pass
+    raise VerifyError("receipt_scope_mismatch", "Cannot bind this receipt to a checked dispatch contract.")
+
 
 _TREE_DOMAIN = b"bundlebees-source-tree:v1\x00"
 _TEST_SOURCES_DOMAIN = b"bundlebees-test-sources:v1\x00"
@@ -732,7 +765,7 @@ def read_record(state_dir: Path, attempt_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _write_record(state_dir: Path, attempt_id: str, record: Mapping[str, Any]) -> Path:
+def _write_record(state_dir: Path, attempt_id: str, record: Mapping[str, Any]) -> bytes:
     path = record_path(state_dir, attempt_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -744,7 +777,7 @@ def _write_record(state_dir: Path, attempt_id: str, record: Mapping[str, Any]) -
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
-    return path
+    return payload
 
 
 def _branch(attempt_id: str) -> str:
@@ -810,6 +843,7 @@ def verify_and_commit(
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     cacheable: bool = True,
     reuse_record: bool = True,
+    on_receipt_written: Callable[[ReceiptPin], None] | None = None,
 ) -> dict[str, Any]:
     """Verify one patch and commit it locally. Returns the verify record.
 
@@ -821,6 +855,12 @@ def verify_and_commit(
 
     Identical requests are serialized by a durable single-flight claim, and each
     exact test invocation is looked up in the receipt ledger before it runs.
+
+    An optional trusted coordinator callback receives the commitment to the
+    exact bytes we wrote, scoped by the MAC-checked lease and matching frozen
+    preflight. It is never called for an old receipt or a failed verification.
+    Supply this pin to a receiver via an independent private channel; it is
+    neither a Rails diagnostic nor a digest to accept from the handoff.
     """
 
     try:
@@ -861,6 +901,7 @@ def verify_and_commit(
             sandbox_timeout=sandbox_timeout,
             cacheable=cacheable,
             reuse_record=reuse_record,
+            on_receipt_written=on_receipt_written,
             stats=_test_cache_stats(),
         )
     finally:
@@ -892,6 +933,7 @@ def _verify_and_commit_locked(
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     cacheable: bool = True,
     reuse_record: bool = True,
+    on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     state_dir = Path(state_dir)
@@ -919,6 +961,7 @@ def _verify_and_commit_locked(
                 f"patch sha256 {actual[:12]} does not match the declared {expected_patch_sha256[:12]}",
                 "Reject this artifact; its bytes changed after dispatch.",
             )
+    outcome = None
     if acdd_preflight is not None or contract_declared:
         if acdd_preflight is None:
             raise VerifyError(
@@ -946,6 +989,7 @@ def _verify_and_commit_locked(
         lease = leases.load_lease(state_dir, attempt_id)
     except leases.LeaseError as exc:
         raise VerifyError(exc.code, str(exc), exc.fix) from exc
+    scope = _receipt_scope(lease, outcome) if on_receipt_written is not None else None
     lease_files = sorted(leases.lease_files(lease))
     declared = sorted(str(path) for path in declared_files)
     if not declared:
@@ -1188,7 +1232,10 @@ def _verify_and_commit_locked(
         test_cache=stats,
         execution_identity=execution_identity,
     )
-    _write_record(state_dir, attempt_id, record)
+    written = _write_record(state_dir, attempt_id, record)
+    if on_receipt_written is not None and scope is not None:
+        on_receipt_written(ReceiptPin(*scope, lease['attempt_id'],
+                                      lease['source_rev'], sha, hashlib.sha256(written).hexdigest()))
     return record
 
 
