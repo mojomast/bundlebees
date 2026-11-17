@@ -349,6 +349,16 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "scrub predicate value-shape repair",
         "keywords": ("value-shape", "negative-control", "test_security"),
     },
+    {
+        # fix/verify-refusal-evidence: verify secret-scan refusal evidence
+        # (att_6b546cbf) - rule id + 1-based line + masked excerpt, enrichment
+        # only on the unchanged fail-closed secret_detected decision; the
+        # uv.lock suite side-effect was excluded from the delivered delta
+        # (coordinator-apply split, disclosed in the commit and PR bodies).
+        "pr": 73,
+        "name": "verify refusal evidence enrichment",
+        "keywords": ("refusal evidence", "masked excerpt", "rule id"),
+    },
 )
 
 

@@ -230,6 +230,15 @@ one pull request.
   refuses with that exact code before a journal entry is written.
 
 ### Security
+- **Verify refusal evidence:** secret-scan refusals (`secret_detected`) raised
+  by `verify` now carry refusal evidence — the matched rule id, its 1-based
+  source line, and a masked excerpt of the matched span — while the fail-closed
+  refusal decision, its single refusal site and its hint are unchanged
+  (enrichment only). Pinned by a 200k-case predicate-parity fuzz, a 15-case
+  differential harness against the pre-change scan, and full-suite
+  failure-set identity (the 114 pre-existing environmental failures are
+  unchanged) in `tests/test_security.py` and `tests/test_cli.py`;
+  `tests/test_client.py` is byte-identical to its mandated value.
 
 - **Scrub predicate value-shape repair:** the redaction predicate now catches
   secret values in tight `k=v` assignments and in the runtime-join construction
