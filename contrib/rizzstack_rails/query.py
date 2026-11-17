@@ -185,6 +185,50 @@ def _result(req, candidates, more, next_token, completeness, missing, warnings, 
                 integrity=integrity,warnings=warnings)
 
 
+def _context(reader, high, last, digest, selector, allowed_scope, excluded, limit):
+    # A byte-limited continuation often needs a suffix of the *same* verified
+    # lookahead. Keep at most one bounded window on this read-only connection.
+    # data_version (not just MAX(seq)) changes even for a repair/tampering
+    # commit with no new events. Never use it across connections.
+    version = reader.query('PRAGMA data_version')[0]['data_version']
+    key = (version, high, digest)
+    saved = getattr(reader, '_rails_bounded_window', None)
+    reuse = saved is not None and saved[0] == key
+    if reuse:
+        _, start, rows, envelopes = saved
+        bounded = populated = True
+        if start <= last:
+            i = next((i for i,r in enumerate(rows) if (r['arrival'],r['sub']) > last), len(rows))
+            end = i + limit + 1
+            if end <= len(rows):  # includes the original scan's lookahead row
+                return rows[i:end], envelopes[i:end], populated, bounded, False
+    else:
+        reader._rails_bounded_window = None
+        rows = _scan(reader,high,selector,allowed_scope,limit=MAX_CONTEXT_ROWS+1)
+        populated = bool(rows)
+        if not populated and selector['kind']=='event':
+            raise QueryError('not_found')
+        bounded = len(rows) > MAX_CONTEXT_ROWS or sum(r['size'] for r in rows)>MAX_CONTEXT_BYTES
+    overflow = False
+    if bounded:
+        if not reuse and last == (0,0) and not excluded and len(rows) >= limit+1:
+            # The context probe already read this exact unfiltered prefix.
+            rows = rows[:limit+1]
+        else:
+            rows = _scan(reader,high,selector,allowed_scope,after=last,exclude=excluded,limit=limit+1)
+        used = 0
+        for i,r in enumerate(rows):
+            used += r['size']
+            if used > MAX_CONTEXT_BYTES:
+                rows = rows[:i]; overflow = True; break
+    if any(r['size'] > MAX_RECORD_BYTES for r in rows) or overflow and not rows:
+        raise QueryError('too_large')
+    envelopes = _envelopes(reader,rows)
+    if bounded:
+        reader._rails_bounded_window = (key, last, rows, envelopes)
+    return rows, envelopes, populated, bounded, overflow
+
+
 def _read(req, reader, allowed_scope, trusted_origins, comparison_context, surface):
     if not getattr(reader,'read_only',False):
         raise QueryError('forbidden')
@@ -196,23 +240,12 @@ def _read(req, reader, allowed_scope, trusted_origins, comparison_context, surfa
     now = reader.query('SELECT COALESCE(MAX(ingest_seq),0) AS n FROM event_rows')[0]['n']
     high, last = _resume(req['after'],reader,now,digest)
     selector = req['selector']
-    rows = _scan(reader,high,selector,allowed_scope,limit=MAX_CONTEXT_ROWS+1)
-    populated = bool(rows)
-    if not populated and selector['kind']=='event':
-        raise QueryError('not_found')
-    bounded = len(rows) > MAX_CONTEXT_ROWS or sum(r['size'] for r in rows)>MAX_CONTEXT_BYTES
     excluded = tuple(k for group,kinds in GROUPS.items() if group not in req['include'] for k in kinds)
-    overflow = False
-    if bounded:
-        rows = _scan(reader,high,selector,allowed_scope,after=last,exclude=excluded,limit=req['limit']+1)
-        used = 0
-        for i,r in enumerate(rows):
-            used += r['size']
-            if used > MAX_CONTEXT_BYTES:
-                rows = rows[:i]; overflow = True; break
-    if any(r['size'] > MAX_RECORD_BYTES for r in rows) or overflow and not rows:
-        raise QueryError('too_large')
-    items = project_events(_envelopes(reader,rows),local_chain=reader.chain_id,show_tokens=req['show_tokens'],
+    rows, envelopes, populated, bounded, overflow = _context(
+        reader, high, last, digest, selector, allowed_scope, excluded, req['limit'])
+    # Repeat the projection, topology and coverage over the exact window of
+    # THIS request; none of those reductions are safely reusable by suffix.
+    items = project_events(envelopes,local_chain=reader.chain_id,show_tokens=req['show_tokens'],
                            trusted_origins=trusted_origins, comparison_context=comparison_context,
                            full_context=not bounded and selector['kind'] != 'event')
     validate_topology(items)

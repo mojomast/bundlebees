@@ -96,6 +96,41 @@ class QueryTests(LedgerCase):
                 req['after'] = page['next_cursor']
         self.assertEqual(seen,expected)
 
+    def test_bounded_wire_continuation_reduces_over_its_own_context(self):
+        # The gap and start both disappear from the continuation's context.
+        self.append('source.gap', dict(source_id='worker',range=[1,2],cursor=None,
+                    count=2,digest='a'*64,code='gap'))
+        self.tool('tool.start','call',outcome='pending',occurred_at='2026-01-01T00:00:00.000000Z')
+        finish = self.tool('tool.finish','call',occurred_at='2026-01-01T00:00:01.000000Z')
+        for _ in range(6): self.append()
+        with patch('rizzstack_rails.query.MAX_CONTEXT_ROWS',4):
+            cap = len(wire_json(query_events(self.request(limit=2),self.reader)))
+            first = query_events(self.request(limit=6,max_bytes=cap),self.reader)
+            self.assertEqual(len(first['items']),2)
+            self.assertEqual(first['missing_sources'],['worker'])
+            resume = self.request(limit=4,after=first['next_cursor'])
+            with closing(RailsLedger(self.path,read_only=True)) as fresh:
+                expected = query_events(resume,fresh)
+            actual = query_events(resume,self.reader)
+            self.assertEqual(wire_json(actual),wire_json(expected))
+            self.assertEqual(actual['missing_sources'],[])
+            self.assertEqual(actual['items'][0]['event_id'],finish)
+            self.assertIsNone(actual['items'][0]['duration_ms'])
+
+    def test_bounded_lookahead_damage_without_new_seq_fails_closed(self):
+        events = [self.append() for _ in range(8)]
+        with patch('rizzstack_rails.query.MAX_CONTEXT_ROWS',4):
+            cap = len(wire_json(query_events(self.request(limit=1),self.reader)))
+            first = query_events(self.request(limit=6,max_bytes=cap),self.reader)
+            self.assertEqual([r['event_id'] for r in first['items']],events[:1])
+            with closing(sqlite3.connect(self.path)) as conn, conn:
+                conn.execute('DROP TRIGGER event_rows_no_update')
+                conn.execute("UPDATE event_rows SET envelope_json=replace(envelope_json,'observed','altered') WHERE event_id=?",
+                             (events[4],))  # damage in the continuation's lookahead
+            with self.assertRaises(QueryError) as caught:
+                query_events(self.request(limit=3,after=first['next_cursor']),self.reader)
+            self.assertEqual(caught.exception.code,'source_fork')
+
     def test_scoped_snapshot_continuation_across_real_import_and_append(self):
         first = self.append()
         self.append(scope={'attempt_id': 'B'})

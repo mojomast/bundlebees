@@ -101,6 +101,17 @@ def project_events(events, *, local_chain, show_tokens=False, trusted_origins=No
     previous_finish = {}
     runs, usages, samples = defaultdict(list), defaultdict(list), defaultdict(list)
     comparable = {}
+    # Scope, lane and source labels repeat across a page. Remember only exact
+    # strings that passed every public_id check, only within this projection.
+    valid_labels = set()
+    def label(value):
+        if type(value) is str and value in valid_labels:
+            return value
+        ident = public_id(value)
+        if type(ident) is str and len(valid_labels) < 1024:
+            valid_labels.add(ident)
+        return ident
+
     for e in events:
         kind, p, chain = e['kind'], e['payload'], e['chain_id']
         if e['schema'] != contracts.SCHEMA or kind not in contracts.KINDS or not public_id(e['event_id']):
@@ -111,7 +122,7 @@ def project_events(events, *, local_chain, show_tokens=False, trusted_origins=No
         if chain != local_chain and role not in (trusted_origins or {}).get(chain, ()):
             role = 'imported_observation'
         lane = e.get('lane', e)  # stored R02 nesting / original R01 flat fields
-        lane_id = public_id(lane.get('lane_id'))
+        lane_id = label(lane.get('lane_id'))
         raw_parent = lane.get('parent_lane_id')
         parent = public_id(raw_parent)
         if (raw_parent is not None and not parent) or (lane.get('lane_id') is not None and not lane_id):
@@ -127,13 +138,13 @@ def project_events(events, *, local_chain, show_tokens=False, trusted_origins=No
                     timing_quality=quality if duration is not None else 'unknown',
                     authority=role, outcome=None, evidence_refs=_refs(p), ghost=False)
         item['origin_hash'] = e['hash']
-        item['source'] = {k: public_id(e['source'].get(k)) for k in contracts.SOURCE_FIELDS}
+        item['source'] = {k: label(e['source'].get(k)) for k in contracts.SOURCE_FIELDS}
         item['scope'] = {k: v for k, v in e['scope'].items() if k in contracts.SCOPE_FIELDS
-                         and k not in ('repo','repo_slug') and public_id(v)}
+                         and k not in ('repo','repo_slug') and label(v)}
         predecessor = previous_finish.pop((chain, lane_id), None)
         if kind.startswith('tool.'):
             family = command_family(p.get('command_family'))
-            call = public_id(p.get('call_id'))
+            call = label(p.get('call_id'))
             item.update(tool_name=tool_label(p.get('tool_name')), command_family=family, call_id=call,
                         outcome=_member(p.get('outcome'), contracts.OUTCOMES,'unknown'))
             key = (chain,lane_id,call)
