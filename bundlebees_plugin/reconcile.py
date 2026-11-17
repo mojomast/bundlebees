@@ -1247,10 +1247,14 @@ def _brief_for(job: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any
     if isinstance(contract, Mapping):
         brief["contract"] = dict(contract)
     binding = task.get("binding")
-    if isinstance(binding, Mapping) and binding.get("project"):
-        # The launcher dispatches into this project; without it the worker falls
-        # back to a default, which is exactly the failure this binding prevents.
-        brief["project"] = str(binding["project"])
+    project = ""
+    if isinstance(binding, Mapping):
+        project = str(binding.get("project") or "").strip()
+    project = project or str(task.get("project") or "").strip()
+    if project:
+        # The launcher dispatches into this project; without it scoped code work fails with
+        # workspace_invalid (a registered local-path project has no provisioning binding).
+        brief["project"] = project
     try:
         validate_brief(brief)
     except BriefError as exc:
