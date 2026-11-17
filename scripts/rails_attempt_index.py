@@ -48,12 +48,55 @@ def install(path, ledger_uuid):
         return 'installed'
 
 
+def migrate(directory, dry_run=False):
+    """Apply the index to every local ledger in a directory (idempotent migration).
+
+    Owner decision 2026-11-17: new ledgers are indexed at creation (ledger._init_schema);
+    this migrates existing ledgers. Each ledger is verified by its own ledger_uuid, so a
+    file that is not a Rails ledger is skipped rather than guessed at.
+    """
+    root = Path(directory)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError('expected an absolute existing directory')
+    results = []
+    for path in sorted(list(root.glob('*.sqlite')) + list(root.glob('*.db')) + list(root.glob('*.sqlite3'))):
+        try:
+            try:
+                with closing(sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, timeout=0)) as probe:
+                    row = probe.execute("SELECT value FROM ledger_meta WHERE key='ledger_uuid'").fetchone()
+            except sqlite3.Error:
+                results.append((path.name, 'skipped: no ledger identity'))
+                continue
+            if not row:
+                results.append((path.name, 'skipped: no ledger identity'))
+                continue
+            ledger_uuid = row[0]
+            if dry_run:
+                results.append((path.name, 'would index'))
+                continue
+            results.append((path.name, install(path, ledger_uuid)))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            results.append((path.name, f'failed: {exc}'))
+    return results
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('db', type=Path, help='absolute path to the existing local SQLite ledger')
-    parser.add_argument('--ledger-uuid', required=True, help='expected local ledger identity')
+    parser.add_argument('db', type=Path, nargs='?', help='absolute path to the existing local SQLite ledger')
+    parser.add_argument('--ledger-uuid', help='expected local ledger identity (single-ledger mode)')
+    parser.add_argument('--migrate', type=Path, metavar='DIR',
+                        help='apply the index to every ledger in DIR (idempotent, per-file report)')
+    parser.add_argument('--dry-run', action='store_true', help='with --migrate: report, change nothing')
     args = parser.parse_args()
     try:
+        if args.migrate is not None:
+            rows = migrate(args.migrate, dry_run=args.dry_run)
+            for name, outcome in rows:
+                print(f'{name}: {outcome}')
+            failed = [r for r in rows if r[1].startswith('failed')]
+            parser.exit(1 if failed else 0)
+        if args.db is None or not args.ledger_uuid:
+            parser.exit(2, 'single-ledger mode needs DB and --ledger-uuid (or use --migrate DIR)\n')
         print(install(args.db, args.ledger_uuid))
     except (OSError, ValueError, sqlite3.Error) as exc:
         parser.exit(1, f'index not installed: {exc}\n')
