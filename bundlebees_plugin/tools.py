@@ -59,6 +59,10 @@ _ATTEMPT_OPS = {"get", "events", "cancel", "review"}
 _OS_VALUES = {"linux", "macos", "windows"}
 _REACH_VALUES = {"same-machine", "lan", "vpn", "ssh"}
 _RUNNING_STATES = {"running", "working", "active", "started"}
+# The terminal attempt states the tool path writes back to the outbox; kept in
+# step with agent_consumer.TOOL_TERMINAL_STATES (imported lazily in
+# _tool_write_back to avoid a module-import cycle).
+_TOOL_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted"}
 
 _FIX_PROJECT = (
     "The owner must add this project to the launcher config and restart the "
@@ -160,6 +164,119 @@ def _unwrap_attempt(data: Any) -> Mapping[str, Any]:
                 return nested
         return data
     return {}
+
+
+def _terminal_attempt_state(attempt: Any) -> str | None:
+    """The attempt's state when it is a terminal tool-path value, else None."""
+
+    if not isinstance(attempt, Mapping):
+        return None
+    state = str(attempt.get("state") or attempt.get("status") or "").strip().lower()
+    if state in _TOOL_TERMINAL_STATES:
+        return state
+    return None
+
+
+def _result_usage(result: Any) -> Any:
+    """The usage mapping a result envelope carries, when it does."""
+
+    if not isinstance(result, Mapping):
+        return None
+    observed = result.get("observed")
+    if isinstance(observed, Mapping) and isinstance(observed.get("usage"), Mapping):
+        return observed["usage"]
+    if isinstance(result.get("usage"), Mapping):
+        return result["usage"]
+    return None
+
+
+def _result_artifact(result: Any) -> Any:
+    """The artifact digest a result envelope carries, when it does.
+
+    A value that is not a digest is dropped later by the write-back's own
+    validation, never echoed.
+    """
+
+    if not isinstance(result, Mapping):
+        return None
+    observed = result.get("observed")
+    if isinstance(observed, Mapping) and isinstance(observed.get("sha256"), str):
+        return observed["sha256"]
+    if isinstance(result.get("artifact_sha256"), str):
+        return result["artifact_sha256"]
+    return None
+
+
+def _tool_write_back(
+    state_dir: Path | None,
+    attempt_id: str,
+    attempt: Any,
+    *,
+    usage: Any = None,
+    result_available: bool | None = None,
+    artifact_sha256: Any = None,
+    branch: Any = None,
+) -> dict[str, Any] | None:
+    """Best-effort tool-path completion write-back for one terminal observation.
+
+    When the launcher reports a terminal attempt state, the same canonical
+    landing event the job path emits is written through the coordinator outbox
+    (``agent_consumer.record_tool_completion``). The emission is deliberately
+    not part of the op's success: every refusal comes back as a value, a write
+    failure is swallowed into a reported refusal, and the op envelope keeps the
+    outcome as its own ``write_back`` fact so a missing event is never silently
+    read as a worker failure. Duplicate observations of the same terminal state
+    deduplicate onto one deterministic event id (``TOOL_TRANSITION_ID``).
+    """
+
+    if state_dir is None:
+        return None
+    state = _terminal_attempt_state(attempt)
+    if state is None:
+        return None
+    try:
+        from . import agent_consumer as _agent_consumer
+
+        return dict(
+            _agent_consumer.record_tool_completion(
+                Path(state_dir),
+                attempt_id,
+                state=state,
+                branch=branch if isinstance(branch, str) and branch.strip() else None,
+                usage=usage if isinstance(usage, Mapping) else None,
+                result_available=result_available,
+                artifact_sha256=artifact_sha256,
+                transition_id=_agent_consumer.TOOL_TRANSITION_ID,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - the completion path must never break
+        return {
+            "emitted": False,
+            "code": "write_back_failed",
+            "error": type(exc).__name__,
+        }
+
+
+def _attempt_write_back(
+    state_dir: Path | None,
+    attempt_id: str,
+    attempt: Any,
+    *,
+    result: Any = None,
+    result_available: bool | None = None,
+) -> dict[str, Any]:
+    """The envelope fragment carrying one write-back outcome (or nothing)."""
+
+    outcome = _tool_write_back(
+        state_dir,
+        attempt_id,
+        attempt,
+        usage=_result_usage(result),
+        result_available=result_available,
+        artifact_sha256=_result_artifact(result),
+        branch=attempt.get("branch") if isinstance(attempt, Mapping) else None,
+    )
+    return {"write_back": outcome} if outcome is not None else {}
 
 
 def _lease_overlap(attempts: Any, brief: Mapping[str, Any]) -> bool:
@@ -485,15 +602,29 @@ def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None
             "attempt": _unwrap_attempt(client.get(attempt_id)),
         }
         result_fn = getattr(client, "result", None)
+        result_payload: Any = None
+        result_available: bool | None = None
         if callable(result_fn):
             try:
                 result = result_fn(attempt_id)
             except ClientError as exc:
                 if exc.code != "no_result_yet":
                     raise
+                result_available = False
             else:
                 # Model-visible: always reduce to the public view so no client can leak a patch here.
                 out["result"] = public_result(result)
+                result_payload = result
+                result_available = True
+        out.update(
+            _attempt_write_back(
+                state_dir,
+                attempt_id,
+                out["attempt"],
+                result=result_payload,
+                result_available=result_available,
+            )
+        )
         return _ok(**out)
 
     if op == "events":
@@ -517,6 +648,7 @@ def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None
         data = _unwrap_attempt(client.cancel(attempt_id))
         out = {"op": op, "attempt_id": attempt_id}
         out.update(data)
+        out.update(_attempt_write_back(state_dir, attempt_id, data))
         return _ok(**out)
 
     accepted = args.get("accepted")
@@ -541,8 +673,10 @@ def _attempt(client: Any, args: Mapping[str, Any], state_dir: Path | None = None
         accepted=accepted,
         note=scrub(note) if note else None,
     )
+    attempt_data = _unwrap_attempt(data)
     out = {"op": op, "attempt_id": attempt_id, "accepted": accepted}
-    out.update(_unwrap_attempt(data))
+    out.update(attempt_data)
+    out.update(_attempt_write_back(state_dir, attempt_id, attempt_data))
     return _ok(**out)
 
 

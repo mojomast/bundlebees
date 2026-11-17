@@ -145,6 +145,83 @@ def _lease_facts(state_dir: Path, attempt_id: str) -> dict[str, Any]:
     return record if isinstance(record, Mapping) else {}
 
 
+def _stored_outbox_event(state_path: Path, event_id: str) -> dict[str, Any] | None:
+    """The outbox record an event id already holds, best-effort."""
+
+    try:
+        raw = bee_events._read_regular(bee_events._outbox_path(state_path, event_id))
+    except Exception:  # noqa: BLE001 - an unreadable outbox is only a refusal
+        return None
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _replay_matches(stored: Mapping[str, Any], event: Mapping[str, Any]) -> bool:
+    """Whether a stored outbox event is this same transition replayed.
+
+    The only legitimate differences between two observations of the same
+    ``(attempt, state, transition)`` are the envelope ``time`` (the outbox
+    keeps the first-seen time) and ``data.result`` evidence an earlier
+    observation fetched (the artifact digest) while the replay did not. Any
+    other difference means the id holds different facts.
+    """
+
+    if set(stored) - {"time"} != set(event) - {"time"}:
+        return False
+    for key, value in event.items():
+        if key == "time":
+            continue
+        if key == "data":
+            if not _data_replay_matches(stored.get("data"), value):
+                return False
+            continue
+        if stored.get(key) != value:
+            return False
+    return True
+
+
+def _data_replay_matches(stored_data: Any, event_data: Any) -> bool:
+    if not isinstance(stored_data, Mapping) or not isinstance(event_data, Mapping):
+        return stored_data == event_data
+    if set(stored_data) - {"result"} != set(event_data) - {"result"}:
+        return False
+    for key, value in event_data.items():
+        if key == "result":
+            continue
+        if stored_data.get(key) != value:
+            return False
+    stored_result = stored_data.get("result")
+    event_result = event_data.get("result")
+    if not isinstance(stored_result, Mapping) or not isinstance(event_result, Mapping):
+        return stored_result == event_result
+    # The stored result may carry more evidence than the replay; the replay
+    # must not contradict anything the stored result asserts.
+    return all(stored_result.get(key) == value for key, value in event_result.items())
+
+
+def _prior_completion(state_path: Path, attempt: str) -> dict[str, Any] | None:
+    """The durable tool-completion record an attempt already has, if any."""
+
+    try:
+        raw = bee_events._read_regular(
+            state_path / _TOOL_COMPLETIONS_DIR / f"{attempt}.json"
+        )
+    except Exception:  # noqa: BLE001 - an unreadable record is only no marker
+        return None
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
 def record_tool_completion(
     state_dir: Path,
     attempt_id: str,
@@ -196,6 +273,24 @@ def record_tool_completion(
         }
 
     state_path = Path(state_dir)
+    transition = _tool_id(transition_id) or TOOL_TRANSITION_ID
+    # Primary dedupe: the durable completion record is the per-attempt marker
+    # a prior emission of this exact terminal state left behind. A duplicate
+    # observation never rebuilds or re-records the event at all.
+    prior = _prior_completion(state_path, attempt)
+    if prior is not None and str(prior.get("state") or "") == state_name:
+        event_id = str(prior.get("event_id") or "")
+        if _tool_id(event_id):
+            return {
+                "emitted": True,
+                "created": False,
+                "event_id": event_id,
+                "transition_id": transition,
+                "state": state_name,
+                "usage_recorded": bool(prior.get("usage")),
+                "completion_record": f"{_TOOL_COMPLETIONS_DIR}/{attempt}.json",
+            }
+
     lease = _lease_facts(state_path, attempt)
     brief = lease.get("brief") if isinstance(lease.get("brief"), Mapping) else {}
     digest = lease_sha256 if lease_sha256 is not None else lease.get("brief_sha256")
@@ -218,7 +313,6 @@ def record_tool_completion(
     )
     job = _tool_id(job_id if job_id else brief.get("job_id"))
     task = _tool_id(task_id if task_id else brief.get("task_id"))
-    transition = _tool_id(transition_id) or TOOL_TRANSITION_ID
     identity = _tool_id(coordinator_identity) or _TOOL_IDENTITY
     harness_text = _tool_id(harness) or _TOOL_HARNESS
     model_text = _tool_id(model)
@@ -259,9 +353,25 @@ def record_tool_completion(
             artifact_sha256=artifact,
             reference=reference,
         )
-        stored = bee_events.record_landing(state_path, event)
     except bee_events.EventError as exc:
         return {"emitted": False, "code": exc.code, "error": exc.error, "fix": exc.fix}
+    except Exception as exc:  # noqa: BLE001 - the completion path must survive any write failure
+        return {"emitted": False, "code": "write_back_failed", "error": type(exc).__name__}
+
+    try:
+        stored = bee_events.record_landing(state_path, event)
+    except bee_events.EventError as exc:
+        # A create-only outbox refuses a rewrite; a replay of this exact
+        # transition (identical except the first-seen time) is the duplicate
+        # observation case, not a failure: the event already landed once.
+        stored_event = (
+            _stored_outbox_event(state_path, str(event.get("id") or ""))
+            if exc.code == "event_conflict"
+            else None
+        )
+        if stored_event is None or not _replay_matches(stored_event, event):
+            return {"emitted": False, "code": exc.code, "error": exc.error, "fix": exc.fix}
+        stored = {"created": False}
     except Exception as exc:  # noqa: BLE001 - the completion path must survive any write failure
         return {"emitted": False, "code": "write_back_failed", "error": type(exc).__name__}
 
