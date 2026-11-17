@@ -50,7 +50,7 @@ def test_overlapping_regression_selector_is_not_frozen_red_intent(tmp_path):
     manifest = dict(repository=dict(identity='fixture/r'), acceptance=[dict(id='AC-002', status='FAIL', evidence=[])],
                     red_green=dict(red=dict(phase='red', record_path=path, revision='a'*40, sha256=sha)))
     with pytest.raises(report.ReturnError, match='RED'):
-        rails_return._document(cfg, task, [h], [e], [], '2026-11-17T00:00:00Z', manifest, tmp_path)
+        rails_return._document(cfg, task, [h], [e], [], '2026-11-17T00:00:00.000000Z', manifest, tmp_path)
 
 
 @pytest.mark.parametrize('winning,verified,expected', [
