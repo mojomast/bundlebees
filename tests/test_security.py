@@ -464,3 +464,94 @@ def test_value_shape_matrix_loses_no_redaction_beyond_exempt_shapes():
             assert not old_hit and not new_hit, f"{label}: benign line trips"
         else:
             assert old_hit and new_hit, f"{label}: redaction lost for {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Tight-separator repair (client scrub regression, PR #71).
+#
+# The bare-identifier exemption is a code-reference exemption, and code
+# references are written with whitespace after the separator. In the tight
+# ``k=v`` position - logfmt event lines, dotenv/ini files, values flush
+# against ``=``/``:`` - the value is carried data, not a reference, so a bare
+# identifier trips there. This is the exact shape the client scrub path must
+# remove: ``token=leakedvalue`` in an event line. The mandated synthetic
+# negative-control marker (``Authorization: Bearer ***``-style prose) stays
+# exempt because its separator is code-style (whitespace after the colon) and
+# ``***`` is not a bearer-token character run, and dotted chains, call
+# parens, and arrows keep their exemption under both spacings. The spaced
+# bare literal stays exempt too; that residual risk is pinned explicitly so a
+# future change cannot silently widen redaction past the documented boundary.
+# ---------------------------------------------------------------------------
+
+_TIGHT_TRIP_LINES = {
+    "tight-bare-value": "tok" + "en=leaked" + "value",
+    "tight-bare-digits": "tok" + "en=abc123",
+    "tight-colon": "pass" + "word:leaked" + "value",
+    "tight-dashed": "tok" + "en=abc-def-ghi",
+    "tight-digit-led": "pass" + "word=123456",
+}
+
+_TIGHT_EXEMPT_LINES = {
+    "tight-call-reference": "api_" + "key=loadSecret(env)",
+    "tight-property-chain": "auth" + "orization=config.token",
+    "tight-env-chain": "signing_" + "token=process.env.SIGNING",
+    "tight-arrow": "sec" + "ret=()=>{",
+    # The mandated synthetic negative-control marker: prose showing the
+    # header shape with a placeholder, not a credential.
+    "negative-control-marker": "auth" + "orization: Bearer ***",
+}
+
+_SPACED_RESIDUAL_LINES = {
+    # Same bare word as tight-bare-value, written code-style: stays exempt.
+    "spaced-bare-literal": "tok" + "en = leaked" + "value",
+}
+
+
+@pytest.mark.parametrize("label", sorted(_TIGHT_TRIP_LINES))
+def test_tight_separator_bare_values_trip(label):
+    line = _TIGHT_TRIP_LINES[label]
+    assert _trip(line), line
+
+
+@pytest.mark.parametrize("label", sorted(_TIGHT_TRIP_LINES))
+def test_scrub_redacts_tight_separator_bare_values(label):
+    line = _TIGHT_TRIP_LINES[label]
+    scrubbed = security.scrub(line)
+    assert scrubbed != line, line
+    assert "[redacted]" in scrubbed, line
+
+
+@pytest.mark.parametrize("label", sorted(_TIGHT_EXEMPT_LINES))
+def test_tight_code_references_and_marker_stay_exempt(label):
+    line = _TIGHT_EXEMPT_LINES[label]
+    assert not _trip(line), line
+    assert security.scrub(line) == line, line
+
+
+def test_client_event_line_shape_is_scrubbed():
+    # The CI regression shape (PR #71): a bare low-entropy assigned value in
+    # a tight logfmt event line must leave the scrubbed text entirely.
+    line = "tok" + "en=leaked" + "value connected to http://10.1.2.3/x"
+    scrubbed = security.scrub(line)
+    assert "leaked" + "value" not in scrubbed
+    assert "10.1.2.3" not in scrubbed
+    assert "tok" + "en=[redacted]" in scrubbed
+
+
+def test_spaced_bare_literal_residual_is_pinned():
+    line = _SPACED_RESIDUAL_LINES["spaced-bare-literal"]
+    assert not _trip(line), line
+    assert security.scrub(line) == line, line
+
+
+def test_repaired_boundary_matrix_loses_no_redaction_beyond_code_style():
+    old_patterns, new_patterns = _pattern_sets()
+    rows = {**_TIGHT_TRIP_LINES, **_TIGHT_EXEMPT_LINES, **_SPACED_RESIDUAL_LINES}
+    for label, line in rows.items():
+        old_hit = any(pattern.search(line) for pattern, _ in old_patterns)
+        new_hit = any(pattern.search(line) for pattern, _ in new_patterns)
+        if label in _TIGHT_TRIP_LINES:
+            assert old_hit and new_hit, f"{label}: redaction lost for {line!r}"
+        else:
+            assert old_hit, f"{label}: pre-fix predicate should trip on {line!r}"
+            assert not new_hit, f"{label}: repaired predicate unexpectedly trips {line!r}"
