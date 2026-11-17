@@ -58,7 +58,12 @@ def make_brief(objective="Do the slice work", rev=REV_A, files=("src/one.py",)):
 
 
 class FakeWorld:
-    """The exact probe surface the watcher requires; nothing more."""
+    """The exact probe surface the watcher requires; nothing more.
+
+    ``landed`` maps an attempt id to its origin-landed delivery proof; an
+    attempt missing from it has no provable delivery on any origin (the
+    zero-delivery shape the campaign record SS172-SS175 exposed).
+    """
 
     def __init__(
         self,
@@ -67,18 +72,24 @@ class FakeWorld:
         facts: dict[str, str] | None = None,
         leases: dict[str, list[str]] | None = None,
         bees: int = 0,
+        landed: dict[str, dict] | None = None,
     ) -> None:
         self.prs = dict(prs or {})
         self.attempts = dict(attempts or {})
         self.facts = dict(facts or {})
         self.leases = dict(leases or {})
         self.bees = bees
+        self.landed = dict(landed or {})
 
     def pr_state(self, pr: int) -> str | None:
         return self.prs.get(int(pr))
 
     def attempt_state(self, attempt_id: str) -> str | None:
         return self.attempts.get(str(attempt_id))
+
+    def origin_landed(self, attempt_id: str) -> dict | None:
+        proof = self.landed.get(str(attempt_id))
+        return dict(proof) if proof is not None else None
 
     def fact_state(self, fact: str) -> str | None:
         return self.facts.get(str(fact))
@@ -234,9 +245,14 @@ def test_gate_pr_merged_states(tmp_path: Path) -> None:
 
 
 def test_gate_attempt_succeeded_states(tmp_path: Path) -> None:
+    landed_att_1 = {"landed": True, "via": "branch", "branch": "feat/one"}
     by_attempt = {"type": "attempt_succeeded", "attempt": "att_1"}
     assert gw.evaluate_gate(
-        by_attempt, world=FakeWorld(attempts={"att_1": "succeeded"}), now=BASE
+        by_attempt,
+        world=FakeWorld(
+            attempts={"att_1": "succeeded"}, landed={"att_1": landed_att_1}
+        ),
+        now=BASE,
     )[0] == "cleared"
     state, _ = gw.evaluate_gate(
         by_attempt, world=FakeWorld(attempts={"att_1": "failed"}), now=BASE
@@ -255,7 +271,12 @@ def test_gate_attempt_succeeded_states(tmp_path: Path) -> None:
     assert state == "stale"
 
     by_slice = {"type": "attempt_succeeded", "slice": "ov0-spike"}
-    world = FakeWorld(attempts={"att_ov0-spike": "succeeded"})
+    world = FakeWorld(
+        attempts={"att_ov0-spike": "succeeded"},
+        landed={
+            "att_ov0-spike": {"landed": True, "via": "branch", "branch": "feat/ov0-spike"}
+        },
+    )
     assert gw.evaluate_gate(
         by_slice, world=world, now=BASE, slices={"ov0-spike": {"attempt_id": "att_ov0-spike"}}
     )[0] == "cleared"
@@ -652,7 +673,10 @@ def test_depends_on_waits_for_the_dependency_slice(tmp_path: Path) -> None:
     assert report["waiting"] == ["F18"]
     report = gw.run_beat(
         tmp_path,
-        world=FakeWorld(attempts={"att_F16": "succeeded"}),
+        world=FakeWorld(
+            attempts={"att_F16": "succeeded"},
+            landed={"att_F16": {"landed": True, "via": "branch", "branch": "feat/f16"}},
+        ),
         dispatcher=dispatcher,
         now=BASE,
     )
@@ -689,6 +713,13 @@ def test_seeded_backlog_beat_routes_and_waits(tmp_path: Path) -> None:
         prs={44: "merged", 40: "merged"},
         facts={"F2": "landed", "M1": "landed"},
         attempts={"att_ov0-spike": "succeeded"},
+        landed={
+            "att_ov0-spike": {
+                "landed": True,
+                "via": "branch",
+                "branch": "feat/ov0-await-spike",
+            }
+        },
     )
     report = gw.run_beat(
         tmp_path, world=world, dispatcher=dispatcher, now=1_796_000_000
@@ -708,6 +739,7 @@ def test_seeded_backlog_beat_routes_and_waits(tmp_path: Path) -> None:
 
     # F16's attempt lands: its dependents queue and dispatch in the same lane.
     world.attempts["att_F16"] = "succeeded"
+    world.landed["att_F16"] = {"landed": True, "via": "branch", "branch": "feat/f16"}
     report = gw.run_beat(
         tmp_path, world=world, dispatcher=dispatcher, now=1_796_100_000
     )
@@ -749,3 +781,193 @@ def test_budget_validation_stays_in_the_owner_envelope(tmp_path: Path) -> None:
             max_bees=11,
         )
     assert err.value.code == "budget_invalid"
+
+
+# ---------------------------------------------------------------------------
+# origin-landed proof (campaign defect f, SS172-SS175): attempt state alone
+# never clears a gate or a dependency edge. The recorded shape: a succeeded
+# attempt with an empty patch and no branch on any origin. A gate or edge
+# clears only when the launcher state is terminal success AND the world's
+# origin probe proves a landed delivery (a merged PR also counts); anything
+# unprovable answers None and leaves the edge blocked.
+# ---------------------------------------------------------------------------
+
+
+def test_attempt_gate_succeeded_without_origin_delivery_stays_waiting() -> None:
+    gate = {"type": "attempt_succeeded", "attempt": "att_r04"}
+    state, evidence = gw.evaluate_gate(
+        gate, world=FakeWorld(attempts={"att_r04": "succeeded"}), now=BASE
+    )
+    assert state == "waiting"
+    assert evidence["state"] == "succeeded"
+    assert evidence["reason"] == "origin_not_proven"
+
+
+def test_slice_gate_succeeded_zero_delivery_attempt_stays_waiting() -> None:
+    gate = {"type": "attempt_succeeded", "slice": "R04"}
+    world = FakeWorld(attempts={"att_R04": "succeeded"})
+    state, _ = gw.evaluate_gate(
+        gate, world=world, now=BASE, slices={"R04": {"attempt_id": "att_R04"}}
+    )
+    assert state == "waiting"
+
+
+def test_dependency_edge_blocks_on_succeeded_zero_delivery_attempt(
+    tmp_path: Path,
+) -> None:
+    lead = seed_one(tmp_path, "R04")
+    lead["gates"] = [{"type": "none"}]
+    follower = seed_one(tmp_path, "R05")
+    follower["gates"] = [{"type": "none"}]
+    follower["brief"] = make_brief(objective="Build R05", rev=REV_B, files=("src/r05.py",))
+    follower["depends_on"] = ["R04"]
+    gw.seed_backlog(tmp_path, slices=[lead, follower], now=BASE)
+    gw.run_beat(tmp_path, world=FakeWorld(), dispatcher=FakeDispatcher(), now=BASE)
+    assert slice_doc(tmp_path, "R04")["status"] == "dispatched"
+
+    # The R04 attempt reports succeeded but delivered nothing: no proof that
+    # its branch ever landed on origin, so the R05 edge stays blocked.
+    report = gw.run_beat(
+        tmp_path,
+        world=FakeWorld(attempts={"att_R04": "succeeded"}),
+        dispatcher=FakeDispatcher(),
+        now=BASE,
+    )
+    assert report["dispatched"] == []
+    assert report["waiting"] == ["R05"]
+    assert slice_doc(tmp_path, "R05")["status"] == "planned"
+
+
+def test_beat_blocked_on_succeeded_zero_delivery_attempt_gate(tmp_path: Path) -> None:
+    slice_record = seed_one(tmp_path, "OV-A")
+    slice_record["gates"] = [{"type": "attempt_succeeded", "attempt": "att_ov0"}]
+    gw.seed_backlog(tmp_path, slices=[slice_record], now=BASE)
+    report = gw.run_beat(
+        tmp_path,
+        world=FakeWorld(attempts={"att_ov0": "succeeded"}),
+        dispatcher=FakeDispatcher(),
+        now=clock(1),
+    )
+    assert report["dispatched"] == []
+    assert slice_doc(tmp_path, "OV-A")["status"] == "planned"
+
+    # The delivery lands on origin: the same gate clears and dispatches.
+    report = gw.run_beat(
+        tmp_path,
+        world=FakeWorld(
+            attempts={"att_ov0": "succeeded"},
+            landed={"att_ov0": {"landed": True, "via": "branch", "branch": "feat/ov0"}},
+        ),
+        dispatcher=FakeDispatcher(),
+        now=clock(2),
+    )
+    assert report["dispatched"] == [{"id": "OV-A", "attempt_id": "att_OV-A"}]
+
+
+def test_attempt_gate_clears_only_with_origin_landed_proof() -> None:
+    gate = {"type": "attempt_succeeded", "attempt": "att_r04"}
+    branch_proof = {"landed": True, "via": "branch", "branch": "rails/r04-importer"}
+    assert gw.evaluate_gate(
+        gate,
+        world=FakeWorld(
+            attempts={"att_r04": "succeeded"}, landed={"att_r04": branch_proof}
+        ),
+        now=BASE,
+    ) == (
+        "cleared",
+        {"attempt": "att_r04", "state": "succeeded", "origin": branch_proof},
+    )
+    # A merged PR also counts as a landed delivery.
+    pr_proof = {"landed": True, "via": "pr", "pr": 57, "state": "merged"}
+    assert gw.evaluate_gate(
+        gate,
+        world=FakeWorld(
+            attempts={"att_r04": "succeeded"}, landed={"att_r04": pr_proof}
+        ),
+        now=BASE,
+    )[0] == "cleared"
+
+
+def test_dependency_edge_clears_with_origin_landed_proof(tmp_path: Path) -> None:
+    lead = seed_one(tmp_path, "R04")
+    lead["gates"] = [{"type": "none"}]
+    follower = seed_one(tmp_path, "R05")
+    follower["gates"] = [{"type": "none"}]
+    follower["brief"] = make_brief(objective="Build R05", rev=REV_B, files=("src/r05.py",))
+    follower["depends_on"] = ["R04"]
+    gw.seed_backlog(tmp_path, slices=[lead, follower], now=BASE)
+    gw.run_beat(tmp_path, world=FakeWorld(), dispatcher=FakeDispatcher(), now=BASE)
+    report = gw.run_beat(
+        tmp_path,
+        world=FakeWorld(
+            attempts={"att_R04": "succeeded"},
+            landed={
+                "att_R04": {"landed": True, "via": "branch", "branch": "rails/r04-importer"}
+            },
+        ),
+        dispatcher=FakeDispatcher(),
+        now=BASE,
+    )
+    assert report["dispatched"] == [{"id": "R05", "attempt_id": "att_R05"}]
+
+
+def test_world_without_origin_probe_stays_fail_closed() -> None:
+    class NoProbeWorld:
+        """A world from before the origin probe: it cannot prove a landing."""
+
+        def __init__(self, attempts: dict[str, str]) -> None:
+            self.attempts = dict(attempts)
+
+        def pr_state(self, pr: int) -> str | None:
+            return None
+
+        def attempt_state(self, attempt_id: str) -> str | None:
+            return self.attempts.get(str(attempt_id))
+
+        def fact_state(self, fact: str) -> str | None:
+            return None
+
+        def active_bee_leases(self) -> dict[str, list[str]]:
+            return {}
+
+        def active_bee_count(self) -> int:
+            return 0
+
+    gate = {"type": "attempt_succeeded", "attempt": "att_r04"}
+    state, _ = gw.evaluate_gate(
+        gate, world=NoProbeWorld({"att_r04": "succeeded"}), now=BASE
+    )
+    assert state == "waiting"
+
+
+def test_unprovable_origin_answers_leave_the_edge_blocked() -> None:
+    gate = {"type": "attempt_succeeded", "attempt": "att_r04"}
+
+    # The probe answers None: nothing provable on origin.
+    state, _ = gw.evaluate_gate(
+        gate,
+        world=FakeWorld(attempts={"att_r04": "succeeded"}, landed={"att_r04": None}),
+        now=BASE,
+    )
+    assert state == "waiting"
+
+    # A proof that does not actually assert a landing is not a proof.
+    state, _ = gw.evaluate_gate(
+        gate,
+        world=FakeWorld(
+            attempts={"att_r04": "succeeded"},
+            landed={"att_r04": {"landed": False, "via": "branch"}},
+        ),
+        now=BASE,
+    )
+    assert state == "waiting"
+
+    # A garbage answer proves nothing and must not clear the edge either.
+    class GarbageWorld(FakeWorld):
+        def origin_landed(self, attempt_id: str):
+            return "succeeded"
+
+    state, _ = gw.evaluate_gate(
+        gate, world=GarbageWorld(attempts={"att_r04": "succeeded"}), now=BASE
+    )
+    assert state == "waiting"

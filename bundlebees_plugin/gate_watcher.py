@@ -134,8 +134,8 @@ _FIX = (
 )
 _FIX_WORLD = (
     "Inject a world exposing pr_state(), attempt_state(), fact_state(), "
-    "active_bee_leases() and active_bee_count(); an unobservable world never "
-    "clears a gate."
+    "origin_landed(), active_bee_leases() and active_bee_count(); an "
+    "unobservable world never clears a gate."
 )
 _FIX_DISPATCHER = (
     "Inject a dispatcher exposing dispatch(payload) -> {attempt_id, ...}; the "
@@ -922,6 +922,13 @@ class World:
     pull request. ``attempt_state(attempt_id)`` answers the launcher's attempt
     state or None. ``fact_state(fact)`` answers the campaign record's landing
     fact for a named slice or dependency (``"landed"``/``"failed"``/other/None).
+    ``origin_landed(attempt_id)`` answers the origin proof that one attempt's
+    delivery actually landed — its project branch pushed and present on an
+    origin, or its PR merged — as a mapping with a truthy ``landed`` key, or
+    None when the delivery cannot be proven (a succeeded attempt that delivered
+    nothing proves nothing). The probe is optional and fail-closed: a world
+    without it, an absent answer or an unusable answer is ``None``, and an
+    unprovable gate state is ``waiting``, never ``cleared``.
     ``active_bee_leases()`` answers the owner-to-assigned-files mapping for
     bees in flight, and ``active_bee_count()`` the number of live bees. A
     probe that cannot observe answers None: an unprovable gate state is
@@ -979,6 +986,26 @@ class World:
                 _FIX_WORLD,
             )
         return state
+
+    def origin_landed(self, attempt_id: str) -> dict[str, Any] | None:
+        """The landed-delivery proof for one attempt, or None when unprovable.
+
+        The probe is optional and fail-closed: a world that predates it, an
+        absent answer, a non-mapping answer or a mapping that does not assert
+        a landing all answer None, so the gate or edge stays blocked.
+        """
+
+        probe = getattr(self._world, "origin_landed", None)
+        if not callable(probe):
+            return None
+        proof = probe(str(attempt_id))
+        if proof is None:
+            return None
+        if isinstance(proof, (str, bytes)) or not isinstance(proof, Mapping):
+            return None
+        if not proof.get("landed"):
+            return None
+        return dict(proof)
 
     def active_bee_leases(self) -> dict[str, list[str]]:
         leases = self._world.active_bee_leases()
@@ -1106,7 +1133,22 @@ def evaluate_gate(
             probe = observed.fact_state(ref)
             evidence = {"fact": ref}
         if probe in SUCCESS_ATTEMPT_STATES:
-            return "cleared", {**evidence, "state": probe}
+            # The fact path is already origin evidence: the campaign record's
+            # landing fact for a named slice or dependency. For an attempt or
+            # slice reference, a terminal launcher state alone is not a
+            # landing (campaign defect f): a succeeded attempt that delivered
+            # nothing must leave the gate waiting. A branch landed on origin
+            # or a merged PR, proven by the world's origin probe, clears it.
+            if "fact" in evidence:
+                return "cleared", {**evidence, "state": probe}
+            proof = observed.origin_landed(ref)
+            if proof is None:
+                return "waiting", {
+                    **evidence,
+                    "state": probe,
+                    "reason": "origin_not_proven",
+                }
+            return "cleared", {**evidence, "state": probe, "origin": proof}
         if probe in FAILED_ATTEMPT_STATES:
             return (
                 "stale",
@@ -1156,11 +1198,15 @@ def _dependency_state(
     slices_by_id: Mapping[str, Mapping[str, Any]],
     observed: World,
 ) -> tuple[str, dict[str, Any]]:
-    """One ``depends_on`` edge: cleared when the dependency's attempt landed.
+    """One ``depends_on`` edge: cleared when the dependency's delivery landed.
 
     A dependency that has never been dispatched, or whose attempt is still in
     flight, keeps the dependent waiting; a failed dependency attempt is stale
-    (the dependent can never proceed on that edge until it is re-pointed).
+    (the dependent can never proceed on that edge until it is re-pointed). A
+    succeeded attempt is not a landing: the edge clears only when the world's
+    origin probe proves the attempt's delivery landed (its project branch on
+    an origin, or its PR merged) — a succeeded zero-delivery attempt keeps the
+    edge blocked.
     """
 
     record = slices_by_id.get(dep_id)
@@ -1174,7 +1220,10 @@ def _dependency_state(
     probe = observed.attempt_state(attempt_id)
     evidence: dict[str, Any] = {"dep": dep_id, "attempt": attempt_id, "state": probe}
     if probe in SUCCESS_ATTEMPT_STATES:
-        return "cleared", evidence
+        proof = observed.origin_landed(attempt_id)
+        if proof is None:
+            return "waiting", {**evidence, "reason": "origin_not_proven"}
+        return "cleared", {**evidence, "origin": proof}
     if probe in FAILED_ATTEMPT_STATES:
         return "stale", {**evidence, "reason": "dependency_failed"}
     return "waiting", evidence
