@@ -99,6 +99,21 @@ class FeedbackCase(unittest.TestCase):
 
 
 class FeedbackRetryTests(FeedbackCase):
+    def test_commit_guard_applies_to_new_record_only(self):
+        target = self.target()
+        def refuse():
+            self.assertTrue(self.ledger._conn.in_transaction)
+            raise PermissionError('grant ended')
+
+        with self.assertRaises(PermissionError):
+            self.record(target=target, authorize_new_record=refuse)
+        first = self.record(target=target)
+        self.assertFalse(first['duplicated'])
+        self.assertEqual(self.record(target=target, authorize_new_record=refuse), dict(first, duplicated=True))
+        with self.assertRaises(rails_feedback.FeedbackConflictRefusal):
+            self.record(target=target, rating=0, authorize_new_record=refuse)
+        self.assertEqual(len(rails_feedback.history(self.ledger)), 1)
+
     def test_retry_duplicate_yields_one_feedback_row(self):
         target = self.target()
         first = self.record(target=target)

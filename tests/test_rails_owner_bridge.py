@@ -37,6 +37,47 @@ class OwnerBridge(unittest.TestCase):
         return subprocess.run(['ssh-keygen','-Y','sign','-n',bridge.NAMESPACE,'-f',str(self.key)],input=review.encode(),
                               env=self.key_env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True).stdout.decode()
 
+    def confirm_request(self):
+        text = bridge.handle(self.config, dict(action='preview', draft=self.draft))['review']
+        return dict(action='confirm', review=text, signature=self.sign(text))
+
+    def assert_refused_at_commit(self, change):
+        head = self.db.head()
+        append = RailsLedger._append_locked
+        with patch.object(bridge, 'time') as clock:
+            clock.time.return_value = 1000
+            submit = self.confirm_request()
+
+            def staged(writer, conn, *args):
+                result = append(writer, conn, *args)
+                self.assertTrue(conn.in_transaction)
+                change(clock)
+                return result
+
+            with patch.object(RailsLedger, '_append_locked', staged), self.assertRaises(bridge.Refusal):
+                bridge.handle(self.config, submit)
+        self.assertEqual(self.db.head(), head)
+        self.assertFalse(history(self.db, self.target))
+        self.assertFalse(self.db.query('SELECT event_id FROM dedupe_index WHERE dedupe_key=?',
+                                       ('feedback:' + self.draft['idempotency_key'],)))
+
+    def test_expiry_at_commit_refuses_first_record(self):
+        self.assert_refused_at_commit(lambda clock: setattr(clock.time, 'return_value', 1300))
+
+    def test_removed_authority_at_commit_refuses_first_record(self):
+        self.assert_refused_at_commit(lambda _: job.authorization_path(self.state, 'job1').unlink())
+
+    def test_removed_signer_at_commit_refuses_first_record(self):
+        self.assert_refused_at_commit(lambda _: self.signers.unlink())
+
+    def test_replaced_profile_at_commit_refuses_first_record(self):
+        def switch_profile(_):
+            alternate = self.root/'alternate-signers'
+            alternate.write_bytes(self.signers.read_bytes()); alternate.chmod(0o600)
+            profile = json.loads(self.config.read_bytes())
+            self.config.write_text(json.dumps(dict(profile, signers=str(alternate))))
+        self.assert_refused_at_commit(switch_profile)
+
     def test_discarded_receipt_replay_is_one_durable_record(self):
         prepared=bridge.handle(self.config,dict(action='preview',draft=self.draft));text=prepared['review'];sig=self.sign(text)
         submit=dict(action='confirm',review=text,signature=sig)
@@ -68,3 +109,23 @@ class OwnerBridge(unittest.TestCase):
         with patch.object(bridge.time,'time',return_value=1100):r=bridge.handle(self.config,submit)
         with patch.object(bridge.time,'time',return_value=1400):
             self.assertEqual(bridge.handle(self.config,submit),dict(event_id=r['event_id'],duplicated=True))
+
+    def test_expired_recovery_requires_exact_review_and_no_write_grant(self):
+        with patch.object(bridge, 'time') as clock:
+            clock.time.return_value = 1000
+            original = self.confirm_request()
+            receipt = bridge.handle(self.config, original)
+            clock.time.return_value = 1001
+            other = self.confirm_request()  # Same key and annotation, different signed expiry.
+            job.authorization_path(self.state, 'job1').unlink()
+            clock.time.return_value = 1400
+
+            def reader(path, *, read_only):
+                self.assertIs(read_only, True)
+                return RailsLedger(path, read_only=True)
+
+            with patch.object(bridge, 'RailsLedger', reader):
+                self.assertEqual(bridge.handle(self.config, original), dict(receipt, duplicated=True))
+                with self.assertRaises(bridge.Refusal):
+                    bridge.handle(self.config, other)
+        self.assertEqual(len(history(self.db, self.target)), 1)

@@ -194,7 +194,7 @@ def _existing_for_key(ledger, dedupe_key):
 
 
 def _mutate(ledger, operation, feedback_id, target_event_id, base_revision, idempotency_key,
-            scope, source, authority, rating, category, note, lane):
+            scope, source, authority, rating, category, note, lane, authorize_new_record=None):
     """CAS and dedupe run under the same BEGIN IMMEDIATE as the event append."""
     ledger._ensure_writable()
     ledger._probe_capacity()
@@ -264,6 +264,10 @@ def _mutate(ledger, operation, feedback_id, target_event_id, base_revision, idem
         # scrubbing, target existence, semantic dedupe, and both chain hashes.
         receipt = ledger._append_locked(conn, FEEDBACK_KIND, source, scope, payload, authority,
                                         dedupe_key, lane, None, None, "unknown", None)
+        # Only an exact semantic replay can return duplicated=True. Anything
+        # newly staged (including its dedupe entry) rolls back on refusal.
+        if authorize_new_record is not None and not receipt['duplicated']:
+            authorize_new_record()
         return dict(receipt, feedback_id=feedback_id, revision=revision,
                     operation=operation, cleared=operation == _CLEAR)
 
@@ -283,15 +287,17 @@ def _mutate(ledger, operation, feedback_id, target_event_id, base_revision, idem
 
 def record(ledger, target_event_id, *, idempotency_key, scope, source=None,
            authority="owner_record", rating=None, category=_DEFAULT_CATEGORY,
-           note=None, feedback_id=None, lane=None):
+           note=None, feedback_id=None, lane=None, authorize_new_record=None):
     """Record feedback against one existing rail event.
 
     The returned row is keyed by ``feedback_id``. Repeating the call with the
     same ``idempotency_key`` returns the original event id with
-    ``duplicated=True``; the ledger holds exactly one row.
+    ``duplicated=True``; the ledger holds exactly one row. If provided,
+    ``authorize_new_record()`` runs inside the writer transaction just before
+    a first record is committed. It must raise if authority is no longer valid.
     """
     return _mutate(ledger, _RECORD, feedback_id, target_event_id, 0, idempotency_key,
-                   scope, source, authority, rating, category, note, lane)
+                   scope, source, authority, rating, category, note, lane, authorize_new_record)
 
 
 def edit(ledger, feedback_id, *, base_revision, idempotency_key, scope,
