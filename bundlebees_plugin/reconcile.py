@@ -504,6 +504,7 @@ def tick(
     launcher: Any,
     verifier: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    accept_integration: Callable[[dict, Mapping[str, Any]], None] | None = None,
     now: Any = None,
     grace_s: float = DEFAULT_GRACE_S,
     max_uncertain_ticks: int = DEFAULT_MAX_UNCERTAIN_TICKS,
@@ -533,7 +534,9 @@ def tick(
     if lock is None:
         return TickResult(status="locked", detail="another live tick holds the job lock")
     try:
-        job = jobs.load_job(Path(state_dir), job_id)
+        # The native driver has already checked recovery with today's settings.
+        # Do not re-adopt a different handoff here via a passive load.
+        job = jobs.load_job(Path(state_dir), job_id, recover=accept_integration is None)
         # Durable work publication is an observer of the mechanical tick, never a
         # gate on it: a broken queue must not stop reconciliation from running.
         work_item: dict[str, Any] | None = None
@@ -544,7 +547,8 @@ def tick(
         except Exception as exc:  # noqa: BLE001 - publication must not block the tick
             work_error = str(getattr(exc, "code", None) or type(exc).__name__)
         result = _run(
-            Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder, decision
+            Path(state_dir), job, adapter, clock, grace_s, max_uncertain_ticks, verifier, integrator, binder, decision,
+            accept_integration,
         )
         try:
             published = work_queue.publish_outstanding(Path(state_dir), job, now=clock)
@@ -587,6 +591,7 @@ def _run(
     integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
     binder: Callable[[str, Mapping[str, Any]], None] | None = None,
     evidence_decision: Mapping[str, Any] | None = None,
+    accept_integration: Callable[[dict, Mapping[str, Any]], None] | None = None,
 ) -> TickResult:
     attempts = adapter.list_attempts()
     transitions: list[str] = []
@@ -660,7 +665,18 @@ def _run(
             )
             jobs.save_job(state_dir, job)
             return result
-        result = _integrate(state_dir, job, integrator, clock, transitions)
+        verdict = integrator(dict(job))
+        ok, evidence = _verdict(verdict, "integrator")
+        if ok and accept_integration is not None:
+            # Native acceptance persists the proved result under its wave and ref
+            # locks. Never follow it with a second, unlocked job save.
+            wave = _wave_number(integration)
+            pending = [t["task_id"] for t in job["tasks"] if t.get("state") in {"verified", "integrating"}]
+            accept_integration(job, verdict)
+            transitions.extend(f"{t}->accepted" for t in pending)
+            transitions.append("integration->accepted")
+            return TickResult(status="ok", transitions=tuple(transitions), action="integrate", detail=f"wave {wave} accepted")
+        result = _integrate(job, verdict, ok, evidence, clock, transitions)
         jobs.save_job(state_dir, job)
         return result
 
@@ -1118,9 +1134,10 @@ def _wave_number(integration: Mapping[str, Any]) -> int:
 
 
 def _integrate(
-    state_dir: Path,
     job: dict[str, Any],
-    integrator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    verdict: Mapping[str, Any],
+    ok: bool,
+    evidence: str,
     clock: float,
     transitions: list[str],
 ) -> TickResult:
@@ -1128,8 +1145,6 @@ def _integrate(
     if integration.get("terminal"):
         return TickResult(status="idle", detail="integration budget exhausted")
 
-    verdict = integrator(dict(job))
-    ok, evidence = _verdict(verdict, "integrator")
     integration["attempts"] = int(integration.get("attempts") or 0) + 1
     integration["evidence"] = evidence
     integration["state"] = "accepted" if ok else "failed"

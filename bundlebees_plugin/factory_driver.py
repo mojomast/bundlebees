@@ -922,8 +922,7 @@ def startup_reconcile(
     for job_id in _job_ids(state, queue):
         try:
             job = jobs.load_job(state, job_id, recover=False)
-            if jobs.recover_integration(state, job):
-                jobs.save_job(state, job)
+            if jobs.recover_integration(state, job, persist=True):
                 report["adopted_waves"].append(job_id)
         except Exception as exc:  # noqa: BLE001 - one damaged job must not stop startup
             report["errors"].append({"job_id": job_id, "error": type(exc).__name__})
@@ -1898,8 +1897,7 @@ def mechanical_tick(state_dir: Any) -> Any:
             job = jobs.load_job(state, job_id, recover=False)
         except Exception as exc:  # noqa: BLE001
             return {"status": "blocked", "detail": f"job unreadable: {type(exc).__name__}"}
-        if jobs.recover_integration(state, job):
-            jobs.save_job(state, job)
+        jobs.recover_integration(state, job, persist=True)
         return {"status": "idle", "detail": "no worker configured; mechanical reconcile only"}
 
     tick.observation_only = True  # type: ignore[attr-defined]

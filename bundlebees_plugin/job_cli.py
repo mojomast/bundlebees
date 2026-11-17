@@ -106,9 +106,7 @@ def recover(
       does that, exactly once.
     """
     job = jobs.load_job(state_dir, job_id, recover=False)
-    adopted = jobs.recover_integration(state_dir, job, repo=repo)
-    if adopted:
-        jobs.save_job(state_dir, job)
+    adopted = jobs.recover_integration(state_dir, job, repo=repo, persist=True)
     head = _last_accepted_head(job)
     restored = ""
     if head and repo is not None:
@@ -421,8 +419,8 @@ def tick(
     # closed before anything else: adopt the accepted record, persist it, and
     # point the durable ref back at the accepted head so a restart can neither
     # integrate the same work twice nor build the next wave on the wrong base.
-    if jobs.recover_integration(state_dir, job, repo=repo, suite_command=suite_command, runner=runner):
-        jobs.save_job(state_dir, job)
+    jobs.recover_integration(state_dir, job, repo=repo, suite_command=suite_command, runner=runner,
+                             persist=True, repair_ref=False)
     head = _last_accepted_head(job)
     if head and Path(repo).exists():
         _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
@@ -548,7 +546,7 @@ def tick(
 
     def integrator(job_doc: Mapping[str, Any]) -> Mapping[str, Any]:
         try:
-            result = integrate_job.integrate(
+            return integrate_job.integrate(
                 state_dir,
                 job_doc,
                 repo,
@@ -557,14 +555,12 @@ def tick(
             )
         except (integrate_job.IntegrateError, Exception) as exc:  # noqa: BLE001 - reported as a failed wave
             return {"ok": False, "evidence": f"integration error: {exc}"}
-        commit = ""
-        ref = result.get("integration_ref")
-        if ref:
-            import subprocess as _sp
 
-            head = _sp.run(["git", "-C", str(repo), "rev-parse", str(ref)], capture_output=True, text=True)
-            commit = head.stdout.strip() if head.returncode == 0 else ""
-        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or ""), "commit": commit}
+    def accept_integration(job_doc: dict, verdict: Mapping[str, Any]) -> None:
+        if not jobs.recover_integration(state_dir, job_doc, repo=repo, suite_command=suite_command, runner=runner,
+                                        live_result=verdict, persist=True, repair_ref=False):
+            raise jobs.JobError("wave_reconciliation_required", "Live integration has no matching sealed acceptance.",
+                                "Inspect the wave and its handoff receipts.")
 
     result = reconcile.tick(
         state_dir,
@@ -572,6 +568,7 @@ def tick(
         launcher=adapter,
         verifier=verifier,
         integrator=integrator,
+        accept_integration=accept_integration,
         binder=binder,
         now=now,
     )

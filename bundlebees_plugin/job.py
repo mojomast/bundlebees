@@ -1423,7 +1423,9 @@ def _resumed_identity(repo: Path, job: dict, wave: str, shas: list, historical: 
 
 
 def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | None = None,
-                        suite_command: Sequence[str] | None = None, runner: Any = None) -> bool:
+                        suite_command: Sequence[str] | None = None, runner: Any = None,
+                        live_result: Mapping[str, Any] | None = None, persist: bool = False,
+                        repair_ref: bool = True) -> bool:
     """Adopt an accepted wave that a crash left out of this job document.
 
     A sealed handoff pins the request, local repo, and materialized result.
@@ -1489,49 +1491,64 @@ def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | No
             record = pair[0]
             head = record["head_sha"]
             ref = ij.integration_ref(job_id)
-            if repo is None:
+            if live_result is not None:
+                if (live_result.get("ok") is not True or live_result.get("request_identity_digest") != digest
+                        or live_result.get("record") != record or live_result.get("integration_ref") != ref):
+                    raise ij._reconcile(selected, "live integration result differs from its sealed handoff")
+            elif repo is not None and repair_ref:
+                ij._publish_head(local, ref, selected, stored["materialized"])
+            if persist:
+                with ij._hold_tested_head(local, ref, selected, head):
+                    _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)
+                    save_job(state, job)
+            else:
                 if ij._ref_value(local, ref, selected) != head:
                     raise ij._reconcile(selected, "use job recover with the pinned repo to finish the ref update")
-            else:
-                ij._publish_head(local, ref, selected, stored["materialized"])
+                _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)
     except (JobError, ij.IntegrateError, LeaseError, test_receipts.ReceiptError, verify_local.VerifyError,
             OSError, KeyError, TypeError) as exc:
         raise JobError("wave_reconciliation_required", f"Wave {wave_id} requires reconciliation: {exc}",
                        "Inspect the preserved request, result and repository before retrying.") from exc
 
+    return True
+
+
+def _apply_proved_wave(job: dict, record: Mapping[str, Any], digest: str, attempts: list[str], *, recovered: bool) -> None:
+    integration = job["integration"]
+    wave = _wave_number(integration.get("wave", 1))
+    selected, head = record["wave_id"], record["head_sha"]
+    actor = "recovery" if recovered else "reconciler"
+    evidence = f"{'recovered ' if recovered else ''}accepted wave {selected} at {head}"
     pending = [task for task in job.get("tasks") or [] if task.get("state") in {"verified", "integrating"}]
     for task in pending:
         task_id = str(task.get("task_id") or "")
         if task.get("state") == "verified":
-            transition(job, task_id, "integrating", actor="recovery",
-                       reason=f"wave {wave_id} was already accepted")
-        transition(job, task_id, "accepted", actor="recovery",
-                   reason=f"adopted accepted wave {wave_id} after a crash",
-                   evidence=f"recovered wave {wave_id} at {head[:12]}")
+            transition(job, task_id, "integrating", actor=actor, reason=evidence)
+        transition(job, task_id, "accepted", actor=actor, reason=evidence, evidence=evidence)
 
     integration.update(
         accepted_waves=[
-            *settled,
+            *(integration.get("accepted_waves") or []),
             {
                 "wave": wave,
                 "at": str(record.get("at") or ""),
-                "evidence": f"recovered accepted wave {selected} at {head}",
+                "evidence": evidence,
                 "commit": head,
                 "wave_id": selected,
                 "attempts": attempts,
                 "request_identity_digest": digest,
-                "recovered": True,
+                "recovered": recovered,
             },
         ],
         wave=wave + 1,
-        wave_id=_wave_id(job_id, wave + 1),
+        wave_id=_wave_id(job["job_id"], wave + 1),
         attempts=0,
         state="pending",
         last_commit=head,
-        recovered={"wave": wave, "wave_id": selected, "head_sha": head,
-                   "at": str(record.get("at") or "")},
+        evidence=evidence,
     )
-    return True
+    if recovered:
+        integration["recovered"] = {"wave": wave, "wave_id": selected, "head_sha": head, "at": record["at"]}
 
 
 def load_job(state_dir: Path, job_id: str, *, recover: bool = True) -> dict[str, Any]:

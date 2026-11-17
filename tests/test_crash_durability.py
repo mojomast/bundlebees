@@ -503,6 +503,61 @@ class WaveEvidence:
 class JobRecovery:
     __test__ = True
 
+    @pytest.mark.parametrize("change", ["missing-ref", "moved-ref", "different-receipt", "missing-digest", "none"])
+    def test_live_tick_consumes_the_sealed_result_through_the_job_save(self, tmp_path, monkeypatch, change):
+        repo, base, state, job = verified_job(tmp_path)
+        ref = integrate_job.integration_ref(job["job_id"])
+        receipts = {}
+        real_integrate, real_save = integrate_job.integrate, jobs.save_job
+        expected = {}
+        writes = []
+
+        def after_integration(*args, **kwargs):
+            result = real_integrate(*args, **kwargs)
+            assert result["ok"] and not result["recovered"]
+            expected.update(commit=result["record"]["head_sha"], request_identity_digest=result["request_identity_digest"],
+                            wave_id=result["record"]["wave_id"], attempts=result["record"]["attempts"])
+            for directory in ("waves", "wave-identities", "job-wave-proofs", "job-wave-requests"):
+                receipts.update({p: p.read_bytes() for p in (state / directory).glob("*.json")})
+            if change == "missing-ref":
+                git(repo, "update-ref", "-d", ref)
+            elif change == "moved-ref":
+                git(repo, "update-ref", ref, base)
+            elif change == "different-receipt":
+                result["record"] = dict(result["record"], head_sha=base)
+            elif change == "missing-digest":
+                result.pop("request_identity_digest")
+            return result
+
+        def at_save(state_dir, body):
+            if body["tasks"][0]["state"] == "accepted":
+                # A competing Git writer at the actual save boundary cannot
+                # change the ref between the proof check and publication.
+                writes.append(git(repo, "update-ref", ref, base, check=False).returncode)
+            return real_save(state_dir, body)
+
+        monkeypatch.setattr(integrate_job, "integrate", after_integration)
+        monkeypatch.setattr(jobs, "save_job", at_save)
+        def tick():
+            return job_cli.tick(state, job["job_id"], client=Client(), repo=repo, suite_command=SUITE, runner=sandboxed)
+
+        if change == "none":
+            assert tick()["status"] == "ok"
+            saved = jobs.load_job(state, job["job_id"], recover=False)
+            entry, = saved["integration"]["accepted_waves"]
+            assert {k: entry[k] for k in expected} == expected and entry["recovered"] is False
+            assert saved["integration"]["last_commit"] == git(repo, "rev-parse", ref).stdout.strip() == expected["commit"]
+            assert len(writes) == 1 and writes[0] != 0
+        else:
+            with pytest.raises(jobs.JobError) as refused:
+                tick()
+            assert refused.value.code == "wave_reconciliation_required" and not writes
+            saved = jobs.load_job(state, job["job_id"], recover=False)
+            assert saved["tasks"][0]["state"] == "verified" and not saved["integration"].get("accepted_waves")
+            current = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            assert current == {"missing-ref": "", "moved-ref": base}.get(change, expected["commit"])
+        assert len(receipts) == 4 and all(p.read_bytes() == b for p, b in receipts.items())
+
     @pytest.mark.parametrize("change", ["missing-request", "missing-proof", "corrupt-request", "foreign-repo",
                                          "commit", "absent-repo", "changed-command", "changed-runner", "stale-ref"])
     def test_unproved_handoff_cannot_change_job_or_ref(self, tmp_path, change):

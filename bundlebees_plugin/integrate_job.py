@@ -27,6 +27,7 @@ import re
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -372,6 +373,23 @@ def _ref_value(repo: Path, ref: str, wave: str) -> str | None:
     if check.returncode or not _SHA.fullmatch(check.stdout.strip()):
         raise _reconcile(wave, "integration ref cannot be read")
     return check.stdout.strip()
+
+
+@contextmanager
+def _hold_tested_head(repo: Path, ref: str, wave: str, head: str):
+    """Verify and lock the ref through the signed job save. No update is queued."""
+    with subprocess.Popen(
+        ["git", "update-ref", "--no-deref", "--stdin"], cwd=repo,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
+    ) as txn:
+        # EOF aborts this verify-only transaction on success or exception.
+        txn.stdin.write(f"start\nverify {ref} {head}\nprepare\n")
+        txn.stdin.flush()
+        if (txn.stdout.readline() != "start: ok\n" or txn.stdout.readline() != "prepare: ok\n"
+                or _ref_value(repo, ref, wave) != head):
+            raise _reconcile(wave, "integration ref no longer identifies the tested head")
+        yield
 
 
 def _publish_head(repo: Path, ref: str, wave: str, result: dict) -> None:
