@@ -1062,6 +1062,11 @@ def _classify(
                     and revision.suite_passed(record.get('gitleaks')) and _covers(record.get('tests') or [], tests))
     green_path = signed.get('paths', {}).get('green')
     if ac_id and green_path and green_record and signed['criteria'].get(ac_id) == 'passed':
+        # A successful dry run can sign GREEN at the baseline without ever
+        # committing the tested patch. Only the verifier can name a candidate.
+        candidate = record.get('sha') if record and record.get('ok') is True else None
+        if not _is_sha(candidate) or candidate != green_record['revision']:
+            return UNVERIFIED, [], [], 'signed GREEN is not bound to a verified candidate commit'
         evidence.append(green_path)
         if corroborates:
             evidence.append(_rel(state, verify_local.record_path(state, record['attempt_id'])))
