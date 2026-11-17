@@ -299,12 +299,26 @@ class RailsLedger:
             self._conn = sqlite3.connect(self.path)
             self._conn.row_factory = sqlite3.Row
             self._conn.isolation_level = None
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            self._enable_wal()
+            self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._init_schema()
             self._init_identity()
+
+    def _enable_wal(self):
+        # Concurrent first opens can both hold read locks before upgrading the
+        # journal mode. SQLite may return BUSY immediately to avoid deadlock.
+        # Retry this statement alone, before any ledger transaction begins.
+        for attempt in range(len(_BUSY_BACKOFF) + 1):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                return
+            except sqlite3.OperationalError as exc:
+                primary = getattr(exc, 'sqlite_errorcode', 0) & 0xff
+                if primary not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or attempt == len(_BUSY_BACKOFF):
+                    raise
+                time.sleep(_BUSY_BACKOFF[attempt])
 
     def _reject_network_share(self):
         if self.path.startswith(_NETWORK_SHARE_PREFIXES):
