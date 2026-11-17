@@ -231,6 +231,14 @@ one pull request.
 
 ### Security
 
+- **Scrub predicate value-shape repair:** the redaction predicate now catches
+  secret values in tight `k=v` assignments and in the runtime-join construction
+  the scrub battery itself uses (fragments concatenated at runtime), with
+  prefix-family matching, bare-SHA safety and scrub parity across paths; the
+  report convention's single mandated negative-control marker line stays
+  exempt. Pinned by the 31-case edge battery plus 18 repair cases in
+  `tests/test_security.py`; the targeted suite with `tests/test_client.py` is
+  137 passed and `tests/test_client.py` is unmodified by the repair.
 - **No automatic weak sandbox.** `verify_isolation=auto` now picks only a
   strong backend (bubblewrap, then firejail). `unshare`, which isolates
   network and PIDs but leaves the coordinator's filesystem readable, is never

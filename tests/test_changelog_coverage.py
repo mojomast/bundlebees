@@ -341,6 +341,14 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "binary payload verification",
         "keywords": ("binary-payload", "base85", "fail-closed"),
     },
+    {
+        # fix/secret-predicate-value-shape: scrub predicate value-shape
+        # repair (att_9b81c201) - tight k=v + joined-fragment overmatch,
+        # mandated negative-control exemption; test_client.py unmodified.
+        "pr": 71,
+        "name": "scrub predicate value-shape repair",
+        "keywords": ("value-shape", "negative-control", "test_security"),
+    },
 )
 
 
