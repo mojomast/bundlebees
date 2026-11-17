@@ -333,6 +333,14 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "rizzstack-rails usage-ledger contract rails",
         "keywords": ("contrib/rizzstack_rails", "vendor-manifest", "test_rails_ledger"),
     },
+    {
+        # feat/verify-binary-payload: binary worker payloads (att_9c70bf84)
+        # verified end-to-end - envelope marker bundlebees-binary-payload/1,
+        # fail-closed adapter validation, lossless git-base85 patch apply.
+        "pr": 72,
+        "name": "binary payload verification",
+        "keywords": ("binary-payload", "base85", "fail-closed"),
+    },
 )
 
 
