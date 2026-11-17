@@ -63,13 +63,8 @@ def _last_accepted_head(job: Mapping[str, Any]) -> str:
     return head or str(integration.get("last_commit") or "")
 
 
-def _restore_ref(repo: Path, ref: str, head: str) -> str:
-    """Point the durable integration ref at the accepted head, or report why not.
-
-    A repository that does not exist here has no ref to repair; a repository
-    that refuses the update is a refusal, because the next wave would otherwise
-    build on the wrong base.
-    """
+def _check_history_ref(repo: Path, ref: str, head: str) -> str:
+    """Recorded job history is not permission to create or rewind a ref."""
     inside = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-dir"],
                             capture_output=True, text=True)
     if inside.returncode != 0:
@@ -78,15 +73,8 @@ def _restore_ref(repo: Path, ref: str, head: str) -> str:
                              capture_output=True, text=True)
     if current.returncode == 0 and current.stdout.strip() == head:
         return head
-    updated = subprocess.run(["git", "-C", str(repo), "update-ref", ref, head],
-                             capture_output=True, text=True)
-    if updated.returncode != 0:
-        raise JobCliError(
-            "integration_ref_unrestored",
-            f"could not restore {ref} to {head[:12]}: {updated.stderr.strip()[:200]}",
-            "Repair the repository refs; the next wave must build on the accepted commit.",
-        )
-    return head
+    raise JobCliError("wave_reconciliation_required", "The integration ref differs from the published job history.",
+                      "Reconcile the ref and history; automatic ref repair requires a pending, proved handoff.")
 
 
 def recover(
@@ -110,22 +98,21 @@ def recover(
 
     * the integration boundary — a wave record published before the job was
       saved is adopted and the durable ``refs/bb/integrated/<job>`` ref is
-      restored from it. Corrupt evidence raises its own code
-      (``wave_malformed``/``wave_unreadable``); it is never read as permission to
-      integrate again;
+      restored only from a verified handoff at its original predecessor. Missing
+      or conflicting evidence requires explicit reconciliation;
     * a rejected task — the durable request is printed, or a decision file
       (``decision_file``) / the deterministic adapter (``adapter="deterministic"``)
       is *recorded*. Recording never applies the decision: the next ``job tick``
       does that, exactly once.
     """
     job = jobs.load_job(state_dir, job_id, recover=False)
-    adopted = jobs.recover_integration(state_dir, job)
+    adopted = jobs.recover_integration(state_dir, job, repo=repo)
     if adopted:
         jobs.save_job(state_dir, job)
     head = _last_accepted_head(job)
     restored = ""
     if head and repo is not None:
-        restored = _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+        restored = _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     recovered = (job.get("integration") or {}).get("recovered") or {}
 
     requests = recovery.list_requests(state_dir, job_id)
@@ -434,11 +421,11 @@ def tick(
     # closed before anything else: adopt the accepted record, persist it, and
     # point the durable ref back at the accepted head so a restart can neither
     # integrate the same work twice nor build the next wave on the wrong base.
-    if jobs.recover_integration(state_dir, job):
+    if jobs.recover_integration(state_dir, job, repo=repo, suite_command=suite_command, runner=runner):
         jobs.save_job(state_dir, job)
     head = _last_accepted_head(job)
     if head and Path(repo).exists():
-        _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+        _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     job = _hydrate_contracts(state_dir, job, repo)
 
     from . import provision_bind

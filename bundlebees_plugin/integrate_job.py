@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import recovery, revision, sandbox, test_receipts as receipts, verify_local
+from . import job as jobs, recovery, revision, sandbox, test_receipts as receipts, verify_local
 
 DEFAULT_SANDBOX_TIMEOUT_S = 900
 _MAX_SANDBOX_TIMEOUT_S = 7200
@@ -807,10 +807,15 @@ def _integrate_locked(
             raise _reconcile(wave, "derived wave belongs to another execution identity")
         if (not pair or not pair[0]["accepted"]) and original["accepted"] and previous_ref != original["head_sha"]:
             raise _reconcile(wave, "changed request is not starting at the previously accepted head")
+    handoff = jobs._integration_request(state_dir, job, repo, identity["wave"], wave, identity_digest)
     if pair and pair[0]["accepted"]:
         existing, stored = pair
         head = existing["head_sha"]
+        if handoff:
+            jobs._confirm_integration(state_dir, handoff, stored["binding_sha256"], fresh=False)
         _publish_head(repo, ref, wave, stored["materialized"])
+        if handoff:
+            jobs._select_integration(state_dir, handoff)
         return {
             "ok": True,
             "evidence": f"wave {wave} already accepted at {head[:8]}; recovered without re-integrating",
@@ -824,6 +829,8 @@ def _integrate_locked(
 
     # Later waves build on the last accepted result, not on the original base.
     start_rev = previous_ref or base_rev
+    if handoff:
+        jobs._select_integration(state_dir, handoff)
     if pair:
         _retain_rejection(state_dir, wave, pair)
 
@@ -910,6 +917,10 @@ def _integrate_locked(
         )
         if record.get("accepted"):
             head = tested_head
+            if handoff:
+                # The coordinator's live execution is the only proof issuer. The
+                # recovery reader also independently checks the Git and suite gates.
+                jobs._confirm_integration(state_dir, handoff, _binding_digest(identity_digest, materialized), fresh=True)
             # Fault boundary: the accepted wave record is durable, but neither the
             # integration ref nor the job document names it yet. A crash here must
             # be recovered from the record, never by integrating the wave again.
