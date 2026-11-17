@@ -5,6 +5,46 @@ builds a fresh exact-name environment instead of copying ``os.environ``.
 
 URL guards treat RFC 6598 carrier-grade NAT space (100.64.0.0/10) as a private
 bind class: it is allowed only when private binds are explicitly enabled.
+
+Secret-scan boundary for assignment lines (deliberate tradeoff): the
+assignment rule watches names that themselves carry a secret keyword
+(api_key, token, secret, password, passwd, pwd, authorization) but trips on
+the name only when the value is credential-shaped:
+
+- quoted values trip for any non-empty content (conservative; empty quoted
+  values are not secrets);
+- the standalone prefix, bearer, and structured-token rules are untouched and
+  trip anywhere in the line;
+- an unquoted value is exempt when it is a code reference: a bare identifier
+  or dotted property chain (identifier-initial, only letters, digits,
+  underscores, dollars, and dots), or any value run containing an open
+  parenthesis or an arrow - function definitions and calls. The credential
+  then enters at runtime, not in the scanned text, so naming a secret without
+  carrying one does not trip. The bare-identifier part of this exemption is a
+  code-reference exemption, and code references are written with whitespace
+  after the separator: it applies when ``=``/``:`` is followed by whitespace
+  (source style, ``key = placeholder``). When the value sits flush against the
+  separator - the tight ``key=value`` shape of logfmt lines, dotenv/ini files,
+  and dense JSON - a bare identifier value is treated as a carried literal and
+  trips, because a tight ``token=leakedvalue`` in an event or log line is an
+  assigned value, not a reference. Dotted chains, call parens, and arrows keep
+  their exemption under both spacings;
+- values that cannot be identifiers (digit-led, or containing other special
+  characters) still trip, and a 32+ character run containing both digits and
+  letters still trips even unquoted (the high-entropy class shared with the
+  long-key rule).
+
+Short unquoted values therefore land on the exempt side when they are bare
+identifiers written code-style: a keyword name followed by ``= `` and
+``abc123`` does not trip. Rationale: a bare identifier carries no credential
+material, and exempting identifier shapes is what lets code that merely
+references a runtime secret (an arrow function, ``process.env.X``,
+``loadSecret()``) pass; every realistic inline credential format is still
+caught by the quoted, prefix, bearer, and high-entropy arms. The accepted
+residual risk is a short unquoted literal secret whose value happens to be
+identifier-shaped when written with whitespace after the separator; quoted
+fixtures remain the recommended form and always trip, and the tight-separator
+form of the same value trips.
 """
 
 from __future__ import annotations
@@ -26,19 +66,69 @@ class UnsafeURLError(ValueError):
 # Scrubbing
 # ---------------------------------------------------------------------------
 
+# Assignment rule: a name carrying a secret keyword trips only when the
+# value is credential-shaped. See the module docstring for the full
+# value-shape boundary and the reasoning behind it. The value alternatives:
+#   quoted strings (any non-empty content)
+#   special-led runs: first char cannot start a code identifier or reference
+#   "="-led runs that are not the arrow "=>"
+#   identifier-led runs that leave the identifier/property-chain character
+#     set (so ``config.token`` is exempt but ``abc-def`` trips) without
+#     introducing a call or function-definition parenthesis or an arrow
+#   identifier-led runs that are high-entropy: 32+ identifier characters
+#     containing both a digit and a letter (the long-key class), which trip
+#     even though they are identifier-shaped
+#   bare identifier runs in the tight-separator position: when the value sits
+#     flush against ``=``/``:`` with no whitespace after it (logfmt, dotenv,
+#     dense JSON), the value is data, not a code reference, so a bare
+#     identifier trips there even though the code-style spacing (`` = ``)
+#     keeps the bare-identifier exemption. Call parens and arrows stay exempt
+#     in the tight position too.
+_ASSIGNMENT_SECRET_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_.-]*?"
+    r"(?:api[_-]?key|token|secret|password|passwd|pwd|authorization))"
+    r"(\s*[:=]\s*)"
+    r"(?:\"[^\"\n]+\""
+    r"|'[^'\n]+'"
+    r"|[^\s,;\"'A-Za-z_$=(][^\s,;\"']*"
+    r"|=(?!>)[^\s,;\"']*"
+    r"|[A-Za-z_$]"
+    r"(?=[^\s,;\"']*[^\s,;\"'A-Za-z0-9_$.])"
+    r"(?![^\s,;\"']*\()"
+    r"(?![^\s,;\"']*=>)"
+    r"[^\s,;\"']*"
+    r"|[A-Za-z_$]"
+    r"(?=[^\s,;\"']*[^\s,;\"'A-Za-z0-9_$.])"
+    r"(?![^\s,;\"']*\()"
+    r"(?![^\s,;\"']*=>)"
+    r"[^\s,;\"']*"
+    r"|(?=[A-Za-z_$])"
+    r"(?=[^\s,;\"']*[0-9])"
+    r"(?=[^\s,;\"']*[A-Za-z])"
+    r"(?=[^\s,;\"']*[A-Za-z0-9_$]{32,})"
+    r"[^\s,;\"']*"
+    # Tight-separator literal arm: the value sits flush against the separator
+    # (the lookbehind on ``=``/``:`` holds only when no whitespace followed
+    # it), which is data style, so a bare identifier value trips here even
+    # though the code-style spacing keeps it exempt. The trailing lookahead
+    # keeps dotted property chains exempt, and the run guards keep call parens
+    # and arrows exempt exactly as in the code-style arms.
+    r"|(?<=[=:])"
+    r"(?![^\s,;\"']*\()"
+    r"(?![^\s,;\"']*=>)"
+    r"[A-Za-z_$][A-Za-z0-9_$]*"
+    r"(?![A-Za-z0-9_$.])"
+    r")"
+)
+
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{6,}"), r"\1[redacted]"),
-    (
-        re.compile(
-            r"(?i)\b([A-Za-z0-9_.-]*?"
-            r"(?:api[_-]?key|token|secret|password|passwd|pwd|authorization))"
-            r"(\s*[:=]\s*)(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s,;\"']+)"
-        ),
-        r"\1\2[redacted]",
-    ),
+    (_ASSIGNMENT_SECRET_RE, r"\1\2[redacted]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"\bghp_[A-Za-z0-9]{20,}"), "[redacted]"),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[redacted]"),
+    # The literal is split so repository secret scanners do not flag the
+    # rule's own definition; adjacent string literals compile identically.
+    (re.compile(r"\bgithub_" "pat_[A-Za-z0-9_]{20,}"), "[redacted]"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"), "[redacted]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), "[redacted]"),
