@@ -14,7 +14,7 @@ import pytest
 
 from bundlebees_plugin import job as jobs, leases, return_report
 from tests.fakes import FakeCtx, load_plugin
-from tests.test_return_report import _frozen
+from tests.test_return_report import GITLEAKS, SUITE, _frozen, _git
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "contrib"))
@@ -25,11 +25,60 @@ JOB, TASK, ATTEMPT = "job_return", "T1", "att_1234567890abcdef"
 
 
 @pytest.fixture
+def signed_run(tmp_path):
+    """Actual failing baseline, successful commit-local receipt and signed candidate GREEN."""
+    from bundlebees_plugin import acdd_cli, sandbox, tdd, verify_local
+
+    repo, state = tmp_path / 'repo', tmp_path / 'state'
+    repo.mkdir()
+    _git(['init', '-q'], repo)
+    impl, test = 'tools/a.py', 'tests/test_a.py'
+    (repo / 'tools').mkdir()
+    (repo / 'tests').mkdir()
+    (repo / impl).write_text('answer = 0\n')
+    (repo / test).write_text('from tools.a import answer\n\ndef test_tool():\n    assert answer == 42\n')
+    _git(['add', '.'], repo)
+    _git(['commit', '-qm', 'baseline'], repo)
+    base = _git(['rev-parse', 'HEAD'], repo)
+    contract, digest = _frozen(base, contract_id='TOOLS', statement='Command recorded', assigned=impl,
+                               test_file=test, test_id=test + '::test_tool', test_first=True)
+    aid = 'att_2234567890abcdef'
+    leases.record_lease(state, aid, dict(job_id=JOB, task_id=TASK, source_rev=base, objective='implement answer',
+                                        assigned_files=[impl], acceptance={'tests': [test]}, contract=contract,
+                                        contract_sha256=digest))
+
+    def run(tree, argv):
+        return sandbox.run_in_sandbox(tree, argv, allow_unsafe_local=True, timeout=60)
+
+    evidence = run(repo, sandbox.pytest_argv([test]))
+    red = tdd.make_record(contract, digest, phase='red', revision=base, command=['pytest', test], test_first=True,
+                          test_fingerprints=tdd.fingerprint_files(repo, [test]), result=acdd_cli._result(evidence),
+                          produced_by={'role': 'verifier', 'name': 'fixture'})
+    tdd.write_record(state, red, leases.evidence_key(state))
+    lease = leases.load_lease(state, aid)
+    preflight = acdd_cli.verify_preflight(lease, state, [impl])
+    (repo / impl).write_text('answer = 42\n')
+    patch = _git(['diff', '--', impl], repo) + '\n'
+    _git(['restore', '--', impl], repo)
+    receipt = verify_local.verify_and_commit(state, repo, aid, patch=patch, declared_files=[impl], base_rev=base,
+        tests=[test], suite_command=SUITE, gitleaks=GITLEAKS, runner=run, contract_declared=True,
+        acdd_preflight=lambda files: acdd_cli.verify_preflight(lease, state, files))
+    candidate = receipt['sha']
+    assert receipt['ok'] and _git(['rev-parse', f'bb-verify/{aid}'], repo) == candidate != base
+    acdd_cli.candidate_green(state, preflight, repo, candidate, run)
+    return base, candidate, aid
+
+
+@pytest.fixture
 def packet(tmp_path, capsys, request):
     state = tmp_path / "state"
-    state.mkdir(mode=0o700)
+    state.mkdir(mode=0o700, exist_ok=True)
+    mode = getattr(request, 'param', 'bound')
+    signed = mode in ('red', 'green')
+    base, candidate, verifier = request.getfixturevalue('signed_run') if signed else (REV, None, None)
+    snapshot = candidate if mode == 'green' else base
     contract, digest = _frozen(
-        REV,
+        base,
         contract_id="TOOLS",
         statement="Command recorded",
         assigned="tools/a.py",
@@ -42,7 +91,7 @@ def packet(tmp_path, capsys, request):
         job_id=JOB,
         statement="Exercise local handoff",
         repo="fixture/tools",
-        base_rev=REV,
+        base_rev=base,
         scope=["tools/**"],
         bees=1,
         wall_clock_s=1800,
@@ -64,14 +113,13 @@ def packet(tmp_path, capsys, request):
         ],
     )
     job = jobs.load_job(state, JOB)
-    job["tasks"][0]["attempts"] = [ATTEMPT]
+    job["tasks"][0]["attempts"] = [ATTEMPT, verifier] if signed else [ATTEMPT]
     jobs.save_job(state, job)
     ledger = tmp_path / "coordinator.sqlite"
     with closing(RailsLedger(tmp_path / "worker.sqlite")) as worker:
         # Test-only dispatch to this newly provisioned ledger before it emits any rows.
         assert worker.head()['seq'] == 0
-        mode = getattr(request, 'param', 'bound')
-        brief = dict(job_id=JOB, task_id=TASK, source_rev=REV, contract_sha256=digest,
+        brief = dict(job_id=JOB, task_id=TASK, source_rev=snapshot, contract_sha256=digest,
                      objective='record tools', assigned_files=['tools/a.py'],
                      acceptance={'tests': ['tests/test_a.py']})
         dispatch = {'dispatch_chain_id': worker.chain_id}
@@ -125,7 +173,7 @@ def packet(tmp_path, capsys, request):
         verify = dict(
             kind="verification.result",
             source=dict(adapter="verifier", instance="coordinator", record_id="red", revision="1"),
-            scope=dict(job_id=JOB, task_id=TASK, contract_sha256=digest, code_rev=REV),
+            scope=dict(job_id=JOB, task_id=TASK, contract_sha256=digest, code_rev=base),
             authority="verifier_record",
             payload=dict(
                 ac_id="AC-001",
@@ -135,7 +183,7 @@ def packet(tmp_path, capsys, request):
                 evidence_refs=[observation],
                 expected_intent_ref="intent:1",
                 run_id="run:1",
-                code_rev=REV,
+                code_rev=base,
                 contract_sha256=digest,
             ),
             dedupe_key="red",
@@ -147,7 +195,7 @@ def packet(tmp_path, capsys, request):
         schema="bundlebees.rails-return-input/1",
         job_id=JOB,
         task_id=TASK,
-        code_rev=REV,
+        code_rev=snapshot,
         contract_sha256=digest,
         coordinator=ch,
         workers=[wh],
@@ -334,49 +382,46 @@ def test_native_wave_blocker_precedes_attachment(packet):
     assert not (return_report.return_dir(state, JOB) / "rails-evidence.json").exists()
 
 
-def test_native_signed_records_resolve_and_later_verifier_failure_refuses_stale_pass(packet):
-    from bundlebees_plugin import rails_bundlebees_source as source, tdd
+@pytest.mark.parametrize('packet', ['red', 'green'], indirect=True)
+def test_native_signed_records_resolve_and_later_verifier_failure_refuses_stale_pass(packet, signed_run, tmp_path):
+    from bundlebees_plugin import rails_bundlebees_source as source
 
     invoke, cfg, anchors, state, coordinator, _ = packet
-    task = jobs.load_job(state, JOB)["tasks"][0]
-    key = leases.evidence_key(state)
-    for phase, outcome, code in [("red", "failed", 1), ("green", "passed", 0)]:
-        record = tdd.make_record(
-            task["contract"],
-            cfg["contract_sha256"],
-            phase=phase,
-            revision=REV,
-            test_fingerprints={"tests/test_a.py": "b" * 64},
-            command=["pytest", "tests/test_a.py"],
-            result={
-                "exit_code": code,
-                "tests": 1,
-                "errors": 0,
-                "failures": code,
-                "skipped": 0,
-                "timed_out": False,
-                "cases": [{"id": "tests/test_a.py::test_tool", "outcome": outcome}],
-            },
-            produced_by={"role": "verifier", "name": "fixture"},
-            test_first=True,
-        )
-        tdd.write_record(state, record, key)
-    drafts = source.collect_events(state, key=key)
+    base, candidate, aid = signed_run
+    repo_args = ('--repo', str(tmp_path / 'repo'))
+    drafts = [d for d in source.collect_events(state, key=leases.evidence_key(state))
+              if d['kind'] == 'verification.result']
     assert [d["payload"]["verdict"] for d in drafts] == ["EXPECTED_RED", "PASS"]
+    assert [d['payload']['code_rev'] for d in drafts] == [base, candidate]
     with closing(RailsLedger(coordinator)) as db:
         eids = [db.append(**d)["event_id"] for d in drafts]
         cfg["coordinator"] = db.head()
-    cfg["evidence"]["AC-001"][1:] = eids
+    # One worker snapshot attests to one revision. Exercise each phase at its own head.
+    green = cfg['code_rev'] == candidate
+    selected = eids[1] if green else eids[0]
+    cfg["evidence"]["AC-001"][1:] = [selected]
     anchors.write_text(json.dumps(cfg))
-    rc, result = invoke()
+    if green:
+        assert invoke(*repo_args)[1]['error'] == 'rails_evidence_refused'
+        assert not return_report.return_path(state, JOB).exists()
+    job = jobs.load_job(state, JOB)
+    assert job['tasks'][0]['attempts'][-1] == aid
+    job['tasks'][0]['state'] = 'verified'
+    jobs.save_job(state, job)
+    rc, result = invoke(*repo_args)
     assert rc == 0, result
-    assert invoke("--verify")[0] == 0
+    assert invoke("--verify", *repo_args)[0] == 0
     path = return_report.return_path(state, JOB)
     native = json.loads(path.read_bytes())
-    assert native["red_green"]["red"] and native["red_green"]["green"]
+    assert native['red_green']['red']['revision'] == base
+    assert native['verification']['commit'] == native['red_green']['green']['revision'] == candidate
+    assert native['verification']['record_path'] == f'verify-results/{aid}.json'
     assert native["acceptance"][0]["status"] == "PASS" and native["receiver_decision"]["status"] == "pending"
     side = json.loads(path.with_name("rails-evidence.json").read_bytes())
-    assert [link["verdict"] for link in side["verification_links"]] == ["EXPECTED_RED", "PASS"]
+    assert side['verification_links'] == [dict(ac_id='AC-001', event_id=selected,
+                                              verdict='PASS' if green else 'EXPECTED_RED')]
+    if not green:
+        return
     # Do not let the sender select yesterday's independent PASS after a failure
     # at this exact task, revision and contract. Native records still exist.
     failure = copy.deepcopy(drafts[-1])
@@ -386,7 +431,9 @@ def test_native_signed_records_resolve_and_later_verifier_failure_refuses_stale_
         db.append(**failure)
         cfg["coordinator"] = db.head()
     anchors.write_text(json.dumps(cfg))
-    assert invoke()[1]["error"] == "rails_evidence_refused"
+    rc, refused = invoke(*repo_args)
+    assert rc == 1 and refused['error'] == 'rails_evidence_refused'
+    assert 'later applicable verifier result' in refused['message']
 
 
 @pytest.mark.parametrize(
