@@ -1,7 +1,5 @@
 """An independently enrolled signer and genuine sealed coordinator authorization."""
-import contextlib
 import json
-import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -59,3 +57,13 @@ class OwnerBridge(unittest.TestCase):
         (self.state/'lease.key').write_bytes(secrets.token_bytes(32))
         with self.assertRaises(bridge.Refusal):bridge.handle(self.config,dict(action='confirm',review=review,signature=sig))
         self.assertFalse(history(self.db,self.target))
+
+    def test_expired_proof_can_only_recover_its_original_receipt(self):
+        with patch.object(bridge.time,'time',return_value=1000):
+            review=bridge.handle(self.config,dict(action='preview',draft=self.draft))['review'];sig=self.sign(review)
+        submit=dict(action='confirm',review=review,signature=sig)
+        with patch.object(bridge.time,'time',return_value=1400), self.assertRaisesRegex(bridge.Refusal,'forbidden'):
+            bridge.handle(self.config,submit)
+        with patch.object(bridge.time,'time',return_value=1100):r=bridge.handle(self.config,submit)
+        with patch.object(bridge.time,'time',return_value=1400):
+            self.assertEqual(bridge.handle(self.config,submit),dict(event_id=r['event_id'],duplicated=True))
