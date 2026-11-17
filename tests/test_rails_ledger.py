@@ -6,6 +6,7 @@ runtime and Workflow's strict validator against both frozen schemas.
 
 import hashlib
 import json
+import multiprocessing
 import os
 import platform
 import runpy
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -385,7 +387,41 @@ class FrozenExportTests(RailsCase):
         self.assertEqual(db.head()['seq'], 1)
 
 
+def _first_writer(path, start, args):
+    # No connection, schema or identity exists before the barrier opens.
+    start.wait(timeout=30)
+    with closing(rails_ledger.RailsLedger(path)) as led:
+        led.append(**args)
+
+
 class ConcurrencyTests(RailsCase):
+    def test_ten_independent_writers_open_fresh_ledger(self):
+        ctx = multiprocessing.get_context('spawn')
+        args = [self.base_args(dedupe_key='writer-%d' % i) for i in range(10)]
+        start = ctx.Barrier(len(args))
+        workers = [ctx.Process(target=_first_writer, args=(self.db_path, start, event))
+                   for event in args]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=40)
+                self.assertEqual(worker.exitcode, 0)
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.kill()
+                if worker.pid is not None:
+                    worker.join()
+
+        with closing(self.ledger()) as led:
+            retries = [led.append(**event) for event in args]
+            self.assertTrue(all(r['duplicated'] for r in retries))
+            self.assertEqual(sorted(r['seq'] for r in retries), list(range(1, 11)))
+            self.assertEqual(led.head()['seq'], 10)
+            verified = led.verify_chain()
+            self.assertTrue(verified['ok'] and verified['legacy_ok'])
+
     def test_ten_concurrent_writers_serialize_with_commit_before_ack(self):
         n_threads, per = 10, 5
         barrier = threading.Barrier(n_threads)
@@ -587,6 +623,29 @@ class PrivacyTests(RailsCase):
 class ImportTests(RailsCase):
     def _stream(self, n, chain_alias="peer-alias"):
         return _origin_stream(chain_alias, "11111111-2222-3333-4444-555555555555", n)
+
+    def test_refused_page_then_restart_and_replay_preserves_checkpoint(self):
+        chain_id, pages = self._stream(4)
+        with closing(self.ledger()) as led:
+            led.import_origin_page(chain_id, pages[:1])
+            cursor = led.import_cursor(chain_id)
+            head = led.head()
+            receipts = led.query('SELECT * FROM import_receipts')
+            for tail, refusal in ((pages[3], rails_ledger.SourceGap),
+                                  ('{}', rails_contracts.RailsRefusal)):
+                with self.assertRaises(refusal):
+                    led.import_origin_page(chain_id, [pages[1], tail])
+
+        with closing(self.ledger()) as reopened:
+            replay = reopened.import_origin_page(chain_id, pages[:1])
+            self.assertTrue(replay['duplicated'])
+            self.assertEqual(reopened.import_cursor(chain_id), cursor)
+            self.assertEqual(reopened.head(), head)
+            self.assertEqual(reopened.query('SELECT * FROM import_receipts'), receipts)
+            self.assertEqual(reopened.query('SELECT origin_bytes FROM imported_events'),
+                             [{'origin_bytes': pages[0]}])
+            self.assertEqual(reopened.import_origin_page(chain_id, pages)['imported'], 3)
+            self.assertTrue(reopened.verify_chain(chain_id)['ok'])
 
     def test_pages_import_queryable_and_checkpointed(self):
         led = self.ledger()
