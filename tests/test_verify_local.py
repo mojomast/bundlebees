@@ -563,7 +563,9 @@ class GitContextGap:
 
         def runner(workdir, argv, *args, **kwargs):
             calls.append(1)
-            if len(calls) > 1:
+            if len(calls) == 2:
+                return {"exit_code": 0, "timed_out": False, "output_tail": "green run"}
+            if len(calls) > 2:
                 return {
                     "exit_code": 1,
                     "timed_out": False,
