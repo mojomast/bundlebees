@@ -119,6 +119,27 @@ one pull request.
 - **Require-contract dispatch gate:** `bundlebees_plugin/contract_gate.py` is the enforcement boundary a dispatcher calls before any launcher call — it refuses a brief without a valid frozen `acdd/1` contract with machine-readable `ContractRefusal` refusals (or returns the envelope block), and the `require_contract` flag resolves through durable settings (the execution profile or the repository's Hermes profile file), never session state, so enforcement survives restarts and recovery. See `docs/contract-enforcement.md`.
 - **Lease payload served on every run:** the payload digest manifest of what the coordinator actually serves is recorded into the brief as ``brief["payload"]`` at dispatch and bound by verify byte for byte before any test runs; every runner-driven sandbox run now serves the payload, a set-but-unusable pin raises `PayloadError`, and `--commit-local` serves from the environment without binding a lease manifest. See `docs/pinned-sources.md`.
 - **Contract-enforcement regression net:** the d8c2356 import-alias defect class (a fourth indented import variant aliasing the payload-server module as the gate) is now pinned by an import-identity test on `bundlebees_plugin.contract_gate` plus an import-variant/whitespace-tolerant sweep over the enforcement files; settings resolution lets an explicit `false` outvote a `default: true` while unparsable values keep their no-vote behavior; scaffold lease checks reject directory-style entries and an unusable `--out` returns the `scaffold_invalid` envelope with exit 1; docs/ACDD.md and docs/contract-enforcement.md truthed against the post-rename behavior. See `tests/test_contract_enforcement.py`.
+- **Tool-path terminal-state write-back:** tool-path attempts now record real
+  terminal states through `bundlebees_plugin/agent_consumer.py` instead of
+  staying `unknown` in the local attempt store; the write-back is
+  duplicate-safe and the completion record carries the real end state. See
+  `tests/test_tool_path_write_back.py`.
+- **Completion events wired into the terminal transitions:**
+  `record_tool_completion` gained its production call sites in
+  `bundlebees_plugin/tools.py`'s attempt-op terminal transitions — best-effort
+  emission (a write failure never breaks completion), duplicate-terminal-safe,
+  with launcher/coordinator/event-delivery/artifact-verification reconciled as
+  separate facts, closing the emission gap that left tool-path dispatches
+  permanently invisible (the F1/P2 failure class). See
+  `tests/test_tool_path_write_back.py`.
+- **rizzstack-rails usage-ledger contract rails:** new
+  `contrib/rizzstack_rails` package (`contracts.py`, `ledger.py`,
+  `privacy.py`) implementing the frozen usage-ledger contract rails:
+  content-hash dedupe (`semantic_sha`/`candidate_sha`), hash vectors and
+  tamper checks, backup/restore, and health/readonly/privacy gates, vendored
+  reproducibly by `scripts/vendor_rails.py` against
+  `contrib/rizzstack_rails/vendor-manifest.json`; acceptance lives in
+  `tests/test_rails_ledger.py` (35 tests).
 ### Fixed
 
 - **The landing-event composition no longer collides with the coordinator

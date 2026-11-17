@@ -312,6 +312,27 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "directory-style",
         ),
     },
+    {
+        # feat/tool-path-write-back: terminal-state write-back so tool-path
+        # attempts record real terminal states instead of staying unknown.
+        "pr": 68,
+        "name": "tool-path terminal-state write-back",
+        "keywords": ("terminal states", "unknown", "agent_consumer"),
+    },
+    {
+        # feat/event-consumer-actions-r2: record_tool_completion wired into
+        # tools.py's terminal transitions (best-effort, duplicate-safe).
+        "pr": 69,
+        "name": "completion events wired into terminal transitions",
+        "keywords": ("record_tool_completion", "duplicate-terminal-safe", "best-effort"),
+    },
+    {
+        # rails/r02-ledger: RAILS-R02 usage-ledger contract rails in
+        # contrib/rizzstack_rails (att_f67c7573 r3, spec @ workflow 9850efa).
+        "pr": 70,
+        "name": "rizzstack-rails usage-ledger contract rails",
+        "keywords": ("contrib/rizzstack_rails", "vendor-manifest", "test_rails_ledger"),
+    },
 )
 
 
