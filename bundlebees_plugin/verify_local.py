@@ -99,6 +99,49 @@ def _run(args: Sequence[str], cwd: Path, *, timeout: float = 600.0, input_text: 
     )
 
 
+#: The probe file every prepared worktree must contain when the verified tree
+#: carries it. A worktree added under ``core.sparseCheckout=true`` inherits the
+#: host's narrow sparse set, silently missing ``bundlebees_plugin/schemas/`` —
+#: which gates schema reads and distorts every digest taken over the tree.
+WORKTREE_PROBE_RELATIVE = "bundlebees_plugin/schemas/brief.schema.json"
+
+#: Mirrors the sandbox check in ``bundlebees_plugin/doctor.py``.
+GIT_CONTEXT_NOTE = (
+    "the verify sandbox has no git repository context; suites that shell out to git "
+    "cannot be verify-tested in-sandbox (see the sandbox check in bundlebees doctor)"
+)
+
+
+def _git_context_hint(tail: Any) -> str:
+    """Diagnostic hint when a tests-gate failure smells like the sandbox git gap."""
+
+    if "not a git repository" in str(tail or "").lower():
+        return f" Hint: {GIT_CONTEXT_NOTE}."
+    return ""
+
+
+def _ensure_full_worktree(worktree: Path, repo: Path, rev: str) -> bool:
+    """Force a full checkout of a freshly added worktree; True when usable.
+
+    A worktree added from a repository with ``core.sparseCheckout=true``
+    inherits the host's narrow sparse set and silently misses files schema
+    reads and worktree digests depend on. ``git sparse-checkout disable``
+    restores the full tree and writes a worktree-scoped
+    ``core.sparseCheckout=false``, so the host checkout's own sparse state is
+    untouched. When the verified tree does not carry the probe path there is
+    nothing to guard, and the worktree is usable as prepared.
+    """
+
+    enabled = _run(["git", "config", "core.sparseCheckout"], worktree)
+    if enabled.returncode == 0 and enabled.stdout.strip().lower() == "true":
+        if _run(["git", "sparse-checkout", "disable"], worktree).returncode != 0:
+            _run(["git", "config", "core.sparseCheckout", "false"], worktree)
+            _run(["git", "read-tree", "-mu", "HEAD"], worktree)
+    if _run(["git", "cat-file", "-e", f"{rev}:{WORKTREE_PROBE_RELATIVE}"], repo).returncode != 0:
+        return True
+    return (worktree / WORKTREE_PROBE_RELATIVE).is_file()
+
+
 def sandbox_runner(
     workdir: Path,
     argv: Sequence[str],
@@ -986,6 +1029,12 @@ def _verify_and_commit_locked(
         _run(["git", "branch", "-D", branch], repo)
 
     _run(["git", "worktree", "add", "--detach", str(worktree), base_rev], repo)
+    if not _ensure_full_worktree(worktree, repo, base_rev):
+        raise VerifyError(
+            "worktree_incomplete",
+            f"the prepared worktree is missing {WORKTREE_PROBE_RELATIVE} even after forcing a full checkout",
+            "Inspect the repository's sparse-checkout state; verify refuses an incomplete worktree.",
+        )
     try:
         # 4. RED before the patch, when tests are named.
         red: dict[str, Any] | None = None
@@ -1071,7 +1120,11 @@ def _verify_and_commit_locked(
                 "Increase the sandbox timeout or fix the test; a timeout is not a pass.",
             )
         if green["exit_code"] != 0:
-            raise VerifyError("tests_failed", f"named tests failed after the patch: {green.get('tail', '')}", "Reject and re-dispatch.")
+            raise VerifyError(
+                "tests_failed",
+                f"named tests failed after the patch: {green.get('tail', '')}",
+                "Reject and re-dispatch." + _git_context_hint(green.get("tail")),
+            )
 
         suite = None
         if suite_command:
@@ -1092,7 +1145,11 @@ def _verify_and_commit_locked(
                     "Increase the sandbox timeout or investigate the hang.",
                 )
             if suite["exit_code"] != 0:
-                raise VerifyError("suite_failed", f"regression suite failed: {suite.get('tail', '')}", "Reject and re-dispatch.")
+                raise VerifyError(
+                    "suite_failed",
+                    f"regression suite failed: {suite.get('tail', '')}",
+                    "Reject and re-dispatch." + _git_context_hint(suite.get("tail")),
+                )
 
         scan = None
         if gitleaks:
@@ -1182,7 +1239,7 @@ def _identity_for_commit(
         _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
     try:
         added = _run(["git", "worktree", "add", "--detach", str(scratch), sha], repo)
-        if added.returncode != 0:
+        if added.returncode != 0 or not _ensure_full_worktree(scratch, repo, sha):
             return None
         return _verification_identity(
             scratch,
@@ -1296,7 +1353,8 @@ def _commit_contains_patch(repo: Path, sha: str, base_rev: str, patch: str) -> b
     if scratch.exists():
         _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
     try:
-        if _run(["git", "worktree", "add", "--detach", str(scratch), base_rev], repo).returncode != 0:
+        added = _run(["git", "worktree", "add", "--detach", str(scratch), base_rev], repo)
+        if added.returncode != 0 or not _ensure_full_worktree(scratch, repo, base_rev):
             return False
         if _run(["git", "apply", "--whitespace=nowarn", "-"], scratch, input_text=patch).returncode != 0:
             return False

@@ -920,8 +920,28 @@ def _sandbox_line(options: Mapping[str, Any], backend: str | None) -> str:
     return "sandbox: none (verify and integrate will refuse; install bubblewrap)"
 
 
+def _with_git_context_note(finding: Finding) -> Finding:
+    """Every sandbox state carries the no-git-repository constraint explicitly.
+
+    The verify sandbox's disposable copy deliberately excludes ``.git`` (a
+    security property), so suites that shell out to git cannot be verify-tested
+    in-sandbox. Stating this on the sandbox row keeps the constraint visible
+    where operators read doctor output; the verify tests-gate failure hint in
+    ``verify_local.py`` points back at this note.
+    """
+    note = (
+        "the verify sandbox has no git repository context; "
+        "suites that shell out to git cannot be verify-tested in-sandbox"
+    )
+    detail = f"{finding.detail}; {note}" if finding.detail else note
+    return Finding(finding.state, detail, fix=finding.fix, rev=finding.rev, line=finding.line)
+
+
 def _sandbox_check(context: Context) -> Finding:
-    options = execution.sandbox_options(context.config)
+    return _with_git_context_note(_sandbox_finding(execution.sandbox_options(context.config)))
+
+
+def _sandbox_finding(options: Mapping[str, Any]) -> Finding:
     try:
         backend = _detect_backend(options)
     except Exception:
