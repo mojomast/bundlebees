@@ -928,24 +928,20 @@ def _classify(
         evidence.append(_rel(state, revision.wave_path(state, wave["wave_id"])))
         return PASS, evidence, unrun, ""
 
-    if verification == "review":
-        green = signed.get("green")
+    if verification in {"review", "manual"}:
         if signed.get("tampered"):
             return BLOCKED, evidence, unrun, f"signed review evidence is not authentic: {signed['tampered']}"
-        if not signed.get("available"):
-            return NOT_RUN, evidence, unrun, ""
-        reviews = [path for phase, path in signed.get("paths", {}).items() if phase == "review"]
-        if not reviews:
+        path = signed.get("paths", {}).get("review")
+        if path is None:
             unrun.append(f"signed review for {criterion['id'] or criterion['statement']}")
             return NOT_RUN, evidence, unrun, ""
-        records = signed.get("records") or {}
-        review = records.get("review") if isinstance(records, Mapping) else None
-        role = str(((review or {}).get("produced_by") or {}).get("role") or "")
-        if (review is not None and review.get("classification") == "passed" and role in {"reviewer", "human"}
-                and review['criteria'].get(criterion['id']) == 'passed' and task['contract_ok']):
-            evidence.append(reviews[0])
-            return PASS, evidence, unrun, ""
-        return UNVERIFIED, evidence, unrun, "a review record exists but does not validate as an independent review"
+        review = signed.get("records", {}).get("review")
+        if not task["contract_ok"] or review is None or criterion['id'] not in review['criteria']:
+            return UNVERIFIED, evidence, unrun, "the recorded review does not bind this criterion, contract and candidate"
+        return UNVERIFIED, [path], unrun, (
+            f"{criterion['id']}: coordinator recorded {review['criteria'][criterion['id']]!r}; "
+            "its seal does not authenticate an independent reviewer"
+        )
 
     if verification != "test":
         return BLOCKED, evidence, unrun, f"unknown verification method {verification!r}; no independent check defines this criterion"
