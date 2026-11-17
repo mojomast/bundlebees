@@ -30,11 +30,14 @@ from pathlib import Path
 import pytest
 
 from bundlebees_plugin import agent_consumer, bee_events, event_consumer, leases
+from bundlebees_plugin.client import ClientError
+from tests.fakes import FakeCtx, load_plugin
 
 T0 = 1_800_000_000.0
 SOURCE_REV = "a" * 40
 LEASE_SHA = "b" * 64
 USAGE = {"tokens": 1234, "cost_usd": 0.42}
+ARTIFACT_SHA = "c" * 64
 
 
 def brief(**overrides) -> dict:
@@ -328,3 +331,279 @@ def test_an_unsafe_attempt_id_is_refused_before_any_write(tmp_path):
 
     assert result["emitted"] is False
     assert not list(tmp_path.rglob("*.json"))
+
+
+# ---------------------------------------------------------------------------
+# RED: the real tool op handlers write the completion back
+# ---------------------------------------------------------------------------
+#
+# These tests do not call ``record_tool_completion`` directly. They drive the
+# production entrypoint — the ``bundlebees_attempt`` tool handler registered by
+# ``tools.register_tools`` against a disposable plugin state dir — the way the
+# coordinator's model would, with a launcher stub whose attempt sits in a
+# caller-chosen state.
+
+
+class LauncherStub:
+    """A launcher client whose attempt sits in a chosen state."""
+
+    def __init__(
+        self,
+        state: str = "succeeded",
+        result: dict | None = None,
+        result_error: Exception | None = None,
+        cancel_state: str = "cancelled",
+        review_state: str = "reviewed",
+    ) -> None:
+        self.state = state
+        self.result_payload = result
+        self.result_error = result_error
+        self.cancel_state = cancel_state
+        self.review_state = review_state
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def get(self, attempt_id: str) -> dict:
+        self.calls.append(("get", (attempt_id,), {}))
+        return {"attempt_id": attempt_id, "task_id": "t1", "state": self.state}
+
+    def result(self, attempt_id: str) -> dict:
+        self.calls.append(("result", (attempt_id,), {}))
+        if self.result_error is not None:
+            raise self.result_error
+        return dict(self.result_payload or {})
+
+    def cancel(self, attempt_id: str) -> dict:
+        self.calls.append(("cancel", (attempt_id,), {}))
+        return {"attempt_id": attempt_id, "state": self.cancel_state}
+
+    def review(self, attempt_id: str, accepted: bool, note=None) -> dict:
+        self.calls.append(("review", (attempt_id,), {"accepted": accepted}))
+        return {
+            "attempt_id": attempt_id,
+            "state": self.review_state,
+            "accepted": accepted,
+        }
+
+
+def result_envelope() -> dict:
+    """The result envelope a finished launcher returns for a successful bee."""
+    return {
+        "attempt_id": "att-tool-1",
+        "state": "succeeded",
+        "observed": {
+            "changed_files": ["src/tool.py"],
+            "usage": dict(USAGE),
+            "sha256": ARTIFACT_SHA,
+        },
+        "checks": [{"name": "unit", "ok": True}],
+    }
+
+
+def tool_ctx(state_dir: Path):
+    plugin = load_plugin()
+    ctx = FakeCtx()
+    ctx.bundlebees_state_dir = Path(state_dir)
+    plugin.register(ctx)
+    return ctx
+
+
+def attempt_op(ctx, args: dict, client=None) -> dict:
+    if client is not None:
+        ctx.bundlebees_client = client
+    raw = ctx.tools["bundlebees_attempt"]["handler"](args)
+    assert isinstance(raw, str)
+    return json.loads(raw)
+
+
+def seeded_ctx(tmp_path: Path, attempt_id: str = "att-tool-1"):
+    """A registered plugin whose state dir holds the dispatch-time lease."""
+    ctx = tool_ctx(tmp_path)
+    leases.record_lease(
+        tmp_path,
+        attempt_id,
+        brief(branch="bee/tool-write-back"),
+        now="2026-01-01T00:00:00Z",
+    )
+    # The review gate: the coordinator accepted this attempt into a wave.
+    waves = tmp_path / "waves"
+    waves.mkdir(parents=True, exist_ok=True)
+    (waves / "w1.json").write_text(
+        json.dumps({"wave_id": "w1", "accepted": True, "attempts": [attempt_id]}),
+        encoding="utf-8",
+    )
+    return ctx
+
+
+def test_attempt_get_with_a_terminal_success_writes_back_the_completion(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(state="succeeded", result=result_envelope())
+
+    envelope = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+
+    assert envelope["ok"] is True
+    assert envelope["attempt"]["state"] == "succeeded"
+    write_back = envelope["write_back"]
+    assert write_back["emitted"] is True
+    assert write_back["created"] is True
+    assert write_back["state"] == "succeeded"
+    event = outbox_events(tmp_path)[0]
+    assert event["type"] == bee_events.EVENT_TYPE
+    assert event["data"]["attempt_id"] == "att-tool-1"
+    assert event["data"]["state"] == "succeeded"
+    assert event["data"]["result"]["available"] is True
+    assert event["data"]["result"]["artifact_sha256"] == ARTIFACT_SHA
+    assert event["data"]["result"]["reference"] == "bee/tool-write-back"
+    assert event["data"]["source_rev"] == SOURCE_REV
+    record = sidecar(tmp_path, "att-tool-1")
+    assert record is not None
+    assert record["usage"] == USAGE
+
+
+def test_attempt_get_with_a_terminal_failure_writes_back_without_a_result(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(
+        state="failed", result_error=ClientError("no result yet", "no_result_yet")
+    )
+
+    envelope = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+
+    assert envelope["ok"] is True
+    assert "result" not in envelope
+    write_back = envelope["write_back"]
+    assert write_back["emitted"] is True
+    data = outbox_events(tmp_path)[0]["data"]
+    assert data["state"] == "failed"
+    # The launcher's terminal state and the missing result stay separate facts:
+    # a failed emission must never be read as a failed worker, and vice versa.
+    assert data["result"]["available"] is False
+    record = sidecar(tmp_path, "att-tool-1")
+    assert record is not None
+    assert "usage" not in record
+
+
+def test_attempt_cancel_writes_back_the_cancellation(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(cancel_state="cancelled")
+
+    envelope = attempt_op(
+        ctx, {"op": "cancel", "attempt_id": "att-tool-1", "confirm": True}, client
+    )
+
+    assert envelope["ok"] is True
+    assert envelope["state"] == "cancelled"
+    assert envelope["write_back"]["emitted"] is True
+    data = outbox_events(tmp_path)[0]["data"]
+    assert data["state"] == "cancelled"
+    assert data["result"]["available"] is False
+
+
+def test_attempt_review_writes_back_only_when_the_response_is_terminal(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(review_state="succeeded")
+
+    envelope = attempt_op(
+        ctx,
+        {"op": "review", "attempt_id": "att-tool-1", "confirm": True, "accepted": True},
+        client,
+    )
+
+    assert envelope["ok"] is True
+    assert envelope["write_back"]["emitted"] is True
+    assert outbox_events(tmp_path)[0]["data"]["state"] == "succeeded"
+
+    # A review whose response is not terminal writes nothing.
+    other = tool_ctx(tmp_path / "second")
+    leases.record_lease(
+        tmp_path / "second", "att-tool-1", brief(), now="2026-01-01T00:00:00Z"
+    )
+    waves = tmp_path / "second" / "waves"
+    waves.mkdir(parents=True, exist_ok=True)
+    (waves / "w1.json").write_text(
+        json.dumps({"wave_id": "w1", "accepted": True, "attempts": ["att-tool-1"]}),
+        encoding="utf-8",
+    )
+    quiet = LauncherStub(review_state="reviewed")
+    envelope = attempt_op(
+        other,
+        {"op": "review", "attempt_id": "att-tool-1", "confirm": True, "accepted": True},
+        quiet,
+    )
+    assert envelope["ok"] is True
+    assert "write_back" not in envelope
+    assert outbox_events(tmp_path / "second") == []
+    assert sidecar(tmp_path / "second", "att-tool-1") is None
+
+
+def test_a_non_terminal_attempt_observation_writes_nothing(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(state="running")
+
+    envelope = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+
+    assert envelope["ok"] is True
+    assert "write_back" not in envelope
+    assert outbox_events(tmp_path) == []
+    assert sidecar(tmp_path, "att-tool-1") is None
+
+
+def test_duplicate_terminal_observations_emit_one_event(tmp_path):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(state="succeeded", result=result_envelope())
+
+    first = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+    second = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+    # A different op observing the same terminal state dedupes too.
+    cancel_client = LauncherStub(cancel_state="succeeded")
+    third = attempt_op(
+        ctx, {"op": "cancel", "attempt_id": "att-tool-1", "confirm": True}, cancel_client
+    )
+
+    assert first["write_back"]["emitted"] is True
+    assert first["write_back"]["created"] is True
+    assert second["write_back"]["emitted"] is True
+    assert second["write_back"]["created"] is False
+    assert third["write_back"]["created"] is False
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_an_emission_write_failure_is_reported_and_recovers(tmp_path, monkeypatch):
+    ctx = seeded_ctx(tmp_path)
+    client = LauncherStub(state="succeeded", result=result_envelope())
+    real_record = bee_events.record_landing
+
+    def broken_record(state_dir, event):
+        raise bee_events.EventError(
+            "event_write_failed", "outbox write failed: OSError", "Check the state directory."
+        )
+
+    monkeypatch.setattr(agent_consumer.bee_events, "record_landing", broken_record)
+
+    envelope = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+
+    # The completion path survives the failed emission and reports it as its
+    # own fact; the op itself does not become a failure.
+    assert envelope["ok"] is True
+    write_back = envelope["write_back"]
+    assert write_back["emitted"] is False
+    assert write_back["code"] == "event_write_failed"
+    assert outbox_events(tmp_path) == []
+
+    monkeypatch.setattr(agent_consumer.bee_events, "record_landing", real_record)
+    retried = attempt_op(ctx, {"op": "get", "attempt_id": "att-tool-1"}, client)
+
+    assert retried["write_back"]["emitted"] is True
+    assert retried["write_back"]["created"] is True
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_completion_without_a_coordinator_lease_is_refused_not_failed(tmp_path):
+    ctx = tool_ctx(tmp_path)
+    client = LauncherStub(state="succeeded", result=result_envelope())
+
+    envelope = attempt_op(ctx, {"op": "get", "attempt_id": "att-orphan"}, client)
+
+    assert envelope["ok"] is True
+    write_back = envelope["write_back"]
+    assert write_back["emitted"] is False
+    assert write_back["code"] == "lease_facts_missing"
+    assert outbox_events(tmp_path) == []
