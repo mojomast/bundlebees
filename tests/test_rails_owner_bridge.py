@@ -25,7 +25,8 @@ class OwnerBridge(unittest.TestCase):
         self.target = self.db.append('tool.finish',source={'adapter':'launcher-log','instance':'worker-1','record_id':'ev1','revision':'v1'},
             scope={'job_id':'job1','attempt_id':'att1'},lane={'lane_id':'att1'},dedupe_key='tool-1',authority='worker_report',
             payload={'call_id':'c1','tool_name':'shell','command_family':'git','outcome':'ok','summary':'ok','evidence_ref':'ref1'})['event_id']
-        self.key=self.root/'signer';subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(self.key)],check=True)
+        self.key_env={'PATH':'/usr/bin:/bin','HOME':str(self.root),'LC_ALL':'C'}
+        self.key=self.root/'signer';subprocess.run(['ssh-keygen','-q','-t','ed25519','-C','fixture','-N','','-f',str(self.key)],env=self.key_env,check=True)
         pub=self.key.with_suffix('.pub').read_text().split()[:2]
         self.signers=self.root/'allowed_signers';self.signers.write_text(f'{self.ws}:alice namespaces="rizzstack-rails-feedback-v1" '+ ' '.join(pub)+'\n');self.signers.chmod(0o600)
         self.config=self.root/'profile';self.config.write_text(json.dumps(dict(workspace_id=self.ws,owner='alice',ledger_uuid=self.db.ledger_uuid,
@@ -34,7 +35,7 @@ class OwnerBridge(unittest.TestCase):
 
     def sign(self,review):
         return subprocess.run(['ssh-keygen','-Y','sign','-n',bridge.NAMESPACE,'-f',str(self.key)],input=review.encode(),
-                              stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True).stdout.decode()
+                              env=self.key_env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True).stdout.decode()
 
     def test_discarded_receipt_replay_is_one_durable_record(self):
         prepared=bridge.handle(self.config,dict(action='preview',draft=self.draft));text=prepared['review'];sig=self.sign(text)
