@@ -167,7 +167,7 @@ def _make_repo(base: Path) -> tuple[Path, str]:
     return repo, _git(["rev-parse", "HEAD"], repo)
 
 
-def _build_exact(base: Path) -> dict:
+def _build_exact(base: Path, *, runner=None) -> dict:
     """A packet-native exact job whose verification and wave records are real."""
 
     _need_workflow()
@@ -190,17 +190,17 @@ def _build_exact(base: Path) -> dict:
     )
     leases.record_lease(state, "att_1", {
         "objective": "answer", "source_rev": root, "assigned_files": ["smoke/answer.py"],
-        "job_id": "job_a", "task_id": "T1",
+        "job_id": "job_a", "task_id": "T1", "project": "smoke-real",
         "acceptance": {"criteria": ["answer() returns 42"], "tests": ["tests/test_smoke.py"]}})
     record = verify_local.verify_and_commit(
         state, repo, "att_1", patch=_patch_new("smoke/answer.py", "def answer():\n    return 42\n"),
         declared_files=["smoke/answer.py"], base_rev=root, tests=["tests/test_smoke.py"],
-        suite_command=SUITE, gitleaks=GITLEAKS,
+        suite_command=SUITE, gitleaks=GITLEAKS, runner=runner,
     )
     job = jobs.load_job(state, "job_a")
     job["tasks"][0].update(state="verified", attempts=["att_1"])
     jobs.save_job(state, job)
-    result = integrate_job.integrate(state, jobs.load_job(state, "job_a"), repo, suite_command=SUITE)
+    result = integrate_job.integrate(state, jobs.load_job(state, "job_a"), repo, suite_command=SUITE, runner=runner)
     assert result["ok"], result["evidence"]
     accepted = result["record"]["head_sha"]
     job = jobs.load_job(state, "job_a")
