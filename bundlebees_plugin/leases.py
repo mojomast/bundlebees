@@ -54,6 +54,7 @@ __all__ = [
 
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SOURCE_REV_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+RAILS_CHAIN_RE = re.compile(r"(m-[a-f0-9]{12})-([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})")
 _KEY_BYTES = 32
 _KEY_NAME = "lease.key"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -400,12 +401,18 @@ def record_lease(
     brief: Mapping[str, Any],
     *,
     now: str | None = None,
+    dispatch_chain_id: str | None = None,
 ) -> dict[str, Any]:
     """Write the immutable lease record for ``attempt_id`` and return it.
 
     The brief must already carry ``source_rev`` (40 or 64 hex), a non-empty
     ``assigned_files`` list, and ``acceptance``. An existing record is never
     overwritten: it raises :class:`LeaseError` with ``code="lease_exists"``.
+
+    Only a coordinator with an independently provisioned dispatch-to-chain
+    assignment may supply ``dispatch_chain_id``. This optional MAC-covered
+    field is outside the brief; neither worker data nor RETURN anchors can
+    set it. Dispatchers without such a registry leave the lease unbound.
 
     The record also pins the lease payload: the digest manifest of what the
     coordinator actually serves is recorded as ``brief["payload"]`` through
@@ -418,6 +425,13 @@ def record_lease(
     """
     attempt = _validate_attempt_id(attempt_id)
     normalized = _normalize_brief(brief)
+    if dispatch_chain_id is not None and not (
+        isinstance(dispatch_chain_id, str) and RAILS_CHAIN_RE.fullmatch(dispatch_chain_id)
+    ):
+        raise LeaseError(
+            "lease_invalid", "invalid dispatch chain identity",
+            "Use the exact worker chain assigned by the coordinator at dispatch.",
+        )
 
     # The manifest is coordinator truth, never worker input: digest what this
     # coordinator serves now. A set-but-unusable pin raises the named
@@ -456,6 +470,8 @@ def record_lease(
         "brief_sha256": hashlib.sha256(_canonical(normalized)).hexdigest(),
         "brief": normalized,
     }
+    if dispatch_chain_id is not None:
+        record["dispatch_chain_id"] = dispatch_chain_id
     record["mac"] = _sign(record, key)
     _write_record(leases / f"{attempt}.json", record)
     return record

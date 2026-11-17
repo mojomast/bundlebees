@@ -25,7 +25,7 @@ JOB, TASK, ATTEMPT = "job_return", "T1", "att_1234567890abcdef"
 
 
 @pytest.fixture
-def packet(tmp_path, capsys):
+def packet(tmp_path, capsys, request):
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     contract, digest = _frozen(
@@ -65,21 +65,24 @@ def packet(tmp_path, capsys):
     job = jobs.load_job(state, JOB)
     job["tasks"][0]["attempts"] = [ATTEMPT]
     jobs.save_job(state, job)
-    leases.record_lease(
-        state,
-        ATTEMPT,
-        {
-            "job_id": JOB,
-            "task_id": TASK,
-            "source_rev": REV,
-            "contract_sha256": digest,
-            "objective": "record tools",
-            "assigned_files": ["tools/a.py"],
-            "acceptance": {"tests": ["tests/test_a.py"]},
-        },
-    )
     ledger = tmp_path / "coordinator.sqlite"
     with closing(RailsLedger(tmp_path / "worker.sqlite")) as worker:
+        # Test-only dispatch to this newly provisioned ledger before it emits any rows.
+        assert worker.head()['seq'] == 0
+        mode = getattr(request, 'param', 'bound')
+        brief = dict(job_id=JOB, task_id=TASK, source_rev=REV, contract_sha256=digest,
+                     objective='record tools', assigned_files=['tools/a.py'],
+                     acceptance={'tests': ['tests/test_a.py']})
+        dispatch = {'dispatch_chain_id': worker.chain_id}
+        if mode in ('legacy', 'brief_claim'):
+            dispatch = {}
+            if mode == 'brief_claim':
+                brief['dispatch_chain_id'] = worker.chain_id
+        elif mode == 'absent_contract':
+            del brief['contract_sha256']
+        elif mode == 'other_contract':
+            brief['contract_sha256'] = '0' * 64
+        leases.record_lease(state, ATTEMPT, brief, **dispatch)
         worker.append(
             "tool.finish",
             scope={"attempt_id": ATTEMPT},
@@ -216,7 +219,48 @@ def test_registered_report_attachment_and_verification(packet):
     assert invoke("--verify")[1]["error"] == "report_tampered"
 
 
-def test_native_worker_export_becomes_a_resolvable_observation(packet, tmp_path, monkeypatch):
+@pytest.mark.parametrize('packet', ['legacy', 'brief_claim', 'absent_contract', 'other_contract'], indirect=True)
+def test_selection_requires_explicit_dispatch_and_contract(packet):
+    invoke, cfg, _, state, coordinator, _ = packet
+    rc, result = invoke()
+    assert rc == 1, result
+    assert result['error'] == 'rails_evidence_refused'
+    assert not return_report.return_path(state, JOB).exists()
+    # The legitimate observation remains available for ordinary origin replay.
+    with closing(RailsLedger(coordinator, read_only=True)) as db:
+        assert db.verify_chain(cfg['workers'][0]['chain_id'])['ok']
+
+
+@pytest.mark.parametrize('authority', ['worker_report', 'imported_observation'])
+def test_coordinator_storage_does_not_authorize_replayed_claim(packet, authority):
+    invoke, cfg, anchors, state, coordinator, _ = packet
+    refs = cfg['evidence']['AC-001']
+    with closing(RailsLedger(coordinator)) as db:
+        raw, = db.query('select origin_bytes from imported_origin_rows where event_id=?', (refs[0],))
+        claim = json.loads(raw['origin_bytes'])
+        # Even a complete, correct-looking scope on a local copy is not a dispatch.
+        scope = {k: cfg[k] for k in ('job_id', 'task_id', 'code_rev', 'contract_sha256')}
+        refs.append(db.append(claim['kind'], source=claim['source'], scope=dict(scope, attempt_id=ATTEMPT),
+                              authority=authority, payload=claim['payload'], dedupe_key='local-claim')['event_id'])
+        cfg['coordinator'] = db.head()
+    anchors.write_text(json.dumps(cfg))
+    assert invoke()[1]['error'] == 'rails_evidence_refused'
+    assert not return_report.return_path(state, JOB).exists()
+
+
+def test_verify_requires_intact_dispatch_lease(packet):
+    invoke, _, _, state, _, _ = packet
+    assert invoke()[0] == 0
+    record = state / 'leases' / f'{ATTEMPT}.json'
+    lease = json.loads(record.read_text())
+    del lease['dispatch_chain_id']
+    record.chmod(0o600)
+    record.write_text(json.dumps(lease))
+    assert invoke('--verify')[1]['error'] == 'rails_evidence_refused'
+
+
+@pytest.mark.parametrize('assigned', [True, False], ids=['assigned-attempt', 'other-workers-attempt'])
+def test_native_worker_observation_requires_its_own_dispatch(packet, tmp_path, monkeypatch, assigned):
     invoke, cfg, anchors, state, coordinator, _ = packet
     hyvv = Path(os.environ.get("RAILS_R18_ROOT", ROOT.parent)) / "hyvv"
     if not hyvv.is_dir():
@@ -230,13 +274,23 @@ def test_native_worker_export_becomes_a_resolvable_observation(packet, tmp_path,
 
     root = tmp_path / "native-worker"
     (root / "attempts").mkdir(parents=True)
+    worker = RailsEmitter(root)
+    aid = ATTEMPT
+    if assigned:
+        aid = 'att_2234567890abcdef'
+        job = jobs.load_job(state, JOB)
+        job['tasks'][0]['attempts'].append(aid)
+        jobs.save_job(state, job)
+        with closing(RailsLedger(worker.path, read_only=True)) as empty:
+            assert empty.head()['seq'] == 0
+            leases.record_lease(state, aid, leases.load_lease(state, ATTEMPT)['brief'],
+                                dispatch_chain_id=empty.chain_id)
     rows = [
         dict(lseq=1, kind="worker:tool_call", tool_id="call_1234567890abcdef", line="[tool read] read"),
         dict(lseq=2, kind="worker:tool_update", tool_id="call_1234567890abcdef", tool_status="completed"),
     ]
-    (root / "attempts" / f"{ATTEMPT}.events.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    worker = RailsEmitter(root)
-    worker.ingest(ATTEMPT)
+    (root / "attempts" / f"{aid}.events.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    worker.ingest(aid)
     page = export_page(worker.path)
     (selected,) = [e["event_id"] for e in page["events"] if e["kind"] == "tool.finish"]
     with closing(RailsLedger(worker.path, read_only=True)) as worker_reader:
@@ -246,6 +300,14 @@ def test_native_worker_export_becomes_a_resolvable_observation(packet, tmp_path,
         cfg["coordinator"] = db.head()
     cfg["evidence"]["AC-001"].append(selected)
     anchors.write_text(json.dumps(cfg))
+    if not assigned:
+        # Both worker heads and the claimed attempt/contract are genuine. Only
+        # the assignment differs. Even selecting both origins cannot confer it.
+        assert invoke()[1]['error'] == 'rails_evidence_refused'
+        assert not return_report.return_path(state, JOB).exists()
+        with closing(RailsLedger(coordinator, read_only=True)) as db:
+            assert db.verify_chain(page['chain_id'])['ok']
+        return
     assert invoke()[0] == invoke("--verify")[0] == 0
     doc = json.loads((return_report.return_dir(state, JOB) / "rails-evidence.json").read_bytes())
     assert selected in doc["selected_event_ids"]

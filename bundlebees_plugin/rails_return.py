@@ -28,7 +28,7 @@ INPUT_SCHEMA = "bundlebees.rails-return-input/1"
 MAX_FILE = 128 * 1024
 MAX_ROWS = 4096
 MAX_BYTES = 8 * 1024 * 1024
-CHAIN = re.compile(r"(m-[a-f0-9]{12})-([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})")
+CHAIN = leases.RAILS_CHAIN_RE
 
 
 def require(ok, reason):
@@ -316,12 +316,15 @@ def _bound(event, cfg, task, state, manifest, lease_cache, *, native=False):
     if attempt is not None:
         require(attempt in task["attempts"], "Attempt is not enrolled in the selected task.")
     local = event["chain_id"] == cfg["coordinator"]["chain_id"]
-    if local and all(s[k] is not None for k in ("job_id", "task_id", "contract_sha256", "code_rev")):
-        return
-    if native:
+    if local:
+        require(
+            event["authority"] not in ("worker_report", "imported_observation"),
+            "Local replay of a worker or imported claim does not identify its dispatched worker.",
+        )
         # R05 signed-record projections use the contract id, not a job id.
-        # This record was independently located/revalidated by this RETURN.
-        return
+        # Native records were independently located/revalidated by this RETURN.
+        if native or all(s[k] is not None for k in ("job_id", "task_id", "contract_sha256", "code_rev")):
+            return
     # Native worker envelopes expose attempt only. Resolve against the actual
     # MAC-checked dispatch lease; never infer relationships by event time.
     require(attempt in task["attempts"], "Selected event has no durable job binding.")
@@ -329,6 +332,13 @@ def _bound(event, cfg, task, state, manifest, lease_cache, *, native=False):
         lease_cache[attempt] = leases.load_lease(state, attempt)
     lease = lease_cache[attempt]
     brief = lease["brief"]
+    if not local:
+        # Enrollment authenticates the rows, not the assignment. load_lease
+        # verifies the immutable attempt id and the MAC over the entire lease.
+        require(
+            lease.get("dispatch_chain_id") == event["chain_id"],
+            "Origin chain is not the worker bound to this dispatch lease.",
+        )
     require(
         brief.get("job_id") == cfg["job_id"]
         and brief.get("task_id") == cfg["task_id"]

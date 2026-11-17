@@ -22,7 +22,11 @@ Supply an operator-controlled JSON file, not an attachment retrieved from a work
 }
 ```
 
-Choose immutable event IDs relevant to each named criterion. For a worker observation, its attempt must belong to the task, and the authenticated dispatch lease must bind that job, task and revision. Verifier links require a local `verifier_record` for the same AC, contract and revision. Supporting event IDs must also be selected for the criterion. A native BundleBees record reference must resolve to the underlying evidence already checked by the RETURN; its bytes must match the source revision. Worker-only selections have no verification link.
+Choose immutable event IDs relevant to each named criterion. For a worker observation, the attempt must belong to the task and its authenticated dispatch lease must name the exact originating chain, job, task, frozen `contract_sha256` and source revision. The chain assignment is the top-level `dispatch_chain_id` recorded by the coordinator when issuing the lease. A field in the brief, an event scope, a worker head or a later selection is not an assignment.
+
+The current production dispatchers have no authoritative dispatch-to-Rails-chain registry. Their leases therefore do not qualify worker rows for a criterion's RETURN attachment. Retain and replay the enrolled origins as observations. Do not backfill old leases from imported events or generated anchors. The offline R18 fixture explicitly assigns a fresh local worker ledger before recording events; this is test-only dispatch evidence.
+
+Verifier links require a local `verifier_record` for the same AC, contract and revision. Supporting event IDs must also be selected for the criterion. A native BundleBees record reference must resolve to the underlying evidence already checked by the RETURN; its bytes must match the source revision. Worker-only selections have no verification link.
 
 The producer writes `jobs/<job>/rails-evidence.json`. Both `return.json` and `RETURN.md` reference the file through the criterion's evidence column. The `#sha256=…` fragment identifies the exact file bytes; open the path before the fragment relative to the state directory. The snapshot timestamp comes from the coordinator head, so the same snapshot produces identical bytes. The receiver uses its own trusted anchors and checks the sidecar and attachment with `--verify`; the decision stays pending. Rails reads do not fill in missing tests, signed RED, measurements, or approvals.
 
