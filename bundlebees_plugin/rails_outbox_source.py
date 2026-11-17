@@ -35,7 +35,7 @@ from typing import Any, Callable, Mapping
 
 from . import bee_events
 from .rails_bundlebees_source import (
-    MAX_RECORD, SourceError, _PagedSource, _Scan, _alias, _directory, _hex, _id,
+    MAX_RECORD, SourceError, _ERROR_REVISION, _PagedSource, _Scan, _alias, _directory, _hex, _id,
     _instance, _parse,
 )
 
@@ -322,11 +322,10 @@ class RailsOutboxSource(_PagedSource):
                         if diagnostics is None:
                             raise OutboxSourceInvalid('invalid landing record') from None
                         rid = _alias('record', name)
-                        digest = hashlib.sha256(raw).hexdigest()
                         diagnostics.append(((order, 0.0, rid), dict(kind='source.error',
-                            source=dict(adapter=ADAPTER, instance=self.instance, record_id=rid, revision=digest),
-                             payload=dict(code='malformed_record', range_start=None, range_end=None,
-                                          source_id=ADAPTER, cursor=None, count=1, digest=digest),
+                            source=dict(adapter=ADAPTER, instance=self.instance, record_id=rid, revision=_ERROR_REVISION),
+                            payload=dict(code='malformed_record', range_start=None, range_end=None,
+                                         source_id=ADAPTER, cursor=None, count=1, digest=None),
                             scope=dict(session_id=self.instance), authority='imported_observation',
                             dedupe_key=_alias('outbox', [self.instance, rid]))))
         records.sort(key=lambda record: record.sort_key)

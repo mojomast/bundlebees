@@ -44,6 +44,8 @@ MAX_DRAFTS = 8192
 _TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _REV = re.compile(r'(?:[a-f0-9]{40}|[a-f0-9]{64})')
 _AC = re.compile(r'AC-\d{3,12}', re.ASCII)
+# A diagnostic's revision describes the projection, never the rejected bytes.
+_ERROR_REVISION = 'source-error-v1'
 
 
 class SourceError(contracts.RailsRefusal):
@@ -173,7 +175,7 @@ def _disk_entries(root):
             except (ValueError, RecursionError):
                 value = None
             path = '/'.join(x for x in (category, contract, name) if x)
-            yield (order, path, category, value, hashlib.sha256(raw).hexdigest())
+            yield (order, path, category, value, hashlib.sha256(raw).hexdigest() if value is not None else None)
 
     entries = []
     with _directory(root) as state:
@@ -230,8 +232,8 @@ def _map(entry, instance, *, disk, key):
         scope['session_id'] = instance
     at = _stamp(r.get('at'))
 
-    def draft(kind, payload, authority, part='record'):
-        src = dict(adapter=ADAPTER_ID, instance=instance, record_id=rid, revision=raw_digest)
+    def draft(kind, payload, authority, part='record', revision=raw_digest):
+        src = dict(adapter=ADAPTER_ID, instance=instance, record_id=rid, revision=revision)
         lane = dict(lane_id=attempt or contract or wave or instance,
                     parent_lane_id=None, parent_event_id=None)
         timing = 'reported' if at else 'unknown'
@@ -243,7 +245,7 @@ def _map(entry, instance, *, disk, key):
 
     def error(code):
         return [draft('source.error', dict(range=[0, 0], cursor=None, code=code,
-                                           count=1, digest=raw_digest), 'imported_observation')]
+                                           count=1, digest=None), 'imported_observation', revision=_ERROR_REVISION)]
 
     if record is None:
         return error('invalid_record')
@@ -390,7 +392,9 @@ def _entries(snapshot):
         cat = ('worker-claims' if kind == 'claim' else 'waves' if kind == 'merge' or 'wave_id' in r
                else 'evidence' if 'phase' in r else 'verify-results')
         digest = hashlib.sha256(body).hexdigest()
-        rid = item.get('record_id', digest)
+        # An anonymous record's public ID must not fingerprint private prose,
+        # even indirectly via its alias, dedupe key or checkpoint.
+        rid = item.get('record_id', f'snapshot-item:{len(entries)}')
         if not isinstance(rid, str) or len(rid) > 1024:
             raise SourceError('snapshot_invalid')
         entries.append((0, rid, cat, r, digest))

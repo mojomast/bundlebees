@@ -167,7 +167,7 @@ class CommittedRecordTests(SnapshotCase):
 
     def test_contract_bound_committed_verify_maps_to_one_valid_pass_result(self):
         record = dict(_verify_record(), contract_sha256=DIGEST('bound contract'), ac_id='AC-001')
-        self.write("verify-results/att-1.json", record)
+        path = Path(self.write("verify-results/att-1.json", record))
         events = source.collect_events(self.state)
         verify = [event for event in events if event["kind"] == "verification.result"]
         self.assertEqual(1, len(verify))
@@ -178,6 +178,7 @@ class CommittedRecordTests(SnapshotCase):
         self.assertEqual("att-1", event["payload"]["run_id"])
         self.assertEqual("green", event["payload"]["phase"])
         self.assertEqual("coordinator_record", event["authority"])
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), event['source']['revision'])
         self.assertTrue(event["payload"]["evidence_refs"])
         self.assertEqual("att-1", event["scope"]["attempt_id"])
         self.assertEqual(STAMP, event["occurred_at"])
@@ -464,10 +465,24 @@ class LedgerReplayTests(SnapshotCase):
         page = s.read_batch()
         self.assertIn('source.error', [r['kind'] for r in page['records']])
         self.assertNotIn(secret, json.dumps(page))
+        self.assertNotIn(DIGEST(secret), json.dumps(page))
+        stat = Path(bad).stat()
+        Path(bad).write_text('another private fixture')
+        os.utime(bad, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(page, s.read_batch())  # Includes source_head and next_cursor.
         self.assertNotIn('private name', json.dumps(page))
         for limit, cap in [(0, 4096), (501, 4096), (True, 4096), (5, 2**21), (1, 100)]:
             with self.assertRaises(source.SourceError):
                 s.read_batch(None, limit, cap)
+
+    def test_anonymous_snapshot_error_does_not_fingerprint_rejected_fields(self):
+        def project(note):
+            return source.BundlebeesSource(snapshot=[dict(note=note)]).read_batch()
+
+        first = project('fixture one')
+        self.assertEqual('missing_revision', first['records'][0]['payload']['code'])
+        self.assertIsNone(first['records'][0]['payload']['digest'])
+        self.assertEqual(first, project('fixture two'))
 
     def test_symlinked_directory_is_unavailable(self):
         with tempfile.TemporaryDirectory() as other:

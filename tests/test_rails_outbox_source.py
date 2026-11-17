@@ -9,6 +9,7 @@ is terminal must be refused rather than silently ignored.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -283,6 +284,11 @@ class SourceProtocolTests(OutboxSourceCase):
         page = self.source().read_batch(None, 2, 4096)
         self.assertCountEqual(['attempt.state', 'source.error'], [r['kind'] for r in page['records']])
         self.assertNotIn('private', json.dumps(page))
+        self.assertNotIn(hashlib.sha256(path.read_bytes()).hexdigest(), json.dumps(page))
+        stat = path.stat()
+        path.write_text('another private fixture')
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(page, self.source().read_batch(None, 2, 4096))
         self.assertNotIn('coordinator-1', json.dumps(page))
         self.assertLessEqual(len(rails_contracts.canonicalize(page)), 4096)
         for count, cap in [(1, 1), (501, 4096), (10, 2**21)]:
