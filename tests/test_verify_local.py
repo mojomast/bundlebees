@@ -27,12 +27,13 @@ def sandboxed(workdir, argv):
     return sandbox.run_in_sandbox(workdir, list(argv), allow_unsafe_local=True, timeout=120)
 
 
-def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def git(repo: Path, *args: str, check: bool = True, input: str | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
         cwd=str(repo),
         capture_output=True,
         text=True,
+        input=input,
     )
     if check and proc.returncode != 0:
         raise AssertionError(f"git {args} failed: {proc.stderr}")
@@ -214,6 +215,381 @@ class Recovery:
         assert second["suite"] is not None and second["suite"]["exit_code"] == 0
         assert second["patch_sha256"]
         assert git(repo, "rev-parse", f"{second['sha']}^").stdout.strip() == base
+
+
+class SparseWorktrees:
+    __test__ = True
+
+    @staticmethod
+    def _add_probe(repo: Path) -> str:
+        """Commit the schema probe file the verify pipeline must always see."""
+        schemas = repo / "bundlebees_plugin" / "schemas"
+        schemas.mkdir(parents=True)
+        (schemas / "brief.schema.json").write_text("{}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "schema")
+        return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    @staticmethod
+    def _sparse(repo: Path, patterns: str) -> None:
+        """Put the host checkout into the observed narrow sparse state."""
+        git(repo, "config", "core.sparseCheckout", "true")
+        sparse = repo / ".git" / "info" / "sparse-checkout"
+        sparse.parent.mkdir(parents=True, exist_ok=True)
+        sparse.write_text(patterns)
+        git(repo, "read-tree", "-mu", "HEAD")
+        assert not (repo / "bundlebees_plugin" / "schemas" / "brief.schema.json").exists()
+
+    def test_a_sparse_checkout_repo_prepares_a_full_worktree(self, tmp_path):
+        """A sparse-checkout host checkout must not gate the prepared worktree.
+
+        A repository with ``core.sparseCheckout=true`` and a narrow sparse set
+        makes every fresh verify worktree inherit that set, silently missing
+        ``bundlebees_plugin/schemas/`` and gating schema reads. The worktree
+        preparation must force a full checkout, so the probe schema file is
+        present in the worktree every test invocation sees.
+        """
+        repo, base = make_repo(tmp_path)
+        base = self._add_probe(repo)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+        self._sparse(repo, "pkg/*\n")
+
+        seen = {}
+
+        def probe_runner(workdir, argv, *args, **kwargs):
+            seen["probe"] = (
+                Path(workdir) / "bundlebees_plugin" / "schemas" / "brief.schema.json"
+            ).is_file()
+            return {"exit_code": 1, "timed_out": False, "output_tail": "probe run"}
+
+        with pytest.raises(verify_local.VerifyError):
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=probe_runner,
+            )
+
+        assert seen.get("probe") is True
+
+    def test_the_prepared_worktree_missing_the_schema_probe_fails_closed(self, tmp_path, monkeypatch):
+        """A worktree that still misses the probe file must stop verification."""
+        repo, base = make_repo(tmp_path)
+        base = self._add_probe(repo)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+        self._sparse(repo, "pkg/*\n")
+
+        real_run = verify_local._run
+
+        def blocked(args, cwd, **kwargs):
+            names = [str(part) for part in args]
+            restore = (
+                names[:2] == ["git", "sparse-checkout"]
+                or (names[:2] == ["git", "config"] and len(names) > 3)
+                or names[:2] == ["git", "read-tree"]
+            )
+            if restore:
+                return subprocess.CompletedProcess(names, 1, "", "blocked")
+            return real_run(args, cwd, **kwargs)
+
+        monkeypatch.setattr(verify_local, "_run", blocked)
+
+        calls = []
+
+        def runner(workdir, argv, *args, **kwargs):
+            calls.append(argv)
+            return {"exit_code": 1, "timed_out": False, "output_tail": "run"}
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=runner,
+            )
+
+        assert exc.value.code == "worktree_incomplete"
+        assert calls == []  # no test ran: verify refused before executing anything
+        assert git(repo, "branch", "--list", "bb-verify/att_1").stdout.strip() == ""
+
+    def test_the_identity_recheck_forces_a_full_worktree_on_sparse_repos(self, tmp_path):
+        """Record reuse must re-digest test sources from a complete worktree."""
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        calls = []
+
+        def stateful(workdir, argv, *args, **kwargs):
+            calls.append(1)
+            exit_code = 0 if len(calls) > 1 else 1
+            return {"exit_code": exit_code, "timed_out": False, "output_tail": "run"}
+
+        record = verify_local.verify_and_commit(
+            state,
+            repo,
+            "att_1",
+            patch=patch,
+            declared_files=list(NEW_FILES),
+            base_rev=base,
+            tests=["tests/test_newmod.py"],
+            suite_command=SUITE,
+            require_gitleaks=False,
+            runner=stateful,
+        )
+        assert record["ok"] is True
+        self._sparse(repo, "pkg/*\n")
+
+        stored = record["execution_identity"]
+        recomputed = verify_local._identity_for_commit(
+            repo,
+            record["sha"],
+            base_rev=record["base_rev"],
+            source_tree_sha256=stored["source_tree_sha256"],
+            patch_sha256=record["patch_sha256"],
+            tests=["tests/test_newmod.py"],
+            suite_command=SUITE,
+            runner=stateful,
+            backend="auto",
+            allow_unsafe_local=False,
+            allow_weak=False,
+            timeout=verify_local.DEFAULT_SANDBOX_TIMEOUT_S,
+            require_gitleaks=False,
+            gitleaks=None,
+        )
+
+        assert recomputed == stored
+
+    def test_the_identity_recheck_fails_closed_without_a_full_worktree(self, tmp_path, monkeypatch):
+        """A scratch worktree still missing the probe must refuse the record."""
+        repo, base = make_repo(tmp_path)
+        base = self._add_probe(repo)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        calls = []
+
+        def stateful(workdir, argv, *args, **kwargs):
+            calls.append(1)
+            exit_code = 0 if len(calls) > 1 else 1
+            return {"exit_code": exit_code, "timed_out": False, "output_tail": "run"}
+
+        record = verify_local.verify_and_commit(
+            state,
+            repo,
+            "att_1",
+            patch=patch,
+            declared_files=list(NEW_FILES),
+            base_rev=base,
+            tests=["tests/test_newmod.py"],
+            suite_command=SUITE,
+            require_gitleaks=False,
+            runner=stateful,
+        )
+        assert record["ok"] is True
+        self._sparse(repo, "pkg/*\n")
+
+        real_run = verify_local._run
+
+        def blocked(args, cwd, **kwargs):
+            names = [str(part) for part in args]
+            restore = (
+                names[:2] == ["git", "sparse-checkout"]
+                or (names[:2] == ["git", "config"] and len(names) > 3)
+                or names[:2] == ["git", "read-tree"]
+            )
+            if restore:
+                return subprocess.CompletedProcess(names, 1, "", "blocked")
+            return real_run(args, cwd, **kwargs)
+
+        monkeypatch.setattr(verify_local, "_run", blocked)
+
+        stored = record["execution_identity"]
+        recomputed = verify_local._identity_for_commit(
+            repo,
+            record["sha"],
+            base_rev=record["base_rev"],
+            source_tree_sha256=stored["source_tree_sha256"],
+            patch_sha256=record["patch_sha256"],
+            tests=["tests/test_newmod.py"],
+            suite_command=SUITE,
+            runner=stateful,
+            backend="auto",
+            allow_unsafe_local=False,
+            allow_weak=False,
+            timeout=verify_local.DEFAULT_SANDBOX_TIMEOUT_S,
+            require_gitleaks=False,
+            gitleaks=None,
+        )
+
+        assert recomputed is None
+
+    def test_the_patch_tree_check_survives_sparse_repos(self, tmp_path):
+        """The committed-tree check works from a sparse repo once fully checked out."""
+        repo, base = make_repo(tmp_path)
+        base = self._add_probe(repo)
+        patch = make_patch(repo, base, NEW_FILES)
+        self._sparse(repo, "pkg/*\ntests/*\n")
+
+        git(repo, "checkout", "-q", "-b", "probe-branch", base)
+        git(repo, "apply", "--whitespace=nowarn", "-", input=patch)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "patched")
+        sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+        git(repo, "checkout", "-q", "main")
+        git(repo, "branch", "-q", "-D", "probe-branch")
+
+        assert verify_local._commit_contains_patch(repo, sha, base, patch) is True
+
+    def test_the_patch_tree_check_fails_closed_without_a_full_worktree(self, tmp_path, monkeypatch):
+        """A scratch worktree still missing the probe must refuse the record."""
+        repo, base = make_repo(tmp_path)
+        base = self._add_probe(repo)
+        patch = make_patch(repo, base, NEW_FILES)
+        self._sparse(repo, "pkg/*\ntests/*\n")
+
+        git(repo, "checkout", "-q", "-b", "probe-branch", base)
+        git(repo, "apply", "--whitespace=nowarn", "-", input=patch)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "patched")
+        sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+        git(repo, "checkout", "-q", "main")
+        git(repo, "branch", "-q", "-D", "probe-branch")
+
+        real_run = verify_local._run
+
+        def blocked(args, cwd, **kwargs):
+            names = [str(part) for part in args]
+            restore = (
+                names[:2] == ["git", "sparse-checkout"]
+                or (names[:2] == ["git", "config"] and len(names) > 3)
+                or names[:2] == ["git", "read-tree"]
+            )
+            if restore:
+                return subprocess.CompletedProcess(names, 1, "", "blocked")
+            return real_run(args, cwd, **kwargs)
+
+        monkeypatch.setattr(verify_local, "_run", blocked)
+
+        assert verify_local._commit_contains_patch(repo, sha, base, patch) is False
+
+
+class GitContextGap:
+    """The verify sandbox has no git repository context; failures say so."""
+    __test__ = True
+
+    def test_a_gitless_green_failure_points_at_the_doctor_note(self, tmp_path):
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        def gitless(workdir, argv, *args, **kwargs):
+            return {
+                "exit_code": 1,
+                "timed_out": False,
+                "output_tail": "E  OSError: fatal: not a git repository (or any of the parent directories): .git",
+            }
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=gitless,
+            )
+
+        assert exc.value.code == "tests_failed"
+        assert "doctor" in exc.value.fix
+        assert "no git repository context" in exc.value.fix
+
+    def test_a_plain_green_failure_keeps_the_plain_guidance(self, tmp_path):
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        def plain(workdir, argv, *args, **kwargs):
+            return {"exit_code": 1, "timed_out": False, "output_tail": "E  assert 2 == 3"}
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=plain,
+            )
+
+        assert exc.value.code == "tests_failed"
+        assert exc.value.fix == "Reject and re-dispatch."
+
+    def test_a_gitless_suite_failure_points_at_the_doctor_note(self, tmp_path):
+        repo, base = make_repo(tmp_path)
+        state = tmp_path / "state"
+        lease(state, base)
+        patch = make_patch(repo, base, NEW_FILES)
+
+        calls = []
+
+        def runner(workdir, argv, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                return {"exit_code": 0, "timed_out": False, "output_tail": "green run"}
+            if len(calls) > 2:
+                return {
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "output_tail": "fatal: not a git repository: .git",
+                }
+            return {"exit_code": 1, "timed_out": False, "output_tail": "red run"}
+
+        with pytest.raises(verify_local.VerifyError) as exc:
+            verify_local.verify_and_commit(
+                state,
+                repo,
+                "att_1",
+                patch=patch,
+                declared_files=list(NEW_FILES),
+                base_rev=base,
+                tests=["tests/test_newmod.py"],
+                suite_command=SUITE,
+                require_gitleaks=False,
+                runner=runner,
+            )
+
+        assert exc.value.code == "suite_failed"
+        assert "doctor" in exc.value.fix
+        assert "no git repository context" in exc.value.fix
 
 
 class SandboxRequirements:

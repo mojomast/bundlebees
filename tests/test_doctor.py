@@ -551,6 +551,17 @@ def test_sandbox_row_states_are_explicit(monkeypatch):
         assert row["state"] == expected, (backend, settings, row)
 
 
+def test_sandbox_row_documents_the_git_context_gap(monkeypatch):
+    """Every sandbox state carries the no-git-repository constraint explicitly."""
+    for backend in ("bwrap", None):
+        monkeypatch.setattr(doctor, "_detect_backend", lambda options, _b=backend: _b)
+        checkers = _merge_defaults(doctor.default_checkers(), keep={"sandbox"})
+        report = doctor.collect(_ctx(), None, checkers)
+        row = next(row for row in report["checks"] if row["check"] == "sandbox")
+        assert "no git repository context" in row["detail"], (backend, row)
+        assert "suites that shell out to git" in row["detail"], (backend, row)
+
+
 def test_pinned_sources_states(tmp_path):
     workflow_dir = tmp_path / "workflow-src"
     workflow_dir.mkdir()
