@@ -31,9 +31,9 @@
       "sha256": "1cc3e03e2ecaf4425b897e920d610957e32d44dce8374c5953a263d124b7bbc7"
     },
     {
-      "bytes": 40619,
+      "bytes": 41331,
       "path": "contrib/rizzstack_rails/ledger.py",
-      "sha256": "a1839151f43f2db08e13e6302ab9f13f5cf5dcc49c632019bd0cfe92070a84b2"
+      "sha256": "5d76253b94f3d251e50add6c66436da9421d1f6c17e8d0e2ac031ddeec7408ce"
     },
     {
       "bytes": 1147,
@@ -66,7 +66,7 @@
       "sha256": "b45bccc973ad5721c6c337c7447abf96b92da8905bba066c6298c340d82a7ddb"
     }
   ],
-  "pin_label": "unreviewed-working-tree",
+  "pin_label": "e176ec25986b5932e4ac5c57098690682b52f88b",
   "schema": "rizzstack.vendor-manifest/1",
   "source_package": "contrib/rizzstack_rails"
 }
