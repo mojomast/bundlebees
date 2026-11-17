@@ -230,6 +230,16 @@ one pull request.
   refuses with that exact code before a journal entry is written.
 
 ### Security
+- **Gate-watcher landed-delivery gate:** dependency and attempt-success gates
+  in the planned-to-queued gate watcher now clear only on terminal attempt
+  success AND an origin-verified landed delivery (branch on origin or merged
+  PR), via a fail-closed `World.origin_landed` probe that answers `None` on
+  every unprovable path (mapped to `waiting/origin_not_proven`) - a
+  succeeded-but-zero-delivery attempt can no longer unlock dependents. Pinned
+  by RED-first both ways (reverting to attempt-state-only clearing fails 7/8
+  new tests with all 28 pre-existing passing; a truthy-default probe fails
+  both dedicated fail-closed tests), byte-identical sha256 restores, and the
+  36-test `tests/test_gate_watcher.py` gate.
 - **Verify refusal evidence:** secret-scan refusals (`secret_detected`) raised
   by `verify` now carry refusal evidence — the matched rule id, its 1-based
   source line, and a masked excerpt of the matched span — while the fail-closed

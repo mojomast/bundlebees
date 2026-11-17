@@ -359,7 +359,16 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "verify refusal evidence enrichment",
         "keywords": ("refusal evidence", "masked excerpt", "rule id"),
     },
-)
+    {
+        # fix/gw-landed-delivery-gate: gate-watcher dependency evidence must
+        # require an origin-verified landed delivery (att_036f1bcd) - the
+        # defect-f fix after six zero-delivery succeeded attempts falsely
+        # cleared dependency edges; fail-closed origin_landed probe.
+        "pr": 74,
+        "name": "gate-watcher landed-delivery gate",
+        "keywords": ("landed-delivery", "origin_landed", "fail-closed"),
+    },
+ )
 
 
 def _read_changelog() -> str:
