@@ -1,0 +1,27 @@
+{
+  "files": [
+    {
+      "bytes": 791,
+      "path": "contrib/rizzstack_rails/__init__.py",
+      "sha256": "3a8119c28610aa6f1bc00837cd8c2eafcf52db305130416feace988077dcb647"
+    },
+    {
+      "bytes": 18561,
+      "path": "contrib/rizzstack_rails/contracts.py",
+      "sha256": "0fa1be9753d217d9b08bf71a8c0ed0f47f940591403d77fc022ccb2e92887f74"
+    },
+    {
+      "bytes": 36061,
+      "path": "contrib/rizzstack_rails/ledger.py",
+      "sha256": "708c51044031b9a35078a0db2d38d6342ac1ec129d477897e9057e89f2bb653a"
+    },
+    {
+      "bytes": 3063,
+      "path": "contrib/rizzstack_rails/privacy.py",
+      "sha256": "e920559263118441975fa71802a133680d4e6035e65e7aec745b7375faa2220b"
+    }
+  ],
+  "pin_label": "rails/r02-ledger",
+  "schema": "rizzstack.vendor-manifest/1",
+  "source_package": "contrib/rizzstack_rails"
+}
