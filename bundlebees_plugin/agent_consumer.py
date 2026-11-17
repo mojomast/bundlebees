@@ -33,18 +33,276 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import agent_work, hermes_adapter, job as jobs, recovery
+from . import bee_events, leases
 
 CRASH_ENV = "BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL"
 CRASH_EXIT_CODE = 97
 CRASH_SCHEMA = "rizzstack.agent-crash/1"
 
 ADAPTERS: tuple[str, ...] = ("hermes", "deterministic", "authorized")
+
+# ---------------------------------------------------------------------------
+# Tool-path write-back
+# ---------------------------------------------------------------------------
+#
+# Attempts dispatched through the tool path (``bundlebees_dispatch``) are
+# completed on the launcher, never inside a job: nothing in the job lifecycle
+# ever emits their landing event, so the attempt store keeps dispatch-time
+# states forever, the usage ingest never sees them, and the reconciliation
+# sweep cannot tell completed from unpushed. When such an attempt reaches a
+# terminal state, the tool path writes the same canonical
+# ``rizzstack.bee.landed.v1`` event through the same outbox write path —
+# attempt id, state, feature/branch and the usage payload the result envelope
+# carries. The write is best-effort by contract: a failure is reported as a
+# value and never raised into the attempt's completion path.
+
+#: The terminal attempt states the write-back emits. ``landed`` is the
+#: launcher's own completion word; the job path maps terminal task states
+#: instead, which is why tool-path attempts were invisible.
+TOOL_TERMINAL_STATES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "cancelled", "interrupted"}
+)
+
+#: Stable per-(attempt, state) transition id: the deterministic event id makes
+#: replays and crash retries of the same completion idempotent.
+TOOL_TRANSITION_ID = "tool-write-back"
+
+TOOL_COMPLETION_SCHEMA = "rizzstack.tool-completion/1"
+
+_TOOL_IDENTITY = "bundlebees-tools"
+_TOOL_HARNESS = "hyvv"
+_TOOL_COMPLETIONS_DIR = "tool-completions"
+
+_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_HEX64_RE = re.compile(r"^(?:[0-9a-fA-F]{64})$")
+_USAGE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+def _tool_id(value: Any) -> str | None:
+    """A canonical landing identifier, or None when the value is unsafe."""
+
+    text = str(value if value is not None else "").strip()
+    if text and bee_events._ID_RE.match(text):
+        return text
+    return None
+
+
+def _tool_clock(now: Any) -> float:
+    """The caller's clock, tolerantly; a bad clock must not stop the write."""
+
+    if now is None:
+        return time.time()
+    if isinstance(now, (int, float)) and not isinstance(now, bool):
+        return float(now)
+    if callable(now):
+        try:
+            return _tool_clock(now())
+        except Exception:  # noqa: BLE001 - best-effort clock
+            return time.time()
+    try:
+        return datetime.fromisoformat(str(now).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return time.time()
+
+
+def _clean_usage(usage: Any) -> dict[str, Any]:
+    """The result envelope's usage, numbers only; never a credential shape."""
+
+    if not isinstance(usage, Mapping):
+        return {}
+    clean: dict[str, Any] = {}
+    for key, value in usage.items():
+        name = str(key or "").strip()
+        if not _USAGE_KEY_RE.fullmatch(name):
+            continue
+        if name == "source":
+            if isinstance(value, str) and value.strip():
+                clean[name] = value.strip()[:40]
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            clean[name] = value
+    return clean
+
+
+def _lease_facts(state_dir: Path, attempt_id: str) -> dict[str, Any]:
+    """The coordinator lease ``bundlebees_dispatch`` recorded, best-effort.
+
+    A missing, tampered or unreadable lease is not an error here: the caller
+    may carry the facts itself. It only means the write-back cannot fill them.
+    """
+
+    try:
+        record = leases.load_lease(state_dir, attempt_id)
+    except Exception:  # noqa: BLE001 - an unusable lease is only missing facts
+        return {}
+    return record if isinstance(record, Mapping) else {}
+
+
+def record_tool_completion(
+    state_dir: Path,
+    attempt_id: str,
+    *,
+    state: str,
+    branch: str | None = None,
+    feature_id: str | None = None,
+    job_id: str | None = None,
+    task_id: str | None = None,
+    transition_id: str | None = None,
+    source_rev: str | None = None,
+    lease_sha256: str | None = None,
+    assigned_files: Any = None,
+    model: str | None = None,
+    harness: str | None = None,
+    coordinator_identity: str | None = None,
+    artifact_sha256: str | None = None,
+    result_available: bool | None = None,
+    usage: Mapping[str, Any] | None = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Write one tool-path attempt's terminal completion to the landing outbox.
+
+    Only terminal states (``TOOL_TERMINAL_STATES``) emit; anything else is a
+    reported no-op that touches no state. Facts the caller does not carry are
+    filled from the immutable coordinator lease the dispatch recorded, so a
+    completion that only knows the attempt id still produces the full
+    canonical event. On success a create-only tool-completion record beside
+    the outbox keeps the usage payload the result envelope carried, which the
+    canonical landing schema itself has no slot for. The emission never
+    raises: every refusal comes back as an ``{"emitted": False, ...}`` value
+    so the attempt's completion path cannot be broken by an outbox write
+    failure.
+    """
+
+    if state_dir is None:
+        return {"emitted": False, "code": "state_dir_missing",
+                "error": "no plugin state directory; the landing outbox is unavailable"}
+    attempt = str(attempt_id or "").strip()
+    if not attempt or not _ATTEMPT_ID_RE.match(attempt):
+        return {"emitted": False, "code": "attempt_id_invalid",
+                "error": "attempt id is not a safe identifier"}
+    state_name = str(state or "").strip()
+    if state_name not in TOOL_TERMINAL_STATES:
+        return {
+            "emitted": False,
+            "reason": "state_not_terminal",
+            "state": state_name,
+        }
+
+    state_path = Path(state_dir)
+    lease = _lease_facts(state_path, attempt)
+    brief = lease.get("brief") if isinstance(lease.get("brief"), Mapping) else {}
+    digest = lease_sha256 if lease_sha256 is not None else lease.get("brief_sha256")
+    if not isinstance(digest, str) or not _HEX64_RE.match(digest):
+        return {
+            "emitted": False,
+            "code": "lease_facts_missing",
+            "error": "no verified lease facts for this attempt; the canonical "
+                     "landing event requires the coordinator lease digest",
+            "fix": "Dispatch through bundlebees_dispatch, or carry "
+                   "lease_sha256 and source_rev in the completion.",
+        }
+    source = source_rev if source_rev is not None else lease.get("source_rev")
+    files = assigned_files if assigned_files is not None else lease.get("assigned_files")
+    branch = branch if branch else lease.get("branch")
+    feature = (
+        _tool_id(feature_id)
+        or _tool_id(brief.get("project"))
+        or attempt
+    )
+    job = _tool_id(job_id if job_id else brief.get("job_id"))
+    task = _tool_id(task_id if task_id else brief.get("task_id"))
+    transition = _tool_id(transition_id) or TOOL_TRANSITION_ID
+    identity = _tool_id(coordinator_identity) or _TOOL_IDENTITY
+    harness_text = _tool_id(harness) or _TOOL_HARNESS
+    model_text = _tool_id(model)
+    if model_text is not None and not bee_events._BACKEND_RE.match(model_text):
+        model_text = None
+    source_text = (
+        source
+        if isinstance(source, str) and bee_events._SOURCE_REV_RE.match(source.strip())
+        else None
+    )
+    artifact = (
+        artifact_sha256
+        if isinstance(artifact_sha256, str) and _HEX64_RE.match(artifact_sha256)
+        else None
+    )
+    reference = str(branch).strip() if isinstance(branch, str) and str(branch).strip() else None
+    available = (
+        result_available
+        if isinstance(result_available, bool)
+        else state_name == "succeeded"
+    )
+
+    try:
+        event = bee_events.build_event(
+            attempt_id=attempt,
+            state=state_name,
+            transition_id=transition,
+            feature_id=feature,
+            job_id=job,
+            task_id=task,
+            coordinator_identity=identity,
+            harness=harness_text,
+            model=model_text,
+            source_rev=source_text,
+            lease_sha256=digest,
+            assigned_files=files if files is not None else [],
+            result_available=available,
+            artifact_sha256=artifact,
+            reference=reference,
+        )
+        stored = bee_events.record_landing(state_path, event)
+    except bee_events.EventError as exc:
+        return {"emitted": False, "code": exc.code, "error": exc.error, "fix": exc.fix}
+    except Exception as exc:  # noqa: BLE001 - the completion path must survive any write failure
+        return {"emitted": False, "code": "write_back_failed", "error": type(exc).__name__}
+
+    # The tool-path completion record: durable, create-only evidence keyed by
+    # the attempt, carrying the usage payload the result envelope had (when it
+    # did) — the canonical landing schema itself carries no usage field.
+    clean_usage = _clean_usage(usage)
+    usage_recorded = False
+    completion_record: str | None = None
+    record: dict[str, Any] = {
+        "schema": TOOL_COMPLETION_SCHEMA,
+        "attempt_id": attempt,
+        "state": state_name,
+        "branch": reference,
+        "feature_id": feature,
+        "event_id": event["id"],
+        "recorded_at": datetime.fromtimestamp(
+            _tool_clock(now), tz=timezone.utc
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    if clean_usage:
+        record["usage"] = clean_usage
+    try:
+        bee_events._create_only_json(
+            state_path / _TOOL_COMPLETIONS_DIR / f"{attempt}.json", record
+        )
+        usage_recorded = bool(clean_usage)
+        completion_record = f"{_TOOL_COMPLETIONS_DIR}/{attempt}.json"
+    except Exception:  # noqa: BLE001 - completion evidence is best-effort too
+        usage_recorded = False
+        completion_record = None
+
+    return {
+        "emitted": True,
+        "created": bool(stored.get("created")),
+        "event_id": event["id"],
+        "transition_id": transition,
+        "state": state_name,
+        "usage_recorded": usage_recorded,
+        "completion_record": completion_record,
+    }
 
 
 class ConsumerError(Exception):
