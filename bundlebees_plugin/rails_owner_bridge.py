@@ -73,7 +73,11 @@ def review(p,db,draft,expires):
     fields=dict(schema=NAMESPACE,owner=p['owner'],ledger_uuid=db.ledger_uuid,job_id=jid,authorization_id=auth['auth_id'],
                 authorization_digest=hashlib.sha256(canonical(auth).encode()).hexdigest(),target_hash=digest,expires_at=expires,**draft)
     # The final newline is required, making this directly signable as a text file.
-    return canonical(fields)+'\n',{'job_id':jid}
+    scope={'job_id':jid}
+    for k in ('task_id','attempt_id','session_id','campaign_id','contract_sha256','code_rev'):
+        v=e['scope'].get(k)
+        if isinstance(v,str) and ID.fullmatch(v):scope[k]=v
+    return canonical(fields)+'\n',scope
 
 def verify(signers,identity,reviewed,signature):
     check(isinstance(signature,str) and len(signature)<=2048 and signature.startswith('-----BEGIN SSH SIGNATURE-----\n'))
@@ -97,18 +101,19 @@ def handle(config,req):
         text,scope=review(p,db,draft,expires);check(req['review']==text,'conflict');return text,scope
     with contextlib.closing(RailsLedger(p['ledger'],read_only=True)) as db:
         text,scope=admit(db);verify(signers,identity,text,req['signature'])
+        provenance=dict(adapter='rails-owner-feedback',instance=p['owner'],record_id=hashlib.sha256(text.encode('ascii')).hexdigest(),revision='v1')
         # An expired signature can reconcile only its exact already-committed
         # operation; never use it to create a row after expiry.
         if expires<=now:
             prior=feedback._existing_for_key(db,'feedback:'+draft['idempotency_key']);check(prior and
               prior['target_event_id']==draft['target_event_id'] and prior['rating']==draft['rating'] and prior['category']=='quality' and
-              prior['note']==draft['note'] and prior['source']['instance']==p['owner'] and prior['scope'].get('job_id')==scope['job_id'])
+              prior['note']==draft['note'] and prior['scope'].get('job_id')==scope['job_id'] and
+              prior['source']==feedback._source_for(prior['feedback_id'],1,'record',provenance))
             return {'event_id':prior['event_id'],'duplicated':True}
     with contextlib.closing(RailsLedger(p['ledger'],allowed_authorities={'owner_record'})) as writer:
         check(permitted(config)==(p,identity,signers));admit(writer);check(int(time.time())<expires)
         receipt=feedback.record(writer,draft['target_event_id'],scope=scope,idempotency_key=draft['idempotency_key'],
-            rating=draft['rating'],category='quality',note=draft['note'],source=dict(adapter='rails-owner-feedback',instance=p['owner'],
-            record_id=hashlib.sha256(text.encode('ascii')).hexdigest(),revision='v1'))
+            rating=draft['rating'],category='quality',note=draft['note'],source=provenance)
         return {'event_id':receipt['event_id'],'duplicated':receipt['duplicated']}
 
 def main():
