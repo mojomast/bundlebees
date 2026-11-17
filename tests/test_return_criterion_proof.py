@@ -13,9 +13,9 @@ from tests.test_return_report import _frozen
 @pytest.mark.parametrize('cases,expected', [
     (None, 'UNVERIFIED'), ([], 'UNVERIFIED'), ([('test_a', 'passed')], 'UNVERIFIED'),
     ([('test_a', 'passed'), ('test_b', 'skipped')], 'UNVERIFIED'),
-    ([('test_a', 'passed'), ('test_b', 'passed')], 'PASS'),
+    ([('test_a', 'passed'), ('test_b', 'passed')], 'UNVERIFIED'),
 ])
-def test_regression_summary_only_proves_observed_cases(tmp_path, cases, expected):
+def test_unsigned_regression_cases_cannot_prove_contract_criterion(tmp_path, cases, expected):
     ids = ['test_impl.py::test_a', 'test_impl.py::test_b']
     suite = {'exit_code': 0}
     if cases is not None:

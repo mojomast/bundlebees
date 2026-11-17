@@ -78,6 +78,21 @@ def test_wave_inputs_bind_the_verified_commit_and_tested_tree(campaign, tmp_path
     assert caught.value.code == 'wave_mismatch'
 
 
+def test_unpinned_cases_appended_to_receipt_cannot_replace_signed_green(campaign, tmp_path):
+    state = _copy_state(campaign, tmp_path)
+    doc = return_report.build(state, 'job_a', repo=campaign['repo'])
+    green = doc['red_green']['green']
+    if green:
+        (state / green['record_path']).unlink()
+    path = verify_local.record_path(state, 'att_1')
+    receipt = json.loads(path.read_bytes())
+    receipt['suite']['cases'] = [dict(id=case, outcome='passed') for case in doc['acceptance'][0]['tests']]
+    path.write_text(json.dumps(receipt))
+    for operation in (return_report.verify, return_report.build):
+        with pytest.raises(return_report.ReturnError, match='AC-001: UNVERIFIED'):
+            operation(state, 'job_a', repo=campaign['repo'])
+
+
 @pytest.mark.parametrize('change', ['unrun_scan', 'timeout', 'blocking', 'bool_exit', 'wrong_base', 'resumed', 'wrong_candidate'])
 def test_native_incomplete_or_contradictory_evidence_cannot_publish(campaign, tmp_path, change):
     state = _copy_state(campaign, tmp_path)
