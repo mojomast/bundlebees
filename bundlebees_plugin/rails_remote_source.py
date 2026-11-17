@@ -706,7 +706,10 @@ class RemoteRailSource:
         if payload.get("ok") is False or status >= 400:
             error = payload.get("error")
             code = error.get("code") if isinstance(error, Mapping) else None
-            if code == "reset_required":
+            if code == "reset_required" and status == 409 and payload.get('ok') is False:
+                if (payload.get('chain_id', chain_id) != chain_id or
+                        payload.get('peer_id', self.peer_id) != self.peer_id):
+                    raise PeerProtocolRefused('reset does not match the enrolled origin')
                 raise ResetRequired("peer cursor is beyond its head")
             if code == "source_gap":
                 raise SourceGapRefused("peer reports a missing retained prefix")
@@ -806,7 +809,7 @@ class RemoteRailSource:
             )
         return entries
 
-    def _verify_entries(self, entries, after, chain_id):
+    def _verify_entries(self, entries, after, chain_id, record):
         verified = []
         seen = set()
         previous_seq = None
@@ -878,7 +881,6 @@ class RemoteRailSource:
             previous_hash = envelope.get("hash")
         if verified:
             first = verified[0]
-            record = self._chain_state(chain_id)
             if first["seq"] == 1:
                 if first["prev_hash"] != rails_contracts.GENESIS:
                     raise OriginBytesRefused("origin does not start at genesis")
@@ -977,8 +979,7 @@ class RemoteRailSource:
                 gaps.append({"start": expected, "end": next_seq - 1})
         return self._merge_gaps(gaps)
 
-    def _loss(self, payload, chain_id, after, next_seq, verified):
-        record = self._chain_state(chain_id)
+    def _loss(self, payload, chain_id, after, next_seq, verified, record):
         committed_next = record["next_seq"]
         committed_cursor = committed_next - 1
         peer_cursor = next_seq - 1
@@ -1107,10 +1108,11 @@ class RemoteRailSource:
         strict,
         require_fresh,
         allow_loss,
+        record,
     ):
         raw_events = payload.get("events", [])
         entries = self._entries(raw_events)
-        verified = self._verify_entries(entries, after, chain_id)
+        verified = self._verify_entries(entries, after, chain_id, record)
         self._check_head(payload, verified)
         next_seq = self._next_seq(payload, verified, after)
         if next_seq <= after:
@@ -1118,7 +1120,7 @@ class RemoteRailSource:
         gaps = self._gaps(
             payload, verified, after, next_seq, self._declared_gaps(payload)
         )
-        loss = self._loss(payload, chain_id, after, next_seq, verified)
+        loss = self._loss(payload, chain_id, after, next_seq, verified, record)
         stale = self._stale(payload, headers)
         texts = [item["text"] for item in verified]
         origin_hashes = [item["hash"] for item in verified]
@@ -1128,7 +1130,6 @@ class RemoteRailSource:
             if first_gap is not None and item["seq"] >= first_gap["start"]:
                 break
             importable.append(item["text"])
-        record = self._chain_state(chain_id)
         head = payload.get("head")
         has_more = payload.get("has_more") is True
         status = "ok"
@@ -1249,16 +1250,18 @@ class RemoteRailSource:
             or limit > MAX_PAGE_LIMIT
         ):
             raise PeerProtocolRefused("limit must be between 1 and 500")
-        try:
-            body, headers, status = self._request(url)
-        except RemoteSourceRefusal:
-            raise
+        return self._read_export(url, chain_id, cursor, limit, strict=strict,
+                                 require_fresh=require_fresh, allow_loss=allow_loss)
+
+    def _read_export(self, url, chain_id, cursor, limit, *, strict=False, require_fresh=False,
+                     allow_loss=False, anchor=None):
+        body, headers, status = self._request(url)
         try:
             payload, resolved_chain = self._decode_body(body, chain_id, cursor, status)
             if limit is not None and len(payload['events']) > limit:
                 raise PeerProtocolRefused("peer page exceeds the requested event limit")
         except ResetRequired:
-            record = self._chain_state(chain_id) if chain_id else None
+            record = anchor if anchor is not None else (self._chain_state(chain_id) if chain_id else None)
             if record is not None and record["next_seq"] > 1:
                 raise LossAfterCommit(
                     "peer reset the export after a committed cursor",
@@ -1274,15 +1277,33 @@ class RemoteRailSource:
                     },
                 )
             raise
-        report = self._evaluate(
-            payload,
-            headers,
-            resolved_chain,
-            cursor,
-            strict=strict,
-            require_fresh=require_fresh,
-            allow_loss=allow_loss,
-        )
+        if anchor is None:
+            record = self._chain_state(resolved_chain)
+        else:
+            # An import is judged against SQLite, never an independent fetch
+            # cache (which can be empty on restart or belong to another DB).
+            committed = anchor['next_seq'] - 1
+            head = payload['head']
+            if committed and (not head or head['seq'] < committed or
+                              (head['seq'] == committed and head['hash'] != anchor['head_hash'])):
+                raise LossAfterCommit('peer no longer agrees with the durable receipt',
+                                      {'reason': 'head_conflict', 'chain_id': resolved_chain})
+            record = dict(anchor, hashes={str(committed): anchor['head_hash']} if committed else {})
+        def evaluate(checkpoint):
+            return self._evaluate(payload, headers, resolved_chain, cursor, strict=strict,
+                                  require_fresh=require_fresh, allow_loss=allow_loss, record=checkpoint)
+
+        report = evaluate(record)
+        if anchor is not None:
+            # Preserve an independent fetch history's replay checks *before*
+            # import. A disagreement only with that cache cannot halt SQLite.
+            cache = self._chain_state(resolved_chain)
+            if cache['next_seq'] > 1 and (cache['next_seq'], cache['head_hash']) != (
+                    anchor['next_seq'], anchor['head_hash']):
+                try:
+                    evaluate(cache)
+                except LossAfterCommit:
+                    raise RemoteSourceRefusal('fetch history differs from the import ledger', code='state') from None
         self._touch_peer(True, observation=report)
         return report
 
@@ -1499,15 +1520,15 @@ class RemoteRailSource:
         if cursor > committed:
             raise SourceGapRefused("cannot import beyond the last durable receipt")
         try:
-            report = self.fetch(chain_id, cursor=cursor, limit=limit)
-        except ResetRequired:
-            if committed and cursor <= committed:
-                raise LossAfterCommit("peer reset a cursor covered by the durable receipt") from None
+            report = self._read_export(self.export_url(chain_id, cursor=cursor, limit=limit),
+                                       chain_id, cursor, limit, anchor=anchor)
+        except LossAfterCommit as exc:
+            # An unaudited loss flag is not proof against a local checkpoint.
+            # Protocol, availability and forward-gap refusals remain retryable.
+            if committed and exc.reason in ('reset_required', 'head_conflict', 'prev_hash_mismatch',
+                                            'hash_mismatch', 'missing_committed', 'peer_cursor_behind'):
+                ledger.halt_import_origin(chain_id)
             raise
-        head = report['head']
-        if committed and (not head or head['seq'] < committed or
-                          (head['seq'] == committed and head['hash'] != anchor['head_hash'])):
-            raise LossAfterCommit("peer no longer agrees with the durable receipt")
         if report["gaps"]:
             raise ExportGapDetected(
                 "refusing to import across an export gap",

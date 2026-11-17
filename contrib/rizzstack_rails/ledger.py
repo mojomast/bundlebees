@@ -785,6 +785,22 @@ class RailsLedger:
             ok = ok and bool(report["ok"])
         return {"ok": ok, "restored_path": dest_abs, "chains": results}
 
+    def halt_import_origin(self, chain_id):
+        """Record a peer contradiction without changing its last durable receipt."""
+        self._ensure_writable()
+        contracts.require_id(chain_id, 'chain_id')
+        if self.chain_id == chain_id or privacy.scrub_text(chain_id) != chain_id:
+            raise AuthorityRefusal('invalid peer chain identity')
+
+        def work(conn):
+            # Only an existing, committed peer cursor can be halted this way.
+            # A concurrent import cannot clear the marker or lose its receipt.
+            if not conn.execute("UPDATE import_cursors SET state='halted' WHERE chain_id=? AND next_seq>1",
+                                (chain_id,)).rowcount:
+                raise SourceGap('cannot halt a peer without a committed cursor')
+
+        self._write_tx(work)
+
     def import_origin_page(self, chain_id, pages):
         self._ensure_writable()
         self._probe_capacity()

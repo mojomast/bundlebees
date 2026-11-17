@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -25,6 +26,7 @@ for path in (REPO_ROOT, CONTRIB_DIR):
 
 from rizzstack_rails import contracts as rails_contracts
 from rizzstack_rails import ledger as rails_ledger
+from rizzstack_rails.importer import Importer
 from bundlebees_plugin import rails_remote_source as remote
 
 CHAIN_ID = "c1"
@@ -793,6 +795,89 @@ class EventDraftTests(RemoteSourceCase):
 
 
 class LedgerIntegrationTests(RemoteSourceCase):
+    def test_conflicting_checkpoint_halts_only_that_origin_across_restart(self):
+        from bundlebees_plugin import rails_return
+
+        pages = _pages(2)
+        other = 'peer-b'
+        other_pages = _pages(2, chain_id=other)
+        reset = _response({'ok': False, 'error': {'code': 'reset_required'}}, status=409)
+        conflicts = {
+            'reset': reset,
+            'empty': _response(_body([], after=2)),
+            'behind': _response(_body([], after=2, head=_head(pages[:1]))),
+            'equal': _response(_body([], after=2, head=dict(seq=2, hash=_head(pages[:1])['hash']))),
+        }
+        for reason, reply in conflicts.items():
+            for fresh in (False, True):
+                with self.subTest(reason=reason, fresh=fresh):
+                    path = os.path.join(self._tmp.name, f'{reason}-{fresh}.sqlite')
+                    with closing(rails_ledger.RailsLedger(path)) as db:
+                        sink = Importer(db)  # The same sink as the launcher pull CLI.
+                        peer = self.source(FakeTransport(_response(_body(pages))))
+                        peer.import_into(sink, CHAIN_ID)
+                        db.import_origin_page(other, other_pages[:1])
+                        heads = [db.head(), dict(_head(pages), chain_id=CHAIN_ID)]
+                        rails_return._snapshot(path, heads)
+                        prior = db.import_cursor(CHAIN_ID)
+                        if fresh:
+                            peer = self.source(FakeTransport(reply))
+                        else:
+                            peer.transport = FakeTransport(reply)
+                        with self.assertRaises(remote.LossAfterCommit):
+                            peer.import_into(sink, CHAIN_ID)
+                    with closing(rails_ledger.RailsLedger(path)) as db:
+                        self.assertEqual(db.import_cursor(CHAIN_ID), dict(prior, state='halted'))
+                        self.assertEqual(heads[0], db.head())
+                        with self.assertRaisesRegex(rails_return.ReturnError, 'halted'):
+                            rails_return._snapshot(path, heads)
+                        offline = FakeTransport()
+                        with self.assertRaises(remote.LossAfterCommit):
+                            self.source(offline).import_into(Importer(db), CHAIN_ID)
+                        self.assertEqual([], offline.requests)
+                        with self.assertRaises(rails_ledger.SourceFork):
+                            db.import_origin_page(CHAIN_ID, pages)
+                        self.assertEqual(1, db.import_origin_page(other, other_pages[1:])['imported'])
+
+    def test_outage_and_unbound_reset_leave_checkpoint_retryable(self):
+        pages = _pages(2)
+        reset = {'ok': False, 'error': {'code': 'reset_required'}}
+        with closing(rails_ledger.RailsLedger(os.path.join(self._tmp.name, 'retry.db'))) as db:
+            peer = self.source(FakeTransport(_response(_body(pages[:1]))))
+            peer.import_into(db, CHAIN_ID)
+            prior = db.import_cursor(CHAIN_ID)
+            for reply, refusal in ((TimeoutError(), remote.PeerUnavailable),
+                                   (_response(reset, status=503), remote.PeerUnavailable),
+                                   (_response(dict(reset, chain_id='other'), status=409), remote.PeerProtocolRefused),
+                                   (_response(_body([], after=1, head=_head(pages))), remote.ExportGapDetected)):
+                peer.transport = FakeTransport(reply)
+                with self.assertRaises(refusal):
+                    peer.import_into(db, CHAIN_ID)
+                self.assertEqual(prior, db.import_cursor(CHAIN_ID))
+            peer.transport = FakeTransport(_response(_body(pages[1:], after=1)))
+            self.assertEqual(1, peer.import_into(db, CHAIN_ID)['ledger']['imported'])
+
+    def test_reset_without_a_durable_receipt_does_not_create_a_halt(self):
+        # A fetch-only cache is not evidence of a commitment in this ledger.
+        pages = _pages(1)
+        peer = self.source(FakeTransport(_response(_body(pages))))
+        peer.commit(peer.fetch(CHAIN_ID))
+        peer.transport = FakeTransport(_response({'ok': False, 'error': {'code': 'reset_required'}}, status=409))
+        with closing(rails_ledger.RailsLedger(os.path.join(self._tmp.name, 'empty.db'))) as db:
+            with self.assertRaises(remote.ResetRequired):
+                peer.import_into(db, CHAIN_ID)
+            self.assertEqual([], db.query('SELECT chain_id FROM import_cursors'))
+
+    def test_conflict_only_with_fetch_history_does_not_touch_import_ledger(self):
+        pages = _pages(2)
+        peer = self.source(FakeTransport(_response(_body(pages)), _response(_body(pages[:1]))))
+        peer.commit(peer.fetch(CHAIN_ID))
+        with closing(rails_ledger.RailsLedger(os.path.join(self._tmp.name, 'fresh.db'))) as db:
+            with self.assertRaises(remote.RemoteSourceRefusal) as refused:
+                peer.import_into(db, CHAIN_ID)
+            self.assertEqual('state', refused.exception.code)
+            self.assertEqual([], db.query('SELECT chain_id FROM import_cursors'))
+
     def test_reopened_reader_resumes_from_sqlite_and_rejects_lost_head(self):
         pages = _pages(3)
         db_path = os.path.join(self._tmp.name, 'rails.sqlite3')

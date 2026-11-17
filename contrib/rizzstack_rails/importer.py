@@ -124,6 +124,9 @@ class Importer:
         """R09 restarts from this ledger's committed origin head."""
         return self.ledger.import_cursor(token(chain_id))
 
+    def halt_import_origin(self, chain_id):
+        return self.ledger.halt_import_origin(token(chain_id))
+
     def import_once(self, source, limit=100, byte_limit=MAX_BYTES):
         self.ledger._ensure_writable()
         limits(limit, byte_limit)
