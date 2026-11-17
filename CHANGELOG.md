@@ -1,3 +1,5 @@
+- **Delivery reconciler (rizzstack.delivery/1) + `hermes bundlebees deliver`**: verify now records a durable delivery intent *before* the push and the pushed sha after it (transactional-outbox style), opens the PR eagerly as part of the same run, and a level-triggered sweep converges anything left pending — an existing PR is the success condition, so repeated sweeps never duplicate. Closes the gap where three verified branches sat on origin with no PR because the last step was a human act.
+
 # Changelog
 
 All notable changes to this project are documented in this file.
