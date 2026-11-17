@@ -45,6 +45,9 @@ class FactoryDriverReturn(unittest.TestCase):
         self.assertTrue((fx.state / "jobs" / "job_c" / "RETURN.md").exists())
         statuses = {row["id"]: row["status"] for row in manifest["acceptance"]}
         self.assertTrue(statuses and all(value == "PASS" for value in statuses.values()), statuses)
+        green = manifest['red_green']['green']
+        self.assertEqual(green['revision'], manifest['verification']['commit'])
+        self.assertIn(green['record_path'], manifest['acceptance'][0]['evidence'])
         before = (len(fx.launcher.posts), job["tasks"][0]["state"])
         again = driver.run_pass()
         self.assertEqual(len(fx.launcher.posts), before[0])

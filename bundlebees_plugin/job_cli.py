@@ -476,7 +476,7 @@ def tick(
         adapter = provision_bind.BoundLauncher(adapter, bindings, validators)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
-        from . import acdd_cli
+        from . import acdd_cli, cli, sandbox
 
         task = ctx.get("task") or {}
         attempt_id = str(ctx.get("attempt_id") or "")
@@ -519,9 +519,12 @@ def tick(
 
         lease_record = leases.load_lease(state_dir, attempt_id)
         declared = bool((lease_record.get("brief") or {}).get("contract"))
+        acdd_state = None
 
         def preflight(patch_files: list[str]) -> object:
-            return acdd_cli.verify_preflight(lease_record, state_dir, patch_files)
+            nonlocal acdd_state
+            acdd_state = acdd_cli.verify_preflight(lease_record, state_dir, patch_files)
+            return acdd_state
 
         try:
             record = verify_local.verify_and_commit(
@@ -540,6 +543,10 @@ def tick(
                 acdd_preflight=preflight,
                 contract_declared=declared,
             )
+            if acdd_state and any(ac['verification'] == 'test' for ac in acdd_state['contract']['acceptance_criteria']):
+                acdd_cli.candidate_green(state_dir, acdd_state, repo, record['sha'], runner or verify_local.sandbox_runner)
+        except (cli.CliError, sandbox.SandboxUnavailable) as exc:
+            return {'ok': False, 'evidence': f'{exc.code}: {exc.error}'}
         except verify_local.VerifyError as exc:
             return {"ok": False, "evidence": _failure_evidence(exc, tests)}
         return {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}

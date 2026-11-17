@@ -18,10 +18,10 @@ before a byte is written:
 Acceptance criteria are classified strictly, from evidence rather than state:
 
 ``PASS``
-    Passing case outcomes for the frozen selection, recorded by the local
-    verifier or an authenticated ``tdd-evidence/1`` GREEN at the candidate.
-    Selector strings and a successful aggregate exit do not prove which
-    cases ran. A task or job state of
+    An authenticated ``tdd-evidence/1`` GREEN at the candidate proves passing
+    case outcomes for the frozen selection. An unpinned receipt (including
+    any case list read back from it) cannot establish a contract PASS.
+    A task or job state of
     ``accepted`` is never evidence by itself.
 ``FAIL``
     A recorded, executed check failed: the verification record is not ``ok``,
@@ -1055,23 +1055,20 @@ def _classify(
             evidence.append(str(signed.get("paths", {}).get("green") or ""))
             return FAIL, [item for item in evidence if item], unrun, f"the signed GREEN record failed: {signed['green_error']}"
 
-    # 2. PASS needs coverage plus a zero suite, or a validated signed GREEN.
-    if record is not None:
-        suite = record.get("suite")
-        suite_ok = revision.suite_passed(suite) and revision.suite_passed(record.get('gitleaks'))
-        covered = _covers(record.get("tests") or [], tests)
-        signed_pass = signed.get('criteria', {}).get(ac_id) == 'passed'
-        if suite_ok and covered and (signed_pass or _passed_cases(tests, suite.get('cases'), signed.get('collected'))):
-            evidence.append(_rel(state, verify_local.record_path(state, str(record.get("attempt_id")))))
-            if ac_id and signed.get("criteria", {}).get(ac_id) == "passed":
-                path = str(signed.get("paths", {}).get("green") or "")
-                if path:
-                    evidence.append(path)
-            return PASS, evidence, unrun, ""
-    if ac_id and signed.get("criteria", {}).get(ac_id) == "passed":
-        path = str(signed.get("paths", {}).get("green") or "")
-        if path:
-            return PASS, [path], unrun, ""
+    # 2. The native reader has no independent write-time pin for the receipt.
+    # It may corroborate a contract PASS, but only authenticated case evidence
+    # may supply it. _signed_evidence binds these criteria to the candidate.
+    corroborates = (record is not None and revision.suite_passed(record.get('suite'))
+                    and revision.suite_passed(record.get('gitleaks')) and _covers(record.get('tests') or [], tests))
+    green_path = signed.get('paths', {}).get('green')
+    if ac_id and green_path and green_record and signed['criteria'].get(ac_id) == 'passed':
+        evidence.append(green_path)
+        if corroborates:
+            evidence.append(_rel(state, verify_local.record_path(state, record['attempt_id'])))
+        return PASS, evidence, unrun, ''
+    if not ac_id and not task.get('contract') and corroborates and _passed_cases(tests, record['suite'].get('cases')):
+        return PASS, [_rel(state, verify_local.record_path(state, record['attempt_id']))], unrun, (
+            'legacy diagnostic: receipt-reported cases for a task statement; no frozen contract criterion is proved')
 
     # 3. No PASS: say precisely why.
     if signed.get("tampered"):
@@ -1091,7 +1088,7 @@ def _classify(
             f"the verification record ran {list(record.get('tests') or [])}, "
             f"which does not cover {list(tests)}"
         )
-    return UNVERIFIED, evidence, unrun, limitation or 'no passing case outcomes for the full frozen selection'
+    return UNVERIFIED, evidence, unrun, limitation or 'no signed GREEN proves passing cases for the full frozen selection'
 
 
 def _acceptance(

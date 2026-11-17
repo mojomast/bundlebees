@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -773,6 +774,24 @@ def record_green(state_dir: Path, acdd_state: Mapping[str, Any], workdir: Path, 
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
     return record
+
+
+def candidate_green(state_dir: Path, acdd_state: Mapping[str, Any], repo: Path, candidate: str,
+                    runner: Callable[[Path, Sequence[str]], Mapping[str, Any]]) -> dict[str, Any]:
+    """Run the approved test files against the committed tree, including on verify replay.
+
+    Neither the aggregate commit-local receipt nor a cache hit contains the
+    authenticated per-case results needed for contracted test criteria.
+    """
+    from . import sandbox
+
+    with tempfile.TemporaryDirectory(prefix='bundlebees-green-') as tmp:
+        tree = _checkout(repo, candidate, Path(tmp))
+        evidence = runner(tree, sandbox.pytest_argv(acdd_state['tests']))
+        if not isinstance(evidence, Mapping) or not evidence.get('cases'):
+            raise _error('green_unverified', 'The contracted GREEN run produced no case evidence.',
+                         'Run the approved pytest files with JUnit case collection enabled.')
+        return record_green(state_dir, acdd_state, tree, evidence, candidate)
 
 
 def print_mode(acdd_state: Mapping[str, Any] | None, green: Mapping[str, Any] | None = None) -> None:

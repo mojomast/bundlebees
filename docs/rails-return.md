@@ -48,6 +48,8 @@ For the pre-fix, public synthetic counterexample see `tests/fixtures/return/r18-
 
 A review recorded under the coordinator's TDD key is an observation. Even when it names the correct criterion, contract and revision and says `passed`, the `reviewer` or `human` label does not authenticate a separate reviewer. The native RETURN reports the review criterion as `UNVERIFIED` and names the applicable record; an executed test for another criterion keeps its own result.
 
+For a frozen test acceptance criterion, `PASS` needs authenticated GREEN at the candidate, with passing cases covering the full frozen selection. A commit-local receipt may corroborate that proof. The native reader does not hold the verifier's independent write-time receipt pin, so even a complete case list in that file cannot supply missing proof. Without signed coverage the criterion is `UNVERIFIED`; an integrated, fully accepted job with an uncovered criterion is refused. In a legacy job report, an ID-less task statement backed only by receipt-reported cases is labeled diagnostic, not a contract verdict.
+
 ### Publication and crash recovery
 
 The producer fsyncs each temporary file and replaces the output names separately: optional `rails-evidence.json`, then `RETURN.md`, then `return.json`. Each replacement is atomic for that one file. There is no transaction across the three names and no parent-directory fsync. A crash can leave files from different generations; the last successful write does not guarantee that this generation, or the previous one, survives power loss.

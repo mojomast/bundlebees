@@ -55,6 +55,17 @@ def test_overlapping_regression_selector_is_not_frozen_red_intent(tmp_path):
         rails_return._document(cfg, task, [h], [e], [], '2026-11-17T00:00:00.000000Z', manifest, tmp_path)
 
 
+def test_idless_local_statement_keeps_its_receipt_provenance(tmp_path):
+    test = 'test_impl.py::test_a'
+    row = dict(id='', tests=[test], verification='test')
+    record = dict(attempt_id='att_old', tests=[test], ok=True, gitleaks={'exit_code': 0},
+                  suite=dict(exit_code=0, cases=[dict(id=test, outcome='passed')]))
+    status, evidence, _, limitation = report._classify(row, task=dict(contract=None, contract_ok=True),
+        record=record, record_problem='', signed={}, waves=[], state_dir=tmp_path)
+    assert (status, evidence) == ('PASS', ['verify-results/att_old.json'])
+    assert 'legacy diagnostic' in limitation
+
+
 @pytest.mark.parametrize('winning,verified,expected', [
     ('att_old', 'b'*40, 'NOT RUN'), ('att_new', 'd'*40, 'UNVERIFIED'), ('att_new', 'b'*40, 'PASS')])
 def test_integrated_ac_requires_winning_attempt_and_candidate(tmp_path, winning, verified, expected):

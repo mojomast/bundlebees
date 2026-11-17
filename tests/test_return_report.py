@@ -27,6 +27,7 @@ import pytest
 
 from bundlebees_plugin import contract as contracts
 from bundlebees_plugin import (
+    acdd_cli,
     handoff,
     integrate_job,
     job as jobs,
@@ -34,6 +35,7 @@ from bundlebees_plugin import (
     leases,
     packets,
     return_report,
+    sandbox,
     tdd,
     transport,
     verify_local,
@@ -167,27 +169,12 @@ def _make_repo(base: Path) -> tuple[Path, str]:
     return repo, _git(["rev-parse", "HEAD"], repo)
 
 
-def _case_receipt_fixture(state, repo, attempt, selector):
-    """Supply actual JUnit cases to the test-only detailed suite receipt.
-
-    verify_local's historical on-disk format is aggregate-only. Don't infer
-    these cases from the selector or fake a signed GREEN: execute the selected
-    test in this fixture's verified candidate worktree and preserve its result.
-    """
-    path = verify_local.record_path(state, attempt)
-    rec = json.loads(path.read_bytes())
-    case_tree = state.parent / ('cases-' + attempt)
-    junit = state.parent / (attempt + '-junit.xml')
-    _git(['worktree', 'add', '--detach', str(case_tree), rec['sha']], repo)
-    try:
-        subprocess.run([*SUITE, selector, f'--junitxml={junit}'], cwd=case_tree, check=True,
-                       capture_output=True, timeout=60)
-        cases = tdd.parse_junit_cases(junit)
-        assert [(c['id'], c['outcome']) for c in cases] == [(selector, 'passed')]
-        rec['suite']['cases'] = cases
-        path.write_text(json.dumps(rec))
-    finally:
-        _git(['worktree', 'remove', '--force', str(case_tree)], repo)
+def _fixture_green(state, repo, candidate, frozen):
+    """Execute the signed phase on the test-authored repo; never edit the receipt."""
+    brief = dict(contract=frozen, source_rev=frozen['source_rev'], assigned_files=frozen['scope']['assigned_files'])
+    preflight = acdd_cli.verify_preflight({'brief': brief}, state, brief['assigned_files'])
+    return acdd_cli.candidate_green(state, preflight, repo, candidate,
+        lambda tree, argv: sandbox.run_in_sandbox(tree, argv, allow_unsafe_local=True, timeout=60))
 
 
 def _build_exact(base: Path, *, runner=None) -> dict:
@@ -221,7 +208,7 @@ def _build_exact(base: Path, *, runner=None) -> dict:
         declared_files=["smoke/answer.py"], base_rev=root, tests=["tests/test_smoke.py"],
         suite_command=SUITE, gitleaks=GITLEAKS, runner=runner,
     )
-    _case_receipt_fixture(state, repo, 'att_1', selector)
+    _fixture_green(state, repo, record['sha'], frozen)
     job = jobs.load_job(state, "job_a")
     job["tasks"][0].update(state="verified", attempts=["att_1"])
     jobs.save_job(state, job)
@@ -317,7 +304,7 @@ def _build_descendant(base: Path) -> dict:
         declared_files=list(task["contract"]["scope"]["assigned_files"]), base_rev=accepted,
         tests=["tests/test_double.py"], suite_command=SUITE, gitleaks=GITLEAKS,
     )
-    _case_receipt_fixture(state, repo, 'att_b', selector)
+    _fixture_green(state, repo, record_b['sha'], task['contract'])
     job_b = jobs.load_job(state, "job_b")
     job_b["tasks"][0].update(state="verified", attempts=["att_b"])
     jobs.save_job(state, job_b)
@@ -428,9 +415,12 @@ class TestExactManifest:
         criterion = manifest["acceptance"][0]
         assert criterion["status"] == "PASS"
         assert criterion["tests"] == ["tests/test_smoke.py::test_answer_is_42"]
-        assert criterion["evidence"] == ["verify-results/att_1.json"]
+        green_path = 'evidence/SMOKE-A/0001-green.json'
+        assert criterion["evidence"] == [green_path, "verify-results/att_1.json"]
 
-        assert manifest["red_green"] == {"test_first": False, "red": None, "green": None}
+        assert manifest["red_green"] == {"test_first": False, "red": None, "green": {
+            'phase': 'green', 'record_path': green_path, 'revision': exact_env['verified'],
+            'sha256': hashlib.sha256((state / green_path).read_bytes()).hexdigest()}}
         assert manifest["verification"]["commit"] == exact_env["verified"]
         assert manifest["verification"]["suite"] == {"result": "PASS", "command": SUITE}
         assert manifest["verification"]["gitleaks"] == {"result": "PASS"}
@@ -559,8 +549,10 @@ class TestExactManifest:
 
 
 class TestClassification:
-    def _manifest(self, env, tmp_path, mutate_record=None, task_state="rejected"):
+    def _manifest(self, env, tmp_path, mutate_record=None, task_state="rejected", *, remove_green=False):
         state = _copy_state(env, tmp_path)
+        if remove_green:
+            (state / 'evidence/SMOKE-A/0001-green.json').unlink()
         if mutate_record is not None:
             _rewrite_verify(state, env["attempt"], mutate_record)
         if task_state is not None:
@@ -590,7 +582,7 @@ class TestClassification:
 
     def test_a_record_that_does_not_cover_the_criterion_tests_is_unverified(self, exact_env, tmp_path):
         manifest = self._manifest(exact_env, tmp_path,
-                                  mutate_record=lambda record: record.update(tests=["tests/other.py"]))
+                                  mutate_record=lambda record: record.update(tests=["tests/other.py"]), remove_green=True)
 
         assert manifest["acceptance"][0]["status"] == "UNVERIFIED"
         assert "does not cover" in " ".join(manifest["limitations"])
@@ -726,6 +718,7 @@ class TestRefusals:
 
     def test_an_accepted_job_with_an_uncovered_criterion_is_refused(self, exact_env, tmp_path):
         state = _copy_state(exact_env, tmp_path)
+        (state / 'evidence/SMOKE-A/0001-green.json').unlink()
         _rewrite_verify(state, "att_1", lambda record: record.update(tests=["tests/other.py"]))
 
         with pytest.raises(return_report.ReturnError) as caught:
@@ -794,23 +787,12 @@ class TestHonesty:
         state = _copy_state(exact_env, tmp_path)
         _rewrite_verify(state, "att_1", lambda record: record.update(tests=['tests/unrelated.py']))
         _edit_job(state, "job_a", lambda job: job["tasks"][0].update(state="rejected"))
-        key = leases.evidence_key(state)
-        record = tdd.make_record(
-            exact_env["contract"], exact_env["contract_sha256"], phase="green",
-            revision=exact_env["verified"],
-            test_fingerprints={"tests/test_smoke.py": "b" * 64},
-            command=["pytest", "tests/test_smoke.py"],
-            result={"exit_code": 0, "tests": 1, "failures": 0, "errors": 0, "skipped": 0, "timed_out": False,
-                    "cases": [{"id": "tests/test_smoke.py::test_answer_is_42", "outcome": "passed"}]},
-            produced_by={"role": "verifier", "name": "fixture"},
-            test_first=False,
-        )
-        tdd.write_record(state, record, key)
 
         manifest = return_report.build(state, "job_a", repo=exact_env["repo"])
 
         assert manifest["acceptance"][0]["status"] == "PASS"
         ref = manifest['red_green']['green']
+        assert manifest['acceptance'][0]['evidence'] == [ref['record_path']]
         assert ref == {'phase': 'green', 'record_path': 'evidence/SMOKE-A/0001-green.json',
                        'revision': exact_env['verified'], 'sha256': hashlib.sha256((state / ref['record_path']).read_bytes()).hexdigest()}
 
