@@ -60,7 +60,7 @@ def test_exact_native_bytes_validate_and_replay(campaign, tmp_path):
     assert return_report.verify(state, 'job_a', repo=campaign['repo'])['ok']
 
 
-@pytest.mark.parametrize('change', ['unrun_scan', 'timeout', 'blocking', 'bool_exit', 'wrong_base'])
+@pytest.mark.parametrize('change', ['unrun_scan', 'timeout', 'blocking', 'bool_exit', 'wrong_base', 'resumed', 'wrong_candidate'])
 def test_native_incomplete_or_contradictory_evidence_cannot_publish(campaign, tmp_path, change):
     state = _copy_state(campaign, tmp_path)
     path = verify_local.record_path(state, 'att_1')
@@ -69,6 +69,10 @@ def test_native_incomplete_or_contradictory_evidence_cannot_publish(campaign, tm
         record['gitleaks'] = None
     elif change == 'wrong_base':
         record['base_rev'] = campaign['verified']
+    elif change == 'resumed':
+        record['resumed'] = True
+    elif change == 'wrong_candidate':
+        record['sha'] = campaign['accepted']
     else:
         record['suite'].update({'timeout': {'timed_out': True}, 'blocking': {'blocking': ['contract']},
                                 'bool_exit': {'exit_code': False}}[change])
@@ -76,3 +80,25 @@ def test_native_incomplete_or_contradictory_evidence_cannot_publish(campaign, tm
     with pytest.raises(return_report.ReturnError):
         return_report.build(state, 'job_a', repo=campaign['repo'])
     assert not return_report.return_path(state, 'job_a').exists()
+
+
+@pytest.mark.parametrize('field', ['authorization', 'receiver_decision', 'tests', 'wave', 'candidate'])
+def test_independent_replay_refuses_resealed_substitution(campaign, tmp_path, field):
+    state = _copy_state(campaign, tmp_path)
+    doc = return_report.build(state, 'job_a', repo=campaign['repo'])
+    if field == 'authorization':
+        doc['authorization']['reference'] = 'authorizations/job_b.json'
+    elif field == 'receiver_decision':
+        doc['receiver_decision']['decided_by'] = 'fixture'
+    elif field == 'tests':
+        doc['acceptance'][0]['tests'] = ['test_other.py']
+    elif field == 'wave':
+        doc['integration']['accepted_wave_digest'] = 'b' * 64
+    else:
+        doc['verification']['commit'] = campaign['root']
+    doc['evidence_digest'] = return_report.evidence_digest(doc)
+    return_report.return_path(state, 'job_a').write_bytes(return_report.document_bytes(doc))
+    return_report.render_path(state, 'job_a').write_text(return_report.render(doc))
+    with pytest.raises(return_report.ReturnError, match='.') as caught:
+        return_report.verify(state, 'job_a', repo=campaign['repo'])
+    assert caught.value.code == 'report_tampered'

@@ -282,7 +282,7 @@ def _build_descendant(base: Path) -> dict:
     leases.record_lease(state, "att_b", {
         "objective": "double", "source_rev": accepted,
         "assigned_files": list(task["contract"]["scope"]["assigned_files"]),
-        "job_id": "job_b", "task_id": task["task_id"],
+        "job_id": "job_b", "task_id": task["task_id"], "project": task["provision"]["project"],
         "acceptance": {"tests": ["tests/test_double.py"]}})
     record_b = verify_local.verify_and_commit(
         state, repo, "att_b", patch=_patch_new("smoke/double.py", "def double_answer():\n    return 84\n"),
@@ -391,7 +391,7 @@ class TestExactManifest:
         assert manifest["repository"] == {"identity": REPO, "source_rev": exact_env["root"]}
         assert manifest["authorization"]["reference"] == "authorizations/job_a.json"
         assert manifest["authorization"]["approved_by"] == "reviewer"
-        assert manifest["authorization"]["authority"] == "human"
+        assert manifest["authorization"]["authority"] == "m1-authorization"
         assert manifest["descendant"] is None
         assert manifest["contract"] == {"id": "SMOKE-A", "sha256": exact_env["contract_sha256"]}
 
@@ -403,16 +403,16 @@ class TestExactManifest:
 
         assert manifest["red_green"] == {"test_first": False, "red": None, "green": None}
         assert manifest["verification"]["commit"] == exact_env["verified"]
-        assert manifest["verification"]["suite"] == {"exit_code": 0}
-        assert manifest["verification"]["gitleaks"] == {"exit_code": 0}
+        assert manifest["verification"]["suite"] == {"result": "PASS", "command": SUITE}
+        assert manifest["verification"]["gitleaks"] == {"result": "PASS"}
         assert manifest["verification"]["record_path"] == "verify-results/att_1.json"
         assert manifest["integration"]["commit"] == exact_env["accepted"]
-        assert manifest["integration"]["wave"] == 1
+        assert manifest["integration"]["wave"] == "job_a.w1"
         wave_record = json.loads(exact_env["wave_path"].read_text())
         assert manifest["integration"]["accepted_wave_digest"] == hashlib.sha256(
             return_report.canonical_bytes(wave_record)).hexdigest()
         assert manifest["transport"] is None
-        assert manifest["attempts"] == [{"attempt_id": "att_1", "state": "accepted", "project": "",
+        assert manifest["attempts"] == [{"attempt_id": "att_1", "state": "accepted", "project": "smoke-real",
                                         "source_rev": exact_env["root"]}]
         assert manifest["pending_approvals"] == ["merge"]
         assert manifest["receiver_decision"] == {"status": "pending", "decided_by": None,
@@ -567,10 +567,10 @@ class TestClassification:
         assert "does not cover" in " ".join(manifest["limitations"])
 
     def test_a_verification_without_a_suite_result_is_unverified(self, exact_env, tmp_path):
-        manifest = self._manifest(exact_env, tmp_path, mutate_record=lambda record: record.update(suite=None))
-
-        assert manifest["acceptance"][0]["status"] == "UNVERIFIED"
-        assert "regression suite result" in manifest["unrun"]
+        with pytest.raises(return_report.ReturnError) as caught:
+            self._manifest(exact_env, tmp_path, mutate_record=lambda record: record.update(suite=None))
+        assert caught.value.code == 'return_schema'
+        assert not return_report.return_path(tmp_path / 'state', 'job_a').exists()
 
     def test_a_failed_suite_is_fail(self, exact_env, tmp_path):
         manifest = self._manifest(
@@ -607,11 +607,10 @@ class TestClassification:
         job["tasks"][0]["state"] = "rejected"
         jobs.save_job(state, job)
 
-        manifest = return_report.build(state, "job_a", repo=exact_env["repo"])
-
-        assert manifest["acceptance"][0]["status"] == "BLOCKED"
-        assert manifest["contract"] == {"id": "", "sha256": ""}
-        assert "cannot be used" in " ".join(manifest["limitations"])
+        with pytest.raises(return_report.ReturnError) as caught:
+            return_report.build(state, "job_a", repo=exact_env["repo"])
+        assert caught.value.code == 'contract_mismatch'
+        assert not return_report.return_path(state, 'job_a').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -738,8 +737,8 @@ class TestRefusals:
 class TestHonesty:
     def test_a_fabricated_signed_record_never_produces_a_pass(self, exact_env, tmp_path):
         state = _copy_state(exact_env, tmp_path)
-        # Without a suite result the verification record alone cannot PASS...
-        _rewrite_verify(state, "att_1", lambda record: record.update(suite=None))
+        # Without coverage the executed regression suite alone cannot PASS.
+        _rewrite_verify(state, "att_1", lambda record: record.update(tests=['tests/unrelated.py']))
         _edit_job(state, "job_a", lambda job: job["tasks"][0].update(state="rejected"))
         contract = exact_env["contract"]
         record = tdd.make_record(
@@ -764,7 +763,7 @@ class TestHonesty:
 
     def test_a_validated_green_record_is_evidence(self, exact_env, tmp_path):
         state = _copy_state(exact_env, tmp_path)
-        _rewrite_verify(state, "att_1", lambda record: record.update(suite=None))
+        _rewrite_verify(state, "att_1", lambda record: record.update(tests=['tests/unrelated.py']))
         _edit_job(state, "job_a", lambda job: job["tasks"][0].update(state="rejected"))
         key = leases.evidence_key(state)
         record = tdd.make_record(
@@ -782,7 +781,9 @@ class TestHonesty:
         manifest = return_report.build(state, "job_a", repo=exact_env["repo"])
 
         assert manifest["acceptance"][0]["status"] == "PASS"
-        assert manifest["red_green"]["green"].startswith("evidence/SMOKE-A/")
+        ref = manifest['red_green']['green']
+        assert ref == {'phase': 'green', 'record_path': 'evidence/SMOKE-A/0001-green.json',
+                       'revision': exact_env['verified'], 'sha256': hashlib.sha256((state / ref['record_path']).read_bytes()).hexdigest()}
 
     def test_a_test_first_contract_reports_its_missing_red(self, tmp_path):
         state = tmp_path / "state"
@@ -799,7 +800,7 @@ class TestHonesty:
 
         manifest = return_report.build(state, "job_t")
 
-        assert manifest["red_green"] == {"test_first": True, "red": None, "green": None}
+        assert manifest["red_green"] == {"test_first": False, "red": None, "green": None}
         assert any(note.startswith("signed RED evidence") for note in manifest["unrun"])
         assert manifest["acceptance"][0]["status"] == "NOT RUN"
 
@@ -810,6 +811,7 @@ class TestHonesty:
 
         manifest = return_report.build(state, "job_legacy")
 
+        assert manifest['schema'] == 'bundlebees.job-report/1'
         assert manifest["packet_digest"] == "" and manifest["feature_id"] == ""
         assert manifest["workflow_ref"] == ""
         assert manifest["descendant"] is None and manifest["transport"] is None

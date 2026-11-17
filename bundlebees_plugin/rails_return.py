@@ -332,7 +332,7 @@ def _bound(event, cfg, task, state, manifest, lease_cache, *, native=False):
     require(
         brief.get("job_id") == cfg["job_id"]
         and brief.get("task_id") == cfg["task_id"]
-        and brief.get("contract_sha256", task["contract_sha256"]) == cfg["contract_sha256"]
+        and brief.get("contract_sha256") == cfg["contract_sha256"]
         and lease["source_rev"] == cfg["code_rev"],
         "Attempt lease disagrees with the selected snapshot.",
     )
@@ -345,19 +345,26 @@ def _native_ref(e, ac, manifest, state):
     from .rails_bundlebees_source import _alias
 
     row = next(a for a in manifest["acceptance"] if a["id"] == ac)
-    paths = list(row["evidence"])
-    if e["payload"]["verdict"] == "EXPECTED_RED" and manifest["red_green"]["red"]:
-        paths.append(manifest["red_green"]["red"])
-    for path in paths:
-        # Only RETURN-resolved paths; never dereference an origin-supplied path.
-        rid = _alias("record", path)
-        if rid == e["source"]["record_id"] and rid in e["payload"]["evidence_refs"]:
-            require(
-                hashlib.sha256(read_file(state / path)).hexdigest() == e["source"]["revision"],
-                "Referenced native record no longer matches its projected bytes.",
-            )
-            return rid
-    return None
+    payload = e['payload']
+    phase = payload['phase']
+    ref = manifest['red_green'].get(phase) if phase in ('red', 'green') else None
+    require(isinstance(ref, dict) and ref['phase'] == phase and ref['revision'] == payload['code_rev'],
+            'Native projection does not resolve to an authenticated record at this revision.')
+    path = ref['record_path']  # never dereference an origin-supplied path
+    rid = _alias('record', path)
+    raw = read_file(state / path)
+    require(rid == e['source']['record_id'] and payload['evidence_refs'] == [rid]
+            and payload['run_id'] == rid
+            and ref['sha256'] == e['source']['revision'] == hashlib.sha256(raw).hexdigest()
+            and ((phase == 'red' and payload['verdict'] == 'EXPECTED_RED')
+                 or (phase == 'green' and payload['verdict'] == 'PASS' and path in row['evidence'])),
+            'Native verification link conflicts with its source bytes, phase or criterion.')
+    if phase == 'red':
+        record = wire.parse_text(raw)
+        require(record['criteria'].get(ac) == 'failed'
+                and payload.get('expected_intent_ref') == _alias('intent', record['test_fingerprints']),
+                'EXPECTED_RED does not resolve to the frozen test intent and failing criterion.')
+    return rid
 
 
 def _document(cfg, task, heads, rows, checks, stamp, manifest, state):
@@ -420,7 +427,7 @@ def _document(cfg, task, heads, rows, checks, stamp, manifest, state):
                     "Verifier evidence must resolve to selected supporting events for this criterion.",
                 )
                 require(
-                    verdict != "PASS" or statuses[ac] == "PASS",
+                    verdict != "PASS" or (statuses[ac] == "PASS" and native is not None),
                     "Verifier PASS lacks matching native RETURN evidence.",
                 )
                 require(
@@ -431,7 +438,10 @@ def _document(cfg, task, heads, rows, checks, stamp, manifest, state):
                     verdict not in ("FAIL", "BLOCKED") or statuses[ac] != "PASS",
                     "Verifier and RETURN results conflict.",
                 )
-                links.append(dict(ac_id=ac, event_id=eid, verdict=verdict))
+                # Retain non-native RED observations in selected_event_ids,
+                # never as proof of the contract's expected failing run.
+                if verdict != 'EXPECTED_RED' or native is not None:
+                    links.append(dict(ac_id=ac, event_id=eid, verdict=verdict))
     gaps = defaultdict(list)
     interventions = set()
     for e in rows:

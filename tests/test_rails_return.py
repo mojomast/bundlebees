@@ -190,15 +190,15 @@ def test_registered_report_attachment_and_verification(packet):
     assert doc["origin_heads"] == [cfg["coordinator"], *cfg["workers"]]
     assert doc["imported_checkpoints"] == [dict(cfg["workers"][0], source="rails_import")]
     assert {g["code"] for s in doc["source_coverage"] for g in s["gaps"]} == {"source_gap"}
-    assert doc["verification_links"] == [
-        {"ac_id": "AC-001", "event_id": cfg["evidence"]["AC-001"][1], "verdict": "EXPECTED_RED"}
-    ]
+    assert doc["verification_links"] == []
+    assert set(doc['selected_event_ids']) == set(cfg['evidence']['AC-001'])
     ref = f"jobs/{JOB}/rails-evidence.json#sha256={hashlib.sha256(data).hexdigest()}"
     assert ref in md.read_text()
     new = json.loads(path.read_bytes())
     assert new["acceptance"][0]["evidence"].pop() == ref
     assert new["acceptance"][0]["status"] == "NOT RUN"
-    assert new["red_green"]["test_first"] and new["red_green"]["red"] is None
+    assert new["red_green"] == {"test_first": False, "red": None, "green": None}
+    assert any('signed RED' in note for note in new['unrun'])
     assert new["pending_approvals"] and result["measurements"]["tokens"] == "UNKNOWN"
     del new["evidence_digest"], original["evidence_digest"]
     assert new == original

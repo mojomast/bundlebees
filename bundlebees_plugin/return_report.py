@@ -53,8 +53,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -63,6 +65,7 @@ from . import contract as contracts
 from . import handoff, job as jobs, leases, packets, recovery, revision, tdd, transport, verify_local
 
 RETURN_SCHEMA = "rizzstack.return/1"
+LOCAL_SCHEMA = "bundlebees.job-report/1"
 RETURN_FILE = "return.json"
 RENDER_FILE = "RETURN.md"
 
@@ -79,7 +82,6 @@ LEGACY_LABEL = (
     "transport evidence are absent by design and are not fabricated here"
 )
 
-_DIGEST_EXCLUDED = ("evidence_digest", "generated_at")
 _SHA40 = 40
 
 _FIX_EVIDENCE = (
@@ -121,8 +123,30 @@ def document_bytes(manifest: Mapping[str, Any]) -> bytes:
 def evidence_digest(manifest: Mapping[str, Any]) -> str:
     """SHA-256 over the manifest minus the digest itself and any ``generated_at``."""
 
-    body = {key: value for key, value in manifest.items() if key not in _DIGEST_EXCLUDED}
+    def stable(value):
+        if isinstance(value, Mapping):
+            return {k: stable(v) for k, v in value.items() if k != "generated_at"}
+        if isinstance(value, list):
+            return [stable(v) for v in value]
+        return value
+
+    body = stable({key: value for key, value in manifest.items() if key != "evidence_digest"})
     return hashlib.sha256(canonical_bytes(body)).hexdigest()
+
+
+def _validate_manifest(manifest):
+    """Delegate both the schema and the semantic gate to the installed protocol."""
+    try:
+        path = packets.workflow_src() / "tools/return_manifest.py"
+        spec = importlib.util.spec_from_file_location("workflow_return_manifest", path)
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+    except (packets.PacketError, ImportError, OSError) as exc:
+        raise ReturnError("workflow_unavailable", "Pinned Workflow RETURN validator unavailable.") from exc
+    try:
+        validator.validate(manifest)
+    except validator.ReturnError as exc:
+        raise ReturnError(exc.code, exc.message, exc.fix) from exc
 
 
 def return_dir(state_dir: Path, job_id: str) -> Path:
@@ -233,6 +257,8 @@ def _read_verify(state_dir: Path, attempt_id: str) -> tuple[dict[str, Any] | Non
     """Return ``(record, problem)``: problem is ``""``, ``"missing"`` or ``"corrupt"``."""
 
     path = verify_local.record_path(Path(state_dir), attempt_id)
+    if path.is_symlink() or path.parent.is_symlink():
+        return None, 'corrupt'
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -266,9 +292,7 @@ def _covers(ran: Sequence[Any], wanted: Sequence[Any]) -> bool:
 def _one_covers(ran: str, wanted: str) -> bool:
     if ran == wanted:
         return True
-    if wanted.startswith(ran.rstrip("/") + "::"):
-        return True
-    return tdd.matches(ran, wanted)
+    return wanted.startswith((ran + "::", ran + "["))
 
 
 # ---------------------------------------------------------------------------
@@ -474,8 +498,8 @@ def _waves(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
                 f"the durable record lists {sorted(attempts)}",
             )
         problems = record.get("problems") or {}
-        if isinstance(problems, Mapping) and problems:
-            raise ReturnError("wave_mismatch", f"wave record {wave_id} is accepted but records problems: {dict(problems)}")
+        if problems or record.get('regressions', 0) != 0 or record.get('blocking') or record.get('timed_out'):
+            raise ReturnError("wave_mismatch", f"wave record {wave_id} is accepted but records regressions or blockers")
         if not revision.suite_passed(record.get("suite")):
             raise ReturnError(
                 "wave_mismatch",
@@ -585,14 +609,14 @@ def _tasks(
     return rows
 
 
-def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contract_sha: str) -> dict[str, Any]:
+def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contract_sha: str, candidate: str) -> dict[str, Any]:
     """Load and validate the signed ``tdd-evidence/1`` records for one contract."""
 
     out: dict[str, Any] = {
         "available": False,
         "records": {},
         "paths": {},
-        "test_first": True,
+        "refs": {},
         "green": None,
         "green_error": "",
         "red": None,
@@ -607,11 +631,14 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
     if not contract_id:
         return out
     try:
-        key = leases.evidence_key(Path(state_dir))
+        # Read-only: verification must never initialize a key.
+        key = hmac.digest(leases._load_key(Path(state_dir)), leases._EVIDENCE_KEY_LABEL, "sha256")
     except leases.LeaseError as exc:
         out["problem"] = f"signed evidence cannot be verified here: {exc.code}"
         return out
     try:
+        if (Path(state_dir) / "evidence").is_symlink():
+            raise tdd.TddError("evidence_tampered", "unsafe evidence directory")
         records = tdd.load_records(Path(state_dir), contract_id, key)
     except tdd.TddError as exc:
         out["tampered"] = f"{exc.code}: {exc.error}"
@@ -622,32 +649,64 @@ def _signed_evidence(state_dir: Path, contract: Mapping[str, Any] | None, contra
     latest: dict[str, Mapping[str, Any]] = {}
     for record in records:
         phase = str(record.get("phase") or "")
+        path = record["_path"]
+        if (record["contract_id"] != contract_id or record["contract_sha256"] != contract_sha
+                or record["base_rev"] != contract["source_rev"]
+                or not re.fullmatch(r"[0-9]{4,}-" + phase + r"\.json", Path(path).name)):
+            out['tampered'] = 'signed record does not match its path or frozen contract'
+            return out
+        # Exact bytes, not a reserialization. Check that these are the same
+        # signed fields just authenticated by load_records (including the MAC).
+        try:
+            raw = (Path(state_dir) / path).read_bytes()
+            observed = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            raise ReturnError('evidence_tampered', 'Signed evidence changed during collection.') from exc
+        if canonical_bytes(observed) != canonical_bytes({k: v for k, v in record.items() if k != '_path'}):
+            raise ReturnError('evidence_tampered', 'Signed evidence changed during collection.')
         latest[phase] = record
-        out["paths"][phase] = str(record.get("_path") or "")
+        out["paths"][phase] = path
+        out['refs'][phase] = dict(record_path=path, revision=record['revision'], phase=phase,
+                                  sha256=hashlib.sha256(raw).hexdigest())
     out["records"] = dict(latest)
     green = latest.get("green")
     red = latest.get("red")
+    expected_first = (contract.get('tdd') or {}).get('test_first') is not False
+    if red is not None:
+        try:
+            tdd.check_red(contract, contract_sha, red)
+            r = red['result']
+            if not (expected_first and red['test_first'] and red['revision'] == contract['source_rev']
+                    and red['command'] and type(r['exit_code']) is int and r['exit_code'] != 0
+                    and not r['timed_out'] and r['tests'] > r['skipped'] and r['failures'] + r['errors'] > 0):
+                raise tdd.TddError('red_invalid', 'RED lacks an executed baseline failure')
+        except tdd.TddError as exc:
+            out['red_error'] = f'{exc.code}: {exc.error}'
+        else:
+            out['red'] = red
     if green is not None:
         try:
-            tdd.check_green(contract, contract_sha, red, green)
+            tdd.check_green(contract, contract_sha, out['red'], green)
+            r = green['result']
+            if (green['revision'] != candidate or green['test_first'] != expected_first
+                    or (out['red'] and records.index(red) >= records.index(green))
+                    or not green['command'] or r['exit_code'] != 0 or r['timed_out']
+                    or not any(c['outcome'] == 'passed' for c in r.get('cases', []))
+                    or r['failures'] or r['errors'] or r['tests'] <= r['skipped']
+                    or set(green['test_fingerprints']) != set(contract['scope']['test_files'])
+                    or any(c['outcome'] in ('failed', 'error') for c in r.get('cases', []))):
+                raise tdd.TddError('green_failed', 'GREEN does not prove this candidate and test sequence')
         except tdd.TddError as exc:
             out["green_error"] = f"{exc.code}: {exc.error}"
         else:
             out["green"] = green
-            out["criteria"] = {str(k): str(v) for k, v in (green.get("criteria") or {}).items()}
-    if red is not None:
-        try:
-            tdd.check_red(contract, contract_sha, red)
-        except tdd.TddError as exc:
-            out["red_error"] = f"{exc.code}: {exc.error}"
-        else:
-            out["red"] = red
-    test_first = (contract.get("tdd") or {}).get("test_first") is not False
-    if green is not None and green.get("test_first") is False:
-        test_first = False
-    if red is not None and red.get("test_first") is False:
-        test_first = False
-    out["test_first"] = test_first
+            passed = [c['id'] for c in r.get('cases', []) if c['outcome'] == 'passed']
+            out['criteria'] = {ac['id']: 'passed' for ac in contract['acceptance_criteria']
+                               if green['criteria'].get(ac['id']) == 'passed' and ac['tests']
+                               and all(any(_one_covers(test, case) for case in passed) for test in ac['tests'])}
+    if latest.get('review', {}).get('revision') != candidate:
+        latest.pop('review', None)
+        out['records'].pop('review', None)
     return out
 
 
@@ -861,10 +920,11 @@ def _classify(
     verification = str(criterion.get("verification") or "test")
 
     if verification == "integration":
-        if not waves:
+        applicable = [wave for wave in waves if set(task['attempts']) & set(wave['attempts'])]
+        if not applicable:
             unrun.append(f"integration wave for {criterion['id'] or criterion['statement']}")
             return NOT_RUN, evidence, unrun, ""
-        wave = waves[-1]
+        wave = applicable[-1]
         evidence.append(_rel(state, revision.wave_path(state, wave["wave_id"])))
         return PASS, evidence, unrun, ""
 
@@ -881,7 +941,8 @@ def _classify(
         records = signed.get("records") or {}
         review = records.get("review") if isinstance(records, Mapping) else None
         role = str(((review or {}).get("produced_by") or {}).get("role") or "")
-        if review is not None and review.get("classification") == "passed" and role in {"reviewer", "human"}:
+        if (review is not None and review.get("classification") == "passed" and role in {"reviewer", "human"}
+                and review['criteria'].get(criterion['id']) == 'passed' and task['contract_ok']):
             evidence.append(reviews[0])
             return PASS, evidence, unrun, ""
         return UNVERIFIED, evidence, unrun, "a review record exists but does not validate as an independent review"
@@ -903,10 +964,9 @@ def _classify(
         failed: list[str] = []
         if record.get("ok") is not True:
             failed.append("the verification record is not ok")
-        if isinstance(suite, Mapping) and suite.get("exit_code") not in (None, 0):
-            failed.append(f"the regression suite exited {suite.get('exit_code')}")
-        if isinstance(scan, Mapping) and scan.get("exit_code") not in (None, 0):
-            failed.append(f"gitleaks exited {scan.get('exit_code')}")
+        for name, check in [('regression suite', suite), ('gitleaks', scan)]:
+            if isinstance(check, Mapping) and not revision.suite_passed(check):
+                failed.append(f"{name} lacks an unblocked, non-timeout integer zero result")
         if failed:
             evidence.append(_rel(state, verify_local.record_path(state, str(record.get("attempt_id")))))
             return FAIL, evidence, unrun, "; ".join(failed)
@@ -921,7 +981,7 @@ def _classify(
     # 2. PASS needs coverage plus a zero suite, or a validated signed GREEN.
     if record is not None:
         suite = record.get("suite")
-        suite_ok = isinstance(suite, Mapping) and suite.get("exit_code") == 0
+        suite_ok = revision.suite_passed(suite) and revision.suite_passed(record.get('gitleaks'))
         covered = _covers(record.get("tests") or [], tests)
         if suite_ok and covered:
             evidence.append(_rel(state, verify_local.record_path(state, str(record.get("attempt_id")))))
@@ -961,7 +1021,7 @@ def _acceptance(
     tasks: Sequence[Mapping[str, Any]],
     records: Mapping[str, Mapping[str, Any]],
     waves: Sequence[Mapping[str, Any]],
-    signed_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    signed_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     state = Path(state_dir)
     signed_cache = signed_cache if signed_cache is not None else {}
@@ -969,12 +1029,11 @@ def _acceptance(
     for task in tasks:
         contract = task["contract"]
         contract_sha = task["contract_sha256"]
-        key = (str((contract or {}).get("id") or ""), contract_sha)
-        if key not in signed_cache:
-            signed_cache[key] = _signed_evidence(state, contract, contract_sha)
-        signed = signed_cache[key]
         latest = task["attempts"][-1] if task["attempts"] else ""
         record = records.get(latest) if latest else None
+        candidate = (record or {}).get('sha') or (contract or {}).get('source_rev') or ''
+        signed = _signed_evidence(state, contract, contract_sha, candidate)
+        signed_cache[task['task_id']] = signed
         _found, problem = _read_verify(state, latest) if latest else (None, "missing")
         if record is not None:
             problem = ""
@@ -1007,11 +1066,11 @@ def _acceptance(
 # ---------------------------------------------------------------------------
 
 
-def _exit_block(value: Any) -> dict[str, Any] | None:
-    """Keep the RETURN schema shape: only the executed result is published."""
-    if not isinstance(value, Mapping):
+def _result_block(value: Any) -> dict[str, Any] | None:
+    """Neither a missing run nor a Python bool is an executed exit status."""
+    if not isinstance(value, Mapping) or type(value.get('exit_code')) is not int:
         return None
-    return {"exit_code": value.get("exit_code")}
+    return {'result': 'PASS' if revision.suite_passed(value) else 'FAIL'}
 
 
 def _recovery_rows(state_dir: Path, job: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1202,7 +1261,7 @@ def _supersession_view(
 
 def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rails_anchors=None):
     state = Path(state_dir)
-    if rails_anchors is None and (return_dir(state, job_id) / 'rails-evidence.json').exists():
+    if rails_anchors is None and os.path.lexists(return_dir(state, job_id) / 'rails-evidence.json'):
         raise ReturnError('rails_evidence_refused', 'This packet has a Rails attachment. Supply its independent anchors.')
     job = jobs.load_job(state, job_id, recover=False)
     jid = str(job.get("job_id") or "")
@@ -1210,11 +1269,15 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
     authorization = jobs.load_authorization(state, jid)
     packet, feature_id = _packet(state, job)
     resolution = _resolution(state, job, packet)
+    source_rev = str(goal.get('base_rev') or '')
+    if (authorization.get('repo') != goal.get('repo') or authorization.get('base_rev') != source_rev
+            or (packet and not resolution and packet['source_policy']['revision'] != source_rev)):
+        raise ReturnError('packet_mismatch', 'Job source does not match its sealed authorization and intent.')
     task_rows = _tasks(state, job, packet, resolution)
     waves = _waves(state, job)
     records = _verifications(state, waves, task_rows, repo)
     receipt = _transport(state, job, waves, authorization, resolution)
-    signed_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    signed_cache: dict[str, dict[str, Any]] = {}
     criteria = _acceptance(state, task_rows, records, waves, signed_cache)
 
     limitations: list[str] = []
@@ -1239,7 +1302,7 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
 
     limitations.append("worker claims are self-reported; only verification, wave and transport records count as evidence")
     limitations.append("receiver_decision stays pending: bundlebees records the producer's evidence, never the receiver's decision")
-    limitations.append("authority 'human' means the interactive authorization document; bundlebees cannot authenticate the person")
+    limitations.append("The authorization reference names a sealed local record; BundleBees does not authenticate the person.")
     if packet is None:
         limitations.insert(0, LEGACY_LABEL)
     if resolution is not None and resolution.get("limitation"):
@@ -1263,20 +1326,38 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
 
     attempts: list[dict[str, Any]] = []
     for task in task_rows:
-        project = str(task["binding"].get("project") or task["provision"].get("project") or "")
+        task_project = task['binding'].get('project') or task['provision'].get('project')
         for attempt_id in task["attempts"]:
-            source_rev = ""
             try:
                 lease = leases.load_lease(state, attempt_id)
-            except leases.LeaseError:
+            except leases.LeaseError as exc:
+                if packet:
+                    raise ReturnError('lease_mismatch', 'Packet attempt has no verifiable dispatch lease.') from exc
                 lease = {}
-            source_rev = str(lease.get("source_rev") or "")
+            brief = lease.get('brief', {})
+            if lease and ((packet and (brief.get('job_id'), brief.get('task_id')) != (jid, task['task_id']))
+                          or brief.get('job_id') not in (None, jid) or brief.get('task_id') not in (None, task['task_id'])
+                          or (brief.get('project') and task_project and brief['project'] != task_project)):
+                raise ReturnError('lease_mismatch', 'Attempt lease disagrees with job, task or project.')
+            if packet and attempt_id in records:
+                rec = records[attempt_id]
+                ident = rec.get('execution_identity') or {}
+                if rec['base_rev'] != lease['source_rev'] or ident.get('base_rev') != rec['base_rev']:
+                    raise ReturnError('verification_missing', 'Verification base differs from the dispatch or execution record.')
+                if (rec.get('mode') != 'commit-local' or rec.get('resumed') is not False
+                        or rec.get('branch') != 'bb-verify/' + attempt_id or rec.get('ok') is not True):
+                    raise ReturnError('verification_missing', 'Verification is not an executed commit-local receipt for this attempt.')
+                if repo is not None:
+                    linked = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--verify',
+                                             f"refs/heads/bb-verify/{attempt_id}^{{commit}}"], capture_output=True)
+                    if linked.returncode or linked.stdout.strip().decode() != rec['sha']:
+                        raise ReturnError('verification_commit_absent', 'Candidate differs from the attempt verification ref.')
             attempts.append(
                 {
                     "attempt_id": attempt_id,
                     "state": task["state"],
-                    "project": project,
-                    "source_rev": source_rev,
+                    "project": brief.get('project') or task_project or '',
+                    "source_rev": lease.get('source_rev') or '',
                 }
             )
 
@@ -1308,12 +1389,14 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
         "commit": str(record.get("sha") or ""),
         "files": [str(item) for item in record.get("files") or []],
         "base_rev": str(record.get("base_rev") or ""),
-        "suite": _exit_block(record.get("suite")),
-        "gitleaks": _exit_block(record.get("gitleaks")),
+        "suite": _result_block(record.get("suite")),
+        "gitleaks": _result_block(record.get("gitleaks")),
         "record_path": f"{verify_local.RECORD_DIR}/{verification_attempt}.json" if verification_attempt else "",
     }
     suite_value = verification_block["suite"]
-    if not isinstance(suite_value, Mapping) or suite_value.get("exit_code") is None:
+    if isinstance(suite_value, Mapping):
+        suite_value['command'] = (record.get('execution_identity') or {}).get('suite_command')
+    else:
         unrun.append("regression suite result")
     if not isinstance(verification_block["gitleaks"], Mapping):
         unrun.append("gitleaks scan")
@@ -1329,44 +1412,44 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
     if receipt is None:
         unrun.append("transport receipt")
 
-    signed_summary: dict[str, Any] = {"test_first": True, "red": None, "green": None}
+    signed_summary: dict[str, Any] = {"test_first": False, "red": None, "green": None}
     for task in task_rows:
         contract = task["contract"]
-        if not contract:
+        if not contract or task['contract_sha256'] != contract_block['sha256']:
             continue
-        key = (str(contract.get("id") or ""), task["contract_sha256"])
-        signed = signed_cache.get(key) or _signed_evidence(state, contract, task["contract_sha256"])
-        signed_cache[key] = signed
-        # The contract decides whether test-first applies; a signed record that
-        # honestly says false also disables it. A missing RED is never invented.
-        test_first = (contract.get("tdd") or {}).get("test_first") is not False
-        if signed.get("available") and not signed.get("test_first"):
-            test_first = False
-        signed_summary["test_first"] = test_first
-        if signed.get("available"):
-            if signed.get("red") is not None:
-                signed_summary["red"] = str(signed.get("paths", {}).get("red") or "")
-            if signed.get("green") is not None:
-                signed_summary["green"] = str(signed.get("paths", {}).get("green") or "")
-            if signed.get("red_error"):
-                limitations.append(f"signed RED does not validate: {signed['red_error']}")
-            if signed.get("green_error"):
-                limitations.append(f"signed GREEN does not validate: {signed['green_error']}")
-        if not test_first:
-            signed_summary["red"] = None
+        signed = signed_cache[task['task_id']]
+        for phase in ('red', 'green'):
+            if signed.get(phase) is not None and task['contract_ok']:
+                signed_summary[phase] = signed['refs'][phase]
+            if signed.get(phase + '_error'):
+                limitations.append(f"signed {phase.upper()} does not validate: {signed[phase + '_error']}")
+        signed_summary['test_first'] = signed_summary['red'] is not None
+        if not signed_summary['test_first'] and (contract.get('tdd') or {}).get('test_first') is not False:
+            unrun.append('signed RED evidence (required by contract, no valid baseline RED recorded)')
         break
-    if signed_summary["test_first"] and signed_summary["red"] is None and any(task["contract"] for task in task_rows):
-        unrun.append("signed RED evidence (test_first is true and no valid RED is recorded)")
 
     integration_block = {
-        "commit": waves[-1]["head"] if waves else "",
-        "wave": waves[-1]["wave"] if waves else 0,
-        "evidence": str(waves[-1]["entry"].get("evidence") or "") if waves else "",
-        "accepted_wave_digest": waves[-1]["digest"] if waves else "",
+        "commit": waves[-1]["head"] if waves else None,
+        "wave": waves[-1]["wave_id"] if waves else None,
+        "evidence": _rel(state, revision.wave_path(state, waves[-1]['wave_id'])) if waves else None,
+        "accepted_wave_digest": waves[-1]["digest"] if waves else None,
     }
 
+    # The protocol has one packet and one reviewed contract. Keep the existing
+    # local diagnostic format explicit when a job has no such representation.
+    protocol = packet is not None and len(contracts_seen) <= 1
+    if protocol and contract_block['sha256'] != (resolution or packet)['contract_sha256']:
+        raise ReturnError('contract_mismatch', 'Reported contract differs from the frozen packet or resolution.')
+    auth_kind = authorization.get('authority') or 'human'
+    if protocol and resolution:
+        if (auth_kind != 'derived' or authorization.get('policy') != {
+                'policy_id': resolution['policy_id'], 'policy_digest': resolution['policy_digest']}):
+            raise ReturnError('resolution_mismatch', 'Derived authorization does not bind the enrolled policy.')
+    elif protocol and auth_kind not in ('human', 'owner-approval'):
+        raise ReturnError('authorization_mismatch', 'Authorization is not representable as exact M1 authority.')
+
     manifest: dict[str, Any] = {
-        "schema": RETURN_SCHEMA,
+        "schema": RETURN_SCHEMA if protocol else LOCAL_SCHEMA,
         "feature_id": feature_id,
         "job_id": jid,
         "packet_digest": str(goal.get("packet_digest") or ""),
@@ -1376,10 +1459,10 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
             "source_rev": str(goal.get("base_rev") or ""),
         },
         "authorization": {
-            "reference": str((job.get("authorization") or {}).get("ref") or f"{jobs.AUTH_DIR}/{jid}.json"),
+            "reference": _rel(state, jobs.authorization_path(state, jid)),
             "approved_by": str(authorization.get("by") or ""),
             "approved_at": str(authorization.get("at") or ""),
-            "authority": str(authorization.get("authority") or "human"),
+            "authority": ('descendant-policy' if resolution else 'm1-authorization') if protocol else auth_kind,
         },
         "descendant": (
             {
@@ -1409,12 +1492,24 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
     if recovery_rows:
         # Optional by design: a job with no recovery has no key at all, so the
         # legacy manifest keeps its exact shape.
-        manifest["recovery"] = recovery_rows
-        if not any(row["decision"] for row in recovery_rows):
-            limitations.append(
-                "a task is rejected and its recovery request has no validated decision yet; "
-                "no corrective attempt is dispatched until one is recorded"
-            )
+        if protocol:
+            entries = []
+            for row in recovery_rows:
+                decision = row['decision']
+                if decision is None:
+                    manifest['limitations'].append(f"Recovery {row['request_id']} has no validated decision.")
+                    continue
+                superseded = row['supersedes']
+                pair = (dict(contract_id=superseded['contract_id'], contract_sha256=superseded['contract_sha256'],
+                             supersedes=superseded['new_contract_id'], supersedes_sha256=superseded['new_contract_sha256'])
+                        if superseded else None)
+                entries.append(dict(request_id=row['request_id'], request_digest=row['request_digest'],
+                                    failure_class=row['failure']['class'], decision=decision['decision'],
+                                    adapter=decision['adapter'], supersession=pair, proposal=row['proposal'], work=row['work']))
+            if entries:
+                manifest['recovery'] = entries
+        else:
+            manifest['recovery'] = recovery_rows
     _refuse_uncovered(job, waves, criteria, task_rows)
     attachment = None
     if rails_anchors is not None:
@@ -1430,6 +1525,8 @@ def _packet_files(state_dir: Path, job_id: str, *, repo=None, rails_db=None, rai
             if row['id'] in ac_ids:
                 row['evidence'].append(ref)
     manifest['evidence_digest'] = evidence_digest(manifest)
+    if protocol:
+        _validate_manifest(manifest)
     return manifest, attachment
 
 
@@ -1578,7 +1675,13 @@ def render(manifest: Mapping[str, Any]) -> str:
     lines.append("")
 
     recovery_rows = manifest.get("recovery") or []
-    if recovery_rows:
+    if recovery_rows and manifest['schema'] == RETURN_SCHEMA:
+        lines += ['## Recovery', '']
+        for row in recovery_rows:
+            lines.append(f"- `{_cell(row['request_id'])}`: {_cell(row['failure_class'])}, "
+                         f"{_cell(row['decision'])} by `{_cell(row['adapter'])}`")
+        lines.append('')
+    elif recovery_rows:
         lines += [
             "## Recovery",
             "",
@@ -1710,6 +1813,11 @@ def verify(state_dir: Path, job_id: str, *, repo: Path | None = None, rails_db=N
         )
 
     fresh, attachment = _packet_files(state, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
+    if fresh['schema'] == RETURN_SCHEMA:
+        try:
+            _validate_manifest(on_disk)
+        except ReturnError as exc:
+            raise ReturnError('report_tampered', f'The recorded RETURN is invalid: {exc.code}') from exc
     if attachment is not None:
         from . import rails_return
         if rails_return.read_file(return_dir(state, job_id) / rails_return.FILE) != attachment:
@@ -1733,7 +1841,7 @@ def verify(state_dir: Path, job_id: str, *, repo: Path | None = None, rails_db=N
     return {
         "ok": True,
         "job_id": str(job_id),
-        "schema": RETURN_SCHEMA,
+        "schema": fresh['schema'],
         "evidence_digest": recorded,
         "return": _rel(state, return_path(state, job_id)),
         "markdown": _rel(state, render_path(state, job_id)),
