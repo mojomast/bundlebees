@@ -494,6 +494,7 @@ class SparseWorktrees:
 
 class GitContextGap:
     """The verify sandbox has no git repository context; failures say so."""
+    __test__ = True
 
     def test_a_gitless_green_failure_points_at_the_doctor_note(self, tmp_path):
         repo, base = make_repo(tmp_path)
