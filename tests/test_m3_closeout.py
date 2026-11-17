@@ -239,22 +239,32 @@ class WaveRecovery:
         patch = patch_for(repo, base, FILES)
         verify_local.verify_and_commit(state, repo, "att_1", patch=patch, declared_files=list(FILES), base_rev=base, tests=["tests/test_a.py"], suite_command=SUITE, require_gitleaks=False)
         job = {"job_id": "job_w", "goal": {"base_rev": base}, "tasks": [{"task_id": "T1", "state": "verified", "attempts": ["att_1"]}], "integration": {"wave": "w1"}}
-        first = integrate_job.integrate(state, job, repo, suite_command=SUITE)
-        return repo, base, state, job, first
+        return repo, base, state, job
 
-    def test_a_crash_before_the_ref_update_is_repaired(self, tmp_path):
-        repo, base, state, job, first = self._wave1(tmp_path)
+    def test_a_standalone_crash_before_the_ref_update_is_repaired(self, tmp_path, monkeypatch):
+        repo, base, state, job = self._wave1(tmp_path)
         ref = integrate_job.integration_ref("job_w")
-        git(repo, "update-ref", "-d", ref)
+        def interrupt(name, **kw):
+            assert name == "wave.after_persist"
+            raise InterruptedError("before publication")
+        with monkeypatch.context() as m:
+            m.setattr(integrate_job, "_checkpoint", interrupt)
+            with pytest.raises(InterruptedError):
+                integrate_job.integrate(state, job, repo, suite_command=SUITE)
+        head = json.loads((state / "waves/job_w.w1.json").read_bytes())["head_sha"]
+        assert git(repo, "for-each-ref", "--format=%(objectname)", "refs/bb/pending-integration/").stdout.strip() == head
+        assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0
 
         again = integrate_job.integrate(state, job, repo, suite_command=SUITE)
 
         assert again["ok"] is True
         assert again["recovered"] is True
-        assert git(repo, "rev-parse", ref).stdout.strip() == first["record"]["head_sha"]
+        assert git(repo, "rev-parse", ref).stdout.strip() == head
+        assert not git(repo, "for-each-ref", "refs/bb/pending-integration/").stdout
 
     def test_a_crash_after_the_ref_does_not_reintegrate(self, tmp_path):
-        repo, base, state, job, first = self._wave1(tmp_path)
+        repo, base, state, job = self._wave1(tmp_path)
+        first = integrate_job.integrate(state, job, repo, suite_command=SUITE)
         before = git(repo, "rev-parse", "refs/bb/integrated/job_w").stdout.strip()
 
         again = integrate_job.integrate(state, job, repo, suite_command=SUITE)

@@ -136,18 +136,19 @@ def test_changed_request_rechecks_derived_slot_and_preserves_both_receipts(run):
     assert not ref_sha(repo, ref) and history(state) == before and len(calls) == 2
 
 
-def test_only_the_interrupted_ref_update_can_be_replayed(run):
+def test_standalone_replay_refuses_deleted_or_moved_ref_after_publication(run):
     integrate, calls, state, repo, base = run
     first = integrate()
     ref, head = first["integration_ref"], first["record"]["head_sha"]
     before = history(state)
-    git(repo, "update-ref", "-d", ref)
-    assert integrate()["recovered"] and ref_sha(repo, ref) == head
     assert integrate()["recovered"] and history(state) == before
 
     later = git(repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "later wave").stdout.strip()
-    for stale in (base, later):
-        git(repo, "update-ref", ref, stale)
+    for stale in ("", base, later):
+        if stale:
+            git(repo, "update-ref", ref, stale)
+        else:
+            git(repo, "update-ref", "-d", ref)
         with pytest.raises(ij.IntegrateError) as refused:
             integrate()
         assert refused.value.code == "wave_reconciliation_required"

@@ -420,7 +420,7 @@ def tick(
     # point the durable ref back at the accepted head so a restart can neither
     # integrate the same work twice nor build the next wave on the wrong base.
     jobs.recover_integration(state_dir, job, repo=repo, suite_command=suite_command, runner=runner,
-                             persist=True, repair_ref=False)
+                             persist=True)
     head = _last_accepted_head(job)
     if head and Path(repo).exists():
         _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
@@ -565,7 +565,7 @@ def tick(
 
     def accept_integration(job_doc: dict, verdict: Mapping[str, Any]) -> None:
         if not jobs.recover_integration(state_dir, job_doc, repo=repo, suite_command=suite_command, runner=runner,
-                                        live_result=verdict, persist=True, repair_ref=False):
+                                        live_result=verdict, persist=True):
             raise jobs.JobError("wave_reconciliation_required", "Live integration has no matching sealed acceptance.",
                                 "Inspect the wave and its handoff receipts.")
 

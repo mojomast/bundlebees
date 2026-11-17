@@ -696,17 +696,50 @@ class JobRecovery:
             job_cli.recover(state, "job_d", repo)
         assert refused.value.code == "wave_reconciliation_required"
 
-    def test_recovery_restores_the_durable_ref_without_a_new_commit(self, tmp_path):
-        repo, _base, state, _job, integrated = crash_state(tmp_path)
+    @pytest.mark.parametrize("caller", ["explicit_job_recover", "direct_integrate"])
+    @pytest.mark.parametrize("move", ["deleted", "moved"])
+    def test_consumed_sealed_intent_cannot_restore_a_published_ref(self, tmp_path, caller, move):
+        repo, base, state, job, first = crash_state(tmp_path)
+        ref = first["integration_ref"]
+        assert not git(repo, "for-each-ref", "refs/bb/pending-integration/").stdout
+        if move == "deleted":
+            git(repo, "update-ref", "-d", ref)
+        else:
+            git(repo, "update-ref", ref, base)
+        saved = {p: p.read_bytes() for p in state.rglob("*.json")}
+        for _ in range(2):
+            with pytest.raises((jobs.JobError, integrate_job.IntegrateError)) as refused:
+                if caller == "explicit_job_recover":
+                    job_cli.recover(state, "job_d", repo)
+                else:
+                    integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+            assert refused.value.code == "wave_reconciliation_required"
+            assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip() == (
+                "" if move == "deleted" else base)
+            assert {p: p.read_bytes() for p in state.rglob("*.json")} == saved
+
+    @pytest.mark.parametrize("caller", ["explicit_job_recover", "direct_integrate"])
+    def test_recovery_restores_the_durable_ref_without_a_new_commit(self, tmp_path, caller, monkeypatch):
+        repo, _base, state, job = verified_job(tmp_path)
         ref = integrate_job.integration_ref("job_d")
-        head = integrated["record"]["head_sha"]
-        git(repo, "update-ref", "-d", ref)
+        with monkeypatch.context() as m:
+            m.setattr(integrate_job, "_checkpoint", lambda *args, **kw: boom())
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+        head = json.loads((state / "waves/job_d.w1.json").read_bytes())["head_sha"]
+        assert git(repo, "for-each-ref", "--format=%(objectname)", "refs/bb/pending-integration/").stdout.strip() == head
+        assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0
         commits = git(repo, "rev-list", "--count", "HEAD").stdout.strip()
 
+        if caller == "direct_integrate":
+            for _ in range(2):
+                result = integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+                assert result["recovered"] and result["record"]["head_sha"] == head
         outcome = job_cli.recover(state, "job_d", repo)
 
         assert outcome["adopted"] is True
         assert outcome["ref_restored"] == head
+        assert not git(repo, "for-each-ref", "refs/bb/pending-integration/").stdout
         assert git(repo, "rev-parse", ref).stdout.strip() == head
         assert git(repo, "rev-list", "--count", "HEAD").stdout.strip() == commits
         assert jobs.load_job(state, "job_d")["integration"]["wave"] == 2

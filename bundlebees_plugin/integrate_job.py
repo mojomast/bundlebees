@@ -397,10 +397,9 @@ def _pending_ref(handoff: dict, binding: str) -> str:
     return "refs/bb/pending-integration/" + _record_digest({"request": handoff, "binding": binding})
 
 
-def _publish_head(repo: Path, ref: str, wave: str, result: dict, *, pending: str | None = None,
-                  allow_repair: bool = True) -> None:
+def _publish_head(repo: Path, ref: str, wave: str, result: dict, *, pending: str) -> None:
     current = _ref_value(repo, ref, wave)
-    if pending is not None and _ref_value(repo, pending, wave) is not None:
+    if _ref_value(repo, pending, wave) is not None:
         head = result["head_sha"]
         if current not in (head, result["previous_ref"]):
             raise _reconcile(wave, "integration ref is not at the recorded predecessor")
@@ -410,13 +409,8 @@ def _publish_head(repo: Path, ref: str, wave: str, result: dict, *, pending: str
         if _git(["update-ref", "--no-deref", "--stdin"], repo, input_text=txn, check=False).returncode:
             raise _reconcile(wave, "integration ref or pending publication changed")
         return
-    if current == result["head_sha"]:
-        return
-    # Only finish the precise update interrupted after persistence. In particular
-    # an old receipt must never rewind a later wave's integration ref.
-    if (not allow_repair or "previous_ref" not in result or current != result["previous_ref"] or
-            _git(["update-ref", "--no-deref", ref, result["head_sha"], current or _ZERO], repo, check=False).returncode):
-        raise _reconcile(wave, "integration ref is not at the recorded predecessor")
+    if current != result["head_sha"]:
+        raise _reconcile(wave, "no pending publication for the tested head")
 
 
 def _retain_rejection(state: Path, wave: str, pair: tuple[dict, dict]) -> None:
@@ -842,13 +836,18 @@ def _integrate_locked(
         if (not pair or not pair[0]["accepted"]) and original["accepted"] and previous_ref != original["head_sha"]:
             raise _reconcile(wave, "changed request is not starting at the previously accepted head")
     handoff = jobs._integration_request(state_dir, job, repo, identity["wave"], wave, identity_digest)
+    # Standalone callers have no sealed job handoff. Their local intent is
+    # scoped to this state store, repo and execution request; the same result
+    # binding and one-shot Git transaction govern publication in either mode.
+    publication = handoff or {"kind": "standalone-integration/1", "state": str(state_dir.resolve()),
+                              "repo": str(repo.resolve()), "selected": wave, "identity_digest": identity_digest}
     if pair and pair[0]["accepted"]:
         existing, stored = pair
         head = existing["head_sha"]
         if handoff:
             jobs._confirm_integration(state_dir, handoff, stored["binding_sha256"], fresh=False)
         _publish_head(repo, ref, wave, stored["materialized"],
-                      pending=_pending_ref(handoff, stored["binding_sha256"]) if handoff else None)
+                      pending=_pending_ref(publication, stored["binding_sha256"]))
         if handoff:
             jobs._select_integration(state_dir, handoff)
         return {
@@ -952,13 +951,12 @@ def _integrate_locked(
         )
         if record.get("accepted"):
             head = tested_head
-            pending = None
+            binding = _binding_digest(identity_digest, materialized)
+            pending = _pending_ref(publication, binding)
+            _git(["update-ref", "--no-deref", pending, head, _ZERO], repo)
             if handoff:
                 # The coordinator's live execution is the only proof issuer. The
                 # recovery reader also independently checks the Git and suite gates.
-                binding = _binding_digest(identity_digest, materialized)
-                pending = _pending_ref(handoff, binding)
-                _git(["update-ref", "--no-deref", pending, head, _ZERO], repo)
                 jobs._confirm_integration(state_dir, handoff, binding, fresh=True)
             # Fault boundary: the accepted wave record is durable, but neither the
             # integration ref nor the job document names it yet. A crash here must
@@ -971,7 +969,7 @@ def _integrate_locked(
             if (not pair or pair[1]["identity_digest"] != identity_digest or pair[1]["materialized"] != materialized
                     or _verified_inputs(state_dir, wave, attempts) != shas):
                 raise _reconcile(wave, "integration evidence changed before publication")
-            _publish_head(repo, ref, wave, materialized, pending=pending, allow_repair=not handoff)
+            _publish_head(repo, ref, wave, materialized, pending=pending)
     finally:
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
 

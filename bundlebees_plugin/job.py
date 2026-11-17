@@ -1424,8 +1424,7 @@ def _resumed_identity(repo: Path, job: dict, wave: str, shas: list, historical: 
 
 def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | None = None,
                         suite_command: Sequence[str] | None = None, runner: Any = None,
-                        live_result: Mapping[str, Any] | None = None, persist: bool = False,
-                        repair_ref: bool = True) -> bool:
+                        live_result: Mapping[str, Any] | None = None, persist: bool = False) -> bool:
     """Adopt an accepted wave that a crash left out of this job document.
 
     A sealed handoff pins the request, local repo, and materialized result.
@@ -1497,7 +1496,7 @@ def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | No
                     raise ij._reconcile(selected, "live integration result differs from its sealed handoff")
             elif repo is not None:
                 pending = ij._pending_ref(request, stored["binding_sha256"])
-                ij._publish_head(local, ref, selected, stored["materialized"], pending=pending, allow_repair=repair_ref)
+                ij._publish_head(local, ref, selected, stored["materialized"], pending=pending)
             if persist:
                 with ij._hold_tested_head(local, ref, selected, head):
                     _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)
