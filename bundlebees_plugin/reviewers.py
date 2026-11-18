@@ -178,11 +178,10 @@ def sign_attestation(state_dir, *, name: str, key: bytes, contract_id: str, cont
         "evidence_signature": str(evidence_signature),
         "signed_at": time.time(),
     }
-    payload = dict(record)
-    payload["binding_sha256"] = hashlib.sha256(binding(
+    record["binding_sha256"] = hashlib.sha256(binding(
         contract_id=contract_id, contract_sha256=contract_sha256, revision=revision,
         outcome=outcome, note=note)).hexdigest()
-    record["signature"] = hmac.new(key.strip(), json.dumps(payload, sort_keys=True,
+    record["signature"] = hmac.new(key.strip(), json.dumps(record, sort_keys=True,
                                                           separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
     directory = _dir(state_dir) / _slug(name)
     directory.mkdir(parents=True, exist_ok=True)
