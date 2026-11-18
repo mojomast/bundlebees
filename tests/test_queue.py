@@ -8,6 +8,7 @@ from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from bundlebees_plugin import job as jobs
 from bundlebees_plugin import job_cli
 from bundlebees_plugin import provision_bind as B
 from bundlebees_plugin import provisioning as P
@@ -681,6 +682,263 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.queue.get("f1").status, "blocked")
         self.assertEqual(self.queue.get("f2").status, "queued")
         self.assertEqual(Q.QueueStore(self.tmp).read("f1")["state"], "blocked")
+
+    # -- a card may diverge from its durable record -------------------------
+
+    def _diverged(self, record_state, *, detail="tick refused: JobError wave_reconciliation_required",
+                  card_status="claimed", record_extra=None):
+        """A card status that disagrees with its already-written store record."""
+        record = {"state": record_state, "job_id": "job_1", "detail": detail}
+        record.update(record_extra or {})
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", record)
+        self.queue.set_status("f1", card_status, {"job_id": "job_1"})
+        return store
+
+    def _card_body(self):
+        return json.loads(self.path.read_text())["f1"]
+
+    def test_a_diverged_claimed_card_is_reconciled_from_its_blocked_record(self):
+        store = self._diverged("blocked")
+        called = []
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "reconciling a terminal record must not tick it")
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(result["reconciled"][0]["feature"], "f1")
+        self.assertEqual(result["reconciled"][0]["state"], "blocked")
+        self.assertIn("wave_reconciliation_required", result["detail"])
+        self.assertIn("wave_reconciliation_required", self._card_body()["evidence"]["detail"])
+        self.assertEqual(store.read("f1")["state"], "blocked",
+                         "the reconciliation reports the existing record; it does not rewrite it")
+
+        before = self.path.read_text()
+        again = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+        self.assertEqual(again["action"], "idle")
+        self.assertEqual(self.path.read_text(), before,
+                         "a second pass must not rewrite an already-reconciled card")
+
+    def test_reconciliation_bounds_the_record_detail_on_the_card(self):
+        detail = "D" * 1000
+        self._diverged("blocked", detail=detail)
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        card_detail = self._card_body()["evidence"]["detail"]
+        self.assertEqual(len(card_detail), 400)
+        self.assertEqual(card_detail, detail[:400])
+
+    def test_reconciliation_reports_failed_and_needs_approval_record_states(self):
+        for state in ("failed", "needs_approval"):
+            with self.subTest(state=state), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({"f1": card("f1", status="claimed")}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                store.write("f1", {"state": state, "job_id": "job_1",
+                                   "detail": f"{state} by contract"})
+
+                result = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+                self.assertEqual(result["action"], "reconciled")
+                self.assertEqual(result["status"], state)
+                self.assertEqual(result["reconciled"][0]["state"], state)
+                self.assertIn("by contract", result["detail"])
+                self.assertEqual(queue.get("f1").status, state)
+                self.assertEqual(store.read("f1")["state"], state,
+                                 "the record state remains the source of truth")
+
+    def test_a_ready_for_review_record_only_reviews_the_card_when_the_job_is_accepted(self):
+        # Choice: a ready_for_review record is trusted only when the existing
+        # _job_accepted rules agree. When they do not, the card is blocked (not
+        # left at claimed) and the record is left untouched; it is never moved
+        # to review on the record's word alone.
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({"f1": card("f1", status="claimed")}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                store.write("f1", {"state": "ready_for_review", "job_id": "job_1",
+                                   "detail": "review requested"})
+
+                with mock.patch.object(Q, "_job_accepted",
+                                       lambda state_dir, job_id, accepted=accepted: accepted):
+                    result = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+                expected = "ready_for_review" if accepted else "blocked"
+                self.assertEqual(result["action"], "reconciled")
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(queue.get("f1").status, expected)
+                self.assertEqual(store.read("f1")["state"], "ready_for_review")
+                if accepted:
+                    self.assertIn("review requested", result["detail"])
+                else:
+                    self.assertIn("not accepted", result["detail"])
+
+    def test_reconciliation_leaves_a_genuinely_active_record_alone(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_1"], "an active record is advanced, never reconciled")
+        self.assertEqual(result["action"], "running")
+        self.assertNotIn("reconciled", result)
+        self.assertEqual(self.queue.get("f1").status, "running")
+
+    def test_a_terminal_record_is_not_ticked_while_active_work_advances(self):
+        self.path.write_text(json.dumps({
+            "f1": card("f1", status="claimed"),
+            "f2": card("f2", job_id="job_2", status="claimed"),
+        }))
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "blocked", "job_id": "job_1",
+                           "detail": "tick refused: JobError wave_reconciliation_required"})
+        store.write("f2", {"state": "running", "job_id": "job_2"})
+        called = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_2"], "only the genuinely active job is ticked")
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(result["feature"], "f2")
+        self.assertEqual(result["reconciled"][0]["feature"], "f1")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+
+    def test_reconciliation_does_not_repair_an_unreadable_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.path("f1").write_text("{")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(caught.exception.code, "queue_state_corrupt")
+        self.assertEqual(self.queue.get("f1").status, "claimed")
+
+    def test_a_claimed_card_without_a_record_keeps_its_existing_outcome(self):
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(called, [])
+        self.assertEqual(self.queue.get("f1").status, "claimed",
+                         "a missing record is not a divergence to repair")
+
+    def test_a_claimed_card_with_an_unrepresentable_id_has_no_record_to_reconcile(self):
+        self.path.write_text(json.dumps({"feat/1": card("feat/1", status="claimed")}))
+        queue = Q.JsonQueue(self.path)
+
+        result = Q.run_once(self.tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(queue.get("feat/1").status, "claimed")
+
+    # -- a typed job refusal settles the card and its record ----------------
+
+    def _assert_blocked_by_job_error(self, result, store, *, code, message):
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["code"], code)
+        self.assertIn(code, result["detail"])
+        self.assertIn(message, result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        record = store.read("f1")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["evidence"]["error"], code)
+        self.assertIn(message, record["detail"])
+        self.assertIn(message, record["evidence"]["detail"])
+
+    def test_a_job_error_from_an_active_tick_blocks_the_card_and_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        def tick(job_id):
+            called.append(job_id)
+            raise jobs.JobError("wave_reconciliation_required",
+                                "the wave record diverged", "Reconcile the wave.")
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=tick)
+
+        self.assertEqual(called, ["job_1"])
+        self._assert_blocked_by_job_error(
+            result, store, code="wave_reconciliation_required",
+            message="the wave record diverged")
+
+    def test_a_job_error_from_the_fresh_claim_tick_blocks_the_card_and_record(self):
+        called = []
+
+        def tick(job_id):
+            called.append(job_id)
+            raise jobs.JobError("wave_reconciliation_required",
+                                "the wave record diverged", "Reconcile the wave.")
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=tick)
+
+        self.assertEqual(called, ["job_1"])
+        self._assert_blocked_by_job_error(
+            result, Q.QueueStore(self.tmp), code="wave_reconciliation_required",
+            message="the wave record diverged")
+
+    def test_a_job_error_from_the_active_claim_load_blocks_the_card_and_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        def corrupt(state_dir, job_id):
+            raise jobs.JobError("job_invalid", "job document could not be read",
+                                "Inspect it by hand.")
+
+        with mock.patch.object(Q, "_load_job_or_none", corrupt):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "a corrupt active job is not ticked")
+        self._assert_blocked_by_job_error(
+            result, store, code="job_invalid", message="job document could not be read")
+
+    def test_a_job_error_from_the_fresh_claim_load_blocks_the_card_and_record(self):
+        called = []
+
+        def corrupt(state_dir, job_id):
+            raise jobs.JobError("job_invalid", "job document could not be read",
+                                "Inspect it by hand.")
+
+        with mock.patch.object(Q, "_load_job_or_none", corrupt):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "a corrupt fresh job is not ticked")
+        self._assert_blocked_by_job_error(
+            result, Q.QueueStore(self.tmp), code="job_invalid",
+            message="job document could not be read")
 
 
 if __name__ == "__main__":
