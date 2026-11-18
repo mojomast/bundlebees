@@ -2127,7 +2127,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         try:
             delivery_record = _delivery.record_intent(
                 state_dir, attempt_id=attempt_id, repo=_origin_repo(workdir), branch=branch,
-                base_sha=base, title=f"verify: {branch} (attempt {attempt_id})",
+                base_sha=source_rev, title=f"verify: {branch} (attempt {attempt_id})",
                 body=(f"Verified worker payload.\n\n- attempt: `{attempt_id}`\n- branch: `{branch}`\n"
                       f"- tests: {', '.join(tests)}\n- files: {len(files)}\n"),
             )
