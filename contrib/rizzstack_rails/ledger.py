@@ -24,6 +24,13 @@ _BUSY_BACKOFF = (0.05, 0.2, 0.4)
 
 _TARGET_KINDS = ("feedback.recorded", "intervention.requested", "intervention.result")
 
+#: Local attempt scan index (mirrors scripts/rails_attempt_index.py; keep the definitions identical).
+_ATTEMPT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS rails_local_attempt_scan ON event_rows ("
+    "json_extract(envelope_json,'$.scope.attempt_id'), ingest_seq, event_id, rails_hash, "
+    "length(CAST(envelope_json AS BLOB)))"
+)
+
 _SCHEMA_STATEMENTS = (
     "CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     (
@@ -355,6 +362,14 @@ class RailsLedger:
         def work(conn):
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            # Owner decision 2026-11-17: the local attempt scan index is the DEFAULT for every
+            # new ledger (created here, before the first append, where it costs nothing).
+            # Builds whose trusted_schema=OFF refuses expression indexes simply run unindexed:
+            # the index is an optimisation, never a correctness condition, so this is best-effort.
+            try:
+                conn.execute(_ATTEMPT_INDEX_SQL)
+            except Exception:  # noqa: BLE001 - unsupported build: stay unindexed, never fail the ledger
+                pass
 
         self._write_tx(work, fire_hooks=False)
 

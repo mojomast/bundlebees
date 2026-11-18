@@ -29,6 +29,11 @@ class AttemptIndexTests(unittest.TestCase):
                     return query_events(make_request('attempt','A',format='json'),reader)
             first = append(1)
             before = read()
+            # Pre-migration ledger: the default index is dropped first so this test keeps
+            # exercising the installer's bounds/identity/lock path (owner decision 2026-11-17
+            # made the index default for NEW ledgers).
+            writer._conn.execute('DROP INDEX IF EXISTS ' + tool.NAME)
+            writer._conn.commit()
             with self.assertRaises(ValueError): tool.install(path, str(uuid4()))
             with patch.object(tool,'MAX_ROWS',0), self.assertRaises(ValueError):
                 tool.install(path,writer.ledger_uuid)
