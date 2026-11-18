@@ -98,6 +98,7 @@ __all__ = [
     "SCHEMA",
     "FENCE_SCHEMA",
     "LEASE_KINDS",
+    "RESEARCH_KIND",
     "DEFAULT_TTL_S",
     "ActionError",
     "actions_dir",
@@ -119,6 +120,10 @@ FENCE_SCHEMA = "bundlebees.coordinator-actions-fence/1"
 #: Kinds that hold a repo lease. Only these serialize per repository, and
 #: only while their claims overlap; every other kind never blocks anything.
 LEASE_KINDS = frozenset({"merge", "deploy"})
+
+#: Research-before-retry actions: a failure finding that must be researched
+#: before the failed work may be retried. Ordinary (non-lease) action kind.
+RESEARCH_KIND = "research"
 
 DEFAULT_TTL_S = 900.0
 

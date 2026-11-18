@@ -489,6 +489,19 @@ def _dispatch(
     except BriefError as exc:
         return _err("brief_invalid", exc.error, exc.fix)
 
+    # RESEARCH-BEFORE-RETRY: a retry of a recorded failure is refused before
+    # any launcher call until accepted findings exist for that failure id.
+    # Imported lazily so the tool module's import graph stays free of queues.
+    from . import research_gate
+
+    gate_refusal = research_gate.require_findings(state_dir, brief)
+    if gate_refusal is not None:
+        return _err(
+            str(gate_refusal.get("code") or "research_required"),
+            str(gate_refusal.get("error") or "research is required before retrying"),
+            str(gate_refusal.get("fix") or "Record accepted findings before retrying."),
+        )
+
     acdd = _dispatch_acdd(brief, require_contract)
     if isinstance(acdd, str):
         return acdd
