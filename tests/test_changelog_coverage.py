@@ -509,6 +509,16 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "verified backup",
         ),
     },
+    {
+        # docs/changelog-107-108: this companion itself - the coverage rows and
+        # Unreleased bullets for #107 and #108.
+        "pr": 113,
+        "name": "docs-sync companion for #107 and #108",
+        "keywords": (
+            "Docs-sync companion",
+            "#107 and #108",
+        ),
+    },
 )
 
 

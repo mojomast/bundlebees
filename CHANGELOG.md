@@ -17,6 +17,7 @@ one pull request.
 
 ### Added
 
+- **Docs-sync companion (this PR):** registers #107 and #108 in the coverage registry with their Unreleased bullets, so a full-history run of the changelog guard stops reporting them as undocumented merges.
 - **Research-before-retry gate (M12):** a retry of a recorded failure is now refused before any launcher call until accepted findings exist for that failure id (`bundlebees_plugin/research_gate.py`, `require_findings`). The failure signature is derived from the failing tests and the key error line, so a duplicate failure enqueues exactly one research item while a new attempt lineage gets its own; findings must carry sources, a rejected alternative and a verdict, and an environment-problem verdict goes to the decision queue with no retry. Fail closed: an unavailable queue or research worker leaves the retry blocked and surfaced as blocked.
 - **Hermes kanban board sync (M13):** `hermes bundlebees board-sync` reflects bee/attempt and GitHub PR lifecycle events onto the existing kanban board through the public CLI instead of writing the SQLite file — cards are keyed by PR link or attempt id so replays change nothing, a reconcile pass repairs anything missed, a verified backup of the board is taken before the first mutation (refused on a bad copy), and the command fails soft when the board is unreachable (`bundlebees_plugin/board_sync.py`). It only reflects state; it never merges, dispatches, restarts or approves anything.
 
