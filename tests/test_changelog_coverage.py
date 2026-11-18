@@ -552,6 +552,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "WORKFLOW_SRC",
         ),
     },
+    {
+        # feat/board-dispatch-bridge: a ready card with a durable approval record
+        # that carries a strict-valid brief and an existing job is stocked as one
+        # queue feature plus one dispatch pre-approval, idempotently; no record,
+        # no stocking.
+        "pr": 122,
+        "name": "board to dispatcher bridge",
+        "keywords": (
+            "board-dispatch",
+            "approval record",
+            "idempotently",
+        ),
+    },
     # The docs-sync companion that adds the four rows below is intended for a
     # SQUASH merge. A squash subject ("...(#N)") never matches
     # MERGE_SUBJECT_RE, so the guard does not count that merge and no registry
