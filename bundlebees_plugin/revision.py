@@ -551,6 +551,12 @@ def _junit_regressions(junit: Any) -> int:
     return total
 
 
+def suite_passed(suite: Any) -> bool:
+    """Writing and consuming an accepted wave require the same positive evidence."""
+    return (isinstance(suite, Mapping) and type(suite.get("exit_code")) is int
+            and suite["exit_code"] == 0 and not suite.get("timed_out") and not suite.get("blocking"))
+
+
 def _clean_record(record: Mapping[str, Any], head: str) -> dict:
     problems = record.get("problems") or {}
     clean_problems = {
@@ -745,11 +751,7 @@ def integrate_wave(
         evidence = run_suite(repo)
         suite = dict(evidence) if isinstance(evidence, Mapping) else {}
         # A runner may name test categories that failed or did not run (fail closed).
-        accepted = (
-            suite.get("exit_code") == 0
-            and not bool(suite.get("timed_out"))
-            and not suite.get("blocking")
-        )
+        accepted = suite_passed(suite)
 
     regressions = 0
     if not accepted and suite is not None:
