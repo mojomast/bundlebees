@@ -178,6 +178,38 @@ The subscriber is a normal file subscriber. `record_landing` +
 `events/inbox/coordinator-actions/<event_id>.json`; `consume_completions`
 claims one, classifies it and either enqueues actions or skips it.
 
+### Landing producer and event id
+
+The producer is the accepted-landing path in
+`bundlebees_plugin.landing_bridge` (`consume_once` / `ingest_remote`, inside
+`_ingest_event_batch`). After an event is validated, correlated, recorded in
+the outbox and durably delivered, the bridge projects each **terminal**
+landing (`landed`, `succeeded`, `failed`, `cancelled`) into one completion
+event addressed to `DEFAULT_COMPLETION_SUBSCRIBER` (`coordinator-actions`) and
+publishes it with `event_consumer.publish_event` — create-only, before the
+source file or export cursor is acknowledged. A non-terminal landing publishes
+nothing. The projection carries only the completion facts
+(`attempt_id`, `state`, `job_id`, `task_id`, `source_rev`,
+`result.available`, `result.reference`, `lease.assigned_files`) plus the
+originating `landing_event_id`; coordinator/backend metadata and free-form
+worker text never enter the inbox record.
+
+The completion event id depends only on the attempt and its terminal state,
+not on the landing transition:
+
+```
+urn:rizzstack:bee-completion:<first 32 hex of sha256(attempt_id NUL state)>
+```
+
+`event_consumer.completion_event_id(attempt_id, state)` builds it and
+`event_consumer.completion_event(landing)` / `publish_completion_event(...)`
+expose the projection. Because `publish_event` is create-only, replaying the
+same `(attempt_id, state)` — including a different transition of the same
+landing — returns the stored record instead of writing a second inbox event.
+A write failure raises and the source landing remains unacknowledged, so the
+next pass retries it rather than acknowledging a landing whose completion
+event is missing.
+
 ### Classification
 
 `classify_completion(event)` accepts the canonical CloudEvents envelope
