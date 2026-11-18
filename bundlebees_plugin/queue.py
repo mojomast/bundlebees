@@ -96,20 +96,83 @@ class QueueAdapter(Protocol):
 
 
 class JsonQueue:
-    """File-backed queue for tests and for hosts without a Kanban bridge."""
+    """File-backed queue for tests and for hosts without a Kanban bridge.
+
+    Two document shapes are accepted, because the live queue file is written by
+    the hive docket publisher while older states and fixtures use a flat map:
+
+    * a **features document** — ``{"schema": "bundlebees.queue/1",
+      "generated_at": ..., "features": [{"feature_id": ...}, ...], ...}``;
+    * a **flat map** — ``{"<feature_id>": {"repo": ..., "job_id": ...}}``.
+
+    Any other shape is a typed :class:`QueueError`, never an ``AttributeError``
+    from calling ``.get`` on a list or a string.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
-    def _load(self) -> dict[str, dict[str, Any]]:
+    def _read_document(self) -> Any:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
         except ValueError as exc:
             raise QueueError("queue_invalid", f"{self.path} is not valid JSON: {exc}", "Repair the queue file.") from exc
+        except OSError as exc:
+            raise QueueError("queue_unreadable", f"{self.path} could not be read: {exc}", "Check the queue file permissions.") from exc
 
-    def _save(self, data: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _entries(data: Any) -> list[tuple[str, Mapping[str, Any]]]:
+        """``(feature_id, card)`` pairs for either supported document shape."""
+
+        if data is None:
+            return []
+        if not isinstance(data, Mapping):
+            raise QueueError(
+                "queue_invalid",
+                "the queue file is neither a feature map nor a features document",
+                "Repair the queue file: use a features list or a feature-id map.",
+            )
+        if "features" in data:
+            features = data.get("features")
+            if features is None:
+                return []
+            if not isinstance(features, list):
+                raise QueueError(
+                    "queue_invalid",
+                    "the queue 'features' value is not a list",
+                    "Repair the queue file: features must be a JSON array.",
+                )
+            entries: list[tuple[str, Mapping[str, Any]]] = []
+            for index, body in enumerate(features):
+                if not isinstance(body, Mapping):
+                    raise QueueError(
+                        "queue_invalid",
+                        f"queue feature at index {index} is not an object",
+                        "Repair the queue file: every feature must be a JSON object.",
+                    )
+                feature_id = body.get("feature_id")
+                if not isinstance(feature_id, str) or not feature_id.strip():
+                    raise QueueError(
+                        "queue_invalid",
+                        f"queue feature at index {index} has no feature_id",
+                        "Repair the queue file: every feature needs a feature_id.",
+                    )
+                entries.append((feature_id.strip(), body))
+            return entries
+        entries = []
+        for feature_id, body in data.items():
+            if not isinstance(body, Mapping):
+                raise QueueError(
+                    "queue_invalid",
+                    f"queue item {feature_id!r} is not an object",
+                    "Repair the queue file: every item must be a JSON object.",
+                )
+            entries.append((str(feature_id), body))
+        return entries
+
+    def _save(self, data: Any) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -117,7 +180,7 @@ class JsonQueue:
 
     def list_items(self) -> list[Item]:
         items = []
-        for feature_id, body in sorted(self._load().items()):
+        for feature_id, body in sorted(self._entries(self._read_document()), key=lambda entry: entry[0]):
             items.append(Item(feature_id=feature_id, repo=str(body.get("repo") or ""),
                               job_id=str(body.get("job_id") or ""), title=str(body.get("title") or ""),
                               depends_on=tuple(body.get("depends_on") or ()),
@@ -128,13 +191,27 @@ class JsonQueue:
         return next((item for item in self.list_items() if item.feature_id == feature_id), None)
 
     def set_status(self, feature_id: str, status: str, evidence: Mapping[str, Any] | None = None) -> None:
-        data = self._load()
-        if feature_id not in data:
-            raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
-        data[feature_id]["status"] = status
+        data = self._read_document()
+        document_shape = isinstance(data, Mapping) and "features" in data
+        # Validate the whole document before mutating anything, so an unknown
+        # shape is a typed refusal and never a partially rewritten file.
+        self._entries(data)
+        if document_shape:
+            features = data.get("features") or []
+            target = next(
+                (body for body in features if str(body.get("feature_id") or "").strip() == feature_id),
+                None,
+            )
+            if target is None:
+                raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
+        else:
+            if feature_id not in data:
+                raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
+            target = data[feature_id]
+        target["status"] = status
         if evidence is not None:
-            data[feature_id]["evidence"] = dict(evidence)
-        data[feature_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            target["evidence"] = dict(evidence)
+        target["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self._save(data)
 
 

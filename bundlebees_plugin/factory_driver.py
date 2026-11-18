@@ -2699,9 +2699,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tick", default=None, help="mechanical worker tick as module:callable")
     parser.add_argument("--launcher-url", default=os.environ.get("BUNDLEBEES_LAUNCHER_URL", ""),
                         help="real launcher base URL (token from BUNDLEBEES_LAUNCHER_TOKEN)")
-    parser.add_argument("--repo", default=None, help="local repository for the real job tick")
-    parser.add_argument("--gitleaks", default=os.environ.get("GITLEAKS", ""),
-                        help="gitleaks binary; required for a real tick")
+    parser.add_argument("--repo", default=os.environ.get("BUNDLEBEES_REPO", ""),
+                        help="local repository for the real job tick (env: BUNDLEBEES_REPO)")
+    parser.add_argument("--gitleaks", default=os.environ.get("BUNDLEBEES_GITLEAKS") or os.environ.get("GITLEAKS", ""),
+                        help="gitleaks binary; required for a real tick (env: BUNDLEBEES_GITLEAKS)")
+    parser.add_argument("--require-dispatch-config", action="store_true",
+                        help="refuse to start unless launcher URL, repo and gitleaks are all configured")
     parser.add_argument("--suite-command", nargs=argparse.REMAINDER, default=None,
                         help="integration suite command, last option (default: python -m pytest -q)")
     parser.add_argument("--provisioning", action="store_true",
@@ -2730,6 +2733,23 @@ def main(argv: list[str] | None = None) -> int:
     tick = load_tick(args.tick)
     launcher_url = str(args.launcher_url or "").strip()
     repo_arg = str(args.repo or "").strip()
+    if args.require_dispatch_config and tick is None:
+        # Fail closed instead of silently degrading to the observation tick,
+        # which looks healthy while it can never claim, dispatch or verify.
+        missing = [
+            name
+            for name, value in (
+                ("BUNDLEBEES_LAUNCHER_URL", launcher_url),
+                ("BUNDLEBEES_REPO", repo_arg),
+                ("BUNDLEBEES_GITLEAKS", str(args.gitleaks or "").strip()),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "bundlebees factory-driver: refusing to start: --require-dispatch-config is set "
+                f"but {', '.join(missing)} is unset; set it in the service EnvironmentFile"
+            )
     if tick is None:
         # Production selection is explicit. A partial launcher/worktree
         # configuration used to fall through to the mechanical tick, which then

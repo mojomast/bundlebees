@@ -390,6 +390,58 @@ def test_the_shipped_unit_file_has_strict_structural_sections():
     assert parser.get("Install", "WantedBy") == "default.target"
 
 
+def test_the_shipped_unit_passes_dispatch_settings_from_the_environment_file():
+    """The unit carries names only; the 0600 env file carries the values.
+
+    Without every one of these the driver used to fall back to the mechanical
+    observation tick, which looks healthy while dispatching nothing.
+    """
+
+    path = _unit_path()
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read(path, encoding="utf-8")
+
+    environment_file = parser.get("Service", "EnvironmentFile").strip()
+    assert environment_file == "%h/.config/bundlebees/factory-driver.env", (
+        "a missing environment file must be fatal, not silently ignored"
+    )
+    execstart = parser.get("Service", "ExecStart")
+    for expected in (
+        "--launcher-url ${BUNDLEBEES_LAUNCHER_URL}",
+        "--repo ${BUNDLEBEES_REPO}",
+        "--gitleaks ${BUNDLEBEES_GITLEAKS}",
+        "--require-dispatch-config",
+    ):
+        assert expected in execstart, f"{expected!r} is missing from ExecStart"
+    assert "BUNDLEBEES_LAUNCHER_TOKEN" not in path.read_text(encoding="utf-8")
+    assert "http://" not in execstart and "https://" not in execstart
+
+
+def test_the_driver_fails_closed_when_required_dispatch_settings_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    for name in ("BUNDLEBEES_LAUNCHER_URL", "BUNDLEBEES_REPO", "BUNDLEBEES_GITLEAKS", "GITLEAKS"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(SystemExit) as caught:
+        factory_driver.main(
+            [
+                "--state", str(tmp_path / "state"),
+                "--queue", str(tmp_path / "queue.json"),
+                "--service",
+                "--require-dispatch-config",
+            ]
+        )
+
+    message = str(caught.value)
+    assert caught.value.code not in (0, None)
+    for name in ("BUNDLEBEES_LAUNCHER_URL", "BUNDLEBEES_REPO", "BUNDLEBEES_GITLEAKS"):
+        assert name in message
+    assert "refusing" in message
+
+
+
 def _render_unit(tmp_path: Path, interpreter: str) -> Path:
     """Copy the shipped unit into a sandbox home, keeping every shipped directive.
 

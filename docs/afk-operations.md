@@ -46,6 +46,28 @@ hermes bundlebees job authorize --job-id job_a \
 }
 ```
 
+A queue file may also be the docket envelope the live state uses:
+
+```json
+{
+  "schema": "bundlebees.queue/1",
+  "generated_at": "2026-11-18T04:27:23Z",
+  "features": [
+    {
+      "feature_id": "feature-a",
+      "repo": "owner/repo",
+      "job_id": "job_a",
+      "status": "queued",
+      "depends_on": []
+    }
+  ]
+}
+```
+
+Both shapes are read and updated in place; any other JSON shape is a typed
+`queue_invalid` refusal, never an `AttributeError`. A missing file is an empty
+queue.
+
 ## Run
 
 One pass, then exit:

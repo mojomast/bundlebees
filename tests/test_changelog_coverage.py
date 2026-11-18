@@ -539,6 +539,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "#107 and #108",
         ),
     },
+    {
+        # fix/factory-dispatch-wiring: the live docket envelope is readable and
+        # unknown shapes are a typed refusal; the shipped unit carries the
+        # dispatch settings from the environment file and fails closed.
+        "pr": 118,
+        "name": "factory dispatch wiring",
+        "keywords": (
+            "live docket envelope",
+            "queue_invalid",
+            "require-dispatch-config",
+            "WORKFLOW_SRC",
+        ),
+    },
     # The docs-sync companion that adds the four rows below is intended for a
     # SQUASH merge. A squash subject ("...(#N)") never matches
     # MERGE_SUBJECT_RE, so the guard does not count that merge and no registry
