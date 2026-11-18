@@ -1805,8 +1805,26 @@ def _sandbox_options(config: Mapping[str, Any]) -> dict[str, Any]:
         raise _as_cli_error(exc) from exc
 
 
+_NODE_TARGET_SUFFIXES = (".mjs", ".cjs", ".js")
+_NODE_MISSING_MARKERS = (
+    "enoent",
+    "no such file or directory",
+    "not found",
+    "command not found",
+)
+_FIX_TEST_TARGETS = (
+    "Pass either Python test files/node ids or Node .mjs/.cjs/.js test files, not both."
+)
+_FIX_NODE_MISSING = "Install Node in the sandbox or pass Python test targets."
+
+
 def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
-    """Keep only the approved targets pytest can collect; drop non-Python fixtures."""
+    """Keep only the approved targets pytest can collect; drop non-Python fixtures.
+
+    This is the legacy ACDD path: a contract's ``scope.test_files`` may name
+    non-Python server fixtures alongside its Python tests. Verify itself uses
+    the strict selector below, where dropping a target is a refusal.
+    """
     kept: list[str] = []
     for target in targets:
         if not isinstance(target, str):
@@ -1826,29 +1844,133 @@ def _pytest_targets(targets: list[str], workdir: Path) -> list[str]:
     return kept
 
 
-def _run_sandboxed(workdir: Path, targets: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
-    """Run pytest on a disposable copy of *workdir*; return evidence only."""
-    pytest_targets = _pytest_targets(list(targets), Path(workdir))
-    if not pytest_targets:
+def _select_test_runner(targets: list[str], workdir: Path) -> tuple[str, list[str]]:
+    """Choose exactly one runner for the approved targets; never drop one.
+
+    Python targets keep pytest's existing selection rules. Node targets must be
+    existing ``.mjs``/``.cjs``/``.js`` files. A mixed or unrecognised set is a
+    refusal, because silently dropping a target would report a false pass.
+    """
+    python_targets: list[str] = []
+    node_targets: list[str] = []
+    offenders: list[str] = []
+    for target in targets:
+        if not isinstance(target, str):
+            offenders.append(repr(target))
+            continue
+        text = target.strip()
+        if not text:
+            continue
+        if "::" in text:
+            python_targets.append(text)
+            continue
+        try:
+            candidate = Path(contain_path(text.split("::", 1)[0] or ".", str(workdir)))
+        except ValueError:
+            offenders.append(text)
+            continue
+        if text == "." or text.endswith(".py"):
+            python_targets.append(text)
+            continue
+        if candidate.is_dir():
+            python_targets.append(text)
+            continue
+        if text.lower().endswith(_NODE_TARGET_SUFFIXES) and candidate.is_file():
+            node_targets.append(text)
+            continue
+        if text.lower().endswith(_NODE_TARGET_SUFFIXES):
+            offenders.append(f"{text} (file does not exist)")
+        else:
+            offenders.append(f"{text} (unknown extension)")
+    if offenders or (python_targets and node_targets):
+        named = offenders or [*python_targets, *node_targets]
         raise CliError(
-            "no_test_targets",
-            "none of the approved test files can be collected by pytest",
-            "Reference at least one Python test file in scope.test_files.",
+            "mixed_test_targets",
+            "test targets are mixed or unrecognised: " + ", ".join(named),
+            _FIX_TEST_TARGETS,
         )
+    if node_targets:
+        return "node-test", node_targets
+    if python_targets:
+        return "pytest", python_targets
+    raise CliError(
+        "no_test_targets",
+        "none of the approved test files can be collected by pytest",
+        "Reference at least one Python test file in scope.test_files.",
+    )
+
+
+def _node_runner_missing(evidence: Mapping[str, Any]) -> bool:
+    if evidence.get("exit_code") != 127:
+        return False
+    tail = str(evidence.get("output_tail") or "").lower()
+    return any(marker in tail for marker in _NODE_MISSING_MARKERS)
+
+
+def _test_argv_text(argv: list[str]) -> str:
+    return " ".join(argv)[:2000]
+
+
+def _run_sandboxed(
+    workdir: Path,
+    targets: list[str],
+    config: Mapping[str, Any],
+    *,
+    strict_targets: bool = False,
+) -> dict[str, Any]:
+    """Run the selected test runner on a disposable copy of *workdir*; evidence only.
+
+    ``strict_targets`` is the verify contract: every named target must be a
+    Python or Node test, and a mixed/unrecognised set is refused. ACDD passes
+    contract ``scope.test_files``, which may include non-test fixtures, so its
+    callers keep the legacy pytest-only selection.
+    """
+    if strict_targets:
+        runner, selected = _select_test_runner(list(targets), Path(workdir))
+    else:
+        pytest_targets = _pytest_targets(list(targets), Path(workdir))
+        if pytest_targets:
+            runner, selected = "pytest", pytest_targets
+        else:
+            runner, selected = _select_test_runner(list(targets), Path(workdir))
+    if runner == "node-test":
+        argv = ["node", "--test", *selected]
+    else:
+        argv = sandbox.pytest_argv(selected)
     try:
-        return sandbox.run_in_sandbox(workdir, sandbox.pytest_argv(pytest_targets), **_sandbox_options(config))
+        result = sandbox.run_in_sandbox(workdir, argv, **_sandbox_options(config))
     except sandbox.SandboxUnavailable as exc:
         raise CliError(exc.code, exc.error, exc.fix) from exc
+    except OSError as exc:
+        if runner == "node-test" and (
+            isinstance(exc, FileNotFoundError) or getattr(exc, "errno", None) == 2
+        ):
+            raise CliError(
+                "node_runner_unavailable",
+                "node is not resolvable inside the sandbox",
+                _FIX_NODE_MISSING,
+            ) from exc
+        raise
     except ValueError as exc:
         raise CliError(
             "invalid_argument",
             f"unknown verify_isolation backend: {exc}",
             "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
         ) from exc
+    if runner == "node-test" and _node_runner_missing(result):
+        raise CliError(
+            "node_runner_unavailable",
+            "node is not resolvable inside the sandbox: " + _tail(result.get("output_tail")),
+            _FIX_NODE_MISSING,
+        )
+    evidence = dict(result)
+    evidence["runner"] = runner
+    evidence["test_argv"] = _test_argv_text(argv)
+    return evidence
 
 
 def _run_tests(workdir: Path, tests: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
-    evidence = _run_sandboxed(workdir, tests, config)
+    evidence = _run_sandboxed(workdir, tests, config, strict_targets=True)
     if evidence.get("timed_out") or evidence.get("exit_code") != 0:
         detail = _tail(evidence.get("output_tail"))
         raise CliError(
@@ -2345,6 +2467,8 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             exit_code=test_evidence.get("exit_code"),
             junit=test_evidence.get("junit"),
             duration_s=test_evidence.get("duration_s"),
+            runner=test_evidence.get("runner"),
+            test_argv=test_evidence.get("test_argv"),
         )
 
         if dry_run:
