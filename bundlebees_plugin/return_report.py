@@ -976,10 +976,13 @@ def _tdd_criteria(state_dir: Path, contract: Any, contract_sha: str) -> dict[str
         report = tdd.acceptance_report(contract, contract_sha, records)
     except Exception:  # noqa: BLE001 - missing/unreadable evidence means "no truth to apply"
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {}
     for ac_id, item in (report.get("criteria") or {}).items():
         if isinstance(item, Mapping):
-            out[str(ac_id)] = str(item.get("status") or "")
+            out[str(ac_id)] = {
+                "status": str(item.get("status") or ""),
+                "evidence": str(item.get("evidence") or ""),
+            }
     return out
 
 
@@ -1007,15 +1010,19 @@ def _acceptance(
             problem = ""
         tdd_truth = _tdd_criteria(state, contract, contract_sha)
         for criterion in _criteria_rows(task):
-            truth = tdd_truth.get(str(criterion["id"]))
-            if truth in ("passed", "failed", "not run", "blocked"):
-                status = {"passed": PASS, "failed": FAIL, "not run": NOT_RUN, "blocked": BLOCKED}[truth]
+            truth = tdd_truth.get(str(criterion["id"])) or {}
+            verdict = truth.get("status") if isinstance(truth, Mapping) else ""
+            if verdict in ("passed", "failed", "not run", "blocked"):
+                status = {"passed": PASS, "failed": FAIL, "not run": NOT_RUN, "blocked": BLOCKED}[verdict]
+                cited = truth.get("evidence") if isinstance(truth, Mapping) else ""
+                label = f"tdd evidence ({contract.get('id') if isinstance(contract, Mapping) else ''})"
                 rows.append({
                     "id": criterion["id"],
                     "statement": criterion["statement"],
                     "tests": list(criterion["tests"]),
                     "status": status,
-                    "evidence": [f"tdd evidence ({contract.get('id') if isinstance(contract, Mapping) else ''})"],
+                    # The record path is its own element: callers and tests match on membership.
+                    "evidence": [cited] if cited else [label],
                     "_unrun": "" if status != NOT_RUN else "tdd evidence reports not run",
                     "_limitation": "resolved from the tdd acceptance report (single source of truth)",
                 })
