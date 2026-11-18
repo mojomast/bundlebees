@@ -380,7 +380,80 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "name": "verify worktree integrity",
         "keywords": ("full checkout", "git-context hint", "GitContextGap"),
     },
- )
+    {
+        # fix/attempts-in-flight-live-only: a dispatched attempt past the
+        # 12-hour idle window is expired rather than in flight, and a verified
+        # result is no longer counted as live work (297 -> 6 on the real store).
+        "pr": 96,
+        "name": "live-only in-flight status",
+        "keywords": ("in-flight", "expired", "live work", "12-hour idle"),
+    },
+    {
+        # feat/attempts-job-id: every attempt row carries the dispatch job id
+        # from the brief (else the lease record) plus the repo those records
+        # name, so a row rendered as "Job unknown" traces back to its job.
+        "pr": 97,
+        "name": "dispatch job id on attempt rows",
+        "keywords": ("dispatch `job_id`", "Job unknown", "project label"),
+    },
+    {
+        # fix/verify-delivery-base: verify defines the lease source_rev as the
+        # base revision before writing the delivery intent; the old name
+        # reference raised NameError after the push and suppressed PR creation.
+        "pr": 99,
+        "name": "delivery intent base revision",
+        "keywords": ("base revision", "delivery intent", "NameError", "PR creation"),
+    },
+    {
+        # fix/verbose-attempt-results: one attempt result (and its detail) is
+        # read under MAX_RESULT_BYTES (24 MiB) instead of the 1 MiB client cap;
+        # ordinary responses and the response_too_large ceiling are unchanged.
+        "pr": 100,
+        "name": "verbose attempt results to 24 MiB",
+        "keywords": ("24 MiB", "`MAX_RESULT_BYTES`", "1 MiB", "`response_too_large`"),
+    },
+    {
+        # fix/secret-scan-archives: an oversize tar is parsed and only added
+        # member lines are scanned, with unsafe paths and parse failures still
+        # failing closed and a 64 MiB decompression bound.
+        "pr": 101,
+        "name": "tar-aware secret scan",
+        "keywords": (
+            "tar archives",
+            "added member lines",
+            "2 MB",
+            "decompression bound",
+            "fails closed",
+        ),
+    },
+    {
+        # fix/verify-refusal-diagnostics: a verify refusal writes its machine
+        # code and a scrubbed, path-reduced reason into the attempt record
+        # instead of ok:false with empty evidence.
+        "pr": 102,
+        "name": "verify refusal diagnostics",
+        "keywords": (
+            "machine code",
+            "scrubbed reason",
+            "verify-results/<attempt>.json",
+            "all-null evidence",
+        ),
+    },
+    {
+        # feat/verify-node-targets: .mjs/.cjs/.js targets run under node --test,
+        # pytest stays the default, mixed sets refuse, a missing Node refuses,
+        # and the runner argv is recorded.
+        "pr": 103,
+        "name": "Node test runner selection",
+        "keywords": (
+            "Node runner",
+            "`node --test`",
+            "mixed_test_targets",
+            "node_runner_unavailable",
+            "evidence.runner/test_argv",
+        ),
+    },
+)
 
 
 def _read_changelog() -> str:
