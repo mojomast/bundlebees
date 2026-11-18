@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import difflib
+import io
 import json
 import os
 import re
@@ -38,6 +40,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -1516,10 +1519,182 @@ def _mask_excerpt(line: str | None, limit: int = 240) -> str | None:
     return scrub(line)[:limit]
 
 
-def _secret_trips(workdir: Path, files: Iterable[str], patch: str | None = None) -> list[dict[str, Any]]:
+_TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+_GZIP_MAGIC = b"\x1f\x8b"
+#: Total uncompressed bytes one archive may yield during the scan. A worker
+#: archive is untrusted input; without a bound a small gzip can exhaust the
+#: coordinator's memory. Over the bound the scan fails closed with no evidence.
+_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+
+
+class _ArchiveParseError(Exception):
+    pass
+
+
+class _UnsafeArchiveMember(Exception):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+def _looks_like_archive(rel: str, data: bytes) -> bool:
+    """True for a tar path suffix or gzip magic (a gzip blob is treated as a
+    possible tar.gz; if it does not parse the scan fails closed)."""
+    return rel.lower().endswith(_TAR_SUFFIXES) or data[:2] == _GZIP_MAGIC
+
+
+def _unsafe_archive_member(name: str) -> bool:
+    if not name or name.startswith(("/", "\\")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", name):
+        return True
+    return ".." in re.split(r"[\\/]+", name)
+
+
+def _read_tar_members(data: bytes) -> dict[str, bytes]:
+    members: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+            total = 0
+            for member in archive.getmembers():
+                if _unsafe_archive_member(member.name):
+                    raise _UnsafeArchiveMember(member.name)
+                if not member.isfile():
+                    continue
+                total += member.size
+                if total > _MAX_ARCHIVE_BYTES:
+                    raise _ArchiveParseError("archive expands beyond the scan bound")
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                members[member.name] = handle.read()
+    except _UnsafeArchiveMember:
+        raise
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
+        raise _ArchiveParseError(str(exc)) from exc
+    return members
+
+
+def _added_member_lines(base_text: str, new_text: str) -> list[tuple[int, str]]:
+    """Lines added to one archive member, with their 1-based line numbers in the
+    new member (the same added-line principle as a unified diff)."""
+    base_lines = base_text.splitlines()
+    new_lines = new_text.splitlines()
+    matcher = difflib.SequenceMatcher(None, base_lines, new_lines, autojunk=False)
+    added: list[tuple[int, str]] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            added.extend((index + 1, new_lines[index]) for index in range(j1, j2))
+    return added
+
+
+def _archive_secret_trips(rel: str, base_bytes: bytes, new_bytes: bytes) -> list[dict[str, Any]]:
+    """Pure archive comparison: scan only member lines the new archive adds
+    relative to the base blob. An unparseable archive, an unsafe member path, or
+    a differing member larger than the scan cap fails closed with no evidence.
+    """
+    base_members: dict[str, bytes] = {}
+    if base_bytes:
+        try:
+            base_members = _read_tar_members(base_bytes)
+        except _UnsafeArchiveMember as exc:
+            return [{"file": rel, "member": exc.name, "line_no": None, "rule": None, "excerpt": None}]
+        except _ArchiveParseError:
+            return [{"file": rel, "line_no": None, "rule": None, "excerpt": None}]
+    try:
+        new_members = _read_tar_members(new_bytes)
+    except _UnsafeArchiveMember as exc:
+        return [{"file": rel, "member": exc.name, "line_no": None, "rule": None, "excerpt": None}]
+    except _ArchiveParseError:
+        return [{"file": rel, "line_no": None, "rule": None, "excerpt": None}]
+
+    trips: list[dict[str, Any]] = []
+    for name, content in new_members.items():
+        base_content = base_members.get(name)
+        if base_content == content:
+            continue
+        if len(content) > _MAX_SCAN_BYTES:
+            trips.append({"file": rel, "member": name, "line_no": None, "rule": None, "excerpt": None})
+            continue
+        base_text = base_content.decode("utf-8", errors="replace") if base_content is not None else ""
+        added = _added_member_lines(base_text, content.decode("utf-8", errors="replace"))
+        private = next(((no, line) for no, line in added if _PRIVATE_KEY_RE.search(line)), None)
+        if private is not None:
+            trips.append(
+                {
+                    "file": rel,
+                    "member": name,
+                    "line_no": private[0],
+                    "rule": "private_key",
+                    "excerpt": _mask_excerpt(private[1]),
+                }
+            )
+            continue
+        for line_no, line in added:
+            rule = first_secret_rule(line)
+            if rule:
+                trips.append(
+                    {
+                        "file": rel,
+                        "member": name,
+                        "line_no": line_no,
+                        "rule": rule,
+                        "excerpt": _mask_excerpt(line),
+                    }
+                )
+                break
+    return trips
+
+
+def _git_blob_bytes(workdir: Path, source_rev: str, rel: str) -> bytes | None:
+    """Read one base-revision blob as raw bytes for archive comparison. Returns
+    ``None`` when the revision cannot be resolved; an absent path is an empty
+    base (every member line is added). Used only by the real verify path."""
+    env = child_env({"GIT_TERMINAL_PROMPT": "0"})
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{source_rev}^{{commit}}"],
+            cwd=str(workdir),
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        if rev.returncode != 0:
+            return None
+        proc = subprocess.run(
+            ["git", "show", f"{source_rev}:{rel}"],
+            cwd=str(workdir),
+            env=dict(env),
+            capture_output=True,
+            text=False,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return b""
+    return proc.stdout
+
+
+def _secret_trips(
+    workdir: Path,
+    files: Iterable[str],
+    patch: str | None = None,
+    *,
+    source_rev: str | None = None,
+    base_blobs: Mapping[str, bytes] | None = None,
+) -> list[dict[str, Any]]:
     """Structured secret-scan trips: ``file``, 1-based ``line_no``, ``rule``
     id, masked ``excerpt``. Flags exactly the files :func:`_secret_scan` flags;
     evidence is enrichment on top of the same decision, never a separate one.
+
+    An oversize tar archive is compared member by member against the base blob
+    (``source_rev`` on the real verify path, or an explicit ``base_blobs`` in
+    tests) and only added member lines are scanned. Every other oversize file
+    still fails closed.
     """
     trips: list[dict[str, Any]] = []
     added = _added_lines_detail(patch) if patch else {}
@@ -1533,7 +1708,30 @@ def _secret_trips(workdir: Path, files: Iterable[str], patch: str | None = None)
             path = Path(contain_path(rel, str(workdir)))
             try:
                 if path.stat().st_size > _MAX_SCAN_BYTES:
-                    trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                    try:
+                        with path.open("rb") as handle:
+                            head = handle.read(2)
+                    except OSError:
+                        trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                        continue
+                    if _looks_like_archive(rel, head):
+                        try:
+                            new_bytes = path.read_bytes()
+                        except OSError:
+                            trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                            continue
+                        if base_blobs is not None:
+                            base_bytes: bytes | None = base_blobs.get(rel, b"")
+                        elif source_rev:
+                            base_bytes = _git_blob_bytes(workdir, source_rev, rel)
+                        else:
+                            base_bytes = b""
+                        if base_bytes is None:
+                            trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
+                        else:
+                            trips.extend(_archive_secret_trips(rel, base_bytes, new_bytes))
+                    else:
+                        trips.append({"file": rel, "line_no": None, "rule": None, "excerpt": None})
                     continue
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1569,13 +1767,20 @@ def _secret_refusal(flagged: list[str], trips: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for trip in trips:
         detail = trip["file"]
+        if trip.get("member"):
+            detail += f" member={trip['member']}"
         if trip["line_no"] is not None:
             detail += f" line={trip['line_no']}"
         if trip["rule"]:
             detail += f" rule={trip['rule']}"
         if trip["excerpt"] is not None:
             detail += f' excerpt="{trip["excerpt"]}"'
-        if trip["line_no"] is None and not trip["rule"] and trip["excerpt"] is None:
+        if (
+            trip["line_no"] is None
+            and not trip["rule"]
+            and trip["excerpt"] is None
+            and not trip.get("member")
+        ):
             detail += " (no line evidence: file exceeds the scan size limit)"
         parts.append(detail)
     return "secret scan found secret-like content in: " + ", ".join(flagged) + "; trips: " + "; ".join(parts)
@@ -2051,7 +2256,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         changed = _apply_patch(workdir, patch, files)
         files = changed
 
-        trips = _secret_trips(workdir, files, patch)
+        trips = _secret_trips(workdir, files, patch, source_rev=source_rev)
         flagged = sorted({trip["file"] for trip in trips})
         if flagged:
             _reset_patch(workdir)
