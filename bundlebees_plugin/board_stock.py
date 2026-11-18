@@ -9,9 +9,9 @@ two numbers and raises a signal when they disagree:
   items currently claimed).
 
 When ready work drops below the free slots it writes one durable record -- the
-Hive signal -- and, if a coordinator card is configured, one board comment per
-shortfall episode.  It creates, moves, approves, dispatches and merges nothing;
-the only board write it can make is that comment.
+Hive signal -- and, if a coordinator card is configured, a board comment
+whenever the low observation changes.  It creates, moves, approves, dispatches
+and merges nothing; the only board write it can make is that comment.
 
 Everything is behind ``BUNDLEBEES_BOARD_STOCK=1``.  With the flag off nothing
 in this module runs: no board read, no subprocess, no file.
@@ -302,7 +302,7 @@ def check(
 
 
 # ---------------------------------------------------------------------------
-# Durable signal and one comment per shortfall episode
+# Durable signal and a comment when the low observation changes
 # ---------------------------------------------------------------------------
 
 
@@ -377,7 +377,8 @@ def flag(
     now: Any = None,
     comment: Callable[[str, str], bool] | None = None,
 ) -> dict[str, Any]:
-    """Observe, write the durable Hive signal, and comment once per episode."""
+    """Observe, write the durable Hive signal, and comment when a low
+    observation changes."""
 
     record = check(
         state_dir,

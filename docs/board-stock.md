@@ -72,17 +72,19 @@ if it matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 
 ## The comment
 
-On a transition into `low`, and only then, the check posts one comment through
-`hermes kanban comment` on the card named by `BUNDLEBEES_BOARD_STOCK_CARD`:
+The check posts one comment when a low observation changes -- `ready_approved`,
+`free_slots`, `shortfall` or `board` -- through `hermes kanban comment` on the
+card named by `BUNDLEBEES_BOARD_STOCK_CARD`:
 
 ```text
 factory stock: 2 ready card(s), 5 free bee slot(s); short by 3.
 Observed only: the factory never creates, moves, approves or dispatches work.
 ```
 
-A continuing shortfall does not comment again; a recovery followed by a new
-shortfall comments once more. Without a configured card the signal is still
-written and `notified` is `false`. A failed comment does not lose the signal.
+Identical repeats do not comment again; a recovery followed by a new shortfall
+starts a new episode and comments again. Without a configured card the signal is
+still written and `notified` is `false`. A failed comment does not lose the
+signal.
 
 ## Fail closed
 
@@ -116,7 +118,8 @@ that case.
 ## Tests
 
 `tests/test_board_stock.py` covers: the exact-`1` flag, both off paths writing
-nothing, the low/stocked/saturated verdicts, the CLI read shape, one comment
-per episode, recovery then a new episode, a missing card, an unreadable board
-or cap writing nothing, the signal containing no paths/hosts/tokens, and the
-beat and service wiring failing soft.
+nothing, the low/stocked/saturated verdicts, the CLI read shape, a comment when
+a low observation changes (with identical repeats staying silent and a drifting
+shortfall commenting again), recovery then a new episode, a missing card, an
+unreadable board or cap writing nothing, the signal containing no
+paths/hosts/tokens, and the beat and service wiring failing soft.
