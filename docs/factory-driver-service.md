@@ -41,7 +41,7 @@ A scheduler item is dispatchable in service mode only with a record like:
 {
   "schema": "bundlebees.factory-dispatch-approval/1",
   "work_id": "ws_verify_att_123",
-  "approval_key": "ws_verify_att_123",
+  "approval_key": "<sanitized work_id>",
   "job_id": "job_a",
   "approved": true,
   "scope": ["src/**", "tests/**"],
@@ -49,6 +49,9 @@ A scheduler item is dispatchable in service mode only with a record like:
   "approved_at": "2026-11-18T12:00:00Z"
 }
 ```
+
+The approval key is the sanitized ``work_id`` that names the record file; it is
+a lookup name, never a secret, so an example may show it as a placeholder.
 
 Write it with:
 
