@@ -12,6 +12,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -381,6 +382,7 @@ def test_the_shipped_unit_file_has_strict_structural_sections():
     assert parser.get("Service", "Type") == "simple"
 
     execstart = parser.get("Service", "ExecStart")
+    assert execstart.startswith("%h/rizzstack/.venv/bin/python ")
     assert "bundlebees_plugin.factory_driver" in execstart
     assert "--service" in execstart
     assert "--state" in execstart
@@ -388,34 +390,63 @@ def test_the_shipped_unit_file_has_strict_structural_sections():
     assert parser.get("Install", "WantedBy") == "default.target"
 
 
-def _user_manager_reachable() -> bool:
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        return False
-    try:
-        probe = subprocess.run(
-            [systemctl, "--user", "is-system-running"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if probe.returncode != 0:
-        return False
-    combined = (probe.stdout or "") + (probe.stderr or "")
-    return "running" in combined or "degraded" in combined
+def _render_unit(tmp_path: Path, interpreter: str) -> Path:
+    """Copy the shipped unit into a sandbox home, keeping every shipped directive.
+
+    ``systemd-analyze verify`` refuses a unit whose ``ExecStart`` binary is
+    missing, and the shipped unit deliberately names the operator's venv
+    (``%h/rizzstack/.venv/bin/python``), which exists on the deployment host and
+    not on a CI runner.  The copy expands ``%h`` into ``tmp_path`` and rewrites
+    only that interpreter; the structural test above still asserts the shipped
+    file names the venv path, so this substitution cannot hide a change there.
+    """
+
+    home = tmp_path / "home"
+    (home / "rizzstack" / "bundlebees").mkdir(parents=True, exist_ok=True)
+    rendered = _unit_path().read_text(encoding="utf-8").replace("%h", str(home))
+    shipped_interpreter = f"{home}/rizzstack/.venv/bin/python"
+    assert shipped_interpreter in rendered, "the shipped unit does not name its interpreter as a %h-relative path"
+    rendered = rendered.replace(shipped_interpreter, interpreter)
+    path = tmp_path / "bundlebees-factory-driver.service"
+    path.write_text(rendered, encoding="utf-8")
+    return path
 
 
-def test_systemd_verify_is_conditional_on_a_reachable_user_manager():
-    systemd_analyze = shutil.which("systemd-analyze")
-    if not systemd_analyze or not _user_manager_reachable():
-        pytest.skip("no reachable systemd user manager in this sandbox")
+def _systemd_analyze() -> str:
+    found = shutil.which("systemd-analyze")
+    if not found:
+        pytest.skip("systemd-analyze is not available in this sandbox")
+    assert found
+    return found
+
+
+def test_systemd_verify_accepts_the_unit_with_an_interpreter_that_exists(tmp_path: Path):
+    systemd_analyze = _systemd_analyze()
+    unit = _render_unit(tmp_path, sys.executable)
 
     completed = subprocess.run(
-        [systemd_analyze, "--user", "verify", str(_unit_path())],
+        [systemd_analyze, "--user", "verify", str(unit)],
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_systemd_verify_still_flags_a_missing_interpreter(tmp_path: Path):
+    """Guard the portability rewrite: a missing ExecStart binary must still fail."""
+
+    systemd_analyze = _systemd_analyze()
+    unit = _render_unit(tmp_path, str(tmp_path / "no-such-python"))
+
+    completed = subprocess.run(
+        [systemd_analyze, "--user", "verify", str(unit)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0, (
+        "systemd-analyze no longer rejects a missing ExecStart binary; "
+        "the interpreter substitution would then hide real breakage"
+    )
+    assert "no-such-python" in (completed.stderr or "") + (completed.stdout or "")
