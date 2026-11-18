@@ -27,7 +27,11 @@ lease payload:
   paths (``./.bundlebees-payload/<name>``). The child's cwd is always the
   copy, so the relative path resolves inside every backend; the host checkout
   path never appears in the child env or in the wrapper argv, and on a masking
-  wrapper it does not even exist inside the jail.
+  wrapper it does not even exist inside the jail. Code that runs in the child
+  and calls back into dispatch (:func:`collect_payload`) is handed that same
+  relative form; :func:`resolve_source` resolves exactly that staged entry
+  under the child's own payload directory and keeps refusing every other
+  relative path.
 """
 
 from __future__ import annotations
@@ -67,6 +71,13 @@ def resolve_source(name: str, value: str) -> Path:
     The value must be an absolute path to an existing directory; anything else
     is a named refusal, because a payload the coordinator cannot serve must
     fail closed rather than leave the suite without its pinned sources.
+
+    The one exception is the served form a sandbox child is given:
+    ``./.bundlebees-payload/<name>`` (see :func:`sandbox.stage_payload`). It is
+    accepted only when it names this payload's staged entry and resolves under
+    the child's own payload directory, so code that runs inside the sandbox
+    can record a lease against the payload it was actually served while every
+    other relative path stays refused.
     """
     if not _NAME_RE.fullmatch(str(name)):
         raise PayloadError("payload_invalid_name", f"invalid payload name: {name!r}")
@@ -81,11 +92,7 @@ def resolve_source(name: str, value: str) -> Path:
         )
     path = Path(raw).expanduser()
     if not path.is_absolute():
-        raise PayloadError(
-            "payload_source_invalid",
-            f"{name} must be an absolute path, got {raw!r}",
-            _FIX_SOURCE,
-        )
+        return _resolve_served_payload_source(name, raw)
     try:
         resolved = path.resolve()
     except OSError as exc:
@@ -98,6 +105,50 @@ def resolve_source(name: str, value: str) -> Path:
         raise PayloadError(
             "payload_source_missing",
             f"{name} does not name an existing directory: {resolved}",
+            _FIX_SOURCE,
+        )
+    return resolved
+
+
+def _resolve_served_payload_source(name: str, raw: str) -> Path:
+    """Resolve the sandbox-served relative form to the staged entry it names.
+
+    The child env inside a sandbox names a staged payload relatively
+    (``./.bundlebees-payload/<name>``) because the jail's cwd is the disposable
+    copy and the copy's host path does not exist inside it. Accepting that one
+    shape lets a test running in the sandbox call the dispatch chokepoint with
+    the env it was given; nothing else loosens: the value must be exactly the
+    staged entry for *name*, and its resolved path must stay under this
+    process's own payload directory (no ``..``, no other name, no symlink out,
+    no bare relative path). Every other relative value keeps the named
+    absolute-path refusal.
+    """
+    if Path(raw).parts != (sandbox._SANDBOX_PAYLOAD_DIR, str(name)):
+        raise PayloadError(
+            "payload_source_invalid",
+            f"{name} must be an absolute path, got {raw!r}",
+            _FIX_SOURCE,
+        )
+    try:
+        root = Path.cwd().resolve()
+        resolved = (root / sandbox._SANDBOX_PAYLOAD_DIR / str(name)).resolve()
+    except OSError as exc:
+        raise PayloadError(
+            "payload_source_invalid",
+            f"{name} cannot be resolved against the sandbox copy: {exc}",
+            _FIX_SOURCE,
+        ) from exc
+    payload_root = root / sandbox._SANDBOX_PAYLOAD_DIR
+    if (
+        resolved.name != str(name)
+        or resolved.parent != payload_root
+        or not resolved.is_relative_to(root)
+        or not resolved.is_dir()
+    ):
+        raise PayloadError(
+            "payload_source_invalid",
+            f"{name} does not resolve to the staged payload "
+            f"({sandbox._SANDBOX_PAYLOAD_DIR}/{name}) of this sandbox copy",
             _FIX_SOURCE,
         )
     return resolved

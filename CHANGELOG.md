@@ -186,6 +186,16 @@ one pull request.
   never creates, moves, approves or dispatches work. See `docs/board-stock.md`.
 ### Fixed
 
+- **A sandboxed run can record the lease for the payload it was served.**
+  `dispatch.collect_payload` refused the served relative form
+  (`./.bundlebees-payload/WORKFLOW_SRC`) that the sandbox child env carries, so
+  a bee test that called `leases.record_lease` inside the verify sandbox died
+  with `payload_source_invalid` before its own assertions ran. The
+  absolute-path requirement is unchanged: the one accepted relative value is
+  exactly the staged entry for that payload name, and it must resolve under the
+  process's own `.bundlebees-payload/` directory — `..`, another name, a bare
+  relative path and a symlink out of the copy all keep the refusal. See
+  `docs/pinned-sources.md`.
 - **The landing-event composition no longer collides with the coordinator
   action queue.** The composed consumer (`consume_completions`) wrote its own
   `rizzstack.coordinator-action/1` items into `coordinator/actions` — the
