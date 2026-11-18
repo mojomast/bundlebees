@@ -632,7 +632,8 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
         attempt_id = str(record.get("attempt_id") or "")
         if not attempt_id:
             continue
-        brief = record.get("brief") if isinstance(record.get("brief"), Mapping) else {}
+        lease: Mapping[str, Any] = record if isinstance(record, Mapping) else {}
+        brief = lease.get("brief") if isinstance(lease.get("brief"), Mapping) else {}
         result = verify_local.read_record(state_dir, attempt_id) or {}
         evidence = result.get("evidence") if isinstance(result.get("evidence"), Mapping) else {}
         updated_at = _latest_stamp(
@@ -658,6 +659,12 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             "branch": _text_or_none(record.get("branch")),
             "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model")),
             "project": _text_or_none(brief.get("project")),
+            # Dispatch identity: the brief pins the job the work was dispatched
+            # for, and the fleet view cannot link an attempt to anything without
+            # it. ``repo`` is only what the brief or lease actually names - the
+            # project label is not a repo slug, so it is never substituted.
+            "job_id": _text_or_none(brief.get("job_id")) or _text_or_none(lease.get("job_id")),
+            "repo": _text_or_none(brief.get("repo")) or _text_or_none(lease.get("repo")),
             "created_at": str(record.get("created_at") or ""),
             "updated_at": updated_at,
         }

@@ -48,6 +48,8 @@ ROW_FIELDS = {
     "branch",
     "model",
     "project",
+    "job_id",
+    "repo",
     "created_at",
     "updated_at",
 }
@@ -80,6 +82,8 @@ def _lease(
     branch: str | None = None,
     project: str | None = None,
     model: str | None = None,
+    job_id: str | None = None,
+    repo: str | None = None,
 ) -> dict:
     brief = {
         "objective": f"work on {attempt_id}",
@@ -92,6 +96,10 @@ def _lease(
         brief["project"] = project
     if model is not None:
         brief["model"] = model
+    if job_id is not None:
+        brief["job_id"] = job_id
+    if repo is not None:
+        brief["repo"] = repo
     return leases.record_lease(state, attempt_id, validate_brief(brief), now=now)
 
 
@@ -357,6 +365,51 @@ def test_status_reports_a_configured_credential_without_its_value(tmp_path: Path
     assert health["launcher_url_configured"] is True
     assert health["credential_configured"] is True
     assert LOOKALIKE not in out
+
+
+# ---------------------------------------------------------------------------
+# Dispatch identity travels with the row
+# ---------------------------------------------------------------------------
+
+
+def test_attempt_row_carries_the_job_the_brief_was_dispatched_for(tmp_path: Path, capsys):
+    """The fleet view cannot say which job an attempt belongs to without this.
+
+    The lease brief pins the dispatch target, but the attempt row used to drop
+    it: the Hive ledger rendered "Job unknown" for every row, the investigation
+    panel could not link an attempt to its job, and Rails had no key to bind to.
+    """
+    state = tmp_path / "state"
+    _lease(state, "att-job", now=CREATED_A, job_id="rizzstack-m2-canary-2")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["job_id"] == "rizzstack-m2-canary-2"
+    # A brief that names no repo leaves it null: project is NOT a repo slug and
+    # substituting it would invent a repository that was never dispatched.
+    assert row["repo"] is None
+
+
+def test_attempt_row_without_a_job_stays_null(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-nojob", now=CREATED_A, project="proj-a")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["job_id"] is None
+    assert row["repo"] is None
+
+
+def test_attempt_row_carries_an_explicit_repo(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-repo", now=CREATED_A, job_id="job-x", repo="mojomast/bundlebees")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["repo"] == "mojomast/bundlebees"
 
 
 # ---------------------------------------------------------------------------
