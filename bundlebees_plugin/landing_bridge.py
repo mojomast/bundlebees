@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from . import bee_events
+from . import bee_events, event_consumer
 from .job import JobError, load_job
 from .leases import LeaseError, load_lease
 
@@ -829,10 +829,34 @@ def _ingest_event_batch(
             "Keep the source file; retry delivery before acknowledging it.",
         )
 
+    # The W6 completion producer: one durable inbox event per terminal
+    # (attempt, state), addressed to the coordinator action consumer. It must
+    # be published before the caller writes the source acknowledgement; a
+    # failure here raises and leaves the landing unacked for a retry.
+    completion_event_ids: list[str] = []
+    for event in events:
+        completion = event_consumer.completion_event(event)
+        if completion is None:
+            continue
+        try:
+            event_consumer.publish_event(
+                state_dir,
+                completion,
+                subscriber=event_consumer.DEFAULT_COMPLETION_SUBSCRIBER,
+            )
+        except Exception as exc:  # noqa: BLE001 - the source must stay unacked
+            raise BridgeError(
+                "completion_event_failed",
+                f"completion inbox write failed: {type(exc).__name__}",
+                "Keep the source file; retry once events/inbox is writable.",
+            ) from exc
+        completion_event_ids.append(str(completion["event_id"]))
+
     return {
         "identities": identities,
         "delivery": delivery,
         "created": created,
+        "completion_event_ids": completion_event_ids,
     }
 
 
@@ -877,6 +901,7 @@ def _process_file(
         "event_ids": stored["event_ids"],
         "delivery": stored["delivery"],
         "identities": batch["identities"],
+        "completion_event_ids": batch["completion_event_ids"],
     }
 
 

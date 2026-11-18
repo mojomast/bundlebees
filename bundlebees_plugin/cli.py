@@ -367,6 +367,57 @@ def _build_parser(parser: Any) -> Any:
     status_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     status_cmd.set_defaults(command="status")
 
+    factory_hook = subparsers.add_parser(
+        "factory-hook",
+        help="Run one factory pass only when a new completed attempt is seen.",
+    )
+    factory_hook.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    factory_hook.add_argument("--queue", default=None, help="Queue JSON file (default: <state>/queue.json).")
+    factory_hook.add_argument(
+        "--attempts-file",
+        default=None,
+        help="Read the scout's attempts document from this JSON file instead of the launcher.",
+    )
+    factory_hook.add_argument(
+        "--lock-wait",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for an overlapping scout hook (default: 0, coalesce immediately).",
+    )
+    factory_hook.add_argument("--launcher-outbox", default=None, help="Local landing outbox for a non-launcher tick.")
+    factory_hook.add_argument(
+        "--subscriber", action="append", dest="subscribers", default=[],
+        help="Event subscriber to drain (repeatable).",
+    )
+    factory_hook.add_argument("--tick", default=None, help="Worker tick as module:callable.")
+    factory_hook.add_argument("--launcher-url", default=None, help="Launcher base URL override.")
+    factory_hook.add_argument("--repo", default=None, help="Local repository for the real job tick.")
+    factory_hook.add_argument("--gitleaks", default=None, help="gitleaks binary for a real tick.")
+    factory_hook.add_argument(
+        "--suite-command", nargs=argparse.REMAINDER, default=None,
+        help="Integration suite command, last option (default: python -m pytest -q).",
+    )
+    factory_hook.add_argument("--provisioning", action="store_true", help="Bind the configured provisioning client.")
+    factory_hook.add_argument("--provisioning-host", default=None, help="Expected provisioning host policy label.")
+    factory_hook.add_argument("--campaign-id", default=None, help="Campaign checkpoint to reconcile on the pass.")
+    factory_hook.set_defaults(command="factory-hook")
+    board_sync_cmd = subparsers.add_parser(
+        "board-sync",
+        help="Reflect bee/PR lifecycle state onto the Hermes kanban board via the public CLI.",
+    )
+    board_sync_cmd.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Compare live cards against durable state and repair only the difference.",
+    )
+    board_sync_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print intended kanban commands and change nothing.",
+    )
+    board_sync_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    board_sync_cmd.set_defaults(command="board-sync")
+
     from . import rails_cli
     rails_cli.add_parsers(subparsers)
     ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
@@ -396,6 +447,34 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
     _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
            f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
     return 0 if not result["errors"] else 2
+
+
+def _cmd_board_sync(ctx: Any, args: Any) -> int:
+    """Reflect durable lifecycle events onto kanban through the public CLI."""
+    from . import board_sync as _board_sync
+
+    state_dir = _state_dir(ctx, args)
+    sync = _board_sync.BoardSync(
+        _board_sync.default_runner,
+        state_dir,
+        events=lambda: _board_sync.default_events(state_dir),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    summary = sync.reconcile() if getattr(args, "reconcile", False) else sync.apply()
+    if getattr(args, "dry_run", False):
+        for argv in summary.get("intended") or []:
+            _print("would run: " + " ".join(str(part) for part in argv))
+    _print(
+        "board-sync: "
+        f"cards={summary.get('cards', 0)} created={len(summary.get('created') or [])} "
+        f"updated={len(summary.get('updated') or [])} comments={len(summary.get('comments') or [])} "
+        f"skipped={len(summary.get('skipped') or [])} errors={len(summary.get('errors') or [])}"
+    )
+    for item in summary.get("errors") or []:
+        _print(f"error: {item.get('action')}: {item.get('error')}")
+    if summary.get("refused"):
+        return 2
+    return 0 if summary.get("ok") else 2
 
 
 def _cmd_owner(ctx: Any, args: Any) -> int:
@@ -519,6 +598,10 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_attempts(ctx, args)
         if command == "status":
             return _cmd_status(ctx, args)
+        if command == "factory-hook":
+            return _cmd_factory_hook(ctx, args)
+        if command == "board-sync":
+            return _cmd_board_sync(ctx, args)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
@@ -544,7 +627,7 @@ def _dispatch(ctx: Any, args: Any) -> int:
             "invalid_argument",
             "unknown bundlebees command",
             "Use one of: verify, integrate, lease, metrics, deploy, doctor, "
-            "contract, tdd, job, repo, campaign, attempts, status.",
+            "contract, tdd, job, repo, campaign, attempts, status, factory-hook.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -807,6 +890,131 @@ def _cmd_status(ctx: Any, args: Any) -> int:
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Interim scout -> factory-driver hook
+# ---------------------------------------------------------------------------
+
+
+def _factory_hook_attempts(ctx: Any, args: Any) -> Any:
+    """The scout's attempt view, or the launcher's, never a stale snapshot."""
+
+    from . import scout_hook
+
+    explicit = getattr(args, "attempts_file", None)
+    if explicit:
+        return scout_hook.load_attempts_file(explicit)
+    client = _client_for(ctx, args)
+    for name in ("attempts", "attempts_raw"):
+        method = getattr(client, name, None)
+        if callable(method):
+            return method()
+    raise CliError(
+        "unsupported_operation",
+        "the configured adapter cannot list attempts",
+        "Configure the launcher adapter or pass --attempts-file from the scout.",
+    )
+
+
+def _factory_hook_driver_pass(ctx: Any, args: Any, state_dir: Path) -> dict[str, Any]:
+    """Run exactly one normal factory-driver pass with the owner's settings."""
+
+    from . import factory_driver
+    from . import queue as queue_mod
+
+    config = _config(ctx)
+    launcher_url = str(
+        getattr(args, "launcher_url", None) or config.get("launcher_url") or ""
+    ).strip()
+    repo_arg = str(getattr(args, "repo", None) or config.get("worktree") or "").strip()
+    tick = factory_driver.load_tick(getattr(args, "tick", None))
+    client = None
+    if launcher_url:
+        client = _client_for(ctx, args)
+
+    if tick is None:
+        if repo_arg and not launcher_url:
+            raise CliError(
+                "not_configured",
+                "--repo requires a launcher URL for a dispatch-capable factory pass",
+                "Set the launcher URL in bundlebees settings, pass --launcher-url, or name a --tick.",
+            )
+        if launcher_url and repo_arg and client is not None:
+            from .execution import SandboxRunner, scanner
+
+            scanner_path = scanner(config, getattr(args, "gitleaks", None))
+            if not scanner_path:
+                raise CliError(
+                    "not_configured",
+                    "--gitleaks or GITLEAKS is required for a real factory tick",
+                    "Configure gitleaks_path, pass --gitleaks, or name a --tick.",
+                )
+            provisioner = None
+            if getattr(args, "provisioning", False):
+                from . import provisioning as provisioning_mod
+
+                provisioner = provisioning_mod.from_client(
+                    {
+                        "provisioning": {
+                            "enabled": True,
+                            "host": getattr(args, "provisioning_host", None) or None,
+                        }
+                    },
+                    client,
+                )
+            tick = factory_driver.make_job_tick(
+                state_dir,
+                client=client,
+                repo=Path(repo_arg),
+                gitleaks=scanner_path,
+                suite_command=getattr(args, "suite_command", None),
+                runner=SandboxRunner(config),
+                provisioner=provisioner,
+                expect_host=getattr(args, "provisioning_host", None),
+            )
+
+    if tick is None:
+        tick = factory_driver.mechanical_tick(state_dir)
+
+    queue_arg = getattr(args, "queue", None)
+    queue_path = Path(queue_arg) if queue_arg else state_dir / "queue.json"
+    driver_options: dict[str, Any] = {
+        "tick": tick,
+        # The worker-local outbox is only for a non-launcher pass; production
+        # landing comes from the authenticated export through the same client.
+        "launcher_outbox": getattr(args, "launcher_outbox", None) if client is None else None,
+        "subscribers": getattr(args, "subscribers", None) or None,
+    }
+    if client is not None:
+        driver_options["landing_client"] = client
+    driver = factory_driver.FactoryDriver(
+        state_dir,
+        queue_mod.JsonQueue(queue_path),
+        campaign_id=getattr(args, "campaign_id", None),
+        **driver_options,
+    )
+    return driver.run_pass()
+
+
+def _cmd_factory_hook(ctx: Any, args: Any) -> int:
+    """Trigger one pilot pass for a newly completed attempt; no-op otherwise."""
+
+    from . import scout_hook
+
+    try:
+        state_dir = _state_dir(ctx, args)
+        result = scout_hook.run_hook(
+            state_dir,
+            lambda: _factory_hook_attempts(ctx, args),
+            run_pass=lambda: _factory_hook_driver_pass(ctx, args, state_dir),
+            lock_wait_s=float(getattr(args, "lock_wait", 0.0) or 0.0),
+        )
+    except scout_hook.ScoutHookError as exc:
+        _print_error(CliError(exc.code, exc.error, exc.fix))
+        return scout_hook.EXIT_ERROR
+    print(json.dumps(result, sort_keys=True, default=str))
+    return scout_hook.EXIT_OK
 
 
 # ---------------------------------------------------------------------------
