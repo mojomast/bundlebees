@@ -112,6 +112,18 @@ class JsonQueue:
     indistinguishable from a features document, so that shape stays
     unsupported rather than guessed at.
 
+    Identity follows one id, one card. A features-list card resolves its id
+    from ``feature_id`` and then ``id``; two cards may not resolve to the same
+    non-blank id. In the features-as-map shape the map key is authoritative: a
+    card body may omit ``feature_id``/``id``, or restate the key (surrounding
+    whitespace is ignored), but a body id that names a different feature is
+    refused. Both violations are a ``queue_invalid`` :class:`QueueError` that
+    names the conflicting ids and carries a repair hint.
+
+    Read-time id syntax is not validated here: an id such as ``"feat/1"`` is
+    accepted by this reader and is only refused later by :class:`QueueStore`
+    (``feature_id_invalid``) when a claim is taken.
+
     Any other shape is a typed :class:`QueueError`, never an ``AttributeError``
     from calling ``.get`` on a list or a string.
     """
@@ -130,7 +142,17 @@ class JsonQueue:
             raise QueueError("queue_unreadable", f"{self.path} could not be read: {exc}", "Check the queue file permissions.") from exc
 
     @staticmethod
-    def _entries(data: Any) -> list[tuple[str, Mapping[str, Any]]]:
+    def _declared_body_ids(body: Mapping[str, Any]) -> list[str]:
+        """Non-blank ids a card body declares, ``feature_id`` before ``id``."""
+        declared = []
+        for field in ("feature_id", "id"):
+            value = body.get(field)
+            if isinstance(value, str) and value.strip():
+                declared.append(value.strip())
+        return declared
+
+    @classmethod
+    def _entries(cls, data: Any) -> list[tuple[str, Mapping[str, Any]]]:
         """``(feature_id, card)`` pairs for either supported document shape."""
 
         if not isinstance(data, Mapping):
@@ -159,6 +181,14 @@ class JsonQueue:
                             "a queue feature id is blank",
                             "Repair the queue file: every feature needs a feature_id or id.",
                         )
+                    for body_id in cls._declared_body_ids(body):
+                        if body_id != key:
+                            raise QueueError(
+                                "queue_invalid",
+                                f"queue feature {key!r} carries body id {body_id!r}",
+                                f"Repair the queue file: the {key!r} card must use {key!r} as its "
+                                f"feature_id/id, or move the {body_id!r} card under that key.",
+                            )
                     entries.append((key, body))
                 return entries
             if not isinstance(features, list):
@@ -167,6 +197,7 @@ class JsonQueue:
                     "the queue 'features' value is not a list or an object",
                     "Repair the queue file: features must be a JSON array or an object mapping feature ids to cards.",
                 )
+            seen: dict[str, int] = {}
             for index, body in enumerate(features):
                 if not isinstance(body, Mapping):
                     raise QueueError(
@@ -183,7 +214,17 @@ class JsonQueue:
                         f"queue feature at index {index} has no feature_id",
                         "Repair the queue file: every feature needs a feature_id or id.",
                     )
-                entries.append((feature_id.strip(), body))
+                key = feature_id.strip()
+                if key in seen:
+                    raise QueueError(
+                        "queue_invalid",
+                        f"queue feature {key!r} appears more than once "
+                        f"(indices {seen[key]} and {index})",
+                        f"Repair the queue file: remove or rename the duplicate {key!r} card "
+                        "so each feature id appears once.",
+                    )
+                seen[key] = index
+                entries.append((key, body))
             return entries
         entries = []
         for feature_id, body in data.items():
