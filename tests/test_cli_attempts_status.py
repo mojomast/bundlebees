@@ -15,6 +15,7 @@ end in the output assertions.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hashlib
 import json
 from pathlib import Path
@@ -23,10 +24,23 @@ from bundlebees_plugin import cli, grants, leases
 from bundlebees_plugin.brief import validate_brief
 from tests.fakes import FakeCtx, load_plugin, secret_scope
 
-CREATED_A = "2026-11-16T09:00:00Z"
-CREATED_B = "2026-11-16T10:00:00Z"
-VERIFIED_AT = "2026-11-16T11:00:00Z"
-ACCEPTED_AT = "2026-11-16T12:00:00Z"
+
+def _stamp(minutes_ago: int) -> str:
+    """An ISO-8601 Zulu stamp relative to the wall clock.
+
+    These fixtures used to be frozen literals. That silently aged: once the
+    literals fell outside ``cli.ATTEMPT_TTL_S`` the "dispatched" fixtures
+    became "expired" and the read-only views changed meaning. Relative stamps
+    keep the fixtures describing the situation they are named for.
+    """
+    moment = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=minutes_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+CREATED_A = _stamp(60)
+CREATED_B = _stamp(50)
+VERIFIED_AT = _stamp(40)
+ACCEPTED_AT = _stamp(30)
 
 ROW_FIELDS = {
     "attempt_id",
@@ -295,8 +309,11 @@ def test_status_counts_in_flight_work_and_the_bee_cap(tmp_path: Path, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert rc == 0
-    assert payload["in_flight"] == 2
-    assert sorted(payload["in_flight_attempts"]) == ["att-fresh", "att-verified"]
+    # Only the dispatched attempt is in flight. att-verified has a verify
+    # result: the bee finished and the result awaits acceptance, so it is not
+    # work in progress (104 such rows were being reported as active bees).
+    assert payload["in_flight"] == 1
+    assert payload["in_flight_attempts"] == ["att-fresh"]
     assert payload["bee_cap"] == grants.GLOBAL_MAX_BEES
 
 
@@ -340,6 +357,73 @@ def test_status_reports_a_configured_credential_without_its_value(tmp_path: Path
     assert health["launcher_url_configured"] is True
     assert health["credential_configured"] is True
     assert LOOKALIKE not in out
+
+
+# ---------------------------------------------------------------------------
+# A dispatch with no recorded outcome is not in flight forever
+# ---------------------------------------------------------------------------
+
+ANCIENT = "2020-01-01T00:00:00Z"
+
+
+def _now_stamp() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_attempt_without_an_outcome_past_the_ttl_is_expired_and_not_in_flight(
+    tmp_path: Path, capsys
+):
+    state = tmp_path / "state"
+    _lease(state, "att-old", now=ANCIENT, project="proj-a")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "expired"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 0
+    assert status["in_flight_attempts"] == []
+
+
+def test_attempt_dispatched_moments_ago_is_still_in_flight(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-now", now=_now_stamp(), project="proj-a")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att-now"]
+
+
+def test_a_recorded_outcome_is_never_expired_away(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-verified", now=ANCIENT, project="proj-a")
+    _verify_result(state, "att-verified", ok=True, at=ANCIENT)
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "verified"
+
+    # Its outcome is recorded, so it is not in flight and must not be expired.
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 0
+
+
+def test_a_failed_outcome_past_the_ttl_stays_failed(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-failed", now=ANCIENT, project="proj-a")
+    _verify_result(state, "att-failed", ok=False, at=ANCIENT)
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "failed"
 
 
 # ---------------------------------------------------------------------------

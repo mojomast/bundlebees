@@ -512,9 +512,36 @@ _ATTEMPT_DISPATCHED = "dispatched"
 _ATTEMPT_VERIFIED = "verified"
 _ATTEMPT_FAILED = "failed"
 _ATTEMPT_ACCEPTED = "accepted"
+#: Dispatched, no outcome ever recorded, and past the window in which an
+#: outcome could plausibly still arrive. This is not a success/failure claim:
+#: it says the store has no verified outcome for the attempt, so counting it
+#: as in-flight would report work that is not happening.
+_ATTEMPT_EXPIRED = "expired"
 
-#: Work has started but no final outcome is recorded yet.
-_IN_FLIGHT_STATES = frozenset({_ATTEMPT_DISPATCHED, _ATTEMPT_VERIFIED})
+#: How long a dispatched attempt with no recorded outcome still counts as
+#: in-flight. A lease is written at dispatch and is immutable; nothing closes
+#: it if the bee dies with its workspace, so without a window every abandoned
+#: dispatch would stay "in flight" forever and the fleet view would report
+#: hundreds of bees that do not exist.
+ATTEMPT_TTL_S = 12 * 60 * 60
+
+#: Work that is still in a bee's hands. ``verified`` is deliberately NOT here:
+#: a verify result means the bee already finished and the result is waiting for
+#: acceptance, so counting it inflates the fleet view with work that is over.
+#: (104 such rows sat in this store, all of them reported as active bees.)
+_IN_FLIGHT_STATES = frozenset({_ATTEMPT_DISPATCHED})
+
+
+def _age_s(stamp: Any, now: _dt.datetime) -> float | None:
+    """Seconds between an ISO-8601 Zulu stamp and ``now``; None if unparseable."""
+    text = str(stamp or "").strip()
+    if len(text) < 20:
+        return None
+    try:
+        parsed = _dt.datetime.strptime(text[:20], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return (now - parsed.replace(tzinfo=_dt.timezone.utc)).total_seconds()
 
 
 def _text_or_none(value: Any) -> str | None:
@@ -608,12 +635,21 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
         brief = record.get("brief") if isinstance(record.get("brief"), Mapping) else {}
         result = verify_local.read_record(state_dir, attempt_id) or {}
         evidence = result.get("evidence") if isinstance(result.get("evidence"), Mapping) else {}
+        updated_at = _latest_stamp(
+            record.get("created_at"), result.get("at"), accepted.get(attempt_id)
+        )
         if attempt_id in accepted:
             state = _ATTEMPT_ACCEPTED
         elif result.get("ok") is True:
             state = _ATTEMPT_VERIFIED
         elif result.get("ok") is False:
             state = _ATTEMPT_FAILED
+        elif (age := _age_s(updated_at, _dt.datetime.now(_dt.timezone.utc))) is not None and (
+            age > ATTEMPT_TTL_S
+        ):
+            # No outcome in the store and the dispatch is old: the workspace is
+            # long gone, so this is not in-flight work.
+            state = _ATTEMPT_EXPIRED
         else:
             state = _ATTEMPT_DISPATCHED
         row = {
@@ -623,9 +659,7 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model")),
             "project": _text_or_none(brief.get("project")),
             "created_at": str(record.get("created_at") or ""),
-            "updated_at": _latest_stamp(
-                record.get("created_at"), result.get("at"), accepted.get(attempt_id)
-            ),
+            "updated_at": updated_at,
         }
         clean = scrub(row)
         if (
