@@ -481,6 +481,44 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "stays scrubbed",
         ),
     },
+    {
+        # feat/research-before-retry-gate (M12 trigger + gate): a retry of a
+        # recorded failure is refused before any launcher call until accepted
+        # findings exist for that failure id; duplicate failures enqueue
+        # exactly one research item and env verdicts go to the decision queue.
+        "pr": 107,
+        "name": "research-before-retry gate",
+        "keywords": (
+            "Research-before-retry",
+            "research_gate.py",
+            "failure signature",
+            "require_findings",
+        ),
+    },
+    {
+        # feat/kanban-board-sync (M13): reflect bee/attempt and GitHub PR
+        # lifecycle events onto the Hermes kanban board through the public
+        # CLI, idempotent by PR link or attempt id, with a reconcile pass and
+        # a verified backup before the first mutation.
+        "pr": 108,
+        "name": "kanban board sync",
+        "keywords": (
+            "board-sync",
+            "board_sync.py",
+            "reconcile pass",
+            "verified backup",
+        ),
+    },
+    {
+        # docs/changelog-107-108: this companion itself - the coverage rows and
+        # Unreleased bullets for #107 and #108.
+        "pr": 113,
+        "name": "docs-sync companion for #107 and #108",
+        "keywords": (
+            "Docs-sync companion",
+            "#107 and #108",
+        ),
+    },
 )
 
 
