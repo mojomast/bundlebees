@@ -202,6 +202,16 @@ def _build_parser(parser: Any) -> Any:
         help="Plugin data directory for verify-results (defaults to Hermes plugin data).",
     )
     verify.set_defaults(command="verify")
+    reviewer = subparsers.add_parser("reviewer", help="Enrolled reviewer identities for signed REVIEW evidence.")
+    reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
+    rv_enroll = reviewer_sub.add_parser("enroll", help="Create (or adopt) a reviewer key and record the identity.")
+    rv_enroll.add_argument("--name", required=True, help="Stable reviewer name (also the record slug).")
+    rv_enroll.add_argument("--key-file", default=None, help="Key path (default: <state>/reviewers/<slug>.key, 0600).")
+    rv_enroll.add_argument("--state-dir", default=None)
+    rv_enroll.set_defaults(command="reviewer")
+    rv_list = reviewer_sub.add_parser("list", help="List enrolled reviewer identities (read-only).")
+    rv_list.add_argument("--state-dir", default=None)
+    rv_list.set_defaults(command="reviewer")
 
     owner = subparsers.add_parser("owner", help="Enrolled owner authority for board/feedback writes (E2/E5).")
     owner_sub = owner.add_subparsers(dest="owner_command", required=True)
@@ -353,11 +363,43 @@ def _cmd_owner(ctx: Any, args: Any) -> int:
     return 2
 
 
+def _cmd_reviewer(ctx: Any, args: Any) -> int:
+    """Enrolled reviewer identities (rizzstack.reviewer/1)."""
+    from . import reviewers as _reviewers
+    state_dir = Path(getattr(args, "state_dir", None) or _state_dir(ctx, args))
+    sub = getattr(args, "reviewer_command", None)
+    if sub == "enroll":
+        try:
+            record = _reviewers.enroll(state_dir, args.name, key_path=getattr(args, "key_file", None))
+        except _reviewers.ReviewerError as exc:
+            raise _as_cli_error(exc)
+        _print("bundlebees reviewer enroll")
+        _print(f"reviewer: {record['name']}")
+        _print(f"key_id: {record['key_id']}")
+        _print(f"key_file: {record['key_path']} (0600; the key never leaves this file)")
+        _print("use: hermes bundlebees tdd review <contract> --reviewer <name> --reviewer-key <key_file> --approve --note ...")
+        return 0
+    if sub == "list":
+        directory = state_dir / "reviewers"
+        rows = sorted(directory.glob("*.json")) if directory.exists() else []
+        if not rows:
+            _print("reviewer: none enrolled")
+            return 0
+        for path in rows:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            _print(f"{record.get('name')}  key_id={record.get('key_id')}  fingerprint={record.get('fingerprint')}")
+        return 0
+    _print("reviewer: unknown subcommand")
+    return 2
+
+
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
         if command == "owner":
             return _cmd_owner(ctx, args)
+        if command == "reviewer":
+            return _cmd_reviewer(ctx, args)
         if command == "verify":
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
