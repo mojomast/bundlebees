@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -87,7 +88,7 @@ def native_records(root, state, *, partial=True, merged=False):
     # Simulated external PR metadata; no web request and no real PR claimed.
     (state / 'coverage-pr.json').write_text(json.dumps(dict(number=3, url=f'https://github.com/{identity}/pull/3',
         headRefOid=head, baseRefName='main', state='MERGED' if merged else 'OPEN', isDraft=not merged,
-        mergedAt='2026-11-01T00:00:00Z' if merged else None)))
+        mergedAt='2000-01-01T00:00:00Z' if merged else None)))
     return dict(head=head, candidate_state='merged' if merged else 'draft', pr=3)
 
 
@@ -136,6 +137,74 @@ def test_full_classification_requires_posture_and_verifier(tmp_path, roots, merg
     assert doc['coverage']['covered'] == doc['coverage']['total'] == 2
     (state / 'verify-results/privateAttempt.json').unlink()
     assert stage(state, pub, **pins)['coverage']['state'] == 'UNKNOWN'
+
+
+def test_merge_must_have_happened_by_the_single_observation_time(tmp_path, roots, monkeypatch):
+    state, pub = roots
+    pins = native_records(tmp_path, state, partial=False, merged=True)
+    capture = state / 'coverage-pr.json'
+    receipt = json.loads(capture.read_bytes())
+    cutoff = '2099-01-01T00:00:00Z'
+    reads = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz):
+            reads.append(tz)
+            return datetime.fromisoformat(cutoff)
+
+    monkeypatch.setattr(hive_docket, 'datetime', Clock)
+    capture.write_text(json.dumps(dict(receipt, mergedAt=cutoff)))
+    docket = stage(state, pub, **pins)
+    assert docket['observedAt'] == cutoff and docket['coverage']['state'] == 'LANDED'
+    assert reads == [timezone.utc]
+
+    old = manifest(pub)
+    capture.write_text(json.dumps(dict(receipt, mergedAt='2099-01-01T00:00:01Z')))
+    with pytest.raises(hive_docket.DocketError):
+        stage(state, pub, **pins)
+    assert reads == [timezone.utc, timezone.utc] and manifest(pub) == old
+
+
+@pytest.mark.parametrize('field', ['claimed_at', 'updated_at'])
+def test_future_queue_observation_does_not_replace_publication(roots, field):
+    state, pub = roots
+    stage(state, pub)
+    old = manifest(pub)
+    p = state / 'queue/F1.json'
+    p.write_text(json.dumps(dict(json.loads(p.read_bytes()), **{field: '9999-01-01T00:00:00Z'})))
+    with pytest.raises(hive_docket.DocketError):
+        stage(state, pub)
+    assert manifest(pub) == old
+
+
+def test_future_native_records_do_not_qualify_observation(tmp_path, roots):
+    state, pub = roots
+    pins = native_records(tmp_path, state)
+    stage(state, pub, **pins)
+    old = manifest(pub)
+    future = '9999-01-01T00:00:00Z'
+    for name in ('coordinator/work.json', 'verify-results/privateAttempt.json'):
+        path = state / name
+        raw = path.read_bytes()
+        record = json.loads(raw)
+        if name == 'coordinator/work.json':
+            next(item for item in record['items'] if item['status'] == 'claimed')['updated_at'] = future
+        else:
+            record['at'] = future
+        path.write_text(json.dumps(record))
+        with pytest.raises(hive_docket.DocketError):
+            stage(state, pub, **pins)
+        assert manifest(pub) == old
+        path.write_bytes(raw)
+
+    lease = state / 'leases/privateAttempt.json'
+    brief = json.loads(lease.read_bytes())['brief']
+    lease.unlink()
+    leases.record_lease(state, 'privateAttempt', brief, now=future)
+    with pytest.raises(hive_docket.DocketError):
+        stage(state, pub, **pins)
+    assert manifest(pub) == old
 
 
 def test_bounds_selection_symlinks_and_private_dir(roots, tmp_path):
