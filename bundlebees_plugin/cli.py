@@ -418,6 +418,29 @@ def _build_parser(parser: Any) -> Any:
     board_sync_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     board_sync_cmd.set_defaults(command="board-sync")
 
+    board_dispatch_cmd = subparsers.add_parser(
+        "board-dispatch",
+        help="Stock the factory queue with ready cards that carry a recorded approval.",
+    )
+    board_dispatch_cmd.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one stock pass (the only supported mode).",
+    )
+    board_dispatch_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the intended writes and change nothing.",
+    )
+    board_dispatch_cmd.add_argument(
+        "--board", default=None, help="Board slug (default: the default board)."
+    )
+    board_dispatch_cmd.add_argument(
+        "--json", action="store_true", help="Print the full report as JSON."
+    )
+    board_dispatch_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    board_dispatch_cmd.set_defaults(command="board-dispatch")
+
     from . import rails_cli
     rails_cli.add_parsers(subparsers)
     ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
@@ -447,6 +470,38 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
     _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
            f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
     return 0 if not result["errors"] else 2
+
+
+def _cmd_board_dispatch(ctx: Any, args: Any) -> int:
+    """Stock the factory queue from the board's ready column (approved cards only)."""
+    from . import board_dispatch as _board_dispatch
+
+    state_dir = _state_dir(ctx, args)
+    board = str(getattr(args, "board", None) or _board_dispatch.board_from_environment()).strip()
+    try:
+        report = _board_dispatch.stock(
+            state_dir,
+            board=board,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except _board_dispatch.BoardDispatchError as exc:
+        raise _as_cli_error(exc) from exc
+    if getattr(args, "json", False):
+        _print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        _print(
+            "board-dispatch: "
+            f"checked={report.get('checked', 0)} "
+            f"stocked={len(report.get('stocked') or [])} "
+            f"unchanged={len(report.get('unchanged') or [])} "
+            f"skipped={len(report.get('skipped') or [])}"
+        )
+        for item in report.get("skipped") or []:
+            detail = f" ({item['detail']})" if item.get("detail") else ""
+            _print(f"skipped {item.get('task_id')}: {item.get('reason')}{detail}")
+        for path in report.get("intended") or []:
+            _print(f"would write: {path}")
+    return 0 if report.get("ok") else 2
 
 
 def _cmd_board_sync(ctx: Any, args: Any) -> int:
@@ -602,6 +657,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_factory_hook(ctx, args)
         if command == "board-sync":
             return _cmd_board_sync(ctx, args)
+        if command == "board-dispatch":
+            return _cmd_board_dispatch(ctx, args)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
