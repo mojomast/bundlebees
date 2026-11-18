@@ -62,8 +62,10 @@ attempt age that made it visible.
 each `FactoryService` pass: it compares the number of cards the board reports
 in `ready` with the free bee slots (shared cap minus claimed work items) and
 raises a signal when ready work is short. It never creates, moves, approves or
-dispatches a card; the only board write it can make is one comment per
-shortfall episode. Default off: unset, no board read, no subprocess, no file.
+dispatches a card; the only board write it can make is one comment when a low
+observation changes, identical repeats are silent, and a recovery followed by a
+new shortfall comments again. Default off: unset, no board read, no subprocess,
+no file.
 See `docs/board-stock.md`.
 
 ## Pre-approval record
