@@ -45,9 +45,10 @@ EXCLUDED_PRS: dict[int, str] = {
 
 #: The merge numbers verified against main's first-parent history
 #: (b0cfecd #43, c6fa4a7 #44, 0416fac #47, 1e6adf8 #48, 4be4e7b #45,
-#: 3eef3b5 #49) for checkouts whose log carries no merge commits. Only a
-#: fallback: real history always wins.
-SNAPSHOT_MERGED_PRS: tuple[int, ...] = (43, 44, 45, 47, 48, 49)
+#: 3eef3b5 #49) plus the B18 docs-sync companion #104 and the verify-output
+#: literal redaction #110 (merged at 2c14cc5) for checkouts whose log carries
+#: no merge commits. Only a fallback: real history always wins.
+SNAPSHOT_MERGED_PRS: tuple[int, ...] = (43, 44, 45, 47, 48, 49, 104, 110)
 
 MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+) from ", re.MULTILINE)
 
@@ -451,6 +452,33 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "mixed_test_targets",
             "node_runner_unavailable",
             "evidence.runner/test_argv",
+        ),
+    },
+    {
+        # B18 docs-sync companion: registers the coverage guard itself. A
+        # full-history run fails when a merged campaign PR since #43 has no
+        # registry row (or a row's keywords are absent from the changelog).
+        "pr": 104,
+        "name": "changelog coverage guard",
+        "keywords": (
+            "Changelog coverage guard",
+            "full-history run",
+            "merged campaign PR since #43",
+            "no registry row",
+        ),
+    },
+    {
+        # Verify-output literal redaction: verify output and durable verify
+        # records print the CLI's own validated branch, the verify-result path
+        # and the commit sha literally instead of [redacted]; untrusted text
+        # stays scrubbed.
+        "pr": 110,
+        "name": "verify output literal redaction",
+        "keywords": (
+            "validated branch",
+            "verify-result path",
+            "commit sha",
+            "stays scrubbed",
         ),
     },
 )
