@@ -1623,6 +1623,9 @@ def _normalize_task(task: Mapping[str, Any], *, for_create: bool = False) -> dic
     body = {
         "task_id": task_id,
         "objective": str(task.get("objective") or ""),
+        # The task's own project (a launcher-registered local-path project) — the dispatch path
+        # uses it when no provisioning binding exists (see reconcile._brief_for).
+        "project": str(task.get("project") or ""),
         "lease": lease,
         "depends_on": [str(dep) for dep in depends_on],
         "contract_path": task.get("contract_path"),
