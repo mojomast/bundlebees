@@ -151,6 +151,15 @@ config_schema:
       UNSAFE. Permit verify_isolation=unshare, which isolates network and
       PIDs but leaves the coordinator's filesystem readable. Never picked
       by auto. Env BUNDLEBEES_ALLOW_WEAK_UNSHARE=1 does the same.
+  attribution_canary_projects:
+    type: list
+    default: []
+    description: >-
+      Projects where pre-dispatch worker attribution (rizzstack.dispatch-attribution/1)
+      is ENFORCED: the endpoint, worker/ledger chain, job, project, contract and revision
+      are recorded and signed BEFORE the POST, the returned attempt is bound to that intent,
+      and dispatch refuses adopted attempts, ambiguous routes and mismatched routes.
+      Empty by default (owner decision 2026-11-17: canary projects only at first).
   require_contract:
     type: bool
     default: false
