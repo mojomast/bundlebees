@@ -1179,6 +1179,9 @@ def inbox_summary(state_dir: Path, subscriber: str | None = None) -> dict[str, A
 ACTION_SCHEMA = "rizzstack.coordinator-action/1"
 ACTION_SUMMARY_SCHEMA = "rizzstack.coordinator-action-summary/1"
 COMPLETION_SCHEMA = "rizzstack.completion-ledger/1"
+COMPLETION_EVENT_SCHEMA = "rizzstack.bee-completion/1"
+COMPLETION_EVENT_TYPE = "rizzstack.bee.completed.v1"
+COMPLETION_EVENT_ID_PREFIX = "urn:rizzstack:bee-completion:"
 SKIPS_SCHEMA = "rizzstack.completion-skips/1"
 
 #: The directory of the composition's bundled item store, under the
@@ -1435,6 +1438,104 @@ def classify_completion(event: Mapping[str, Any]) -> dict[str, Any]:
             else event.get("assigned_files")
         ),
     }
+
+
+def completion_event_id(attempt_id: str, state: str) -> str:
+    """The deterministic inbox id for one ``(attempt_id, terminal state)``.
+
+    The landing's own CloudEvents id also covers the transition, so the same
+    attempt and state can arrive with different canonical ids. A completion is
+    keyed only by the pair the ledger uses::
+
+        urn:rizzstack:bee-completion:<first 32 hex of sha256(attempt\\0state)>
+
+    ``publish_event`` is create-only, so this id turns a replay of the same
+    terminal fact into a no-op instead of a second inbox event.
+    """
+
+    attempt = _safe_attempt(attempt_id)
+    if attempt is None:
+        raise ActionQueueError(
+            "action_attempt_invalid",
+            f"attempt id {attempt_id!r} is not a safe identifier",
+        )
+    state_name = _safe_attempt(state)
+    if state_name is None:
+        raise ActionQueueError("state_invalid", f"state {state!r} is not a safe identifier")
+    if state_name not in TERMINAL_COMPLETION_STATES:
+        raise ActionQueueError(
+            "state_not_terminal",
+            f"state {state_name!r} is not a terminal completion state",
+        )
+    seed = f"{attempt}\x00{state_name}".encode("utf-8")
+    return COMPLETION_EVENT_ID_PREFIX + hashlib.sha256(seed).hexdigest()[:32]
+
+
+def completion_event(source: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project one accepted landing into a durable completion event.
+
+    Returns ``None`` for a non-terminal or malformed landing. The projection
+    carries only the facts the completion consumer already copies — never the
+    whole landing — so coordinator/backend metadata and any free-form worker
+    text stay out of the inbox record. The event is addressed to
+    :data:`DEFAULT_COMPLETION_SUBSCRIBER` and its id depends only on the
+    ``(attempt_id, state)`` pair.
+    """
+
+    classified = classify_completion(source)
+    if not classified.get("completion"):
+        return None
+    attempt = str(classified["attempt_id"])
+    state_name = str(classified["state"])
+    event: dict[str, Any] = {
+        "schema": COMPLETION_EVENT_SCHEMA,
+        "event_id": completion_event_id(attempt, state_name),
+        "type": COMPLETION_EVENT_TYPE,
+        "attempt_id": attempt,
+        "state": state_name,
+        "subscriber": DEFAULT_COMPLETION_SUBSCRIBER,
+    }
+    for name in ("job_id", "task_id", "source_rev"):
+        value = str(classified.get(name) or "")
+        if value:
+            event[name] = value
+    landing_event_id = str(classified.get("event_id") or "")
+    if landing_event_id:
+        event["landing_event_id"] = landing_event_id
+    result: dict[str, Any] = {}
+    available = classified.get("result_available")
+    if available is not None:
+        result["available"] = bool(available)
+    reference = str(classified.get("result_reference") or "")
+    if reference:
+        result["reference"] = reference
+    if result:
+        event["result"] = result
+    lease_files = list(classified.get("lease_files") or ())
+    if lease_files:
+        event["lease"] = {"assigned_files": lease_files}
+    return event
+
+
+def publish_completion_event(
+    state_dir: Path,
+    source: Mapping[str, Any],
+    *,
+    subscriber: str = DEFAULT_COMPLETION_SUBSCRIBER,
+    now: Any = None,
+) -> dict[str, Any] | None:
+    """Publish one landing's completion event, or ``None`` when not terminal.
+
+    Create-only through :func:`publish_event`: the deterministic event id makes
+    a replay return the stored record without overwriting it. A write failure
+    raises (:class:`EventConsumerError` or ``OSError``) so the caller keeps the
+    landing unacknowledged and retries.
+    """
+
+    event = completion_event(source)
+    if event is None:
+        return None
+    return publish_event(state_dir, event, subscriber=subscriber, now=now)
 
 
 def enqueue_action(
@@ -2172,6 +2273,9 @@ __all__ = [
     "ACTION_STATUSES",
     "ACTION_SUMMARY_SCHEMA",
     "COMPLETION_ACTIONS_DIR",
+    "COMPLETION_EVENT_ID_PREFIX",
+    "COMPLETION_EVENT_SCHEMA",
+    "COMPLETION_EVENT_TYPE",
     "COMPLETION_MAX_ATTEMPTS",
     "COMPLETION_SCHEMA",
     "DEFAULT_ACTION_CONSUMER",
@@ -2199,6 +2303,8 @@ __all__ = [
     "coordinator_actions_enqueue",
     "complete_action",
     "completion_actions_dir",
+    "completion_event",
+    "completion_event_id",
     "completion_path",
     "completion_record",
     "completions_dir",
@@ -2211,6 +2317,7 @@ __all__ = [
     "inbox_dir",
     "inbox_path",
     "inbox_summary",
+    "publish_completion_event",
     "publish_event",
     "record_completion",
     "replay_acked",
