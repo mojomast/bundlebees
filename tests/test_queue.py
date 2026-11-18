@@ -45,6 +45,82 @@ class QueueTests(unittest.TestCase):
         result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
         self.assertEqual(result["action"], "idle")
 
+    # -- live queue document shape ------------------------------------------
+    #
+    # The deployed queue file is a docket envelope:
+    # {"schema": "bundlebees.queue/1", "generated_at": ..., "features": [...],
+    #  "note": ...}. The legacy flat map (feature_id -> card) is still accepted
+    # for fixtures and older states.
+
+    def _write_live_envelope(self, features):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "2026-11-18T04:27:23Z",
+                    "features": features,
+                    "note": "live-shaped queue",
+                }
+            )
+        )
+
+    def test_an_empty_live_envelope_is_an_empty_queue_not_an_attribute_error(self):
+        self._write_live_envelope([])
+
+        self.assertEqual(Q.JsonQueue(self.path).list_items(), [])
+
+    def test_list_items_reads_the_features_list_of_the_live_envelope(self):
+        self._write_live_envelope(
+            [
+                {
+                    "feature_id": "f1",
+                    "repo": "mojomast/bundlebees",
+                    "job_id": "job_1",
+                    "status": "queued",
+                    "depends_on": [],
+                }
+            ]
+        )
+
+        items = Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual([item.feature_id for item in items], ["f1"])
+        self.assertEqual(items[0].repo, "mojomast/bundlebees")
+        self.assertEqual(items[0].job_id, "job_1")
+        self.assertEqual(items[0].status, "queued")
+
+    def test_set_status_updates_the_feature_and_preserves_the_live_envelope(self):
+        self._write_live_envelope(
+            [
+                {
+                    "feature_id": "f1",
+                    "repo": "mojomast/bundlebees",
+                    "job_id": "job_1",
+                    "status": "queued",
+                    "depends_on": [],
+                }
+            ]
+        )
+        queue = Q.JsonQueue(self.path)
+
+        queue.set_status("f1", "running", {"job_id": "job_1"})
+
+        body = json.loads(self.path.read_text())
+        self.assertEqual(body["schema"], "bundlebees.queue/1")
+        self.assertEqual(body["note"], "live-shaped queue")
+        self.assertNotIn("f1", body, "a document-shaped queue must not be rewritten as a flat map")
+        self.assertEqual(body["features"][0]["status"], "running")
+        self.assertEqual(body["features"][0]["evidence"], {"job_id": "job_1"})
+        self.assertEqual(queue.get("f1").status, "running")
+
+    def test_an_unknown_queue_shape_is_a_typed_error_not_an_attribute_error(self):
+        self.path.write_text(json.dumps([{"feature_id": "f1", "job_id": "job_1"}]))
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+
     def test_run_once_claims_and_calls_the_production_tick(self):
         called = []
         patcher = mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id})

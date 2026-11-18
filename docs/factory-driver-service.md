@@ -101,20 +101,44 @@ factory_driver.record_dispatch_approval(
 
 The driver never infers consent from a missing, malformed or false record.
 
+## Required environment
+
+The unit reads every value from `~/.config/bundlebees/factory-driver.env`
+(mode 0600) through variable names only; no value belongs in the unit file.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `BUNDLEBEES_LAUNCHER_URL` | yes for a real tick | Launcher base URL. Without it the driver only runs the mechanical observation tick. |
+| `BUNDLEBEES_LAUNCHER_TOKEN` | yes when the URL is set | Bearer token the launcher accepts. Never put this value in the unit or a log. |
+| `BUNDLEBEES_REPO` | yes for a real tick | Local repository checkout the job tick operates on. |
+| `BUNDLEBEES_GITLEAKS` | yes for a real tick | gitleaks executable; a pass refuses before claiming anything without it. |
+| `WORKFLOW_SRC` | **yes** | Checkout of `workflow` containing `tools/feature_packet.py`, `tools/recovery.py`, `tools/return_manifest.py` and the schemas. Landing validation, packet admission and recovery fail closed (for example `workflow_schema_unavailable`) when it is unset or unreadable. Point it at the pinned revision CI uses. |
+| `HERMES_API_URL`, `HERMES_API_KEY` | no | Wake endpoint and bearer key; without them a judgment is recorded durably but no gateway wake is delivered. |
+
+The unit starts with `--require-dispatch-config`: if the launcher URL, repo or
+gitleaks value is unset it exits nonzero with the missing names instead of
+silently degrading to observation-only. The `EnvironmentFile` directive has no
+`-` prefix, so a missing file is also a startup failure.
+
 ## Running from the CLI
 
 ```bash
 python -m bundlebees_plugin.factory_driver \
   --state "$BUNDLEBEES_STATE" \
   --queue "$BUNDLEBEES_QUEUE" \
+  --launcher-url "$BUNDLEBEES_LAUNCHER_URL" \
+  --repo "$BUNDLEBEES_REPO" \
+  --gitleaks "$BUNDLEBEES_GITLEAKS" \
+  --require-dispatch-config \
   --service \
   --service-interval 30
 ```
 
 `--service-interval` is the upper bound between idle passes. Landing events
-wake the loop immediately; the interval is not a fixed sleep. Set the same
-launcher, repo and gitleaks options as the ordinary driver when a real tick is
-wanted.
+wake the loop immediately; the interval is not a fixed sleep. Without a
+launcher URL, repo and gitleaks the driver can only run the mechanical
+observation tick; `--require-dispatch-config` makes that a startup error
+instead of a silent degradation.
 
 ## Unit file (not installed)
 
@@ -131,8 +155,10 @@ These are the manual steps; **this repository does not perform them**:
 mkdir -p ~/.config/systemd/user
 cp contrib/systemd/bundlebees-factory-driver.service ~/.config/systemd/user/
 
-# 2. Provide the non-secret configuration and, in a 0600 file, the launcher
-#    token/URL and any Hermes wake endpoint/key.
+# 2. Provide the values in a 0600 file (the unit references names only):
+#    BUNDLEBEES_LAUNCHER_URL, BUNDLEBEES_LAUNCHER_TOKEN, BUNDLEBEES_REPO,
+#    BUNDLEBEES_GITLEAKS, WORKFLOW_SRC, and optionally HERMES_API_URL and
+#    HERMES_API_KEY.
 install -m 0600 /dev/null ~/.config/bundlebees/factory-driver.env
 
 # 3. Only after reviewing the unit and environment:

@@ -308,7 +308,7 @@ The runtime runs a fixed protocol revision, not whatever is on a branch tip:
 
 | Variable | Meaning |
 |---|---|
-| `WORKFLOW_SRC` | checkout of `workflow` containing `tools/feature_packet.py`, `tools/recovery.py`, `tools/return_manifest.py` and the schemas |
+| `WORKFLOW_SRC` (required) | checkout of `workflow` containing `tools/feature_packet.py`, `tools/recovery.py`, `tools/return_manifest.py` and the schemas; landing validation, packet admission and recovery refuse with `workflow_schema_unavailable` when it is unset |
 | `REQUIRE_WORKFLOW=1` | a missing or unreadable checkout is a test/operation failure, not a skip |
 | `HYVV_SRC` | checkout of `hyvv` containing the provisioning contract; `REQUIRE_HYVV=1` makes it mandatory |
 
