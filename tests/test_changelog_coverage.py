@@ -48,7 +48,9 @@ EXCLUDED_PRS: dict[int, str] = {
 #: 3eef3b5 #49) plus the B18 docs-sync companion #104 and the verify-output
 #: literal redaction #110 (merged at 2c14cc5) for checkouts whose log carries
 #: no merge commits. Only a fallback: real history always wins.
-SNAPSHOT_MERGED_PRS: tuple[int, ...] = (43, 44, 45, 47, 48, 49, 104, 110)
+SNAPSHOT_MERGED_PRS: tuple[int, ...] = (
+    43, 44, 45, 47, 48, 49, 104, 105, 106, 109, 110, 111
+)
 
 MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+) from ", re.MULTILINE)
 
@@ -517,6 +519,63 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "keywords": (
             "Docs-sync companion",
             "#107 and #108",
+        ),
+    },
+    {
+        # Interim scout hook (docs/scout-hook.md, tests/test_scout_hook.py):
+        # repo-only factory-hook bridge from the 2-minute scout to at most one
+        # driver pass per newly observed terminal attempt, a durable watermark,
+        # flock coalescing, and the heartbeat as the untouched backstop.
+        "pr": 105,
+        "name": "interim factory-hook scout bridge",
+        "keywords": (
+            "bundlebees factory-hook",
+            "durable watermark",
+            "flock",
+            "owner action",
+        ),
+    },
+    {
+        # Durable completion emission from the landing bridge
+        # (docs/event-consumer.md, tests/test_completion_event_emit.py):
+        # create-only completion event per terminal (attempt, state) written to
+        # the coordinator inbox before the source ack, at-least-once with one
+        # bounded retry.
+        "pr": 106,
+        "name": "durable completion event emission",
+        "keywords": (
+            "landing bridge",
+            "coordinator inbox",
+            "at-least-once",
+            "one bounded retry",
+        ),
+    },
+    {
+        # Resident factory driver service mode
+        # (docs/factory-driver-service.md, tests/test_factory_service_mode.py):
+        # inbox wake, durable dispatch pre-approval, scope/cap/planning limits,
+        # fail closed with one coalesced wake, systemd unit is template-only.
+        "pr": 109,
+        "name": "factory driver service mode",
+        "keywords": (
+            "factory-driver service mode",
+            "durable dispatch pre-approval",
+            "shared bee cap",
+            "fails closed",
+        ),
+    },
+    {
+        # Ready-column stocking flag plus heartbeat-as-reconcile docs
+        # (docs/board-stock.md, tests/test_board_stock.py): opt-in flag,
+        # saturated/low/stocked verdict, one durable Hive signal and one board
+        # comment per shortfall episode, no read/subprocess/file when unset.
+        "pr": 111,
+        "name": "board-stock flag and heartbeat reconcile docs",
+        "keywords": (
+            "board-stock",
+            "saturated",
+            "Hive signal",
+            "no board read",
         ),
     },
 )
