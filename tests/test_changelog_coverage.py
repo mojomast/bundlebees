@@ -519,6 +519,19 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "#107 and #108",
         ),
     },
+    {
+        # fix/factory-dispatch-wiring: the live docket envelope is readable and
+        # unknown shapes are a typed refusal; the shipped unit carries the
+        # dispatch settings from the environment file and fails closed.
+        "pr": 118,
+        "name": "factory dispatch wiring",
+        "keywords": (
+            "live docket envelope",
+            "queue_invalid",
+            "require-dispatch-config",
+            "WORKFLOW_SRC",
+        ),
+    },
 )
 
 
