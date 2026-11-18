@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import dispatch
+from . import dispatch, memory_recall
 from .security import scrub
 
 __all__ = [
@@ -472,6 +472,16 @@ def record_lease(
     }
     if dispatch_chain_id is not None:
         record["dispatch_chain_id"] = dispatch_chain_id
+    # Recall is advisory and cannot widen scope. It runs after the brief has
+    # been frozen and before the MAC, so the context is covered by the MAC but
+    # never enters the brief or brief_sha256. A disabled flag returns None and
+    # leaves the record byte-identical to the pre-recall shape.
+    try:
+        memory_context = memory_recall.recall(state, normalized, now=now)
+    except Exception:
+        memory_context = None
+    if isinstance(memory_context, Mapping):
+        record["memory_context"] = memory_context
     record["mac"] = _sign(record, key)
     _write_record(leases / f"{attempt}.json", record)
     return record
