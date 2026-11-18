@@ -40,6 +40,13 @@ TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
 DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_TIMEOUT = 10.0
 MAX_RESPONSE_BYTES = 1_048_576
+#: A single attempt's result document (and the attempt detail that can carry
+#: it) may include a whole verbose result envelope with the patch; the
+#: launcher's ``GET /v1/attempts/<id>/result`` has no cap of its own. Orbit's
+#: artifact cap is 8 MiB of patch, so allow the same JSON-escaping headroom as
+#: ``MAX_ARTIFACT_BYTES`` (24 MiB). This budget is scoped to the attempt
+#: result/get path only: every ordinary response keeps ``MAX_RESPONSE_BYTES``.
+MAX_RESULT_BYTES = 24 * 1_048_576
 MAX_REDIRECTS = 5
 USER_AGENT = "bundlebees/0.1.1"
 
@@ -880,8 +887,26 @@ class LauncherClient(_BaseClient):
     def attempts(self) -> list[dict[str, Any]]:
         return [public_attempt(item) for item in self.attempts_raw()]
 
+    def _attempt_request_json(self, method: str, path: str) -> Any:
+        """Read one attempt document with the bounded result budget.
+
+        ``MAX_RESPONSE_BYTES`` stays the cap for every ordinary endpoint. A
+        single attempt's result (or the attempt detail that can carry it) may
+        be a verbose envelope far past 1 MiB, so it is read up to
+        ``MAX_RESULT_BYTES`` and still refused with ``response_too_large``
+        beyond that ceiling.
+        """
+        saved = self._max_bytes
+        self._max_bytes = max(saved, MAX_RESULT_BYTES)
+        try:
+            return self.request_json(method, path)
+        finally:
+            self._max_bytes = saved
+
     def get_raw(self, attempt_id: str) -> Any:
-        return self.request_json("GET", f"/v1/attempts/{_quote_id(attempt_id)}")
+        return self._attempt_request_json(
+            "GET", f"/v1/attempts/{_quote_id(attempt_id)}"
+        )
 
     def get(self, attempt_id: str) -> dict[str, Any]:
         return public_attempt(_unwrap_attempt(self.get_raw(attempt_id)))
@@ -894,7 +919,7 @@ class LauncherClient(_BaseClient):
 
     def result(self, attempt_id: str) -> dict[str, Any]:
         try:
-            data = self.request_json(
+            data = self._attempt_request_json(
                 "GET", f"/v1/attempts/{_quote_id(attempt_id)}/result"
             )
         except ClientError as exc:
@@ -919,7 +944,7 @@ class LauncherClient(_BaseClient):
         It is never exposed through a model-facing tool.
         """
         try:
-            data = self.request_json(
+            data = self._attempt_request_json(
                 "GET", f"/v1/attempts/{_quote_id(attempt_id)}/result"
             )
         except ClientError as exc:
