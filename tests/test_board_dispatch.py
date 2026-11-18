@@ -26,6 +26,7 @@ import pytest
 
 from bundlebees_plugin import board_dispatch
 from bundlebees_plugin import factory_driver
+from bundlebees_plugin import job as job_mod
 
 SOURCE_REV = "73162e0c72cef888487d313a4905a243d6832f08"
 
@@ -71,21 +72,38 @@ def _brief(task_id: str = "t_ready_1", **overrides: Any) -> dict[str, Any]:
     return brief
 
 
-def _write_job(state: Path, job_id: str, *, task_id: str = "T1") -> None:
-    path = state / "jobs" / f"{job_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
+def _write_job(
+    state: Path,
+    job_id: str,
+    *,
+    task_id: str = "T1",
+    lease: tuple[str, ...] = ("rizzstack_memory/retention.py",),
+) -> None:
+    """Create a real sealed authorization + job through the production store."""
+
+    job_mod.record_authorization(
+        state,
+        job_id=job_id,
+        statement="test fixture authorization for one leased slice",
+        repo="mojomast/workflow",
+        base_rev=SOURCE_REV,
+        scope=list(lease),
+        bees=1,
+        wall_clock_s=3600,
+        require_tty=False,
+    )
+    job_mod.create_job(
+        state,
+        job_id=job_id,
+        tasks=[
             {
-                "schema_version": 1,
-                "kind": "job",
-                "job_id": job_id,
-                "tasks": [{"task_id": task_id, "state": "pending", "lease": ["a.py"]}],
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+                "task_id": task_id,
+                "objective": "fixture slice",
+                "project": "workflow",
+                "lease": list(lease),
+                "acceptance": {"criteria": ["fixture"]},
+            }
+        ],
     )
 
 

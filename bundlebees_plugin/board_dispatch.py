@@ -49,6 +49,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import board_stock
 from . import brief as brief_mod
 from . import factory_driver
+from . import job as job_mod
 from .security import child_env, scrub
 
 SCHEMA = "bundlebees.board-dispatch/1"
@@ -371,11 +372,12 @@ def stock(
         job_id = str(approval["job_id"]).strip()
         repo = str(approval["repo"]).strip()
 
-        job_file = _job_path(state_dir, job_id)
         try:
-            job_body = json.loads(job_file.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            skip(card, task_id, "job_absent", f"no job document for {job_id}")
+            job_body = job_mod.load_job(Path(state_dir), job_id, recover=False)
+        except job_mod.JobError as exc:
+            reason = "job_absent" if exc.code == "job_missing" else "job_unreadable"
+            detail = f"no job document for {job_id}" if reason == "job_absent" else exc.message
+            skip(card, task_id, reason, detail)
             continue
         except (OSError, ValueError):
             skip(card, task_id, "job_unreadable", f"the job document for {job_id} is unreadable")
