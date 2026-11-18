@@ -40,6 +40,12 @@ DEFAULTS: dict[str, Any] = {
     "verify_allow_unsafe_local": False,
     "verify_allow_weak_unshare": False,
     "require_contract": False,
+    # Pre-dispatch worker attribution (E9). Declared here as well as in plugin.yaml:
+    # settings_from_ctx only returns DEFAULTS keys, and a key missing here made the gate
+    # silently inert while its unit tests (which inject settings directly) stayed green.
+    "attribution_canary_projects": [],
+    "attribution_worker_id": "",
+    "attribution_ledger_chain": "",
     "verify_timeout_s": 900,
     "integrate_suite": "",
     "integrate_security_tests": "",

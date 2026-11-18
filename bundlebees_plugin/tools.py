@@ -573,9 +573,10 @@ def _dispatch(
         facts = facts if isinstance(facts, Mapping) else {}
         endpoint = (facts.get("endpoint") or getattr(client, "base_url", "") or
                     getattr(client, "endpoint", "") or canary_settings.get("launcher_url") or "")
-        worker_id = facts.get("worker") or facts.get("worker_id") or canary_settings.get("worker_id") or ""
-        ledger_chain = (facts.get("ledger_chain") or facts.get("ledger") or
-                        canary_settings.get("ledger_chain") or "")
+        worker_id = (facts.get("worker") or facts.get("worker_id")
+                     or canary_settings.get("attribution_worker_id") or "")
+        ledger_chain = (facts.get("ledger_chain") or facts.get("ledger")
+                        or canary_settings.get("attribution_ledger_chain") or "")
         try:
             intent = _attribution.intent_for(
                 endpoint=endpoint, worker_id=worker_id, ledger_chain=ledger_chain,
