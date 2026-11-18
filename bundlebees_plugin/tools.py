@@ -24,6 +24,7 @@ from .client import (
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
 from . import contract as _contract
+from . import attribution as _attribution
 from . import leases as _leases
 from . import metrics as _metrics
 from . import revision as _revision
@@ -559,6 +560,36 @@ def _dispatch(
             "Pass the Hermes task id as a string, or omit it.",
         )
 
+    # E9 pre-dispatch attribution (owner decision: canary projects only). The intent is written
+    # BEFORE the POST so the route facts are durable even if the dispatch dies mid-flight; the
+    # returned attempt is bound to it on success. Other projects keep current behaviour.
+    attribution_intent = None
+    canary_settings = args.get("_settings") if isinstance(args.get("_settings"), Mapping) else {}
+    if _attribution.applies_to(canary_settings, brief.get("project")):
+        try:
+            facts = client.health() if hasattr(client, "health") else {}
+        except Exception:  # noqa: BLE001 - an unreadable route means "cannot attribute"
+            facts = {}
+        facts = facts if isinstance(facts, Mapping) else {}
+        endpoint = (facts.get("endpoint") or getattr(client, "base_url", "") or
+                    getattr(client, "endpoint", "") or canary_settings.get("launcher_url") or "")
+        worker_id = facts.get("worker") or facts.get("worker_id") or canary_settings.get("worker_id") or ""
+        ledger_chain = (facts.get("ledger_chain") or facts.get("ledger") or
+                        canary_settings.get("ledger_chain") or "")
+        try:
+            intent = _attribution.intent_for(
+                endpoint=endpoint, worker_id=worker_id, ledger_chain=ledger_chain,
+                job_id=brief.get("job_id") or args.get("job_id") or canary_settings.get("job_id") or "",
+                project=brief.get("project"), contract=brief.get("contract") or "",
+                revision=brief.get("source_rev") or "", client=type(client).__name__)
+            attribution_intent = _attribution.record_intent(state_dir, intent)
+        except _attribution.AttributionError as exc:
+            return _err(str(exc.code), str(exc.message), str(exc.fix))
+        except Exception as exc:  # noqa: BLE001 - never dispatch unattributed inside the canary
+            return _err("attribution_unavailable",
+                        f"the canary dispatch could not record its attribution intent: {exc}",
+                        "Fix the attribution store before dispatching; nothing was sent.")
+
     try:
         data = client.create(
             brief,
@@ -569,6 +600,11 @@ def _dispatch(
         if exc.code == "project_unauthorized":
             return _err(exc.code, exc.error, _FIX_PROJECT)
         raise
+    if attribution_intent is not None and data.get("attempt_id"):
+        try:
+            _attribution.bind_attempt(state_dir, attribution_intent["intent_id"], data.get("attempt_id"))
+        except Exception:  # noqa: BLE001 - the intent stays unbound; the audit will report adopted
+            pass
     return _dispatched(
         client, brief, _unwrap_attempt(data), args, state_dir, acdd=acdd
     )
@@ -1006,9 +1042,13 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             if tool_name == "bundlebees_status":
                 return _status(client, data)
             if tool_name == "bundlebees_dispatch":
+                try:
+                    dispatch_settings = settings_from_ctx(ctx)
+                except Exception:  # noqa: BLE001 - no settings means "no canary projects configured"
+                    dispatch_settings = {}
                 return _dispatch(
                     client,
-                    data,
+                    {**data, "_settings": dispatch_settings},
                     _state_dir_for(ctx),
                     require_contract=_require_contract(ctx),
                 )

@@ -16,6 +16,8 @@ the coordinator's lease key and is never produced by the worker.
 
 from __future__ import annotations
 
+import hashlib
+
 import ast
 import json
 import os
@@ -334,6 +336,8 @@ def add_parsers(subparsers: Any) -> None:
     verdict.add_argument("--approve", action="store_true", help="Accept the change.")
     verdict.add_argument("--reject", action="store_true", help="Reject the change.")
     review.add_argument("--note", required=True, help="Why the change was approved or rejected.")
+    review.add_argument("--reviewer-key", default=None,
+                        help="Path to the enrolled reviewer key; signs the review binding (E1/E4).")
     tdd_cmd.set_defaults(command="tdd")
 
 
@@ -590,6 +594,7 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
     # C6: this is a review the coordinator *recorded*. The HMAC proves the
     # coordinator wrote it, not who the reviewer is, so the record never
     # carries role "human"; the reviewer and claimed kind are unverified labels.
+    reviewer_key_path = getattr(args, "reviewer_key", None)
     record = tdd.make_record(
         contract, sha, phase="review", revision=str(target["revision"]),
         test_fingerprints=target["test_fingerprints"], command=["review"],
@@ -598,17 +603,33 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
         review_outcome="passed" if approve else "failed",
         attestation=tdd.coordinator_review_attestation(scrub(reviewer), role),
     )
+    signed = None
     try:
         tdd.write_record(state_dir, record, key)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
+    if reviewer_key_path:
+        from . import reviewers as _reviewers
+        enrolled = _reviewers.load_reviewer(state_dir, str(reviewer))
+        if enrolled is None:
+            raise _error("reviewer_not_enrolled", f"reviewer {reviewer!r} has no enrolled identity",
+                         "Run `hermes bundlebees reviewer enroll --name <name>` first.")
+        signed = _reviewers.sign_attestation(
+            state_dir, name=str(reviewer), key=Path(reviewer_key_path).read_bytes(),
+            contract_id=str(contract.get("id") or ""), contract_sha256=sha,
+            revision=str(target["revision"]), outcome=str(record.get("review_outcome") or ""),
+            note=str(record.get("note") or ""), evidence_signature=str(record.get("signature") or ""))
+
     if not approve:
         raise _error("review_failed", "the reviewer rejected the change",
                      "Address the review note and record a new GREEN/REFACTOR, then review again.")
     print("bundlebees tdd review")
     print(f"contract: {scrub(str(contract['id']))}")
     _print_hex("revision", str(target["revision"]))
-    print("review: valid (coordinator-recorded; reviewer identity not authenticated)")
+    if signed:
+        print(f"review: valid (SIGNED by enrolled reviewer {scrub(str(reviewer))}, key {signed['key_id']}; attestation beside the evidence record)")
+    else:
+        print("review: valid (coordinator-recorded; reviewer identity not authenticated)")
     return 0
 
 

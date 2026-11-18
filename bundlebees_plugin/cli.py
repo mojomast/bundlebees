@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
+from . import delivery as _delivery
 from . import campaign_cli
 from . import job_cli
 from . import acdd_cli, adapters, dispatch, leases, metrics, revision, sandbox
@@ -202,6 +203,37 @@ def _build_parser(parser: Any) -> Any:
         help="Plugin data directory for verify-results (defaults to Hermes plugin data).",
     )
     verify.set_defaults(command="verify")
+    reviewer = subparsers.add_parser("reviewer", help="Enrolled reviewer identities for signed REVIEW evidence.")
+    reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
+    rv_enroll = reviewer_sub.add_parser("enroll", help="Create (or adopt) a reviewer key and record the identity.")
+    rv_enroll.add_argument("--name", required=True, help="Stable reviewer name (also the record slug).")
+    rv_enroll.add_argument("--key-file", default=None, help="Key path (default: <state>/reviewers/<slug>.key, 0600).")
+    rv_enroll.add_argument("--state-dir", default=None)
+    rv_enroll.set_defaults(command="reviewer")
+    rv_list = reviewer_sub.add_parser("list", help="List enrolled reviewer identities (read-only).")
+    rv_list.add_argument("--state-dir", default=None)
+    rv_list.set_defaults(command="reviewer")
+
+    owner = subparsers.add_parser("owner", help="Enrolled owner authority for board/feedback writes (E2/E5).")
+    owner_sub = owner.add_subparsers(dest="owner_command", required=True)
+    ow_enroll = owner_sub.add_parser("enroll", help="Create (or adopt) an owner key and record its authority.")
+    ow_enroll.add_argument("--name", required=True)
+    ow_enroll.add_argument("--scope", default="board,feedback", help="Comma-separated scopes (board,feedback,rail_clear,approve).")
+    ow_enroll.add_argument("--expires", default="never", help="ISO-8601 date or never.")
+    ow_enroll.add_argument("--key-file", default=None)
+    ow_enroll.add_argument("--state-dir", default=None)
+    ow_enroll.set_defaults(command="owner")
+    ow_list = owner_sub.add_parser("list", help="List enrolled owner authorities (read-only).")
+    ow_list.add_argument("--state-dir", default=None)
+    ow_list.set_defaults(command="owner")
+
+    deliver = subparsers.add_parser(
+        "deliver",
+        help="Reconcile pending deliveries: open missing PRs for verified branches (idempotent).",
+    )
+    deliver.add_argument("--state-dir", default=None, help="Plugin data directory (defaults to Hermes plugin data).")
+    deliver.add_argument("--dry-run", action="store_true", help="Report what would happen; touch nothing.")
+    deliver.set_defaults(command="deliver")
 
     deploy = subparsers.add_parser(
         "deploy",
@@ -282,6 +314,91 @@ def _build_parser(parser: Any) -> Any:
     campaign_cli.add_parsers(subparsers)
     return group
 
+def _cmd_deliver(ctx: Any, args: Any) -> int:
+    """Reconcile pending deliveries (open missing PRs). Idempotent; safe on a timer."""
+    state_dir = Path(getattr(args, "state_dir", None) or settings.state_dir(ctx))
+    rows = _delivery.pending(state_dir)
+    if not rows:
+        _print("deliver: nothing pending (every pushed delivery already has a PR)")
+        return 0
+    result = _delivery.sweep(state_dir, dry_run=getattr(args, "dry_run", False))
+    for row in result["opened"]:
+        _print(f"opened: {row['branch']} -> {row['pr_url']}")
+    for row in result["existing"]:
+        _print(f"existing: {row['branch']} -> {row['pr_url']}")
+    for row in result["blocked"]:
+        _print(f"blocked: {row['branch']} - {row['reason']} (re-run verify)")
+    for row in result["errors"]:
+        _print(f"error: {row['branch']} - {row['error']['message']}")
+    _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
+           f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
+    return 0 if not result["errors"] else 2
+
+
+def _cmd_owner(ctx: Any, args: Any) -> int:
+    """Enrolled owner authority (rizzstack.owner-authority/1)."""
+    from . import owners as _owners
+    state_dir = _state_dir(ctx, args)
+    sub = getattr(args, "owner_command", None)
+    if sub == "enroll":
+        try:
+            record = _owners.enroll(state_dir, args.name,
+                                    scope=[s for s in str(args.scope).split(",") if s.strip()],
+                                    expires=getattr(args, "expires", "never"),
+                                    key_path=getattr(args, "key_file", None))
+        except _owners.OwnerAuthorityError as exc:
+            raise _as_cli_error(exc)
+        _print("bundlebees owner enroll")
+        _print(f"owner: {record['name']}")
+        _print(f"key_id: {record['key_id']}")
+        _print(f"scope: {', '.join(record['scope'])}")
+        _print(f"expires_at: {record['expires_at']}")
+        _print(f"key_file: {record['key_path']} (0600; the key never leaves this file)")
+        return 0
+    if sub == "list":
+        directory = state_dir / "owners"
+        rows = sorted(directory.glob("*.json")) if directory.exists() else []
+        if not rows:
+            _print("owner: none enrolled")
+            return 0
+        for path in rows:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            _print(f"{record.get('name')}  key_id={record.get('key_id')}  scope={','.join(record.get('scope') or [])}")
+        return 0
+    _print("owner: unknown subcommand")
+    return 2
+
+
+def _cmd_reviewer(ctx: Any, args: Any) -> int:
+    """Enrolled reviewer identities (rizzstack.reviewer/1)."""
+    from . import reviewers as _reviewers
+    state_dir = Path(getattr(args, "state_dir", None) or _state_dir(ctx, args))
+    sub = getattr(args, "reviewer_command", None)
+    if sub == "enroll":
+        try:
+            record = _reviewers.enroll(state_dir, args.name, key_path=getattr(args, "key_file", None))
+        except _reviewers.ReviewerError as exc:
+            raise _as_cli_error(exc)
+        _print("bundlebees reviewer enroll")
+        _print(f"reviewer: {record['name']}")
+        _print(f"key_id: {record['key_id']}")
+        _print(f"key_file: {record['key_path']} (0600; the key never leaves this file)")
+        _print("use: hermes bundlebees tdd review <contract> --reviewer <name> --reviewer-key <key_file> --approve --note ...")
+        return 0
+    if sub == "list":
+        directory = state_dir / "reviewers"
+        rows = sorted(directory.glob("*.json")) if directory.exists() else []
+        if not rows:
+            _print("reviewer: none enrolled")
+            return 0
+        for path in rows:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            _print(f"{record.get('name')}  key_id={record.get('key_id')}  fingerprint={record.get('fingerprint')}")
+        return 0
+    _print("reviewer: unknown subcommand")
+    return 2
+
+
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
@@ -290,10 +407,16 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return rails_cli.cmd_rails(ctx, args)
         if command == 'rails-import':
             return _rails_import(ctx, args)
+        if command == "owner":
+            return _cmd_owner(ctx, args)
+        if command == "reviewer":
+            return _cmd_reviewer(ctx, args)
         if command == "verify":
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
             return _cmd_verify(ctx, args)
+        if command == "deliver":
+            return _cmd_deliver(ctx, args)
         if command == "deploy":
             return _cmd_deploy(ctx, args)
         if command == "doctor":
@@ -1465,6 +1588,16 @@ def _first_verify(state_dir: Path, run_id: str, attempt_id: str) -> bool:
     return not any(e.get("event") == "verify" and e.get("attempt_id") == attempt_id for e in events)
 
 
+def _origin_repo(workdir: Path) -> str:
+    """owner/repo from the worktree's origin URL (the delivery record's PR target)."""
+    out = _run_git(["remote", "get-url", "origin"], workdir, check=False).stdout.strip()
+    m = re.search(r"[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", out)
+    if not m:
+        raise _delivery.DeliveryError("origin_unparsable", f"cannot derive owner/repo from origin URL: {out[:120]}",
+                            "Add an origin remote and rerun verify.")
+    return f"{m.group(1)}/{m.group(2)}"
+
+
 def _push_branch(workdir: Path, branch: str) -> None:
     # Explicit feature-branch refspec; no force, no tags, no hook skip.
     _run_git(["push", "origin", f"HEAD:refs/heads/{branch}"], workdir)
@@ -1872,7 +2005,25 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         sha = _commit_changes(workdir, attempt_id, files)
         if acdd_state is not None:
             green = acdd_cli.record_green(state_dir, acdd_state, workdir, test_evidence, sha)
+        # Durable delivery intent BEFORE the push (transactional-outbox style): a crash here
+        # leaves an `intent` record the `deliver` sweep reports instead of silently losing the
+        # obligation to open a PR.
+        delivery_record = None
+        try:
+            delivery_record = _delivery.record_intent(
+                state_dir, attempt_id=attempt_id, repo=_origin_repo(workdir), branch=branch,
+                base_sha=base, title=f"verify: {branch} (attempt {attempt_id})",
+                body=(f"Verified worker payload.\n\n- attempt: `{attempt_id}`\n- branch: `{branch}`\n"
+                      f"- tests: {', '.join(tests)}\n- files: {len(files)}\n"),
+            )
+        except Exception as exc:  # noqa: BLE001 - delivery bookkeeping must never block the push
+            _print(f"delivery: intent not recorded: {exc}")
         _push_branch(workdir, branch)
+        if delivery_record is not None:
+            try:
+                _delivery.record_pushed(state_dir, attempt_id, sha)
+            except Exception as exc:  # noqa: BLE001
+                _print(f"delivery: pushed-sha not recorded: {exc}")
 
         target = _write_verify_result(
             state_dir, attempt_id, ok=True, sha=sha, branch=branch,
@@ -1890,6 +2041,18 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _print_digest("patch_sha256", evidence.get("patch_sha256"))
         acdd_cli.print_mode(acdd_state, green)
         _print(f"pushed: feature branch only ({BRANCH_BUDGET_NOTE})")
+        if delivery_record is not None:
+            # Eager relay: the PR is opened as part of the same verify run, so "verified" is
+            # never a resting state. Failure is non-fatal - the record stays pending for the
+            # `deliver` sweep (the level-triggered backstop).
+            try:
+                url, created = _delivery.open_pr_idempotent(
+                    delivery_record["repo"], branch, delivery_record["title"], delivery_record["body"])
+                _delivery.record_pr(state_dir, attempt_id, url)
+                _print(f"pr: {url}" + ("" if created else " (existing)"))
+            except Exception as exc:  # noqa: BLE001
+                _print(f"pr: pending - the platform refused or lacked access ({exc}); "
+                       "run `hermes bundlebees deliver` to converge")
         _print(f"verify result: {target}")
         _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")
         suggested = (
