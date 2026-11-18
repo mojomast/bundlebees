@@ -2,7 +2,7 @@
 
 The check may only *observe* two numbers: approved cards sitting in the board's
 ready column and the bee slots the factory could still use.  It raises a durable
-signal (the Hive reads it) and, on a transition into a shortfall, one board
+signal (the Hive reads it) and, when a low observation changes, one board
 comment.  It never creates, moves, approves or dispatches a card.
 """
 
@@ -277,6 +277,44 @@ def test_a_recovery_then_a_new_shortfall_comments_again(tmp_path: Path):
     assert (recovered["revision"], recovered["state"], recovered["notified"]) == (2, "stocked", False)
     assert (again["revision"], again["state"], again["notified"]) == (3, "low", True)
     assert len(spy.calls) == 2
+
+
+def test_a_drifting_low_comments_on_each_change_and_the_docs_say_so(tmp_path: Path):
+    spy = CommentSpy()
+    state = {"ready": 1}
+
+    def runner(argv: list[str]) -> str:
+        return json.dumps(_cards(state["ready"]))
+
+    kwargs = {
+        "card": "t_coord",
+        "runner": runner,
+        "cap_reader": lambda: 6,
+        "items_reader": lambda state_dir: [{"status": "claimed"}] * 2,
+        "comment": spy,
+    }
+
+    first = board_stock.flag(tmp_path, **kwargs)
+    state["ready"] = 0
+    drifted = board_stock.flag(tmp_path, **kwargs)
+    repeated = board_stock.flag(tmp_path, **kwargs)
+
+    assert first["state"] == "low"
+    assert (first["changed"], first["notified"]) == (True, True)
+    assert drifted["state"] == "low"
+    assert (drifted["changed"], drifted["notified"]) == (True, True)
+    assert repeated["state"] == "low"
+    assert (repeated["changed"], repeated["notified"]) == (False, False)
+    assert len(spy.calls) == 2
+
+    docs = (Path(__file__).resolve().parent.parent / "docs" / "board-stock.md").read_text(
+        encoding="utf-8"
+    )
+    assert "On a transition into `low`, and only then" not in docs
+    assert "A continuing shortfall does not comment again" not in docs
+    assert "when a low observation changes" in docs
+    assert "Identical repeats do not comment again" in docs
+    assert "starts a new episode" in docs
 
 
 def test_without_a_card_the_signal_is_still_written(tmp_path: Path):
