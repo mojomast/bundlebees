@@ -98,12 +98,19 @@ class QueueAdapter(Protocol):
 class JsonQueue:
     """File-backed queue for tests and for hosts without a Kanban bridge.
 
-    Two document shapes are accepted, because the live queue file is written by
-    the hive docket publisher while older states and fixtures use a flat map:
+    The live queue file's external writer is not identified in this repository:
+    the hive docket publisher only emits its separate ``hive.queue/1`` document
+    and never writes this file. Two document shapes are accepted:
 
     * a **features document** — ``{"schema": "bundlebees.queue/1",
-      "generated_at": ..., "features": [{"feature_id": ...}, ...], ...}``;
+      "generated_at": ..., "features": [{"feature_id": ...}, ...], ...}``.
+      The ``features`` value may also be an object mapping feature ids to cards,
+      and a list card may name itself with ``id`` instead of ``feature_id``;
     * a **flat map** — ``{"<feature_id>": {"repo": ..., "job_id": ...}}``.
+
+    A flat map whose sole feature id is literally ``"features"`` is
+    indistinguishable from a features document, so that shape stays
+    unsupported rather than guessed at.
 
     Any other shape is a typed :class:`QueueError`, never an ``AttributeError``
     from calling ``.get`` on a list or a string.
@@ -126,25 +133,40 @@ class JsonQueue:
     def _entries(data: Any) -> list[tuple[str, Mapping[str, Any]]]:
         """``(feature_id, card)`` pairs for either supported document shape."""
 
-        if data is None:
-            return []
         if not isinstance(data, Mapping):
             raise QueueError(
                 "queue_invalid",
                 "the queue file is neither a feature map nor a features document",
-                "Repair the queue file: use a features list or a feature-id map.",
+                "Repair the queue file: use a features list or an object, or a feature-id map.",
             )
         if "features" in data:
             features = data.get("features")
             if features is None:
                 return []
+            entries: list[tuple[str, Mapping[str, Any]]] = []
+            if isinstance(features, Mapping):
+                for feature_id, body in features.items():
+                    if not isinstance(body, Mapping):
+                        raise QueueError(
+                            "queue_invalid",
+                            f"queue feature {feature_id!r} is not an object",
+                            "Repair the queue file: every feature must be a JSON object.",
+                        )
+                    key = str(feature_id).strip()
+                    if not key:
+                        raise QueueError(
+                            "queue_invalid",
+                            "a queue feature id is blank",
+                            "Repair the queue file: every feature needs a feature_id or id.",
+                        )
+                    entries.append((key, body))
+                return entries
             if not isinstance(features, list):
                 raise QueueError(
                     "queue_invalid",
-                    "the queue 'features' value is not a list",
-                    "Repair the queue file: features must be a JSON array.",
+                    "the queue 'features' value is not a list or an object",
+                    "Repair the queue file: features must be a JSON array or an object mapping feature ids to cards.",
                 )
-            entries: list[tuple[str, Mapping[str, Any]]] = []
             for index, body in enumerate(features):
                 if not isinstance(body, Mapping):
                     raise QueueError(
@@ -154,10 +176,12 @@ class JsonQueue:
                     )
                 feature_id = body.get("feature_id")
                 if not isinstance(feature_id, str) or not feature_id.strip():
+                    feature_id = body.get("id")
+                if not isinstance(feature_id, str) or not feature_id.strip():
                     raise QueueError(
                         "queue_invalid",
                         f"queue feature at index {index} has no feature_id",
-                        "Repair the queue file: every feature needs a feature_id.",
+                        "Repair the queue file: every feature needs a feature_id or id.",
                     )
                 entries.append((feature_id.strip(), body))
             return entries
@@ -192,22 +216,17 @@ class JsonQueue:
 
     def set_status(self, feature_id: str, status: str, evidence: Mapping[str, Any] | None = None) -> None:
         data = self._read_document()
-        document_shape = isinstance(data, Mapping) and "features" in data
         # Validate the whole document before mutating anything, so an unknown
-        # shape is a typed refusal and never a partially rewritten file.
-        self._entries(data)
-        if document_shape:
-            features = data.get("features") or []
-            target = next(
-                (body for body in features if str(body.get("feature_id") or "").strip() == feature_id),
-                None,
-            )
-            if target is None:
-                raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
-        else:
-            if feature_id not in data:
-                raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
-            target = data[feature_id]
+        # shape is a typed refusal and never a partially rewritten file. The
+        # entry bodies are the live cards in ``data``, so mutating one leaves
+        # the surrounding document (schema, generated_at, note, extra keys)
+        # untouched for every supported shape.
+        target = next(
+            (body for entry_id, body in self._entries(data) if entry_id == feature_id),
+            None,
+        )
+        if target is None:
+            raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
         target["status"] = status
         if evidence is not None:
             target["evidence"] = dict(evidence)

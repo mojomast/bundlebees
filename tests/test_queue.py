@@ -47,10 +47,14 @@ class QueueTests(unittest.TestCase):
 
     # -- live queue document shape ------------------------------------------
     #
-    # The deployed queue file is a docket envelope:
-    # {"schema": "bundlebees.queue/1", "generated_at": ..., "features": [...],
-    #  "note": ...}. The legacy flat map (feature_id -> card) is still accepted
-    # for fixtures and older states.
+    # The live queue file is written by an external producer that is not
+    # identified in this repository; the hive docket publisher only emits its
+    # separate hive.queue/1 document, never this file. Both a features envelope
+    # and the legacy flat map (feature_id -> card) are accepted. The features
+    # value may be a list or an object mapping feature ids to cards, and a list
+    # card may use "id" in place of "feature_id". A flat map whose sole feature
+    # id is literally "features" is indistinguishable from an envelope, so that
+    # shape stays unsupported rather than guessed at.
 
     def _write_live_envelope(self, features):
         self.path.write_text(
@@ -112,6 +116,137 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(body["features"][0]["status"], "running")
         self.assertEqual(body["features"][0]["evidence"], {"job_id": "job_1"})
         self.assertEqual(queue.get("f1").status, "running")
+
+    def test_features_as_an_object_maps_ids_to_the_same_items_as_the_list_shape(self):
+        cards = [
+            {
+                "feature_id": "f2",
+                "repo": "mojomast/b",
+                "job_id": "job_2",
+                "title": "Second",
+                "depends_on": ["f1"],
+                "status": "queued",
+            },
+            {
+                "feature_id": "f1",
+                "repo": "mojomast/a",
+                "job_id": "job_1",
+                "title": "First",
+                "depends_on": [],
+                "status": "blocked",
+            },
+        ]
+        self._write_live_envelope(cards)
+        expected = Q.JsonQueue(self.path).list_items()
+
+        self._write_live_envelope({card["feature_id"]: card for card in cards})
+
+        mapped = Q.JsonQueue(self.path)
+        self.assertEqual(mapped.list_items(), expected)
+        self.assertEqual(mapped.get("f1").title, "First")
+        self.assertEqual(mapped.get("f1").depends_on, ())
+
+    def test_a_features_list_card_may_use_id_instead_of_feature_id(self):
+        self._write_live_envelope(
+            [
+                {
+                    "id": "f1",
+                    "repo": "mojomast/bundlebees",
+                    "job_id": "job_1",
+                    "title": "Feature",
+                    "depends_on": [],
+                    "status": "queued",
+                }
+            ]
+        )
+
+        queue = Q.JsonQueue(self.path)
+        items = queue.list_items()
+
+        self.assertEqual(
+            [(item.feature_id, item.repo, item.job_id, item.title, item.status) for item in items],
+            [("f1", "mojomast/bundlebees", "job_1", "Feature", "queued")],
+        )
+        self.assertEqual(queue.get("f1").job_id, "job_1")
+
+    def test_a_features_list_card_without_a_usable_id_is_a_typed_refusal(self):
+        for body in ({"repo": "r", "job_id": "j"}, {"feature_id": "", "id": "  "}):
+            with self.subTest(card=body):
+                self._write_live_envelope([body])
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_set_status_updates_only_the_target_card_of_a_features_object_map(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "2026-11-18T04:27:23Z",
+                    "note": "live-shaped queue",
+                    "extra": {"kept": True},
+                    "features": {
+                        "f1": {"repo": "mojomast/a", "job_id": "job_1", "status": "queued"},
+                        "f2": {"repo": "mojomast/b", "job_id": "job_2", "status": "queued"},
+                    },
+                }
+            )
+        )
+        queue = Q.JsonQueue(self.path)
+
+        queue.set_status("f1", "running", {"job_id": "job_1"})
+
+        body = json.loads(self.path.read_text())
+        self.assertEqual(body["schema"], "bundlebees.queue/1")
+        self.assertEqual(body["generated_at"], "2026-11-18T04:27:23Z")
+        self.assertEqual(body["note"], "live-shaped queue")
+        self.assertEqual(body["extra"], {"kept": True})
+        self.assertNotIn("f1", body, "a document-shaped queue must not be rewritten as a flat map")
+        self.assertEqual(body["features"]["f1"]["status"], "running")
+        self.assertEqual(body["features"]["f1"]["evidence"], {"job_id": "job_1"})
+        self.assertEqual(
+            body["features"]["f2"],
+            {"repo": "mojomast/b", "job_id": "job_2", "status": "queued"},
+            "a non-target card must be untouched",
+        )
+        self.assertEqual(queue.get("f1").status, "running")
+
+    def test_features_object_map_with_a_non_object_card_is_a_typed_error(self):
+        self._write_live_envelope({"f1": ["not", "an", "object"]})
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+
+    def test_non_mapping_top_level_queue_documents_are_typed_errors(self):
+        for document in ([], "queue", 3, None):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+
+    def test_malformed_json_is_a_typed_error(self):
+        self.path.write_text("{")
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_an_unreadable_queue_file_is_a_typed_error(self):
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.tmp).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_unreadable")
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
 
     def test_an_unknown_queue_shape_is_a_typed_error_not_an_attribute_error(self):
         self.path.write_text(json.dumps([{"feature_id": "f1", "job_id": "job_1"}]))
