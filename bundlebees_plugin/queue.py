@@ -95,19 +95,92 @@ class QueueAdapter(Protocol):
     def set_status(self, feature_id: str, status: str, evidence: Mapping[str, Any] | None = None) -> None: ...
 
 
+QUEUE_REPAIR = (
+    "Repair the queue file: use a {feature_id: card} map, or a bundlebees.queue/1 "
+    "envelope whose 'features' is that map (or a list of cards carrying feature_id or id)."
+)
+
+
+def _is_envelope(document: Any) -> bool:
+    """A published envelope, not a flat map whose feature id happens to be 'features'.
+
+    A flat map's cards are JSON objects, so a ``features`` list can only be an
+    envelope; a ``features`` mapping needs the envelope's string ``schema`` to
+    be told apart from a feature that is literally named ``features``.
+    """
+    if not isinstance(document, Mapping) or "features" not in document:
+        return False
+    return isinstance(document.get("schema"), str) or isinstance(document["features"], list)
+
+
 class JsonQueue:
     """File-backed queue for tests and for hosts without a Kanban bridge."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
-    def _load(self) -> dict[str, dict[str, Any]]:
+    def _document(self) -> Any:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
         except ValueError as exc:
             raise QueueError("queue_invalid", f"{self.path} is not valid JSON: {exc}", "Repair the queue file.") from exc
+
+    def _invalid(self, message: str) -> QueueError:
+        return QueueError("queue_invalid", message, QUEUE_REPAIR)
+
+    def _features(self, features: Any) -> dict[str, dict[str, Any]]:
+        """Normalize an envelope's ``features`` to a feature_id -> card map."""
+        if isinstance(features, dict):
+            mapping = features
+        elif isinstance(features, list):
+            mapping = {}
+            for index, card in enumerate(features):
+                if not isinstance(card, dict):
+                    raise self._invalid(
+                        f"{self.path} features[{index}] is a {type(card).__name__}, not a card object"
+                    )
+                feature_id = card.get("feature_id")
+                if not isinstance(feature_id, str) or not feature_id:
+                    feature_id = card.get("id")
+                if not isinstance(feature_id, str) or not feature_id:
+                    raise self._invalid(
+                        f"{self.path} features[{index}] has no usable 'feature_id' or 'id'"
+                    )
+                mapping[feature_id] = card
+        else:
+            raise self._invalid(
+                f"{self.path} 'features' is a {type(features).__name__}, not a map or a list of cards"
+            )
+        for feature_id, card in mapping.items():
+            if not isinstance(card, dict):
+                raise self._invalid(
+                    f"{self.path} maps {feature_id!r} to a {type(card).__name__}, not a card object"
+                )
+        return mapping
+
+    def _items(self, document: Any) -> dict[str, dict[str, Any]]:
+        """The feature_id -> card map shared by the flat and envelope shapes.
+
+        A flat map is returned unchanged so callers keep the historical
+        contract; an envelope returns the mapping nested under ``features``.
+        Every accepted card is a JSON object, so a caller never meets a raw
+        list or scalar from a malformed file.
+        """
+        if _is_envelope(document):
+            return self._features(document["features"])
+        if not isinstance(document, dict):
+            raise self._invalid(f"{self.path} is a JSON {type(document).__name__}, not a queue object")
+        for feature_id, card in document.items():
+            if not isinstance(card, dict):
+                raise self._invalid(
+                    f"{self.path} maps {feature_id!r} to a {type(card).__name__}, not a card object"
+                )
+        return document
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        return self._items(self._document())
 
     def _save(self, data: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,14 +201,18 @@ class JsonQueue:
         return next((item for item in self.list_items() if item.feature_id == feature_id), None)
 
     def set_status(self, feature_id: str, status: str, evidence: Mapping[str, Any] | None = None) -> None:
-        data = self._load()
-        if feature_id not in data:
+        document = self._document()
+        items = self._items(document)
+        if feature_id not in items:
             raise QueueError("queue_unknown", f"no queue item {feature_id}", "Add it first.")
-        data[feature_id]["status"] = status
+        card = items[feature_id]
+        card["status"] = status
         if evidence is not None:
-            data[feature_id]["evidence"] = dict(evidence)
-        data[feature_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self._save(data)
+            card["evidence"] = dict(evidence)
+        card["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # ``document`` still carries an envelope's schema/generated_at/note;
+        # for a flat map it is the map itself, so its shape is unchanged.
+        self._save(document)
 
 
 class KanbanQueue:
