@@ -31,7 +31,40 @@ is NOT installed, enabled or started by this project.**
 
 The generic `--interval` loop is unchanged. `FactoryDriver.run_pass()` also
 keeps its existing behavior; service mode calls it with `advance_work=False`
-and owns the dispatch gate itself.
+and owns the dispatch gate itself. `--service` passes are flag-gated for the
+ready-column observation described below; unset, the pass result and the
+filesystem are unchanged.
+
+## Triggers: events first, the heartbeat last
+
+The 30-minute heartbeat is **the reconcile safety net only; it is no longer the
+primary trigger**. In order:
+
+1. **Landing event (seconds).** A bee landing writes a completion event into
+   `events/inbox/<subscriber>/`; the driver service wakes on it (inotify, with
+   a bounded poll fallback) and runs one pass. This is the primary path.
+2. **Scout hook (about 2 minutes).** When the resident service is not running,
+   the 2-minute scout can call the hook so a completed attempt triggers exactly
+   one driver pass instead of waiting for the beat. The hook is a trigger, not
+   a second driver.
+3. **Heartbeat (30 minutes).** `beat.beat()` reconciles what the push triggers
+   missed: the completed-attempt sweep, the merge stream, and the flag-gated
+   ready-column observation. It repairs state; it is not what normally starts a
+   landing's verification or dispatch.
+
+An idle beat turn is therefore expected and healthy. A landing that only the
+beat noticed is a defect in the event path, and the beat report shows the
+attempt age that made it visible.
+
+## Ready-column stocking (flag-gated)
+
+`BUNDLEBEES_BOARD_STOCK=1` adds one observation-only duty to the beat and to
+each `FactoryService` pass: it compares the number of cards the board reports
+in `ready` with the free bee slots (shared cap minus claimed work items) and
+raises a signal when ready work is short. It never creates, moves, approves or
+dispatches a card; the only board write it can make is one comment per
+shortfall episode. Default off: unset, no board read, no subprocess, no file.
+See `docs/board-stock.md`.
 
 ## Pre-approval record
 
@@ -121,10 +154,12 @@ rm ~/.config/systemd/user/bundlebees-factory-driver.service
 ## Sandbox tests
 
 `tests/test_factory_service_mode.py` validates the shipped unit with strict
-INI/structural checks (`[Unit]`, `[Service]`, `Type`, `ExecStart`) and never
-requires a systemd user manager. A `systemd-analyze --user verify` call is
-attempted only when a live user manager is reachable; otherwise that check
-skips cleanly.
+INI/structural checks (`[Unit]`, `[Service]`, `Type`, `ExecStart`). The
+`systemd-analyze --user verify` check renders the shipped unit into a temporary
+home with `ExecStart` pointing at an interpreter that exists on the runner, so
+it runs on a CI runner without the deployment host's venv; a second case proves
+the same check still rejects a missing interpreter. It skips only when
+`systemd-analyze` itself is absent.
 
 The service tests use temporary state, a fake tick and a spy for the gateway
 wake, so they pass with no network, no systemd user session and no real

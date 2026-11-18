@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
     fcntl = None  # type: ignore[assignment]
 
 from . import bee_events
+from . import board_stock
 from . import campaign as campaign_mod
 from . import job_cli
 from . import hermes_adapter
@@ -2514,6 +2515,24 @@ class FactoryService:
 
     # -- loop ----------------------------------------------------------------
 
+    def stock_ready_column(self) -> dict[str, Any]:
+        """Observe the ready column when the flag is on; never fail the pass.
+
+        The observation can refuse (unreadable board, cap or scheduler); that
+        refusal is reported for this pass and nothing is written.  The loop and
+        the dispatch decision are unaffected.
+        """
+
+        try:
+            record = board_stock.flag(self.state, now=self.driver.now)
+        except Exception as exc:  # noqa: BLE001 - an observation never stops the factory
+            return {
+                "status": "error",
+                "code": str(getattr(exc, "code", type(exc).__name__)),
+                "error": str(getattr(exc, "message", "") or type(exc).__name__)[:300],
+            }
+        return {"status": "ok", **record}
+
     def run_pass(self) -> dict[str, Any]:
         self.passes += 1
         errors: list[dict[str, str]] = []
@@ -2537,6 +2556,10 @@ class FactoryService:
             "wake": dispatch.get("wake"),
             "errors": list(driven.get("errors") or []) + errors + list(dispatch.get("errors") or []),
         }
+        # Flag-gated: with BUNDLEBEES_BOARD_STOCK unset the pass result is
+        # byte-for-byte what it was before this duty existed.
+        if board_stock.enabled():
+            result["stock"] = self.stock_ready_column()
         self.last_result = result
         return result
 
