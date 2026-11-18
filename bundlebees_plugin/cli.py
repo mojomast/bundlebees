@@ -100,12 +100,65 @@ def _print(message: str = "") -> None:
     print(scrub(message))
 
 
-def _print_sha(sha: str | None) -> None:
+def _literal_branch(value: Any) -> str | None:
+    """Return *value* only when it is a fully validated branch name.
+
+    The branch must match the same grammar ``_safe_branch`` enforces, and a
+    branch that is itself secret-shaped is never echoed literally.
+    """
+    if not isinstance(value, str):
+        return None
+    if not _BRANCH_RE.fullmatch(value):
+        return None
+    if ".." in value or value.endswith("/") or value.endswith(".") or "//" in value:
+        return None
+    if looks_like_secret(value):
+        return None
+    return value
+
+
+def _literal_state_path(value: Any, state_dir: Path) -> str | None:
+    """Return *value* only when it resolves strictly inside *state_dir*."""
+    if not isinstance(value, (str, Path)):
+        return None
+    text = str(value)
+    if not text or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        return None
+    try:
+        root = Path(state_dir).expanduser().resolve()
+        resolved = Path(text).expanduser().resolve()
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not relative.parts:
+        return None
+    return str(resolved)
+
+
+def _print_branch(value: Any, suffix: str = "") -> None:
+    """Print a validated branch literally; anything else keeps full scrubbing."""
+    branch = _literal_branch(value)
+    if branch is not None:
+        print(f"branch: {branch}{suffix}")
+    else:
+        _print(f"branch: {value}{suffix}")
+
+
+def _print_state_path(label: str, value: Any, state_dir: Path) -> None:
+    """Print a state-directory path literally; outside paths stay redacted."""
+    literal = _literal_state_path(value, state_dir)
+    if literal is not None:
+        print(f"{label}: {literal}")
+    else:
+        _print(f"{label}: {value}")
+
+
+def _print_sha(sha: str | None, label: str = "sha") -> None:
     """Print a validated commit digest without passing it through scrub()."""
     if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
-        print(f"sha: {sha}")
+        print(f"{label}: {sha}")
     else:
-        print("sha: unavailable")
+        print(f"{label}: unavailable")
 
 
 def _print_error(exc: CliError) -> None:
@@ -720,6 +773,9 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             and not looks_like_secret(attempt_id)
         ):
             clean["attempt_id"] = attempt_id
+        validated_branch = _literal_branch(row.get("branch"))
+        if validated_branch is not None:
+            clean["branch"] = validated_branch
         rows.append(clean)
     return rows
 
@@ -2146,6 +2202,9 @@ def _write_verify_result(
         payload["error"] = _clip_verify_reason(str(error))
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
+    validated_branch = _literal_branch(branch)
+    if validated_branch is not None:
+        clean["branch"] = validated_branch
     if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
         clean["evidence"]["source_rev"] = source_rev
     for key in ("patch_sha256", "result_sha256"):
@@ -2296,8 +2355,8 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
 
     _print("bundlebees verify --commit-local")
     _print(f"attempt: {attempt_id}")
-    _print(f"commit: {record['sha']}")
-    _print(f"branch: {record['branch']} (local only, not pushed)")
+    _print_sha(record["sha"], label="commit")
+    _print_branch(record["branch"], " (local only, not pushed)")
     _print(f"files: {', '.join(record['files'])}")
     return 0
 
@@ -2479,14 +2538,14 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
             _print(f"attempt: {attempt_id}")
-            _print(f"branch: {branch}")
+            _print_branch(branch)
             _print(f"files: {', '.join(files)}")
             _print(f"tests: {', '.join(tests)}")
             _print(f"sandbox: {evidence.get('backend')}")
             _print_digest("patch_sha256", evidence.get("patch_sha256"))
             acdd_cli.print_mode(acdd_state, green)
             _print("result: dry-run passed; nothing was committed or pushed")
-            _print(f"verify result: {target}")
+            _print_state_path("verify result", target, state_dir)
             if kanban_id:
                 _print(
                     f"suggested: hermes kanban comment {kanban_id} "
@@ -2530,7 +2589,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
 
         _print("bundlebees verify")
         _print(f"attempt: {attempt_id}")
-        _print(f"branch: {branch}")
+        _print_branch(branch)
         _print_sha(sha)
         _print(f"files: {', '.join(files)}")
         _print(f"tests: {', '.join(tests)}")
@@ -2550,7 +2609,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             except Exception as exc:  # noqa: BLE001
                 _print(f"pr: pending - the platform refused or lacked access ({exc}); "
                        "run `hermes bundlebees deliver` to converge")
-        _print(f"verify result: {target}")
+        _print_state_path("verify result", target, state_dir)
         _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")
         suggested = (
             f'hermes kanban comment {kanban_id} '
@@ -2882,7 +2941,7 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
     integration = acdd_cli.record_integration(state_dir, contract_items, workdir, suite, record.get("head_sha"))
     _print("bundlebees integrate")
     _print(f"wave: {record.get('wave_id')}")
-    _print(f"branch: {branch}")
+    _print_branch(branch)
     _print_sha(record.get("head_sha"))
     _print(f"attempts: {', '.join(record.get('attempts') or [])}")
     for attempt, problem in sorted((record.get("problems") or {}).items()):
