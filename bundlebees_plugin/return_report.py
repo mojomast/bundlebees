@@ -1164,7 +1164,10 @@ def _acceptance(
             truth = (tdd_truth.get(str(criterion["id"])) or {}) if tdd_truth else {}
             verdict = truth.get("status") if isinstance(truth, Mapping) else ""
             cited = truth.get("evidence") if isinstance(truth, Mapping) else ""
-            if status in (NOT_RUN, UNVERIFIED) and verdict in ("passed", "failed"):
+            # A verified commit is required: a green recorded on an uncommitted patch (a dry run
+            # at the baseline revision) is not evidence about a candidate, so it cannot fill a gap.
+            verified_commit = str(record.get("sha") or "").strip() if isinstance(record, Mapping) else ""
+            if status == NOT_RUN and verdict in ("passed", "failed") and verified_commit:
                 status = PASS if verdict == "passed" else FAIL
                 if cited:
                     evidence = [cited]
