@@ -613,6 +613,45 @@ def _lease_records(state_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _attribution_route(state_dir: Path, attempt_id: str) -> tuple[str | None, str | None]:
+    """Route and model from one verified attribution intent, else ``(None, None)``.
+
+    The view has no live launcher facts, so the audit re-checks the recorded
+    intent itself: its signature, its unique binding to this attempt and the
+    tuple it recorded. A missing attribution store, an unreadable or tampered
+    intent, an adopted attempt (no bound intent) and two bound intents all
+    yield null rather than a guess. The route is never inferred from a model.
+    """
+    from . import attribution
+
+    root = Path(state_dir) / "attribution"
+    if not root.is_dir():
+        return None, None
+    try:
+        intents = attribution.load_intents(state_dir)
+    except Exception:  # noqa: BLE001 - an unreadable store cannot attribute anything
+        return None, None
+    bound = [
+        intent for intent in intents
+        if str(intent.get("attempt_id") or "") == attempt_id
+    ]
+    if len(bound) != 1:
+        return None, None
+    intent = bound[0]
+    facts = {field: intent.get(field) for field in attribution.FIELDS}
+    try:
+        verdict = attribution.verify_attribution(
+            state_dir, attempt_id=attempt_id, facts=facts
+        )
+    except Exception:  # noqa: BLE001 - any refusal leaves the row unattributed
+        return None, None
+    if not isinstance(verdict, Mapping) or verdict.get("ok") is not True:
+        return None, None
+    route = _text_or_none(intent.get("route"))
+    model = _text_or_none(intent.get("model")) or _text_or_none(intent.get("attributed_model"))
+    return route, model
+
+
 def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
     """One row per recorded attempt, derived from local evidence only.
 
@@ -653,11 +692,14 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             state = _ATTEMPT_EXPIRED
         else:
             state = _ATTEMPT_DISPATCHED
+        route, attributed_model = _attribution_route(state_dir, attempt_id)
         row = {
             "attempt_id": attempt_id,
             "state": state,
             "branch": _text_or_none(record.get("branch")),
             "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model")),
+            "route": route,
+            "attributed_model": attributed_model,
             "project": _text_or_none(brief.get("project")),
             # Dispatch identity: the brief pins the job the work was dispatched
             # for, and the fleet view cannot link an attempt to anything without
