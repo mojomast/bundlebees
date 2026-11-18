@@ -46,9 +46,13 @@ EXCLUDED_PRS: dict[int, str] = {
 #: The merge numbers verified against main's first-parent history
 #: (b0cfecd #43, c6fa4a7 #44, 0416fac #47, 1e6adf8 #48, 4be4e7b #45,
 #: 3eef3b5 #49) plus the B18 docs-sync companion #104 and the verify-output
-#: literal redaction #110 (merged at 2c14cc5) for checkouts whose log carries
-#: no merge commits. Only a fallback: real history always wins.
-SNAPSHOT_MERGED_PRS: tuple[int, ...] = (43, 44, 45, 47, 48, 49, 104, 110)
+#: literal redaction #110 (merged at 2c14cc5), and the 2026-11-18 campaign
+#: PRs #105 (factory hook), #107 (research-before-retry) and #108 (kanban
+#: board sync) for checkouts whose log carries no merge commits. Only a
+#: fallback: real history always wins.
+SNAPSHOT_MERGED_PRS: tuple[int, ...] = (
+    43, 44, 45, 47, 48, 49, 104, 110, 105, 107, 108
+)
 
 MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+) from ", re.MULTILINE)
 
@@ -479,6 +483,47 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "verify-result path",
             "commit sha",
             "stays scrubbed",
+        ),
+    },
+    {
+        # feat/factory-hook: `bundlebees factory-hook` runs at most one
+        # factory-driver pass when the scout observes an attempt reach a
+        # terminal state, coalesced by a durable watermark and flock; the
+        # 30-minute heartbeat stays the backstop, and wiring the hook into the
+        # live scout is an owner action.
+        "pr": 105,
+        "name": "interim scout factory hook",
+        "keywords": (
+            "bundlebees factory-hook",
+            "durable watermark",
+            "flock coalescing",
+            "30-minute heartbeat",
+        ),
+    },
+    {
+        # feat/research-before-retry: a failed verify or a recurrence of the
+        # same failure signature enqueues exactly one research item, and a
+        # retry is refused until an accepted findings artifact exists.
+        "pr": 107,
+        "name": "research-before-retry gate",
+        "keywords": (
+            "Research-before-retry gate",
+            "exactly one research item",
+            "accepted findings artifact",
+        ),
+    },
+    {
+        # feat/kanban-board-sync: coordinator-side sync of the Hermes kanban
+        # board from bee/PR lifecycle evidence with card-key identity,
+        # idempotent replay, no merges or dispatches, a verified backup before
+        # the first mutation, and `--dry-run` changing nothing.
+        "pr": 108,
+        "name": "coordinator kanban board sync",
+        "keywords": (
+            "Hermes kanban board",
+            "card-key identity",
+            "verified backup",
+            "`--dry-run` changes nothing",
         ),
     },
 )

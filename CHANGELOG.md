@@ -434,6 +434,20 @@ one pull request.
   this Unreleased section; a non-feature merge still needs an explicit
   exclusion reason, and a checkout without merge commits falls back to the
   pinned snapshot set.
+- **Factory hook for the interim scout:** `bundlebees factory-hook` runs at
+  most one factory-driver pass when the scout observes an attempt reach a
+  terminal state. A durable watermark records what has already been driven and
+  flock coalescing collapses concurrent observations into that single pass,
+  while the 30-minute heartbeat remains the backstop; wiring the hook into the
+  live scout is an owner action, not an automatic change.
+- **Research-before-retry gate:** a failed verify or a recurrence of the same
+  failure signature enqueues exactly one research item, and a retry is refused
+  until an accepted findings artifact exists, so the same failure cannot be
+  retried without new evidence.
+- **Coordinator-side Hermes kanban board sync:** the coordinator syncs the
+  Hermes kanban board from bee/PR lifecycle evidence by card-key identity with
+  idempotent replay, never merges or dispatches, takes a verified backup before
+  the first mutation, and `--dry-run` changes nothing.
 
 ### Changed
 
