@@ -45,10 +45,30 @@ EXCLUDED_PRS: dict[int, str] = {
 
 #: The merge numbers verified against main's first-parent history
 #: (b0cfecd #43, c6fa4a7 #44, 0416fac #47, 1e6adf8 #48, 4be4e7b #45,
-#: 3eef3b5 #49) plus the B18 docs-sync companion #104 and the verify-output
-#: literal redaction #110 (merged at 2c14cc5) for checkouts whose log carries
-#: no merge commits. Only a fallback: real history always wins.
-SNAPSHOT_MERGED_PRS: tuple[int, ...] = (43, 44, 45, 47, 48, 49, 104, 110)
+#: 3eef3b5 #49) plus the B18 docs-sync companion #104, the verify-output
+#: literal redaction #110 (merged at 2c14cc5), the research-before-retry gate
+#: #107, kanban board sync #108, the factory-hook bridge #105, the durable
+#: completion inbox hand-off #106, factory service mode #109, board-stock
+#: comment-on-change #111 and the #114 docs-sync companion #113, for checkouts
+#: whose log carries no merge commits. Only a fallback: real history always
+#: wins.
+SNAPSHOT_MERGED_PRS: tuple[int, ...] = (
+    43,
+    44,
+    45,
+    47,
+    48,
+    49,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    113,
+)
 
 MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+) from ", re.MULTILINE)
 
@@ -517,6 +537,66 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
         "keywords": (
             "Docs-sync companion",
             "#107 and #108",
+        ),
+    },
+    # The docs-sync companion that adds the four rows below is intended for a
+    # SQUASH merge. A squash subject ("...(#N)") never matches
+    # MERGE_SUBJECT_RE, so the guard does not count that merge and no registry
+    # row for this branch's own PR number is required or added here.
+    {
+        # feat/factory-hook (PR #105): optional scout -> factory-driver bridge
+        # - one pass per newly observed terminal attempt, a durable handled-id
+        # watermark, a non-blocking flock that reports `coalesced` to the
+        # loser, an unadvanced watermark on failure, the 30-minute heartbeat
+        # retained as backstop, and live-scout wiring left to an owner action.
+        "pr": 105,
+        "name": "factory-hook bridge",
+        "keywords": (
+            "factory-hook",
+            "durable watermark",
+            "flock",
+            "heartbeat backstop",
+        ),
+    },
+    {
+        # feat/completion-inbox-durability (PR #106): the terminal landing
+        # publishes one durable completion event to the coordinator inbox
+        # before the source acknowledgement; deduplicated by the deterministic
+        # event id, at-least-once with one accepted decision, and one bounded
+        # retry before an event is marked failed.
+        "pr": 106,
+        "name": "durable completion inbox hand-off",
+        "keywords": (
+            "before the source acknowledgement",
+            "event id",
+            "at-least-once",
+            "one bounded retry",
+        ),
+    },
+    {
+        # feat/factory-service-mode (PR #109): the resident service wakes on
+        # the inbox, dispatches only with a durable pre-approval plus scope,
+        # shared cap and planning limits, and emits one coalesced wake; the
+        # shipped unit is a template only.
+        "pr": 109,
+        "name": "factory driver service mode",
+        "keywords": (
+            "WakeCoalescer",
+            "planning limits",
+            "durable pre-approval",
+        ),
+    },
+    {
+        # fix/board-stock-comment-on-change (PR #111): a low observation
+        # comments whenever it changes (state, ready count, free slots,
+        # shortfall or board); identical repeats are silent again and a
+        # recovery followed by a new shortfall starts a new episode.
+        "pr": 111,
+        "name": "board-stock comment on change",
+        "keywords": (
+            "board comment",
+            "identical repeats",
+            "new episode",
         ),
     },
 )
