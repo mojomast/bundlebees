@@ -29,6 +29,7 @@ import pytest
 
 from bundlebees_plugin import integrate_job, job as jobs, job_cli, leases, queue, reconcile, revision, verify_local
 from bundlebees_plugin import faults
+from tests.test_integrate_job import sandboxed
 
 PY = sys.executable
 SUITE = [PY, "-m", "pytest", "-q"]
@@ -140,6 +141,7 @@ def verified_attempt(state: Path, repo: Path, base: str, attempt_id: str = "att_
         suite_command=SUITE,
         gitleaks=SCANNER,
         require_gitleaks=True,
+        runner=sandboxed,
     )
 
 
@@ -166,7 +168,7 @@ def crash_state(tmp_path: Path, *, job_id: str = "job_d") -> tuple[Path, str, Pa
     the save that follows integration.
     """
     repo, base, state, job = verified_job(tmp_path, job_id=job_id)
-    integrated = integrate_job.integrate(state, job, repo, suite_command=SUITE)
+    integrated = integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
     assert integrated["ok"] is True, integrated
     return repo, base, state, job, integrated
 
@@ -224,7 +226,7 @@ def integrating_tick(state: Path, repo: Path):
 
     def tick(job_id: str) -> dict[str, Any]:
         job = jobs.load_job(state, job_id, recover=False)
-        integrate_job.integrate(state, job, repo, suite_command=SUITE)
+        integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
         jobs.save_job(state, job)
         job_cli.recover(state, job_id, repo)
         return {"status": "ok"}
@@ -501,6 +503,154 @@ class WaveEvidence:
 class JobRecovery:
     __test__ = True
 
+    @pytest.mark.parametrize("change", ["missing-ref", "moved-ref", "different-receipt", "missing-digest", "none"])
+    def test_live_tick_consumes_the_sealed_result_through_the_job_save(self, tmp_path, monkeypatch, change):
+        repo, base, state, job = verified_job(tmp_path)
+        ref = integrate_job.integration_ref(job["job_id"])
+        receipts = {}
+        real_integrate, real_save = integrate_job.integrate, jobs.save_job
+        expected = {}
+        writes = []
+
+        def after_integration(*args, **kwargs):
+            result = real_integrate(*args, **kwargs)
+            assert result["ok"] and not result["recovered"]
+            expected.update(commit=result["record"]["head_sha"], request_identity_digest=result["request_identity_digest"],
+                            wave_id=result["record"]["wave_id"], attempts=result["record"]["attempts"])
+            for directory in ("waves", "wave-identities", "job-wave-proofs", "job-wave-requests"):
+                receipts.update({p: p.read_bytes() for p in (state / directory).glob("*.json")})
+            if change == "missing-ref":
+                git(repo, "update-ref", "-d", ref)
+            elif change == "moved-ref":
+                git(repo, "update-ref", ref, base)
+            elif change == "different-receipt":
+                result["record"] = dict(result["record"], head_sha=base)
+            elif change == "missing-digest":
+                result.pop("request_identity_digest")
+            return result
+
+        def at_save(state_dir, body):
+            if body["tasks"][0]["state"] == "accepted":
+                # A competing Git writer at the actual save boundary cannot
+                # change the ref between the proof check and publication.
+                writes.append(git(repo, "update-ref", ref, base, check=False).returncode)
+            return real_save(state_dir, body)
+
+        monkeypatch.setattr(integrate_job, "integrate", after_integration)
+        monkeypatch.setattr(jobs, "save_job", at_save)
+        def tick():
+            return job_cli.tick(state, job["job_id"], client=Client(), repo=repo, suite_command=SUITE, runner=sandboxed)
+
+        if change == "none":
+            assert tick()["status"] == "ok"
+            saved = jobs.load_job(state, job["job_id"], recover=False)
+            entry, = saved["integration"]["accepted_waves"]
+            assert {k: entry[k] for k in expected} == expected and entry["recovered"] is False
+            assert saved["integration"]["last_commit"] == git(repo, "rev-parse", ref).stdout.strip() == expected["commit"]
+            assert len(writes) == 1 and writes[0] != 0
+        else:
+            with pytest.raises(jobs.JobError) as refused:
+                tick()
+            assert refused.value.code == "wave_reconciliation_required" and not writes
+            saved = jobs.load_job(state, job["job_id"], recover=False)
+            assert saved["tasks"][0]["state"] == "verified" and not saved["integration"].get("accepted_waves")
+            current = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            assert current == {"missing-ref": "", "moved-ref": base}.get(change, expected["commit"])
+        assert len(receipts) == 4 and all(p.read_bytes() == b for p, b in receipts.items())
+        if change == "missing-ref":
+            # Restarting the tick must not turn a post-publication deletion
+            # back into a permitted, interrupted publish.
+            monkeypatch.setattr(integrate_job, "integrate", lambda *a, **kw: pytest.fail("reintegrated"))
+            with pytest.raises(jobs.JobError) as refused:
+                tick()
+            assert refused.value.code == "wave_reconciliation_required"
+            assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0
+
+    @pytest.mark.parametrize("change", ["missing-request", "missing-proof", "corrupt-request", "foreign-repo",
+                                         "commit", "absent-repo", "changed-command", "changed-runner", "stale-ref"])
+    def test_unproved_handoff_cannot_change_job_or_ref(self, tmp_path, change):
+        repo, base, state, _, result = crash_state(tmp_path)
+        ref = result["integration_ref"]
+        args = {}
+        if change == "missing-request":
+            (state / "job-wave-requests/job_d.w1.json").unlink()
+        elif change == "missing-proof":
+            (state / "job-wave-proofs/job_d.w1.json").unlink()
+        elif change == "corrupt-request":
+            path = state / "job-wave-requests/job_d.w1.json"
+            data = json.loads(path.read_bytes())
+            data["body"]["repo"] = str(tmp_path)
+            path.write_text(json.dumps(data))
+        elif change == "foreign-repo":
+            args["repo"] = tmp_path
+        elif change == "absent-repo":
+            repo = repo.rename(tmp_path / "moved")
+        elif change == "commit":
+            path = state / "verify-results/att_1.json"
+            data = json.loads(path.read_bytes())
+            data["sha"] = base  # also an ancestor, but not the verified input to this wave
+            path.write_text(json.dumps(data))
+        elif change == "stale-ref":
+            git(repo, "update-ref", ref, base)
+            args["repo"] = repo
+        else:
+            args.update(repo=repo, suite_command=SUITE, runner=sandboxed)
+            if change == "changed-command":
+                args["suite_command"] = [*SUITE, "-x"]
+            else:
+                args["runner"] = None
+        job = jobs.load_job(state, "job_d", recover=False)
+        before = json.dumps(job, sort_keys=True)
+        snapshot = {p: p.read_bytes() for p in state.rglob("*.json")}
+        head = git(repo, "rev-parse", ref).stdout.strip()
+        with pytest.raises(jobs.JobError) as refused:
+            jobs.recover_integration(state, job, **args)
+        assert refused.value.code == "wave_reconciliation_required"
+        assert json.dumps(job, sort_keys=True) == before
+        assert snapshot == {p: p.read_bytes() for p in state.rglob("*.json")}
+        assert git(repo, "rev-parse", ref).stdout.strip() == head
+
+    def test_changed_request_cannot_recover_the_original_acceptance(self, tmp_path):
+        repo, _, state, job, first = crash_state(tmp_path)
+        original = {p: p.read_bytes() for p in state.glob("*/job_d.w1.json") if p.parent.name != "job-wave-requests"}
+        cmd = [*SUITE, "-k", "no_tests_selected"]
+        failed = integrate_job.integrate(state, job, repo, suite_command=cmd, runner=sandboxed)
+        assert not failed["ok"] and not jobs.recover_integration(state, job)
+        assert job["tasks"][0]["state"] == "verified"
+        cmd = [*SUITE, "-x"]
+        second = integrate_job.integrate(state, job, repo, suite_command=cmd, runner=sandboxed)
+        assert second["request_identity_digest"] != first["request_identity_digest"]
+        assert jobs.recover_integration(state, job, repo=repo, suite_command=cmd, runner=sandboxed)
+        entry, = job["integration"]["accepted_waves"]
+        assert entry["request_identity_digest"] == second["request_identity_digest"]
+        assert entry["wave_id"] == second["record"]["wave_id"] and entry["attempts"] == ["att_1"]
+        assert all(p.read_bytes() == b for p, b in original.items())
+
+    def test_passive_load_refingerprints_the_configured_runner(self, tmp_path, monkeypatch):
+        from bundlebees_plugin import execution
+
+        repo, _, state, job = verified_job(tmp_path)
+        runner = execution.SandboxRunner({"verify_allow_unsafe_local": True, "verify_python": sys.executable})
+        integrated = integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=runner)
+        assert jobs.load_job(state, "job_d")["integration"]["last_commit"] == integrated["record"]["head_sha"]
+        before = jobs.job_path(state, "job_d").read_bytes()
+        monkeypatch.setattr(execution, "_content_digest", lambda _: "0" * 64)
+        with pytest.raises(jobs.JobError) as refused:
+            jobs.load_job(state, "job_d")
+        assert refused.value.code == "wave_reconciliation_required"
+        assert jobs.job_path(state, "job_d").read_bytes() == before
+
+    def test_settled_job_history_cannot_rewind_a_ref(self, tmp_path):
+        repo, state, job_id = accepted_job(tmp_path)
+        ref = integrate_job.integration_ref(job_id)
+        base = git(repo, "rev-parse", "main").stdout.strip()
+        git(repo, "update-ref", ref, base)
+        before = jobs.job_path(state, job_id).read_bytes()
+        with pytest.raises(job_cli.JobCliError) as refused:
+            job_cli.recover(state, job_id, repo)
+        assert refused.value.code == "wave_reconciliation_required"
+        assert jobs.job_path(state, job_id).read_bytes() == before and git(repo, "rev-parse", ref).stdout.strip() == base
+
     def test_a_job_load_adopts_the_accepted_wave_a_crash_left_behind(self, tmp_path):
         _repo, _base, state, _job, integrated = crash_state(tmp_path)
         head = integrated["record"]["head_sha"]
@@ -537,26 +687,59 @@ class JobRecovery:
             reconcile.tick(state, "job_d", launcher=launcher,
                            integrator=lambda job: integrations.append(dict(job)) or {"ok": True, "evidence": "x"})
 
-        assert caught.value.code == "wave_malformed"
+        assert caught.value.code == "wave_reconciliation_required"
         assert integrations == [] and launcher.posts == []
         assert git(repo, "rev-list", "--count", "HEAD").stdout.strip() == commits
         assert jobs.load_job(state, "job_d", recover=False)["tasks"][0]["state"] == "verified"
 
         with pytest.raises(jobs.JobError) as refused:
             job_cli.recover(state, "job_d", repo)
-        assert refused.value.code == "wave_malformed"
+        assert refused.value.code == "wave_reconciliation_required"
 
-    def test_recovery_restores_the_durable_ref_without_a_new_commit(self, tmp_path):
-        repo, _base, state, _job, integrated = crash_state(tmp_path)
+    @pytest.mark.parametrize("caller", ["explicit_job_recover", "direct_integrate"])
+    @pytest.mark.parametrize("move", ["deleted", "moved"])
+    def test_consumed_sealed_intent_cannot_restore_a_published_ref(self, tmp_path, caller, move):
+        repo, base, state, job, first = crash_state(tmp_path)
+        ref = first["integration_ref"]
+        assert not git(repo, "for-each-ref", "refs/bb/pending-integration/").stdout
+        if move == "deleted":
+            git(repo, "update-ref", "-d", ref)
+        else:
+            git(repo, "update-ref", ref, base)
+        saved = {p: p.read_bytes() for p in state.rglob("*.json")}
+        for _ in range(2):
+            with pytest.raises((jobs.JobError, integrate_job.IntegrateError)) as refused:
+                if caller == "explicit_job_recover":
+                    job_cli.recover(state, "job_d", repo)
+                else:
+                    integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+            assert refused.value.code == "wave_reconciliation_required"
+            assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip() == (
+                "" if move == "deleted" else base)
+            assert {p: p.read_bytes() for p in state.rglob("*.json")} == saved
+
+    @pytest.mark.parametrize("caller", ["explicit_job_recover", "direct_integrate"])
+    def test_recovery_restores_the_durable_ref_without_a_new_commit(self, tmp_path, caller, monkeypatch):
+        repo, _base, state, job = verified_job(tmp_path)
         ref = integrate_job.integration_ref("job_d")
-        head = integrated["record"]["head_sha"]
-        git(repo, "update-ref", "-d", ref)
+        with monkeypatch.context() as m:
+            m.setattr(integrate_job, "_checkpoint", lambda *args, **kw: boom())
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+        head = json.loads((state / "waves/job_d.w1.json").read_bytes())["head_sha"]
+        assert git(repo, "for-each-ref", "--format=%(objectname)", "refs/bb/pending-integration/").stdout.strip() == head
+        assert git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0
         commits = git(repo, "rev-list", "--count", "HEAD").stdout.strip()
 
+        if caller == "direct_integrate":
+            for _ in range(2):
+                result = integrate_job.integrate(state, job, repo, suite_command=SUITE, runner=sandboxed)
+                assert result["recovered"] and result["record"]["head_sha"] == head
         outcome = job_cli.recover(state, "job_d", repo)
 
         assert outcome["adopted"] is True
         assert outcome["ref_restored"] == head
+        assert not git(repo, "for-each-ref", "refs/bb/pending-integration/").stdout
         assert git(repo, "rev-parse", ref).stdout.strip() == head
         assert git(repo, "rev-list", "--count", "HEAD").stdout.strip() == commits
         assert jobs.load_job(state, "job_d")["integration"]["wave"] == 2
@@ -565,15 +748,13 @@ class JobRecovery:
         assert again["adopted"] is False, "a second recovery must adopt nothing"
 
     @pytest.mark.parametrize(
-        "tamper, code",
+        "tamper",
         [
-            ({"head_sha": "short"}, "wave_evidence_invalid"),
-            ({"attempts": ["att_other"]}, "wave_evidence_mismatch"),
-            ({"wave_id": "another-job.w1"}, "wave_evidence_mismatch"),
-            ({"attempts": []}, "wave_evidence_invalid"),
+            {"head_sha": "short"}, {"attempts": ["att_other"]}, {"wave_id": "another-job.w1"}, {"attempts": []},
+            {"suite": None}, {"suite": {"exit_code": 0, "blocking": True}},
         ],
     )
-    def test_accepted_evidence_that_does_not_match_the_job_is_refused(self, tmp_path, tamper, code):
+    def test_accepted_evidence_that_does_not_match_the_job_is_refused(self, tmp_path, tamper):
         repo, _base, state, _job, _integrated = crash_state(tmp_path)
         path = state / "waves" / "job_d.w1.json"
         record = json.loads(path.read_text(encoding="utf-8"))
@@ -585,12 +766,12 @@ class JobRecovery:
 
         with pytest.raises(jobs.JobError) as caught:
             jobs.load_job(state, "job_d")
-        assert caught.value.code == code
+        assert caught.value.code == "wave_reconciliation_required"
 
         with pytest.raises(jobs.JobError) as refused:
             reconcile.tick(state, "job_d", launcher=Launcher(),
                            integrator=lambda job: integrations.append(dict(job)) or {"ok": True, "evidence": "x"})
-        assert refused.value.code == code
+        assert refused.value.code == "wave_reconciliation_required"
         assert integrations == []
         assert git(repo, "rev-list", "--count", "HEAD").stdout.strip() == commits
 

@@ -1,20 +1,24 @@
 """Rails R02 acceptance tests (RED-first).
 
-Hash vectors below are self-derived in this workspace from the frozen formula
-in spec section 4; R01's schemas/rails/fixtures/hash-vectors.json is not
-readable here, so R17/R18 integration cross-applies R01's vectors later.
+The four-checkout test also runs the real Hyvv emitter/exporter with this
+runtime and Workflow's strict validator against both frozen schemas.
 """
 
 import hashlib
 import json
+import multiprocessing
 import os
 import platform
+import runpy
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTRIB_DIR = os.path.join(REPO_ROOT, "contrib")
@@ -273,8 +277,151 @@ class HashVectorTests(RailsCase):
         view_row = led.query("SELECT id, ts, kind, why, sha, prev_hash, hash FROM events")[0]
         self.assertEqual(view_row["id"], led.chain_id + ":1")
 
+    def test_old_row_and_retry_are_unchanged_across_new_append(self):
+        # Seed precisely the pre-freeze bytes/index, independently of today's
+        # emitter. Exercise *both* chains and the original receipt after reopen.
+        led = self.ledger()
+        args = self.base_args()
+        body = {k: v for k, v in args.items() if k != 'dedupe_key'}
+        body.update(schema='rizzstack.rails/1', chain_id=led.chain_id,
+                    lane=dict(lane_id=None, parent_event_id=None, parent_lane_id=None),
+                    occurred_at=None, duration_ms=None, timing_quality='unknown',
+                    redaction_policy={'mode':'structured_safe', 'path_detail':'omitted'})
+        old_sha = hashlib.sha256(rails_contracts.canonicalize(body)).hexdigest()
+        eid = led.chain_id + ':1'
+        old = dict(body, lane=dict(body['lane'], orphan=False), event_id=eid, seq=1,
+                   prev_hash='genesis', recorded_at='2026-01-01T00:00:01.000000Z')
+        old['hash'] = _ref_rails_hash('genesis', old)
+        text = rails_contracts.canonicalize(old).decode('ascii')
+        row = dict(ingest_seq=1, chain_id=led.chain_id, seq=1, event_id=eid, id=eid,
+                   envelope_json=text, ts=old['recorded_at'], task_id='task-1', actor='worker_report',
+                   parent='', kind='decision.recorded', ac_id='', result='proceed', why=text,
+                   tokens_in='', tokens_out='', prev_hash='genesis', sha=old['hash'], rails_hash=old['hash'])
+        row['hash'] = rails_contracts.legacy_hash('genesis', row)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f"INSERT INTO event_rows ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
+                         tuple(row.values()))
+            conn.execute('INSERT INTO dedupe_index VALUES (?,?,?,?)', (led.chain_id, 'dedupe-1', eid, old_sha))
+        led.close()
+        led = self.ledger()
+        self.addCleanup(led.close)
+        replay = led.append(**args)
+        self.assertEqual((replay['duplicated'], replay['hash']), (True, old['hash']))
+        with self.assertRaises(rails_ledger.IdempotencyConflict):
+            led.append(**dict(args, payload={'decision':'changed'}))
+        led.append(**self.base_args(kind='usage.observed', dedupe_key='next', lane={'parent_event_id':eid},
+            payload=dict(usage_record_id='u1', metric_scope='task-1', basis='final', tokens_in=12,
+                         tokens_out=None, tokens_thinking=None, provider='p', model='m')))
+        first, second = led.query('SELECT * FROM event_rows ORDER BY seq')
+        self.assertEqual(row, first)
+        self.assertEqual(json.loads(second['why'])['prev_hash'], old['hash'])
+        self.assertEqual(second['prev_hash'], row['hash'])
+        self.assertEqual((second['parent'], second['tokens_in'], second['tokens_out']), (eid, 12, ''))
+        self.assertTrue(led.verify_chain()['legacy_ok'])
+        self.assertTrue(led.verify_chain()['ok'])
+
+
+class FrozenExportTests(RailsCase):
+    def test_actual_worker_export_validates_and_imports_verbatim(self):
+        root = Path(os.environ.get('RAILS_R18_ROOT', Path(REPO_ROOT).parent)).resolve()
+        checkouts = [root / repo for repo in ('workflow', 'hyvv', 'bundlebees', 'orbitdesktop')]
+        if not all(p.is_dir() for p in checkouts):
+            if os.environ.get('RAILS_R18_ROOT') or os.environ.get('RAILS_R18_REQUIRED') == '1':
+                self.fail('four-checkout fixture incomplete')
+            self.skipTest('requires sibling Workflow, Hyvv, BundleBees and Orbit checkouts')
+        workflow, hyvv, _, _ = checkouts
+        frozen = runpy.run_path(str(workflow / 'tests/test_rails_contract.py'))
+        schemas = workflow / 'schemas/rails'
+        load, validate = frozen['load_json'], frozen['validate_schema']
+        event_schema = load(schemas / 'event.schema.json')
+        payloads = load(schemas / 'payload.schema.json')['properties']['kinds']['properties']
+        root = Path(self._tmp.name)
+        (root / 'attempts').mkdir()
+        aid = 'att_1234567890abcdef'
+        rows = [dict(lseq=1, kind='worker:tool_call', tool_id='call_1234567890abcdef',
+                     line='[tool read] read', text='private fixture prompt'),
+                dict(lseq=2, kind='worker:tool_update', tool_id='call_1234567890abcdef', tool_status='completed')]
+        (root / 'attempts' / (aid + '.events.jsonl')).write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        # Use the checkouts' actual modules, intentionally against the runtime
+        # under test (which may not have been vendor-refreshed into Hyvv yet).
+        with patch.object(sys, 'path', [str(hyvv), *sys.path]):
+            from rails_emitter import RailsEmitter
+            from rails_export import export_page
+            worker = RailsEmitter(root)
+            worker.ingest(aid)
+            page = export_page(worker.path)
+        self.assertEqual(validate(page, load(schemas / 'http.schema.json')['properties']['export_page']), [])
+        events = page['events']
+        self.assertEqual([e['kind'] for e in events], ['tool.start','tool.finish','source.checkpoint'])
+        origin = [frozen['canonical'](e).decode('ascii') for e in events]
+        with sqlite3.connect(worker.path) as conn:
+            self.assertEqual(origin, [r[0] for r in conn.execute('SELECT why FROM event_rows ORDER BY seq')])
+        db = self.ledger()
+        self.addCleanup(db.close)
+        db.import_origin_page(page['chain_id'], origin)
+        self.assertEqual(db.query('SELECT origin_bytes FROM imported_events ORDER BY seq'),
+                         [{'origin_bytes': text} for text in origin])
+        checkpoint, = db.query('SELECT envelope_json FROM event_rows')
+        for env in [*events, json.loads(checkpoint['envelope_json'])]:
+            with self.subTest(kind=env['kind']):
+                self.assertEqual(validate(env, event_schema), [])
+                self.assertEqual(validate(env['payload'], payloads[env['kind']]), [])
+                self.assertEqual(env['hash'], frozen['rails_hash'](env['prev_hash'], frozen['strip_hash'](env)))
+
+    def test_published_identifiers_policy_and_closed_payload(self):
+        db = self.ledger()
+        self.addCleanup(db.close)
+        db.append(**self.base_args(scope={'repo_slug':'a/b', 'job_id':'j'}, timing_quality='reported',
+                                   redaction_policy='rails-safe/1'))
+        env = json.loads(db.query('SELECT why FROM events')[0]['why'])
+        self.assertEqual(env['scope'], dict.fromkeys(rails_contracts.SCOPE_FIELDS) | {'repo':'a/b','job_id':'j'})
+        self.assertEqual(env['timing_quality'], 'estimated')
+        self.assertEqual(env['dedupe_key'], 'dedupe-1')
+        self.assertEqual(env['payload'], {'summary':'proceed'})
+        for bad in (dict(dedupe_key=None), dict(dedupe_key='/private/some_id'),
+                    dict(scope={'task_id':'/private', 'code_rev':'main'}), dict(scope={'repo':'a/b'}),
+                    dict(payload={'summary':'ok', 'unrecognized':'value'}),
+                    dict(redaction_policy={'mode':'structured_safe','notes':'unbounded'})):
+            with self.subTest(keys=list(bad)), self.assertRaises(rails_contracts.RailsRefusal):
+                db.append(**self.base_args(**bad))
+        self.assertEqual(db.head()['seq'], 1)
+
+
+def _first_writer(path, start, args):
+    # No connection, schema or identity exists before the barrier opens.
+    start.wait(timeout=30)
+    with closing(rails_ledger.RailsLedger(path)) as led:
+        led.append(**args)
+
 
 class ConcurrencyTests(RailsCase):
+    def test_ten_independent_writers_open_fresh_ledger(self):
+        ctx = multiprocessing.get_context('spawn')
+        args = [self.base_args(dedupe_key='writer-%d' % i) for i in range(10)]
+        start = ctx.Barrier(len(args))
+        workers = [ctx.Process(target=_first_writer, args=(self.db_path, start, event))
+                   for event in args]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=40)
+                self.assertEqual(worker.exitcode, 0)
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.kill()
+                if worker.pid is not None:
+                    worker.join()
+
+        with closing(self.ledger()) as led:
+            retries = [led.append(**event) for event in args]
+            self.assertTrue(all(r['duplicated'] for r in retries))
+            self.assertEqual(sorted(r['seq'] for r in retries), list(range(1, 11)))
+            self.assertEqual(led.head()['seq'], 10)
+            verified = led.verify_chain()
+            self.assertTrue(verified['ok'] and verified['legacy_ok'])
+
     def test_ten_concurrent_writers_serialize_with_commit_before_ack(self):
         n_threads, per = 10, 5
         barrier = threading.Barrier(n_threads)
@@ -477,6 +624,29 @@ class ImportTests(RailsCase):
     def _stream(self, n, chain_alias="peer-alias"):
         return _origin_stream(chain_alias, "11111111-2222-3333-4444-555555555555", n)
 
+    def test_refused_page_then_restart_and_replay_preserves_checkpoint(self):
+        chain_id, pages = self._stream(4)
+        with closing(self.ledger()) as led:
+            led.import_origin_page(chain_id, pages[:1])
+            cursor = led.import_cursor(chain_id)
+            head = led.head()
+            receipts = led.query('SELECT * FROM import_receipts')
+            for tail, refusal in ((pages[3], rails_ledger.SourceGap),
+                                  ('{}', rails_contracts.RailsRefusal)):
+                with self.assertRaises(refusal):
+                    led.import_origin_page(chain_id, [pages[1], tail])
+
+        with closing(self.ledger()) as reopened:
+            replay = reopened.import_origin_page(chain_id, pages[:1])
+            self.assertTrue(replay['duplicated'])
+            self.assertEqual(reopened.import_cursor(chain_id), cursor)
+            self.assertEqual(reopened.head(), head)
+            self.assertEqual(reopened.query('SELECT * FROM import_receipts'), receipts)
+            self.assertEqual(reopened.query('SELECT origin_bytes FROM imported_events'),
+                             [{'origin_bytes': pages[0]}])
+            self.assertEqual(reopened.import_origin_page(chain_id, pages)['imported'], 3)
+            self.assertTrue(reopened.verify_chain(chain_id)['ok'])
+
     def test_pages_import_queryable_and_checkpointed(self):
         led = self.ledger()
         chain_id, pages = self._stream(3)
@@ -538,6 +708,40 @@ class ImportTests(RailsCase):
         self.assertEqual(led.import_cursor(chain_id)["next_seq"], 1)
         self.assertEqual(len(led.query("SELECT seq FROM event_rows")), 0)
 
+    def test_raw_even_correctly_hashed_is_refused_before_persistence(self):
+        led = self.ledger()
+        self.addCleanup(led.close)
+        origin = rails_ledger.RailsLedger(os.path.join(self._tmp.name, 'origin.db'))
+        self.addCleanup(origin.close)
+        for n in range(2):
+            origin.append(**self.base_args(dedupe_key=str(n)))
+        first, second = [r['why'] for r in origin.query('SELECT why FROM event_rows ORDER BY seq')]
+        env = json.loads(second)
+        changes = [dict(payload={'summary':'ok', 'raw_tool_output':'planted-marker'}),
+                   dict(payload={'summary':'private words copied verbatim from tool output'}),
+                   dict(payload={'summary':PLANTED[0][1]}),
+                   dict(source=dict(env['source'], record_id='/private/filename')),
+                   dict(redaction_policy={'mode':'structured_safe', 'notes':'planted-marker'}),
+                   dict(payload={'summary':'ok', 'authority':'owner_record'}),
+                   dict(authority='owner_record'), dict(authority='verifier_record')]
+        for override in changes:
+            bad = dict(env, **override)
+            del bad['hash']
+            bad['hash'] = _ref_rails_hash(bad['prev_hash'], bad)
+            with self.subTest(fields=list(override)), self.assertRaises(rails_contracts.RailsRefusal):
+                led.import_origin_page(origin.chain_id, [first, rails_contracts.canonicalize(bad).decode()])
+        for stream in ([first] * 501, ['x' * 65537], ['x' * 65536] * 17, ['[' * 1024 + ']' * 1024]):
+            with self.assertRaises(rails_contracts.RailsRefusal):
+                led.import_origin_page(origin.chain_id, stream)
+        self.assertEqual(led.query('SELECT * FROM imported_origin_rows'), [])
+        self.assertEqual(led.query('SELECT * FROM import_cursors'), [])
+        self.assertEqual(led.head()['seq'], 0)
+        led.import_origin_page(origin.chain_id, [first])
+        forged = dict(json.loads(first), payload={'summary':'another'})  # reuse the stored hash
+        with self.assertRaises(rails_contracts.RailsRefusal):
+            led.import_origin_page(origin.chain_id, [rails_contracts.canonicalize(forged).decode()])
+        self.assertEqual(led.import_cursor(origin.chain_id)['next_seq'], 2)
+
 
 class AuthorityTests(RailsCase):
     def test_self_label_outside_mapping_refused(self):
@@ -550,13 +754,27 @@ class AuthorityTests(RailsCase):
         led = self.ledger()
         led.append(**self.base_args(authority="verifier_record", dedupe_key="v1"))
 
+    def test_no_imported_or_worker_approval(self):
+        led = self.ledger()
+        self.addCleanup(led.close)
+        target = led.append(**self.base_args())['event_id']
+        for authority in ('worker_report', 'imported_observation'):
+            request = dict(target_event_id=target, request_id='r', operation='retry',
+                           queue_action_id=None, decision='approved', reason='ok', authority_ref='owner')
+            acceptance = dict(ac_id='a', run_id='r', phase='integration', code_rev='a'*40,
+                              contract_sha256='a'*64, verdict='PASS', evidence_refs=['e'], reason='')
+            for kind, payload in [('intervention.result', request), ('acceptance.result', acceptance)]:
+                with self.assertRaises(rails_ledger.AuthorityRefusal):
+                    led.append(**self.base_args(kind=kind, payload=payload, authority=authority, dedupe_key='claim'))
+        self.assertEqual(led.head()['seq'], 1)
+
 
 class PayloadRuleTests(RailsCase):
     def _ver(self, **over):
         payload = {
             "ac_id": "ac-1",
             "contract_sha256": "a" * 64,
-            "code_rev": "r1",
+            "code_rev": "b" * 40,
             "run_id": "run-1",
             "phase": "green",
             "verdict": "PASS",
@@ -618,7 +836,7 @@ class PayloadRuleTests(RailsCase):
                     verdict="EXPECTED_RED",
                     evidence_refs=[],
                     reason="planned",
-                    frozen_test_intent={"test_ids": ["t1"], "frozen": True},
+                    expected_intent_ref="intent:t1",
                 ),
                 dedupe_key="er2",
             )

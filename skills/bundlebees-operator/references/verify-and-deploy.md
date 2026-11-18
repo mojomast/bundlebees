@@ -101,6 +101,24 @@ is refused with `integration_required` until then.
   regressions, failed-worker recoveries. `--note <text>` records one human
   intervention.
 
+`cost_per_accepted` divides the **whole run's** reported USD cost (including
+rejected attempts and retries) by `accepted_changes`, the number of distinct
+attempt IDs in successful integrations. Accepting the same ID twice counts
+once. With no accepted changes the rate is `null` (`n/a` in text).
+
+Read `cost_coverage.attempts_with_cost` and `attempts_without_cost` alongside
+`cost_usd_known_subtotal`. The subtotal sums the last valid cumulative cost
+report for each metered attempt. A reported zero counts; no report is `null`,
+and token counts do not imply a price. Coverage includes IDs referenced by
+the run, even if seen only in a wave or as a retry's predecessor. Each legacy
+dispatch without an ID counts as one attempt without attributable cost.
+`unattributed_events` counts events that cannot be joined reliably: costs
+without an attempt ID, verify/integrate events without IDs, or references to
+invalid or scrubbed IDs. A wave with redacted IDs cannot establish a rate.
+If coverage is incomplete, `cost_usd_total` and `cost_per_accepted` are both
+`null`. For example, if two of three attempts report $0.70 between them and
+two changes are accepted, $0.70 is the subtotal; the rate is still unknown.
+
 If verify or integrate is red:
 
 | Code | Meaning and next step |

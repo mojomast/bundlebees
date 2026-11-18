@@ -223,6 +223,8 @@ def test_summarize_has_exact_numbers_for_a_synthetic_run(tmp_path: Path):
         "accepted_changes",
         "tokens_total",
         "tokens_per_accepted",
+        "cost_usd_known_subtotal",
+        "cost_coverage",
         "cost_usd_total",
         "cost_per_accepted",
         "human_interventions",
@@ -249,8 +251,13 @@ def test_summarize_has_exact_numbers_for_a_synthetic_run(tmp_path: Path):
     assert summary["accepted_changes"] == 2
     assert summary["tokens_total"] == 1500
     assert summary["tokens_per_accepted"] == pytest.approx(750.0)
-    assert summary["cost_usd_total"] == pytest.approx(0.7)
-    assert summary["cost_per_accepted"] == pytest.approx(0.35)
+    # att-2 was rejected but its unknown cost still belongs in the run numerator.
+    assert summary["cost_usd_known_subtotal"] == pytest.approx(0.7)
+    assert summary["cost_coverage"] == {
+        "attempts_with_cost": 2, "attempts_without_cost": 1, "unattributed_events": 0,
+    }
+    assert summary["cost_usd_total"] is None
+    assert summary["cost_per_accepted"] is None
     assert summary["human_interventions"] == 1
     assert summary["plan_to_accepted_s"]["median"] == pytest.approx(210.0)
     assert summary["plan_to_accepted_s"]["max"] == pytest.approx(240.0)
@@ -288,6 +295,7 @@ def test_summarize_without_data_does_not_divide_by_zero():
     assert summary["accepted_changes"] == 0
     assert summary["tokens_total"] is None  # BM1: unavailable, not zero
     assert summary["tokens_per_accepted"] is None
+    assert summary["cost_usd_known_subtotal"] is None
     assert summary["cost_usd_total"] is None
     assert summary["cost_per_accepted"] is None
     assert summary["human_interventions"] == 0
@@ -296,6 +304,73 @@ def test_summarize_without_data_does_not_divide_by_zero():
     assert summary["failed_worker_recoveries"] == 0
     assert summary["waves_accepted"] == 0
     assert summary["waves_rejected"] == 0
+
+
+def test_cost_rate_includes_retries_and_divides_by_distinct_accepted_changes():
+    events = [
+        {"event": "verify", "attempt_id": "rejected", "ok": False, "cost_usd": 1},
+        {"event": "verify", "attempt_id": "rejected", "ok": False, "cost_usd": 3},
+        {"event": "recovery", "attempt_id": "retry", "retry_of": "rejected"},
+        {"event": "verify", "attempt_id": "retry", "ok": True, "cost_usd": 1},
+        {"event": "integrate", "attempts": ["retry", "free"], "ok": True},
+        {"event": "integrate", "attempts": ["retry"], "ok": True},
+    ]
+    partial = metrics.summarize(events)
+    assert partial["cost_usd_known_subtotal"] == 4
+    assert partial["cost_coverage"]["attempts_without_cost"] == 1  # seen only at integration
+    assert partial["cost_usd_total"] is None and partial["cost_per_accepted"] is None
+
+    complete = metrics.summarize(events + [{"event": "verify", "attempt_id": "free", "cost_usd": 0}])
+    assert complete["cost_coverage"] == {
+        "attempts_with_cost": 3, "attempts_without_cost": 0, "unattributed_events": 0,
+    }
+    assert complete["cost_usd_known_subtotal"] == complete["cost_usd_total"] == 4
+    assert complete["accepted_changes"] == 2 and complete["cost_per_accepted"] == 2
+
+
+def test_free_run_cost_and_no_accepted_changes():
+    verify = {"event": "verify", "attempt_id": "free", "cost_usd": 0}
+    before = metrics.summarize([verify])
+    assert before["cost_usd_known_subtotal"] == before["cost_usd_total"] == 0
+    assert before["accepted_changes"] == 0 and before["cost_per_accepted"] is None
+    after = metrics.summarize([verify, {"event": "integrate", "attempt_id": "free", "ok": True}])
+    assert after["cost_per_accepted"] == 0
+
+
+@pytest.mark.parametrize("invalid", [None, False, "0", -1, float("nan"), float("inf")])
+def test_invalid_cost_does_not_cover_an_attempt(invalid):
+    s = metrics.summarize([{"event": "verify", "attempt_id": "a", "tokens": 0, "cost_usd": invalid}])
+    assert s["cost_coverage"]["attempts_without_cost"] == 1
+    assert s["cost_usd_known_subtotal"] is None and s["cost_usd_total"] is None
+
+
+def test_anonymous_events_cannot_complete_or_double_count_attributed_cost():
+    s = metrics.summarize([
+        {"event": "dispatch", "attempt_id": "a"}, {"event": "dispatch", "attempt_id": "a"},
+        {"event": "dispatch"},
+        {"event": "verify", "attempt_id": "a", "cost_usd": 0},
+        {"event": "integrate", "attempts": ["a"], "ok": True, "cost_usd": 10},
+    ])
+    assert s["cost_coverage"] == {
+        "attempts_with_cost": 1, "attempts_without_cost": 1, "unattributed_events": 1,
+    }
+    assert s["cost_usd_known_subtotal"] == 0 and s["accepted_changes"] == 1
+    assert s["cost_usd_total"] is None and s["cost_per_accepted"] is None
+
+
+def test_redacted_wave_references_do_not_establish_cost_coverage(tmp_path):
+    # Legacy logs scrub long opaque IDs inside arrays. Do not treat the shared
+    # redaction marker as a third real attempt or infer a rate from this wave.
+    attempts = ["a" * 31 + "1", "b" * 31 + "2"]
+    for attempt_id in attempts:
+        _append(tmp_path, "verify", attempt_id=attempt_id, cost_usd=1)
+    _append(tmp_path, "integrate", attempts=["[redacted]", "[redacted]"], ok=True)
+    summary = metrics.summarize(metrics.read_events(tmp_path, "default"))
+    assert summary["cost_coverage"] == {
+        "attempts_with_cost": 2, "attempts_without_cost": 0, "unattributed_events": 1,
+    }
+    assert summary["cost_usd_known_subtotal"] == 2
+    assert summary["cost_usd_total"] is None and summary["cost_per_accepted"] is None
 
 
 def test_format_summary_lists_every_key_and_marks_missing_values():

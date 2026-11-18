@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import re
 import shlex
 import shutil
@@ -310,6 +311,11 @@ def _build_parser(parser: Any) -> Any:
     status_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     status_cmd.set_defaults(command="status")
 
+    from . import rails_cli
+    rails_cli.add_parsers(subparsers)
+    ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
+    ingest.add_argument('--source', choices=('bundlebees','outbox','queue','hermes','launcher'), required=True)
+    ingest.add_argument('--limit', type=int, default=100)
     acdd_cli.add_parsers(subparsers)
     job_cli.add_parsers(subparsers)
     campaign_cli.add_parsers(subparsers)
@@ -426,6 +432,11 @@ def _cmd_coverage(ctx: Any, args: Any) -> int:
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
+        if command == 'rails':
+            from . import rails_cli
+            return rails_cli.cmd_rails(ctx, args)
+        if command == 'rails-import':
+            return _rails_import(ctx, args)
         if command == "owner":
             return _cmd_owner(ctx, args)
         if command == "reviewer":
@@ -2528,4 +2539,121 @@ def _cmd_doctor(ctx: Any, args: Any) -> int:
     """The rizzstack doctor: read-only stack parity and health diagnostic."""
     from . import doctor
 
-    return doctor.run(ctx, args)
+    path = _rails_setting(ctx, 'rails_db')
+    if not path:
+        return doctor.run(ctx, args)
+    checkers = getattr(ctx, 'bundlebees_doctor_checkers', None)
+    report = doctor.collect(ctx, args, checkers if isinstance(checkers, doctor.Checkers) else None)
+    row = _rails_doctor(path)
+    report['checks'].append(row)
+    if row['fix']:
+        report['remediation'].append('rails: ' + row['fix'])
+    if args.json:
+        print(json.dumps(doctor._public_report(report), indent=2, sort_keys=True))
+    else:
+        print('\n'.join(doctor.render(report)))
+    return int(bool(args.check_parity and not report['parity_ok']))
+
+
+def _rails_setting(ctx, name, default=''):
+    return getattr(ctx, 'get_config', lambda k, d: d)(name, default)
+
+
+def _rails_doctor(path):
+    from contextlib import closing
+    from rizzstack_rails import RailsLedger
+    from rizzstack_rails.query import make_request, query
+    row = dict(check='rails', state='unavailable', detail='Configured ledger is unavailable.',
+               fix='Check the local ledger and its profile read permission.', rev=None)
+    try:
+        with closing(RailsLedger(path, read_only=True)) as reader:
+            head = reader.head()
+            if head['seq']:
+                result = query(make_request('event', f"{head['chain_id']}:{head['seq']}", format='json'), reader)
+                if not result.get('ok') or not result['items']:
+                    return row
+            origins = reader.query("select count(*) as total, coalesce(sum(state='halted'),0) as halted from import_cursors")[0]
+            pages = 0
+            if reader.query("select 1 from sqlite_master where type='table' and name='source_pages'"):
+                pages = reader.query('select count(distinct source_key) as n from source_pages')[0]['n']
+            row.update(state='stale' if origins['halted'] else 'healthy',
+                       detail=f"Read-only ledger; local head {head['seq']}, checkpointed sources {pages}, "
+                       f"imported origins {origins['total']}, halted origins {origins['halted']}. "
+                       'Full integrity and freshness unchecked.',
+                       fix='Reconcile the halted origin against its pinned head.' if origins['halted'] else '')
+    except Exception:
+        pass  # Never expose a configured path or exception text in doctor.
+    return row
+
+
+def _rails_import(ctx, args):
+    """Explicit CLI importer, no network/filesystem parameters on the model tool."""
+    from contextlib import closing
+    from rizzstack_rails import RailsLedger
+    from rizzstack_rails.importer import Importer
+    from rizzstack_rails.source import SourceError, token
+    try:
+        path = _rails_setting(ctx, 'rails_db')
+        name = args.source
+        configured = _rails_setting(ctx, 'rails_import_sources')
+        if not path or not Path(path).is_absolute() or name not in {n.strip() for n in configured.split(',')}:
+            raise SourceError('not_configured')
+        if type(args.limit) is not int or not 1 <= args.limit <= 500:
+            raise SourceError('invalid_limit')
+        state = getattr(ctx, 'bundlebees_state_dir', None) or plugin_state_dir()
+        if not state or not Path(state).is_dir():
+            raise SourceError('not_configured')
+        authorities = {'imported_observation'}  # local page checkpoints
+        if name == 'bundlebees':
+            from .rails_bundlebees_source import BundlebeesSource
+            source = BundlebeesSource.from_existing_state(state)
+            authorities.update(('worker_report','coordinator_record','verifier_record','reviewer_record'))
+        elif name == 'outbox':
+            from .rails_outbox_source import RailsOutboxSource
+            source = RailsOutboxSource(state)
+            authorities.add('worker_report')
+        elif name == 'queue':
+            from .rails_queue_source import QueueSource
+            source = QueueSource(state)
+            authorities.add('coordinator_record')
+        elif name == 'hermes':
+            from .rails_hermes_source import HermesSource
+            aliases = json.loads(_rails_setting(ctx, 'rails_session_aliases', '{}'))
+            db = _rails_setting(ctx, 'rails_hermes_db')
+            if not aliases or not isinstance(aliases, dict) or not db or not Path(db).is_absolute():
+                raise SourceError('not_configured')
+            source = HermesSource(db, aliases)
+        elif name == 'launcher':
+            from .rails_remote_source import RemoteRailSource
+            from .client import get_launcher_token
+            base = _rails_setting(ctx, 'launcher_url')
+            if not base or _rails_setting(ctx, 'adapter') != 'launcher':
+                raise SourceError('not_configured')
+            chain = token(_rails_setting(ctx, 'rails_launcher_chain'))
+            authorities.add('worker_report')
+            source = RemoteRailSource(base_url=base, peer_id='worker-1', env={},
+                                      config={'launcher_url':base, 'allow_private': _rails_setting(ctx, 'allow_private', False) is True},
+                                      token_provider=lambda: get_launcher_token('BUNDLEBEES_RAILS_READ_TOKEN'),
+                                      max_response_bytes=1 << 20)
+        else:
+            raise SourceError('invalid_source')
+        with closing(RailsLedger(path, allowed_authorities=authorities)) as ledger:
+            importer = Importer(ledger, authorities=authorities)
+            if name == 'launcher':
+                pos = ledger.import_cursor(chain)
+                if pos['state'] != 'active':
+                    raise SourceError('source_fork')
+                # R09 compares the peer head to the durable receipt, even
+                # on an empty page. R04 validates original bytes and authority.
+                report = source.import_into(importer, chain, cursor=pos['next_seq']-1, limit=args.limit)
+                result = dict(imported=report['ledger'].get('imported',0), has_more=report['has_more'])
+            else:
+                result = importer.import_once(source, limit=args.limit)
+        print(json.dumps(dict(ok=True,source=name,imported=result['imported'],has_more=result['has_more'])))
+        return 0
+    except Exception as exc:
+        code = getattr(exc, 'code', 'source_unavailable')
+        if not isinstance(code,str) or not re.fullmatch(r'[a-z_]{1,48}', code):
+            code = 'source_unavailable'
+        print(json.dumps(dict(ok=False, error={'code':code})))
+        return 2 if code.startswith('invalid_') else 3

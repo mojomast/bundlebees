@@ -25,3 +25,15 @@ dev = [
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bundlebees_plugin", "rizzstack_rails"]
+package-dir = {rizzstack_rails = "contrib/rizzstack_rails"}
+
+[tool.setuptools.package-data]
+bundlebees_plugin = ["schemas/*.json", "templates/*.md"]
+rizzstack_rails = ["vendor-manifest.json"]

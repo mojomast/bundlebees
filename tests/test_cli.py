@@ -799,6 +799,28 @@ def test_integrate_accepts_a_wave_only_after_the_full_suite_passes(
     assert summary["accepted_changes"] == 1
     assert summary["first_pass_rate"] == 1.0
     assert summary["tokens_per_accepted"] == 1200
+    assert summary["cost_usd_total"] == summary["cost_per_accepted"] == 0.03
+
+
+def test_metrics_cli_exposes_partial_cost_in_json_and_text(tmp_path: Path, capsys):
+    metrics.append_event(tmp_path, "r", "verify", attempt_id="accepted", cost_usd=0.5)
+    metrics.append_event(tmp_path, "r", "integrate", attempts=["accepted"], ok=True)
+    metrics.append_event(tmp_path, "r", "dispatch", attempt_id="unmetered")
+    args = ["metrics", "--run", "r", "--state-dir", str(tmp_path)]
+    ctx = _ctx(FakeClient())
+    assert _invoke(ctx, [*args, "--json"]) == 0
+    summary, = json.loads(capsys.readouterr().out)
+    assert summary["accepted_changes"] == 1
+    assert summary["cost_usd_total"] is None and summary["cost_per_accepted"] is None
+    assert summary["cost_usd_known_subtotal"] == 0.5
+    assert summary["cost_coverage"] == {
+        "attempts_with_cost": 1, "attempts_without_cost": 1, "unattributed_events": 0,
+    }
+    assert _invoke(ctx, args) == 0
+    text = capsys.readouterr().out
+    assert "cost_usd_known_subtotal: 0.5" in text
+    assert "cost_usd_total: n/a" in text and "cost_per_accepted: n/a" in text
+    assert '"attempts_without_cost": 1' in text
 
 
 def test_integrate_rejects_a_wave_whose_combined_suite_fails(

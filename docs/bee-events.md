@@ -50,7 +50,23 @@ facts, with no legacy `transition_id`, `lease_sha256`, `artifact_sha256`,
 `result.reference`, `correlation_id` and `causation_id` are optional and are
 omitted when absent. `coordinator.identity`, `backend.harness`,
 `lease.sha256`, `lease.assigned_files` and `result.available` are part of the
-canonical shape. Extra envelope or `data` fields are refused.
+canonical shape.
+
+Hyvv can also send `rizzstackusage` at the **envelope root**. This optional
+object must contain at least one of `input`, `output`, `cache_read`,
+`cache_write`, `reasoning`, `thinking`, or `total`. Counts (including optional
+`tool_calls`) are integers from 0 through 999,999,999. Zero is preserved;
+missing counts stay absent. For example:
+
+```json
+{"rizzstackusage": {"input": 120, "cache_read": 0, "stop_reason": "end_turn", "model": "zoo:glm-5.3-flash", "route": "zoo"}}
+```
+
+Optional metadata is limited to a stop-reason code or `turn ended` (64
+characters max), a model identifier (128 characters max), and its route
+(`zoo`, `go`, `deepseek`, `free`, or `agy`). Invalid usage is refused before
+recording; aliases, free-form payloads and private text are never copied into
+the outbox. All other extra envelope or `data` fields are still refused.
 
 The id is deterministic:
 `event_id_for(attempt_id, state, transition_id)` is

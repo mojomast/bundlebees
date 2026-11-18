@@ -23,16 +23,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import recovery, revision, sandbox, test_receipts as receipts, verify_local
+from . import job as jobs, recovery, revision, sandbox, test_receipts as receipts, verify_local
 
 DEFAULT_SANDBOX_TIMEOUT_S = 900
 _MAX_SANDBOX_TIMEOUT_S = 7200
 SuiteRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
+_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_ZERO = "0" * 40
 
 
 def _checkpoint(name: str, **payload: Any) -> None:
@@ -59,11 +64,12 @@ class IntegrateError(Exception):
         self.fix = fix
 
 
-def _git(args: Sequence[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
+def _git(args: Sequence[str], cwd: Path, *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", "-c", "user.name=bundlebees", "-c", "user.email=bees@localhost", *args],
         cwd=str(cwd),
         capture_output=True,
+        input=input_text,
         text=True,
         env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
     )
@@ -112,41 +118,19 @@ def _legacy_names(job: Mapping[str, Any]) -> list[str]:
     return [f"w{_wave_number(job)}", f"{safe}.w{_wave_number(job)}"]
 
 
-def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> dict[str, Any] | None:
-    """Copy an old ``wN`` record to its per-job name, only on exact proof.
+def _reconcile(wave: str, why: str) -> IntegrateError:
+    return IntegrateError("wave_reconciliation_required", f"Wave {wave} requires reconciliation: {why}.",
+                          "Reconcile the integration evidence and ref explicitly; preserve the original records.")
 
-    Existing evidence is preserved (the legacy file is left in place); adoption
-    happens only when the legacy record lists exactly this job's attempts.
-    """
+
+def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> None:
+    """A differently named receipt cannot attest today's wave-bound identity."""
     if wave == legacy:
         return None
     target = Path(state_dir) / "waves" / f"{wave}.json"
     source = Path(state_dir) / "waves" / f"{legacy}.json"
-    if target.exists() or not source.exists():
-        return None
-    try:
-        record = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    recorded = record.get("attempts") if isinstance(record, dict) else None
-    if not isinstance(recorded, list) or sorted(str(a) for a in recorded) != sorted(str(a) for a in attempts):
-        return None
-    body = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, target)          # atomic: two recoverers see one result
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
-    return record
+    if not target.exists() and (os.path.lexists(source) or os.path.lexists(_wave_identity_path(state_dir, legacy))):
+        raise _reconcile(wave, f"legacy evidence at {legacy} cannot be adopted by attempt name")
 
 
 def integration_ref(job_id: str) -> str:
@@ -162,9 +146,10 @@ def verified_attempts(job: Mapping[str, Any]) -> list[str]:
     for task in job.get("tasks", []):
         if task.get("state") not in {"verified", "integrating"}:
             continue
-        attempt_id = (task.get("attempts") or [None])[-1]
-        if attempt_id:
-            attempts.append(str(attempt_id))
+        history = task.get("attempts")
+        if not isinstance(history, list) or not history or not revision._safe_attempt_id(history[-1]):
+            raise _reconcile(job_wave_id(job), "verified task has no valid latest attempt")
+        attempts.append(history[-1])
     return attempts
 
 
@@ -231,13 +216,11 @@ def _suite_evidence(
             "the suite runner returned no evidence",
             "Check the sandbox runner and retry.",
         )
-    try:
-        exit_code = int(evidence.get("exit_code"))
-    except (TypeError, ValueError):
-        exit_code = 1
+    exit_code = evidence.get("exit_code")
     return {
-        "exit_code": exit_code,
+        "exit_code": exit_code if type(exit_code) is int else 1,
         "timed_out": bool(evidence.get("timed_out")),
+        "blocking": bool(evidence.get("blocking")),
         "tail": str(evidence.get("output_tail") or evidence.get("tail") or "").strip()[-300:],
         "junit": evidence.get("junit"),
         "backend": evidence.get("backend"),
@@ -247,24 +230,6 @@ def _suite_evidence(
 
 def _test_cache_stats() -> dict[str, int]:
     return {"executions": 0, "hits": 0, "misses": 0}
-
-
-def _integration_request_lock(
-    job: Mapping[str, Any],
-    *,
-    wave: str,
-    attempts: Sequence[str],
-    suite_command: Sequence[str],
-) -> str:
-    payload = {
-        "job_id": str(job.get("job_id") or ""),
-        "wave": str(wave),
-        "attempts": [str(attempt) for attempt in attempts],
-        "suite_command": [str(item) for item in suite_command],
-    }
-    return "integrate-request:" + json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    )
 
 
 def _identity_digest(identity: Mapping[str, Any]) -> str:
@@ -335,12 +300,150 @@ def _wave_identity_path(state_dir: Path, wave: str) -> Path:
     return Path(state_dir) / "wave-identities" / f"{wave}.json"
 
 
-def _read_wave_identity(state_dir: Path, wave: str) -> dict[str, Any] | None:
+def _read_evidence(path: Path, wave: str) -> dict[str, Any] | None:
+    """Only absence is normal. Never follow links or block on a special file."""
     try:
-        data = json.loads(_wave_identity_path(state_dir, wave).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if path.parent.is_symlink():
+            raise _reconcile(wave, f"linked {path.parent.name} directory")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _reconcile(wave, f"non-regular {path.parent.name} record")
+            data = json.load(handle)
+    except FileNotFoundError:
         return None
-    return data if isinstance(data, dict) else None
+    except (OSError, ValueError) as exc:
+        raise _reconcile(wave, f"unreadable {path.parent.name} record") from exc
+    if not isinstance(data, dict):
+        raise _reconcile(wave, f"malformed {path.parent.name} record")
+    return data
+
+
+def _record_digest(record: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(record, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+
+
+def _wave_pair(state: Path, repo: Path, wave: str, request: dict) -> tuple[dict, dict] | None:
+    """Verify the historical evidence before routing a changed request or replaying it."""
+    record = _read_evidence(revision.wave_path(state, wave), wave)
+    stored = _read_evidence(_wave_identity_path(state, wave), wave)
+    if record is None and stored is None:
+        return None
+    identity = (stored or {}).get("identity")
+    result = (stored or {}).get("materialized")
+    if (record is None or not isinstance(identity, dict) or identity.keys() != request.keys()
+            or stored.get("identity_digest") != _identity_digest(identity)
+            or identity.get("job_id") != request["job_id"] or identity.get("wave") != request["wave"]
+            or not isinstance(result, dict)):
+        raise _reconcile(wave, "missing or inconsistent execution identity")
+
+    head = record.get("head_sha")
+    accepted = record.get("accepted")
+    inputs = identity.get("attempts")
+    if (record.get("wave_id") != wave or result.get("wave_id") != wave
+            or type(accepted) is not bool or result.get("accepted") is not accepted
+            or not isinstance(head, str) or not _SHA.fullmatch(head) or result.get("head_sha") != head
+            or not isinstance(inputs, list) or not inputs
+            or not all(isinstance(i, dict) and revision._safe_attempt_id(i.get("attempt_id"))
+                       and isinstance(i.get("sha"), str) and _SHA.fullmatch(i["sha"]) for i in inputs)
+            or record.get("attempts") != [i["attempt_id"] for i in inputs]
+            or len(set(record["attempts"])) != len(inputs)
+            or "previous_ref" not in result or result.get("record_sha256") != _record_digest(record)
+            or stored.get("binding_sha256") != _binding_digest(stored["identity_digest"], result)):
+        raise _reconcile(wave, "wave record does not match its materialized identity")
+    if accepted:
+        if not revision.suite_passed(record.get("suite")) or record.get("problems") != {}:
+            raise _reconcile(wave, "accepted record lacks a passing unblocked suite or has attempt problems")
+        parents = [identity["base_rev"], *(i["sha"] for i in inputs)]
+        if result.get("previous_ref") is not None:
+            parents.append(result["previous_ref"])
+        if (_git(["cat-file", "-t", head], repo, check=False).stdout.strip() != "commit"
+                or any(not isinstance(p, str) or not _SHA.fullmatch(p)
+                       or _git(["merge-base", "--is-ancestor", p, head], repo, check=False).returncode for p in parents)
+                or result.get("source_tree_sha256") != verify_local._tree_digest(repo, head)):
+            raise _reconcile(wave, "accepted head does not contain the recorded inputs or tested tree")
+    return record, stored
+
+
+def _ref_value(repo: Path, ref: str, wave: str) -> str | None:
+    if _git(["symbolic-ref", "-q", ref], repo, check=False).returncode != 1:
+        raise _reconcile(wave, "integration ref is not a direct ref")
+    check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
+    if check.returncode == 1:
+        return None
+    if check.returncode or not _SHA.fullmatch(check.stdout.strip()):
+        raise _reconcile(wave, "integration ref cannot be read")
+    return check.stdout.strip()
+
+
+@contextmanager
+def _hold_tested_head(repo: Path, ref: str, wave: str, head: str):
+    """Verify and lock the ref through the signed job save. No update is queued."""
+    with subprocess.Popen(
+        ["git", "update-ref", "--no-deref", "--stdin"], cwd=repo,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
+    ) as txn:
+        # EOF aborts this verify-only transaction on success or exception.
+        txn.stdin.write(f"start\nverify {ref} {head}\nprepare\n")
+        txn.stdin.flush()
+        if (txn.stdout.readline() != "start: ok\n" or txn.stdout.readline() != "prepare: ok\n"
+                or _ref_value(repo, ref, wave) != head):
+            raise _reconcile(wave, "integration ref no longer identifies the tested head")
+        yield
+
+
+def _pending_ref(handoff: dict, binding: str) -> str:
+    return "refs/bb/pending-integration/" + _record_digest({"request": handoff, "binding": binding})
+
+
+def _publish_head(repo: Path, ref: str, wave: str, result: dict, *, pending: str) -> None:
+    current = _ref_value(repo, ref, wave)
+    if _ref_value(repo, pending, wave) is not None:
+        head = result["head_sha"]
+        if current not in (head, result["previous_ref"]):
+            raise _reconcile(wave, "integration ref is not at the recorded predecessor")
+        # The intent exists only before publication. Consume it in the *same*
+        # Git transaction: a later deleted ref is not a pending crash repair.
+        txn = f"update {ref} {head} {current or _ZERO}\ndelete {pending} {head}\n"
+        if _git(["update-ref", "--no-deref", "--stdin"], repo, input_text=txn, check=False).returncode:
+            raise _reconcile(wave, "integration ref or pending publication changed")
+        return
+    if current != result["head_sha"]:
+        raise _reconcile(wave, "no pending publication for the tested head")
+
+
+def _retain_rejection(state: Path, wave: str, pair: tuple[dict, dict]) -> None:
+    """Revision retries may replace a rejected log. Keep the exact original files."""
+    directory = state / "wave-history" / wave / _record_digest({"record": pair[0], "sidecar": pair[1]})
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in (revision.wave_path(state, wave), _wave_identity_path(state, wave)):
+        dest = directory / f"{path.parent.name}.json"
+        try:
+            os.link(path, dest)
+        except FileExistsError:
+            if dest.read_bytes() != path.read_bytes():
+                raise _reconcile(wave, "conflicting rejection history") from None
+
+
+def _verified_inputs(state: Path, wave: str, attempts: list[str]) -> list[tuple[str, str]]:
+    shas = []
+    if len(set(attempts)) != len(attempts):
+        raise _reconcile(wave, "duplicate attempt id")
+    for attempt in attempts:
+        record = _read_evidence(verify_local.record_path(state, attempt), wave)
+        if not record or record.get("ok") is not True:
+            raise IntegrateError("not_verified", f"{attempt} has no accepted verify record", "Verify it first.")
+        sha = record.get("sha")
+        if record.get("attempt_id") != attempt or not isinstance(sha, str) or not _SHA.fullmatch(sha):
+            raise _reconcile(wave, "verification does not name the requested attempt and commit")
+        shas.append((attempt, sha))
+    return shas
+
+
+def _binding_digest(digest: str, materialized: Mapping[str, Any]) -> str:
+    """Commit the execution identity and its result together, including the ref CAS."""
+    return _record_digest({"domain": "bb.integration.binding.v1", "request": digest, "result": materialized})
 
 
 def _write_wave_identity(
@@ -349,7 +452,7 @@ def _write_wave_identity(
     identity: Mapping[str, Any],
     digest: str,
     *,
-    materialized: Mapping[str, Any] | None = None,
+    materialized: Mapping[str, Any],
 ) -> None:
     path = _wave_identity_path(state_dir, wave)
     try:
@@ -358,7 +461,8 @@ def _write_wave_identity(
             {
                 "identity": dict(identity),
                 "identity_digest": str(digest),
-                "materialized": dict(materialized or {}),
+                "materialized": dict(materialized),
+                "binding_sha256": _binding_digest(digest, materialized),
             },
             sort_keys=True,
             indent=2,
@@ -393,14 +497,13 @@ def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
             "the stored suite receipt has no complete result",
             "Remove the corrupt receipt only by intending to rerun the suite.",
         )
-    try:
-        exit_code = int(result.get("exit_code"))
-    except (TypeError, ValueError) as exc:
+    exit_code = result.get("exit_code")
+    if type(exit_code) is not int:
         raise IntegrateError(
             "receipt_corrupt",
-            "the stored suite receipt has no exit code",
+            "the stored suite receipt has no integer exit code",
             "Remove the corrupt receipt only by intending to rerun the suite.",
-        ) from exc
+        )
     timed_out = result.get("timed_out", False)
     if not isinstance(timed_out, bool):
         raise IntegrateError(
@@ -420,6 +523,7 @@ def _receipt_suite_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "blocking": bool(result.get("blocking")),
         "tail": tail,
         "junit": result.get("junit"),
         "backend": result.get("backend"),
@@ -637,17 +741,10 @@ def integrate(
     """
 
     wave = wave_id or job_wave_id(job)
-    attempts = verified_attempts(job)
+    # Different requests can compete for the same wave/sidecar slot.
+    request_key = "integrate-wave:" + wave
     try:
-        claim = receipts.claim_key(
-            state_dir,
-            _integration_request_lock(
-                job,
-                wave=wave,
-                attempts=attempts,
-                suite_command=suite_command,
-            ),
-        )
+        claim = receipts.claim_key(state_dir, request_key)
     except receipts.ReceiptError as exc:
         raise IntegrateError(exc.code, exc.error, exc.fix) from exc
     try:
@@ -655,6 +752,7 @@ def integrate(
             state_dir,
             job,
             repo,
+            request_key=request_key,
             suite_command=suite_command,
             worktree_root=worktree_root,
             wave_id=wave,
@@ -675,6 +773,7 @@ def _integrate_locked(
     job: Mapping[str, Any],
     repo: Path,
     *,
+    request_key: str,
     suite_command: Sequence[str] = ("python", "-m", "pytest", "-q"),
     worktree_root: Path | None = None,
     wave_id: str | None = None,
@@ -694,22 +793,14 @@ def _integrate_locked(
         raise IntegrateError("nothing_verified", "no verified tasks to integrate", "Verify at least one attempt first.")
 
     base_rev = str((job.get("goal") or {}).get("base_rev") or "")
-    if len(base_rev) != 40:
+    if not _SHA.fullmatch(base_rev):
         raise IntegrateError("bad_base_rev", "the job has no pinned base revision", "Fix the job document.")
 
     wave = wave_id or job_wave_id(job)
 
     # The verified commits are inputs to the request identity, so read them
     # before deciding whether an accepted wave is recovery or a stale result.
-    shas: list[tuple[str, str]] = []
-    for attempt_id in attempts:
-        record = verify_local.read_record(state_dir, attempt_id)
-        if not record or record.get("ok") is not True:
-            raise IntegrateError("not_verified", f"{attempt_id} has no accepted verify record", "Verify it first.")
-        sha = str(record.get("sha") or "")
-        if len(sha) != 40:
-            raise IntegrateError("bad_verify_record", f"{attempt_id} has no commit sha", "Re-verify it.")
-        shas.append((attempt_id, sha))
+    shas = _verified_inputs(state_dir, wave, attempts)
 
     identity = _integration_request_identity(
         repo,
@@ -730,43 +821,58 @@ def _integrate_locked(
     # but only for the execution identity it was earned under.  A changed
     # command/runtime/policy is a new validation request and must not inherit
     # the old accepted evidence.
-    for legacy in _legacy_names(job):
-        adopted = adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
-        if adopted is not None:
-            break
-    existing = _accepted_wave_record(state_dir, wave)
-    if existing is not None:
-        stored = _read_wave_identity(state_dir, wave)
-        stored_digest = str((stored or {}).get("identity_digest") or "")
-        if stored_digest and stored_digest != identity_digest:
-            wave = _derived_wave_id(wave, identity_digest)
-            existing = _accepted_wave_record(state_dir, wave)
-    if existing is not None:
-        head = str(existing.get("head_sha") or "")
-        if len(head) != 40:
-            raise IntegrateError("bad_wave_record", f"accepted wave {wave} has no head sha", "Inspect the wave record.")
-        ref_name = integration_ref(str(job.get("job_id") or ""))
-        current = _git(["rev-parse", "--verify", "--quiet", ref_name], repo, check=False).stdout.strip()
-        if current != head:
-            _git(["update-ref", ref_name, head], repo)
+    ref = integration_ref(str(job.get("job_id") or ""))
+    previous_ref = _ref_value(repo, ref, wave)
+    pair = _wave_pair(state_dir, repo, wave, identity)
+    if pair is None:
+        for legacy in _legacy_names(job):
+            adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
+    elif pair[1]["identity_digest"] != identity_digest:
+        original = pair[0]
+        wave = _derived_wave_id(wave, identity_digest)
+        pair = _wave_pair(state_dir, repo, wave, identity)
+        if pair and pair[1]["identity_digest"] != identity_digest:
+            raise _reconcile(wave, "derived wave belongs to another execution identity")
+        if (not pair or not pair[0]["accepted"]) and original["accepted"] and previous_ref != original["head_sha"]:
+            raise _reconcile(wave, "changed request is not starting at the previously accepted head")
+    handoff = jobs._integration_request(state_dir, job, repo, identity["wave"], wave, identity_digest)
+    # Standalone callers have no sealed job handoff. Their local intent is
+    # scoped to this state store, repo and execution request; the same result
+    # binding and one-shot Git transaction govern publication in either mode.
+    publication = handoff or {"kind": "standalone-integration/1", "state": str(state_dir.resolve()),
+                              "repo": str(repo.resolve()), "selected": wave, "identity_digest": identity_digest}
+    if pair and pair[0]["accepted"]:
+        existing, stored = pair
+        head = existing["head_sha"]
+        if handoff:
+            jobs._confirm_integration(state_dir, handoff, stored["binding_sha256"], fresh=False)
+        _publish_head(repo, ref, wave, stored["materialized"],
+                      pending=_pending_ref(publication, stored["binding_sha256"]))
+        if handoff:
+            jobs._select_integration(state_dir, handoff)
         return {
             "ok": True,
             "evidence": f"wave {wave} already accepted at {head[:8]}; recovered without re-integrating",
             "record": existing,
-            "integration_ref": ref_name,
-            "start_rev": current or head,
+            "integration_ref": ref,
+            "start_rev": stored["materialized"].get("previous_ref") or base_rev,
             "recovered": True,
             "request_identity_digest": identity_digest,
             "test_cache": dict(stats),
         }
 
     # Later waves build on the last accepted result, not on the original base.
-    ref = integration_ref(str(job.get("job_id") or ""))
-    ref_check = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
-    start_rev = ref_check.stdout.strip() if ref_check.returncode == 0 else base_rev
+    start_rev = previous_ref or base_rev
+    if handoff:
+        jobs._select_integration(state_dir, handoff)
+    if pair:
+        _retain_rejection(state_dir, wave, pair)
 
     root = Path(worktree_root) if worktree_root else repo.parent / ".bb-integrate"
-    worktree = root / "wt"
+    # Only the owner of this request lock may reclaim its abandoned checkout.
+    # Independent state stores hold independent locks, even for identical keys.
+    namespace = json.dumps([str(state_dir.resolve()), str(repo.resolve()), request_key])
+    worktree = root.resolve() / ("wt-" + hashlib.sha256(namespace.encode()).hexdigest())
     if worktree.exists():
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
     root.mkdir(parents=True, exist_ok=True)
@@ -801,7 +907,8 @@ def _integrate_locked(
         patch_sha256 = hashlib.sha256(
             b"bundlebees-integration-identity:v1\x00" + combined.encode("utf-8")
         ).hexdigest()
-        source_tree_sha256 = verify_local._tree_digest(worktree, "HEAD")
+        tested_head = _git(["rev-parse", "HEAD"], worktree).stdout.strip()
+        source_tree_sha256 = verify_local._tree_digest(worktree, tested_head)
         receipt_context = {
             "state_dir": state_dir,
             "stage": "integrate.suite",
@@ -832,21 +939,25 @@ def _integrate_locked(
             run_suite,
         )
         materialized: dict[str, Any] = {
-            "wave_id": str(record.get("wave_id") or wave),
-            "head_sha": str(record.get("head_sha") or ""),
-            "accepted": bool(record.get("accepted")),
+            "wave_id": wave,
+            "head_sha": tested_head,
+            "source_tree_sha256": source_tree_sha256,
+            "previous_ref": previous_ref,
+            "accepted": record["accepted"],
+            "record_sha256": _record_digest(record),
         }
-        if materialized["head_sha"]:
-            materialized["source_tree_sha256"] = verify_local._tree_digest(
-                worktree, str(materialized["head_sha"])
-            )
         _write_wave_identity(
             state_dir, wave, identity, identity_digest, materialized=materialized
         )
         if record.get("accepted"):
-            head = str(record.get("head_sha") or "")
-            if len(head) != 40:
-                raise IntegrateError("bad_wave_record", "the accepted wave has no head sha", "Inspect the wave record.")
+            head = tested_head
+            binding = _binding_digest(identity_digest, materialized)
+            pending = _pending_ref(publication, binding)
+            _git(["update-ref", "--no-deref", pending, head, _ZERO], repo)
+            if handoff:
+                # The coordinator's live execution is the only proof issuer. The
+                # recovery reader also independently checks the Git and suite gates.
+                jobs._confirm_integration(state_dir, handoff, binding, fresh=True)
             # Fault boundary: the accepted wave record is durable, but neither the
             # integration ref nor the job document names it yet. A crash here must
             # be recovered from the record, never by integrating the wave again.
@@ -854,7 +965,11 @@ def _integrate_locked(
                         wave_id=str(record.get("wave_id") or wave), head_sha=head,
                         attempts=list(attempts))
             # Durable ref: the next wave starts here, not at the original base.
-            _git(["update-ref", ref, head], repo)
+            pair = _wave_pair(state_dir, repo, wave, identity)
+            if (not pair or pair[1]["identity_digest"] != identity_digest or pair[1]["materialized"] != materialized
+                    or _verified_inputs(state_dir, wave, attempts) != shas):
+                raise _reconcile(wave, "integration evidence changed before publication")
+            _publish_head(repo, ref, wave, materialized, pending=pending)
     finally:
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
 
@@ -890,16 +1005,3 @@ def _integrate_locked(
         ),
         "test_cache": dict(stats),
     }
-
-
-def _accepted_wave_record(state_dir: Path, wave: str) -> dict[str, Any] | None:
-    """The accepted wave record, if one was already written for this wave."""
-
-    path = Path(state_dir) / "waves" / f"{wave}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if isinstance(data, dict) and data.get("accepted") is True:
-        return data
-    return None

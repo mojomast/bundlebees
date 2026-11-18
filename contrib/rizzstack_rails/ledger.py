@@ -24,6 +24,13 @@ _BUSY_BACKOFF = (0.05, 0.2, 0.4)
 
 _TARGET_KINDS = ("feedback.recorded", "intervention.requested", "intervention.result")
 
+#: Local attempt scan index (mirrors scripts/rails_attempt_index.py; keep the definitions identical).
+_ATTEMPT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS rails_local_attempt_scan ON event_rows ("
+    "json_extract(envelope_json,'$.scope.attempt_id'), ingest_seq, event_id, rails_hash, "
+    "length(CAST(envelope_json AS BLOB)))"
+)
+
 _SCHEMA_STATEMENTS = (
     "CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     (
@@ -167,32 +174,86 @@ class ParentCycleRefusal(contracts.RailsRefusal):
 
 
 def _scan_raw_fields(value):
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str) and key in contracts.RAW_FIELDS:
-                raise RawIngestionRefusal("raw ingestion field %r is refused" % (key,))
-            _scan_raw_fields(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _scan_raw_fields(item)
+    try:
+        contracts._scan_raw_fields(value)
+    except contracts.PayloadRefusal as exc:
+        raise RawIngestionRefusal(str(exc)) from None
+
+
+def _check_observation(kind, authority, payload):
+    # Queue outcomes may be reported by the coordinator. A worker's claim
+    # cannot create an owner decision, including in the legacy events view.
+    if authority in ('worker_report', 'imported_observation') and (
+        (kind == 'acceptance.result' and payload.get('verdict') == 'PASS') or
+        (kind in ('intervention.requested', 'intervention.result') and
+         payload.get('decision') in ('approved', 'completed'))
+    ):
+        raise AuthorityRefusal('observation cannot record approval')
+
+
+def _validate_origin_content(env):
+    """Prove these very bytes are admissible; never scrub/re-emit a peer row.
+
+    /1-R02 once used a nested lane and sparse scope. Only that identifiable
+    historical shape is grandfathered, and only for representable safe facts.
+    A flat /1 must match the frozen contract without any compatibility repair.
+    """
+    base = {'schema', 'chain_id', 'kind', 'source', 'scope', 'payload', 'authority',
+            'occurred_at', 'duration_ms', 'timing_quality', 'redaction_policy',
+            *contracts.SERVER_ASSIGNED_KEYS}
+    legacy = 'lane' in env
+    fields = base | ({'lane'} if legacy else {'dedupe_key', *contracts.LANE_FIELDS})
+    if env.keys() != fields:
+        raise contracts.PayloadRefusal('unexpected or missing origin fields')
+    _scan_raw_fields(env)
+    if (privacy.scrub_structure(env) != env or not isinstance(env['source'], dict) or
+            privacy.scrub_source(env['source']) != env['source']):
+        raise RawIngestionRefusal('origin would require redaction')
+    if not isinstance(env['payload'], dict) or not privacy.safe_origin_text(env['payload']):
+        raise RawIngestionRefusal('origin contains unprojected free text')
+    if env['authority'] not in ('worker_report', 'imported_observation'):
+        # This transport has no authenticated mapping for higher roles. Keep
+        # verifier/owner data local rather than re-labeling the committed bytes.
+        raise AuthorityRefusal('untrusted origin cannot assert elevated authority')
+    if not isinstance(env['recorded_at'], str) or not contracts.STAMP_RE.fullmatch(env['recorded_at']):
+        raise contracts.PayloadRefusal('invalid origin timestamp')
+    if legacy:
+        if env['redaction_policy'] != contracts.OLD_POLICY or not isinstance(env['lane'], dict):
+            raise contracts.PayloadRefusal('unknown historical envelope')
+        lane = dict(env['lane'])
+        if not isinstance(lane.pop('orphan', False), bool) or lane.keys() != set(contracts.LANE_FIELDS):
+            raise contracts.PayloadRefusal('unknown historical lane fields')
+    else:
+        contracts.require_id(env['dedupe_key'], 'dedupe_key')
+        lane = {k: env[k] for k in contracts.LANE_FIELDS}
+    body = contracts.event_body(env['kind'], env['source'], env['scope'], env['payload'],
+                                env['authority'], lane, env['occurred_at'], env['duration_ms'],
+                                env['timing_quality'], env['redaction_policy'])
+    if not legacy and any(value != env[k] for k, value in body.items()):
+        raise contracts.PayloadRefusal('origin is not a frozen /1 envelope')
+    _check_observation(env['kind'], env['authority'], body['payload'])
 
 
 def _legacy_fields(envelope, envelope_json, rails_digest, legacy_prev):
     payload = envelope["payload"]
     result = ""
-    for key in ("verdict", "outcome", "result", "decision"):
+    for key in ("verdict", "outcome", "result", "decision", "review_verdict", "status"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             result = value
             break
-    tokens_in = payload.get("tokens_in")
-    tokens_out = payload.get("tokens_out")
+    if envelope['kind'] == 'decision.recorded':
+        result = payload.get('summary', result)
+    if envelope['kind'] == 'acceptance.result' and envelope['authority'] != 'owner_record':
+        result = 'UNVERIFIED'
+    tokens_in = payload.get('input_tokens', payload.get('tokens_in'))
+    tokens_out = payload.get('output_tokens', payload.get('tokens_out'))
     row = {
         "id": envelope["event_id"],
         "ts": envelope["recorded_at"],
         "task_id": envelope["scope"].get("task_id") or "",
         "actor": envelope["authority"],
-        "parent": envelope["lane"].get("parent_event_id") or "",
+        "parent": envelope.get('lane', envelope).get("parent_event_id") or "",
         "kind": envelope["kind"],
         "ac_id": payload.get("ac_id") if isinstance(payload.get("ac_id"), str) else "",
         "result": result,
@@ -245,12 +306,26 @@ class RailsLedger:
             self._conn = sqlite3.connect(self.path)
             self._conn.row_factory = sqlite3.Row
             self._conn.isolation_level = None
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            self._enable_wal()
+            self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._init_schema()
             self._init_identity()
+
+    def _enable_wal(self):
+        # Concurrent first opens can both hold read locks before upgrading the
+        # journal mode. SQLite may return BUSY immediately to avoid deadlock.
+        # Retry this statement alone, before any ledger transaction begins.
+        for attempt in range(len(_BUSY_BACKOFF) + 1):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                return
+            except sqlite3.OperationalError as exc:
+                primary = getattr(exc, 'sqlite_errorcode', 0) & 0xff
+                if primary not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or attempt == len(_BUSY_BACKOFF):
+                    raise
+                time.sleep(_BUSY_BACKOFF[attempt])
 
     def _reject_network_share(self):
         if self.path.startswith(_NETWORK_SHARE_PREFIXES):
@@ -287,6 +362,14 @@ class RailsLedger:
         def work(conn):
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            # Owner decision 2026-11-17: the local attempt scan index is the DEFAULT for every
+            # new ledger (created here, before the first append, where it costs nothing).
+            # Builds whose trusted_schema=OFF refuses expression indexes simply run unindexed:
+            # the index is an optimisation, never a correctness condition, so this is best-effort.
+            try:
+                conn.execute(_ATTEMPT_INDEX_SQL)
+            except Exception:  # noqa: BLE001 - unsupported build: stay unindexed, never fail the ledger
+                pass
 
         self._write_tx(work, fire_hooks=False)
 
@@ -390,10 +473,9 @@ class RailsLedger:
             pass
 
     def _check_authority(self, authority):
-        if self.allowed_authorities is not None and authority not in self.allowed_authorities:
-            raise AuthorityRefusal(
-                "authority %r is outside the authenticated producer mapping" % (authority,)
-            )
+        if not isinstance(authority, str) or (self.allowed_authorities is not None and
+                                              authority not in self.allowed_authorities):
+            raise AuthorityRefusal('authority outside the authenticated producer mapping')
 
     def _check_target_exists(self, conn, payload):
         target = payload.get("target_event_id")
@@ -423,64 +505,62 @@ class RailsLedger:
             seen.add(current)
             row = conn.execute(
                 "SELECT envelope_json FROM event_rows WHERE kind IN ('lane.open','lane.spawn')"
-                " AND json_extract(envelope_json, '$.lane.lane_id') = ?"
+                " AND coalesce(json_extract(envelope_json, '$.lane_id'),"
+                " json_extract(envelope_json, '$.lane.lane_id')) = ?"
                 " ORDER BY seq DESC LIMIT 1",
                 (current,),
             ).fetchone()
             if row is None:
                 break
-            current = json.loads(row["envelope_json"])["lane"].get("parent_lane_id")
+            env = json.loads(row['envelope_json'])
+            current = env.get('lane', env).get('parent_lane_id')
             depth += 1
+        if current is not None and depth == 64:
+            raise ParentCycleRefusal('lane ancestry exceeds verification limit')
 
     def _append_locked(self, conn, kind, source, scope, payload, authority, dedupe_key,
                        lane, occurred_at, duration_ms, timing_quality, redaction_policy):
-        self._check_target_exists(conn, payload)
-        self._check_parent_cycle(conn, lane or {})
-        lane_base = {"lane_id": None, "parent_lane_id": None, "parent_event_id": None}
-        lane_base.update(lane or {})
-        if redaction_policy is None:
-            redaction_policy = {"mode": "structured_safe", "path_detail": "omitted"}
-        body = {
-            "schema": contracts.SCHEMA,
-            "chain_id": self.chain_id,
-            "kind": kind,
-            "source": source,
-            "scope": scope,
-            "lane": lane_base,
-            "occurred_at": occurred_at,
-            "duration_ms": duration_ms,
-            "timing_quality": timing_quality,
-            "authority": authority,
-            "payload": payload,
-            "redaction_policy": redaction_policy,
-        }
-        candidate_sha = hashlib.sha256(contracts.canonicalize(body)).hexdigest()
-        if dedupe_key is not None:
-            existing = conn.execute(
-                "SELECT event_id, semantic_sha FROM dedupe_index"
-                " WHERE chain_id = ? AND dedupe_key = ?",
-                (self.chain_id, dedupe_key),
-            ).fetchone()
-            if existing is not None:
-                if existing["semantic_sha"] != candidate_sha:
-                    raise IdempotencyConflict(
-                        "dedupe key %r already recorded with different semantic bytes"
-                        % (dedupe_key,)
-                    )
-                stored = json.loads(
-                    conn.execute(
-                        "SELECT envelope_json FROM event_rows WHERE event_id = ?",
-                        (existing["event_id"],),
-                    ).fetchone()["envelope_json"]
-                )
-                return {
-                    "event_id": stored["event_id"],
-                    "seq": stored["seq"],
-                    "hash": stored["hash"],
-                    "recorded_at": stored["recorded_at"],
-                    "chain_id": self.chain_id,
-                    "duplicated": True,
-                }
+        # All producer paths (including atomic batches and receipts) pass the
+        # same persistence boundary. Keep the transaction helper signature.
+        self._check_authority(authority)
+        candidate = [kind, source, scope, payload, authority, dedupe_key, lane, occurred_at,
+                     duration_ms, timing_quality, redaction_policy]
+        _scan_raw_fields(candidate)
+        if len(contracts.canonicalize(candidate)) > contracts.MAX_RECORD:
+            raise RawIngestionRefusal('record exceeds byte limit')
+        contracts.require_id(dedupe_key, 'dedupe_key')
+        if privacy.scrub_text(dedupe_key) != dedupe_key:
+            raise RawIngestionRefusal('sensitive dedupe key')
+        source = privacy.scrub_source(source)
+        scope, payload, lane = privacy.scrub_structure([scope, payload, lane])
+        body = contracts.event_body(kind, source, scope, payload, authority, lane,
+                                    occurred_at, duration_ms, timing_quality, redaction_policy)
+        body.update(chain_id=self.chain_id, dedupe_key=dedupe_key)
+        _check_observation(kind, authority, body['payload'])
+        candidate_sha = contracts.semantic_digest(body)
+        existing = conn.execute(
+            'SELECT semantic_sha, envelope_json FROM dedupe_index JOIN event_rows USING(event_id)'
+            ' WHERE dedupe_index.chain_id = ? AND dedupe_key = ?', (self.chain_id, dedupe_key),
+        ).fetchone()
+        if existing is not None:
+            stored = json.loads(existing['envelope_json'])
+            expected = candidate_sha
+            if 'lane' in stored and 'dedupe_key' not in stored:
+                # Pre-freeze index committed the sparse producer spelling,
+                # without the computed orphan bit. Compare that exact preimage
+                # on retry; don't upgrade an immutable row or its index.
+                old = dict(schema=contracts.SCHEMA, chain_id=self.chain_id, kind=kind,
+                           scope=scope, source=source, payload=payload, authority=authority,
+                           lane={**dict.fromkeys(contracts.LANE_FIELDS), **(lane or {})},
+                           occurred_at=occurred_at, duration_ms=duration_ms, timing_quality=timing_quality,
+                           redaction_policy=contracts.OLD_POLICY if redaction_policy is None else redaction_policy)
+                expected = contracts.semantic_digest(old)
+            if existing['semantic_sha'] != expected:
+                raise IdempotencyConflict('dedupe key already recorded with different semantic bytes')
+            return {**{k: stored[k] for k in ('event_id', 'seq', 'hash', 'recorded_at', 'chain_id')},
+                    'duplicated': True}
+        self._check_target_exists(conn, body['payload'])
+        self._check_parent_cycle(conn, body)
         row = conn.execute(
             "SELECT seq, rails_hash FROM event_rows WHERE chain_id = ?"
             " ORDER BY seq DESC LIMIT 1",
@@ -491,28 +571,16 @@ class RailsLedger:
         seq = head_seq + 1
         event_id = self.chain_id + ":" + str(seq)
         recorded_at = contracts.utc_now()
-        lane_full = dict(lane_base)
-        orphan = False
-        if lane_full.get("parent_event_id"):
-            parent_row = conn.execute(
-                "SELECT 1 FROM event_rows WHERE event_id = ?", (lane_full["parent_event_id"],)
-            ).fetchone()
-            if parent_row is None:
-                parent_row = conn.execute(
-                    "SELECT 1 FROM imported_origin_rows WHERE event_id = ?",
-                    (lane_full["parent_event_id"],),
-                ).fetchone()
-            orphan = parent_row is None
-        lane_full["orphan"] = orphan
         envelope = dict(body)
         envelope["seq"] = seq
         envelope["event_id"] = event_id
         envelope["prev_hash"] = prev_hash
         envelope["recorded_at"] = recorded_at
-        envelope["lane"] = lane_full
         rails_digest = contracts.rails_hash(prev_hash, envelope)
         envelope["hash"] = rails_digest
         envelope_json = contracts.canonicalize(envelope).decode("ascii")
+        if len(envelope_json) > contracts.MAX_RECORD:
+            raise RawIngestionRefusal('envelope exceeds byte limit')
         legacy_prev = "genesis"
         last = conn.execute(
             "SELECT hash FROM event_rows ORDER BY ingest_seq DESC LIMIT 1"
@@ -571,24 +639,6 @@ class RailsLedger:
                timing_quality="unknown", redaction_policy=None):
         self._ensure_writable()
         self._probe_capacity()
-        self._check_authority(authority)
-        _scan_raw_fields(payload)
-        source = privacy.scrub_source(source)
-        scope = privacy.scrub_structure(scope)
-        payload = privacy.scrub_structure(payload)
-        lane = privacy.scrub_structure(lane) if lane else None
-        contracts.validate_event(
-            kind,
-            source,
-            scope,
-            payload,
-            authority,
-            lane,
-            occurred_at,
-            duration_ms,
-            timing_quality,
-            redaction_policy,
-        )
         return self._write_tx(
             lambda conn: self._append_locked(
                 conn,
@@ -632,15 +682,23 @@ class RailsLedger:
         for row in rows:
             if upto is not None and row["seq"] > upto:
                 break
-            env = json.loads(row["origin_bytes" if "origin_bytes" in row.keys() else "envelope_json"])
-            if env["chain_id"] != chain_id or env["seq"] != expected_seq:
+            imported = 'origin_bytes' in row.keys()
+            text = row['origin_bytes' if imported else 'envelope_json']
+            try:
+                env = contracts.parse_text(text)
+                if not isinstance(env, dict) or contracts.canonicalize(env).decode('ascii') != text:
+                    return {'ok': False, 'at_seq': expected_seq, 'reason': 'noncanonical'}
+            except contracts.RailsRefusal:
+                return {'ok': False, 'at_seq': expected_seq, 'reason': 'noncanonical'}
+            if row['seq'] != expected_seq or env.get('chain_id') != chain_id or env.get('seq') != expected_seq:
                 return {"ok": False, "at_seq": expected_seq, "reason": "ordering"}
-            if env["event_id"] != chain_id + ":" + str(expected_seq):
+            if env.get('event_id') != chain_id + ':' + str(expected_seq) or env['event_id'] != row['event_id']:
                 return {"ok": False, "at_seq": expected_seq, "reason": "event_id"}
-            if env["prev_hash"] != expected_prev:
+            if env.get('prev_hash') != expected_prev:
                 return {"ok": False, "at_seq": expected_seq, "reason": "prev_hash"}
             without_hash = {k: v for k, v in env.items() if k != "hash"}
-            if env.get("hash") != contracts.rails_hash(expected_prev, without_hash):
+            if (env.get('hash') != row['origin_hash' if imported else 'rails_hash'] or
+                    env.get('hash') != contracts.rails_hash(expected_prev, without_hash)):
                 return {"ok": False, "at_seq": expected_seq, "reason": "hash_mismatch"}
             expected_prev = env["hash"]
             expected_seq += 1
@@ -742,13 +800,38 @@ class RailsLedger:
             ok = ok and bool(report["ok"])
         return {"ok": ok, "restored_path": dest_abs, "chains": results}
 
+    def halt_import_origin(self, chain_id):
+        """Record a peer contradiction without changing its last durable receipt."""
+        self._ensure_writable()
+        contracts.require_id(chain_id, 'chain_id')
+        if self.chain_id == chain_id or privacy.scrub_text(chain_id) != chain_id:
+            raise AuthorityRefusal('invalid peer chain identity')
+
+        def work(conn):
+            # Only an existing, committed peer cursor can be halted this way.
+            # A concurrent import cannot clear the marker or lose its receipt.
+            if not conn.execute("UPDATE import_cursors SET state='halted' WHERE chain_id=? AND next_seq>1",
+                                (chain_id,)).rowcount:
+                raise SourceGap('cannot halt a peer without a committed cursor')
+
+        self._write_tx(work)
+
     def import_origin_page(self, chain_id, pages):
         self._ensure_writable()
         self._probe_capacity()
-        if not isinstance(chain_id, str) or not chain_id:
-            raise contracts.RailsRefusal("chain_id must be a nonempty string", code="chain_id")
-        if not isinstance(pages, (list, tuple)) or not pages:
-            raise contracts.RailsRefusal("pages must be a nonempty list", code="pages")
+        contracts.require_id(chain_id, 'chain_id')
+        if self.chain_id == chain_id or privacy.scrub_text(chain_id) != chain_id:
+            raise AuthorityRefusal('invalid peer chain identity')
+        if not isinstance(pages, (list, tuple)) or not 1 <= len(pages) <= contracts.MAX_RECORDS:
+            raise contracts.RailsRefusal('invalid origin page count', code='pages')
+        pages = tuple(pages)
+        total = 0
+        for text in pages:
+            if not isinstance(text, str) or len(text) > contracts.MAX_RECORD or not text.isascii():
+                raise contracts.RailsRefusal('invalid or oversized origin record', code='origin_bytes')
+            total += len(text)
+            if total > contracts.MAX_PAGE:
+                raise contracts.RailsRefusal('origin page exceeds byte limit', code='pages')
 
         def work(conn):
             outcome = self._validate_origin_pages(conn, chain_id, pages)
@@ -841,10 +924,8 @@ class RailsLedger:
         batch = {}
         new_rows = []
         for text in pages:
-            if not isinstance(text, str):
-                raise contracts.RailsRefusal("origin entries must be canonical text", code="origin_bytes")
-            parsed = json.loads(contracts.canonicalize_text(text).decode("ascii"))
-            if contracts.canonicalize(parsed).decode("ascii") != text:
+            parsed = contracts.parse_text(text)
+            if not isinstance(parsed, dict) or contracts.canonicalize(parsed).decode('ascii') != text:
                 raise contracts.RailsRefusal("origin bytes are not canonical", code="origin_bytes")
             if parsed.get("schema") != contracts.SCHEMA:
                 raise contracts.RailsRefusal("origin schema mismatch", code="origin_bytes")
@@ -855,6 +936,12 @@ class RailsLedger:
                 raise contracts.RailsRefusal("origin seq must be a positive integer", code="origin_bytes")
             if parsed.get("event_id") != chain_id + ":" + str(seq):
                 raise contracts.RailsRefusal("origin event_id mismatch", code="origin_bytes")
+            contracts.require_id(parsed['event_id'], 'event_id')
+            without_hash = {k: v for k, v in parsed.items() if k != 'hash'}
+            if parsed.get('hash') != contracts.rails_hash(parsed.get('prev_hash'), without_hash):
+                raise contracts.RailsRefusal('invalid origin hash', code='origin_bytes')
+            _validate_origin_content(parsed)
+            self._check_authority(parsed['authority'])
             if seq < next_seq:
                 known = batch.get(seq)
                 if known is None:
@@ -871,10 +958,7 @@ class RailsLedger:
                     "source gap for %s: missing origin seq %d..%d"
                     % (chain_id, next_seq, seq - 1)
                 )
-            without_hash = {k: v for k, v in parsed.items() if k != "hash"}
-            if parsed.get("prev_hash") != prev or parsed.get("hash") != contracts.rails_hash(
-                prev, without_hash
-            ):
+            if parsed.get("prev_hash") != prev:
                 return _FORK
             batch[seq] = parsed["hash"]
             new_rows.append((seq, parsed, text))

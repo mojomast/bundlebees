@@ -191,7 +191,7 @@ class QueueTests(unittest.TestCase):
     def _claimed(self, tick, *, task_state="dispatched"):
         """Claim f1, then run one pass with a job row in ``task_state``."""
         job = {"job_id": "job_1", "tasks": [{"task_id": "T1", "state": task_state}]}
-        patcher = mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id: job)
+        patcher = mock.patch.object(Q.jobs, "load_job", lambda state_dir, job_id, *, recover=True: job)
         patcher.start()
         self.addCleanup(patcher.stop)
         store = Q.QueueStore(self.tmp)

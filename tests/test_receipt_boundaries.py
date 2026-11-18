@@ -378,6 +378,7 @@ def test_integration_suite_reuses_the_combined_receipt(tmp_path):
     # durable integration ref, then request the identical integration again.
     wave = integrate_job.job_wave_id(job)
     (state / "waves" / f"{wave}.json").unlink()
+    (state / "wave-identities" / f"{wave}.json").unlink()
     git(repo, "update-ref", "-d", integrate_job.integration_ref("job_a"), check=False)
 
     second = integrate_job.integrate(

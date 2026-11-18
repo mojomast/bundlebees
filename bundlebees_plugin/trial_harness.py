@@ -922,14 +922,17 @@ def start_driver(
         started_at=clock.monotonic(), _log=handle,
     )
     reported = _proc_cmdline(record.pid)
-    if not reported and proc.poll() is None:
-        # A just-forked child may not have exec'd yet, so /proc/<pid>/cmdline is
-        # briefly empty. Give exec a few milliseconds; an empty read is never
-        # treated as a wrapper, and a non-empty mismatch is always refused.
+    if reported != items and proc.poll() is None:
+        # Across fork/exec procfs can briefly show an empty cmdline *or our
+        # own*. Neither identifies the driver. Retry only those two cases;
+        # keep an unrelated wrapper a refusal and require an exact match.
+        inherited = _proc_cmdline(os.getpid())
         for _ in range(20):
+            if (reported and reported != inherited) or proc.poll() is not None:
+                break
             time.sleep(0.002)
             reported = _proc_cmdline(record.pid)
-            if reported or proc.poll() is not None:
+            if reported == items:
                 break
     if reported and reported != items:
         record.close_log()

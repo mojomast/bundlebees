@@ -794,7 +794,7 @@ class M4Dogfood(unittest.TestCase):
     def assert_return_packet(self, job):
         result = job_cli.report(self.state, JOB, repo=self.work)
         manifest = json.loads((self.state / "jobs" / JOB / "return.json").read_text())
-        self.assertEqual(manifest["schema"], "rizzstack.return/1")
+        self.assertEqual(manifest["schema"], "bundlebees.job-report/1")  # multiple distinct contracts
         self.assertEqual(manifest["receiver_decision"], {"status": "pending", "decided_by": None,
                                                          "decided_at": None, "note": None})
         statuses = {row["id"]: row["status"] for row in manifest["acceptance"]}

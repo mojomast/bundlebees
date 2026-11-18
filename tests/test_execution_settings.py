@@ -125,12 +125,17 @@ def test_tick_uses_the_same_runner_for_verification_and_integration(monkeypatch,
     runner = object()
     job = {"job_id": "j", "tasks": []}
     monkeypatch.setattr(jobs, "load_job", lambda *args, **kwargs: job)
-    monkeypatch.setattr(jobs, "recover_integration", lambda *args: False)
+    captured = []
+    def recover(*args, **kwargs):
+        assert kwargs["repo"] == tmp_path
+        assert kwargs["suite_command"] == (sys.executable, "-m", "pytest", "-q")
+        captured.append(kwargs["runner"])
+        return False
+    monkeypatch.setattr(jobs, "recover_integration", recover)
     monkeypatch.setattr(jobs, "release_repo_grant_for_job", lambda *args: None)
     monkeypatch.setattr(job_cli, "record_handoff", lambda *args: None)
     monkeypatch.setattr(job_cli, "_after_dispatch", lambda *args: None)
     monkeypatch.setattr(job_cli.leases, "load_lease", lambda *args: {})
-    captured = []
     def verified(*args, **kwargs):
         captured.append(kwargs["runner"])
         return {"sha": "a" * 40}
@@ -154,7 +159,7 @@ def test_tick_uses_the_same_runner_for_verification_and_integration(monkeypatch,
         return job_cli.reconcile.TickResult(status="idle")
     monkeypatch.setattr(job_cli.reconcile, "tick", reconcile)
     job_cli.tick(tmp_path, "j", client=Client(), repo=tmp_path, runner=runner)
-    assert captured == [runner, runner]
+    assert captured == [runner, runner, runner]
 
 
 def test_authorize_cli_seals_the_explicit_recovery_ceiling(monkeypatch, tmp_path):

@@ -172,8 +172,98 @@ def job_with_one_attempt(base: str) -> dict:
     }
 
 
+def _text_slice(repo, state, base, job_id, attempt_id, label):
+    """A sibling commit and a persisted verify-result fixture; no worker runs."""
+    git(repo, "checkout", "-q", "-b", label, base)
+    (repo / "slice.txt").write_text(label)
+    git(repo, "add", "slice.txt")
+    git(repo, "commit", "-qm", label)
+    sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "checkout", "-q", "main")
+    verify_local._write_record(state, attempt_id, {"attempt_id": attempt_id, "ok": True, "sha": sha})
+    return {"job_id": job_id, "goal": {"base_rev": base}, "integration": {"wave": 1},
+            "tasks": [{"task_id": "T1", "state": "verified", "attempts": [attempt_id]}]}
+
+
+@pytest.mark.parametrize("separate_state", [False, True], ids=["distinct-jobs", "independent-lock-stores"])
+def test_overlapping_integrations_test_their_own_checkouts(tmp_path, separate_state):
+    repo, base = repo_with_base(tmp_path)
+    state = tmp_path / "state"
+    outer = _text_slice(repo, state, base, "job_a", "att_a", "outer")
+    # Independent state stores can issue identical request IDs. Distinct jobs
+    # in a single state store are the ordinary parallel case.
+    other_state = tmp_path / "other" if separate_state else state
+    inner = _text_slice(repo, other_state, base, "job_a" if separate_state else "job_b",
+                        "att_a" if separate_state else "att_b", "inner")
+    options = {"cacheable": False, "worktree_root": tmp_path / "custom"} if separate_state else {"cacheable": False}
+    paths = []
+
+    def inner_suite(worktree, _argv):
+        paths.append(worktree)
+        assert (worktree / "slice.txt").read_text() == "inner"
+        # Exercise cleanup on rejection, too. The independent stores have
+        # the same job id and must not both publish a head to its Git ref.
+        return {"exit_code": 1 if separate_state else 0}
+
+    def outer_suite(worktree, _argv):
+        paths.append(worktree)
+        assert (worktree / "slice.txt").read_text() == "outer"
+        # Nest the calls at the suite boundary to force a deterministic
+        # overlap without threads, sleeps, or running a real suite.
+        result = integrate_job.integrate(other_state, inner, repo, runner=inner_suite, **options)
+        assert result["ok"] is (not separate_state)
+        assert git(repo, "show", result["record"]["head_sha"] + ":slice.txt").stdout == "inner"
+        assert (worktree / "slice.txt").is_file(), "the inner job removed the outer suite's checkout"
+        assert (worktree / "slice.txt").read_text() == "outer"
+        return {"exit_code": 0}
+
+    accepted = integrate_job.integrate(state, outer, repo, runner=outer_suite, **options)
+    assert accepted["ok"]
+    assert git(repo, "show", accepted["record"]["head_sha"] + ":slice.txt").stdout == "outer"
+    assert len(set(paths)) == 2
+    assert all(not path.exists() for path in paths)
+    assert git(repo, "worktree", "list", "--porcelain").stdout.count("worktree ") == 1
+
+
+def test_retry_reclaims_abandoned_checkout_for_its_own_request(tmp_path):
+    repo, base = repo_with_base(tmp_path)
+    state = tmp_path / "state"
+    job = _text_slice(repo, state, base, "job_a", "att_a", "outer")
+    paths = []
+
+    def suite(worktree, _argv):
+        paths.append(worktree)
+        assert not (worktree / "stale.txt").exists()
+        return {"exit_code": 0 if len(paths) > 1 else 1}
+
+    assert not integrate_job.integrate(state, job, repo, runner=suite, cacheable=False)["ok"]
+    rejected = {p.parent.name: p.read_bytes() for p in state.glob("*/job_a.w1.json")}
+    # Restore the linked worktree that an interrupted attempt would leave.
+    git(repo, "worktree", "add", "--detach", str(paths[0]), base)
+    (paths[0] / "stale.txt").write_text("left over")
+    assert integrate_job.integrate(state, job, repo, runner=suite, cacheable=False)["ok"]
+    assert {p.stem: p.read_bytes() for p in (state / "wave-history").rglob("*.json")} == rejected
+    assert not paths[0].exists()
+    assert git(repo, "worktree", "list", "--porcelain").stdout.count("worktree ") == 1
+
+
 class SandboxRequirements:
     __test__ = True
+
+    @pytest.mark.parametrize("raw", [{"exit_code": False}, {"exit_code": "0"}, {"exit_code": 0.5},
+                                     {"exit_code": 0, "blocking": ["contract"]}])
+    def test_live_and_cached_suite_results_cannot_convert_a_refusal_to_a_pass(self, tmp_path, raw):
+        observed = integrate_job._suite_evidence(
+            tmp_path, ["fixture"], runner=lambda *_: raw, backend="auto",
+            allow_unsafe_local=False, allow_weak=False, timeout=5,
+        )
+        assert not integrate_job.revision.suite_passed(observed)
+        if type(raw["exit_code"]) is not int:
+            with pytest.raises(integrate_job.IntegrateError, match="exit code"):
+                integrate_job._receipt_suite_evidence({"result": raw})
+        else:
+            cached = integrate_job._receipt_suite_evidence({"result": observed})
+            assert not integrate_job.revision.suite_passed(cached)
 
     def test_the_integration_suite_does_not_inherit_coordinator_environment(self, tmp_path, monkeypatch):
         for name in ("BUNDLEBEES_LAUNCHER_TOKEN", "BUNDLEBEES_SIGNING_KEY", "HERMES_API_KEY", "HERMES_API_URL"):

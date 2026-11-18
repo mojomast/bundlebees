@@ -1350,102 +1350,205 @@ def _wave_id(job_id: Any, wave: Any) -> str:
     return revision.wave_id_for(str(job_id or ""), wave)
 
 
-def _wave_record(state_dir: Path, wave_id: str) -> dict[str, Any] | None:
-    """Read one wave record: absent is ``None``, damaged is a named refusal."""
-    from . import revision  # noqa: PLC0415
+def _handoff_scope(job: Mapping[str, Any]) -> str:
+    """The sealed job inputs applicable to this handoff (verified and integrating are equivalent)."""
+    tasks = [{k: t.get(k) for k in ("task_id", "attempts", "contract_sha256", "contract", "lease", "acceptance")}
+             for t in job.get("tasks", []) if t.get("state") in ("verified", "integrating")]
+    integration = job["integration"]
+    return hashlib.sha256(_canonical({"job_id": job["job_id"], "goal": job["goal"], "tasks": tasks,
+                                      "wave": _wave_number(integration.get("wave")),
+                                      "history": integration.get("accepted_waves", []),
+                                      "previous": integration.get("last_commit")})).hexdigest()
 
-    try:
-        return revision.read_wave(Path(state_dir), wave_id)
-    except revision.RevisionError as exc:
-        if exc.code == revision.WAVE_MISSING:
-            return None
-        raise JobError(exc.code, exc.error, exc.fix) from exc
+
+def _integration_request(state: Path, job: Mapping[str, Any], repo: Path, logical: str,
+                         selected: str, digest: str) -> dict | None:
+    """Only a persisted job needs the cross-process integration-to-job handoff."""
+    if not (state / JOBS_DIR / f"{_job_id(job['job_id'])}.json").exists():
+        return None
+    if logical != _wave_id(job["job_id"], job["integration"].get("wave")):
+        raise JobError("wave_reconciliation_required", "Noncanonical request for a persisted job.", _FIX_TAMPERED)
+    return {"kind": "job-integration-request/1", "wave": logical, "selected": selected,
+            "scope": _handoff_scope(job), "repo": str(repo.resolve()), "identity_digest": digest}
 
 
-def recover_integration(state_dir: Path, job: dict[str, Any]) -> bool:
+def _select_integration(state: Path, request: dict) -> None:
+    # Select before execution, so a failed or interrupted changed command cannot
+    # fall back to the previous acceptance. Completed proof files are immutable.
+    path = _subdir(state, "job-wave-requests") / f"{request['wave']}.json"
+    _atomic_write(path, _canonical(_seal(request, _load_key(state))))
+
+
+def _confirm_integration(state: Path, request: dict, binding: str, *, fresh: bool) -> None:
+    from . import integrate_job as ij
+
+    wave = request["selected"]
+    path = state / "job-wave-proofs" / f"{wave}.json"
+    expected = {"kind": "job-integration-proof/1", "request": request, "binding": binding}
+    key = _load_key(state)
+    if fresh:
+        _create_only(path, _canonical(_seal(expected, key)))
+    envelope = ij._read_evidence(path, wave)
+    if not envelope or open_sealed(envelope, key, "integration proof") != expected:
+        raise ij._reconcile(wave, "no matching sealed integration result")
+
+
+def _resumed_identity(repo: Path, job: dict, wave: str, shas: list, historical: dict,
+                      command: Sequence[str] | None, runner: Any) -> dict:
+    """Active calls supply their policy. Passive readers finish the sealed invocation."""
+    from . import execution, integrate_job as ij
+
+    policy = historical["sandbox"] if command is None else {
+        "backend": "auto", "allow_unsafe_local": False, "allow_weak": False,
+        "timeout": ij.DEFAULT_SANDBOX_TIMEOUT_S}
+    env = historical["environment"]
+    passive = command is None and runner is None
+    if passive and "execution" in env:
+        if env["runner"] != "SandboxRunner":
+            raise ij._reconcile(wave, "supply the original runner to recheck its dynamic receipt identity")
+        # Re-fingerprint the configured interpreter/cache and today's staged payload.
+        opts = env["execution"]["options"]
+        runner = execution.SandboxRunner({"verify_isolation": opts["backend"], "verify_timeout_s": opts["timeout"],
+            "verify_allow_unsafe_local": opts["allow_unsafe_local"], "verify_allow_weak_unshare": opts["allow_weak"],
+            "verify_python": opts["python"], "sandbox_tiktoken_cache": opts["tiktoken_cache"]})
+    current = ij._integration_request_identity(repo, job=job, wave=wave, base_rev=job["goal"]["base_rev"], shas=shas,
+        suite_command=historical["command"] if command is None else command, runner=runner, backend=policy["backend"],
+        allow_unsafe_local=policy["allow_unsafe_local"], allow_weak=policy["allow_weak"], timeout=policy["timeout"])
+    if passive and runner is None and policy["runner"] == "injected":
+        # No callable is executed or imported by name. For a plain function its
+        # recorded name is the runner identity, and the coordinator sealed it.
+        current["sandbox"]["runner"] = "injected"
+        current["environment"]["runner"] = env["runner"]
+    return current
+
+
+def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | None = None,
+                        suite_command: Sequence[str] | None = None, runner: Any = None,
+                        live_result: Mapping[str, Any] | None = None, persist: bool = False) -> bool:
     """Adopt an accepted wave that a crash left out of this job document.
 
-    A wave record is published before the job is saved, so a crash between the
-    two leaves durable proof that the wave was accepted next to a job that does
-    not say so. Re-running integration from that state would commit the same
-    work twice, so the accepted record is adopted instead: the tasks it
-    integrated move to ``accepted``, the wave counter advances, and the record's
-    head commit becomes ``last_commit``. Evidence that exists but cannot be read
-    raises with its own code; it is never read as "no accepted wave".
+    A sealed handoff pins the request, local repo, and materialized result.
+    Adopt only after the same evidence and identity checks as integration. A
+    passive read can observe a completed ref update, but never repairs it.
     """
+    from . import integrate_job as ij, test_receipts, verify_local
+
     job_id = str(job.get("job_id") or "").strip()
     integration = job.get("integration")
     if not job_id or not isinstance(integration, dict):
         return False
     wave = _wave_number(integration.get("wave", 1))
-    settled = [entry for entry in (integration.get("accepted_waves") or []) if isinstance(entry, Mapping)]
-    if any(_wave_index(entry.get("wave", 0)) >= wave for entry in settled):
+    settled = integration.get("accepted_waves") or []
+    if any(isinstance(entry, Mapping) and _wave_index(entry.get("wave", 0)) >= wave for entry in settled):
         return False
     wave_id = _wave_id(job_id, wave)
-    record = _wave_record(state_dir, wave_id)
-    if record is None or record.get("accepted") is not True:
+    state = Path(state_dir)
+    selection = state / "job-wave-requests" / f"{wave_id}.json"
+    if not any(os.path.lexists(p) for p in (selection, state / "waves" / f"{wave_id}.json",
+                                            state / "job-wave-proofs" / f"{wave_id}.json",
+                                            ij._wave_identity_path(state, wave_id))):
+        for legacy in ij._legacy_names(job):
+            if legacy != wave_id and os.path.lexists(state / "waves" / f"{legacy}.json"):
+                raise JobError("wave_reconciliation_required", f"Legacy wave {legacy} requires reconciliation.",
+                               "Inspect the saved job and evidence; a legacy record cannot prove a handoff.")
         return False
+    try:
+        with test_receipts.claim_key(state, "integrate-wave:" + wave_id):
+            envelope = ij._read_evidence(selection, wave_id)
+            if not envelope:
+                raise ij._reconcile(wave_id, "no authenticated integration request")
+            request = open_sealed(envelope, _load_key(state), "integration request")
+            digest = request.get("identity_digest")
+            selected = request.get("selected")
+            if (request.get("kind") != "job-integration-request/1" or request.get("wave") != wave_id
+                    or not isinstance(digest, str) or selected not in (wave_id, ij._derived_wave_id(wave_id, digest))):
+                raise ij._reconcile(wave_id, "request names a different wave")
+            record = ij._read_evidence(state / "waves" / f"{selected}.json", selected)
+            if record is None:
+                if os.path.lexists(ij._wave_identity_path(state, selected)) or os.path.lexists(state / "job-wave-proofs" / f"{selected}.json"):
+                    raise ij._reconcile(selected, "missing materialized wave")
+                return False  # Selected request interrupted before its wave was published.
+            if record.get("accepted") is False and not os.path.lexists(state / "job-wave-proofs" / f"{selected}.json"):
+                return False
+            if request.get("scope") != _handoff_scope(job):
+                raise ij._reconcile(selected, "pending tasks or job scope changed")
+            local = Path(request["repo"])
+            if not local.is_dir() or (repo is not None and Path(repo).resolve() != local):
+                raise ij._reconcile(selected, "the pinned local repository is unavailable or different")
+            stored = ij._read_evidence(ij._wave_identity_path(state, selected), selected) or {}
+            _confirm_integration(state, request, stored.get("binding_sha256"), fresh=False)
+            historical = stored["identity"]
+            if not isinstance(historical, dict) or ij._identity_digest(historical) != digest:
+                raise ij._reconcile(selected, "stored execution identity differs from the sealed request")
+            attempts = ij.verified_attempts(job)
+            shas = ij._verified_inputs(state, selected, attempts)
+            current = _resumed_identity(local, job, wave_id, shas, historical, suite_command, runner)
+            pair = ij._wave_pair(state, local, selected, current)
+            if (not pair or pair[0]["accepted"] is not True or pair[1]["identity_digest"] != digest
+                    or ij._identity_digest(current) != digest or pair[1] != stored):
+                raise ij._reconcile(selected, "execution identity or acceptance changed")
+            record = pair[0]
+            head = record["head_sha"]
+            ref = ij.integration_ref(job_id)
+            if live_result is not None:
+                if (live_result.get("ok") is not True or live_result.get("request_identity_digest") != digest
+                        or live_result.get("record") != record or live_result.get("integration_ref") != ref):
+                    raise ij._reconcile(selected, "live integration result differs from its sealed handoff")
+            elif repo is not None:
+                pending = ij._pending_ref(request, stored["binding_sha256"])
+                ij._publish_head(local, ref, selected, stored["materialized"], pending=pending)
+            if persist:
+                with ij._hold_tested_head(local, ref, selected, head):
+                    _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)
+                    save_job(state, job)
+            else:
+                if ij._ref_value(local, ref, selected) != head:
+                    raise ij._reconcile(selected, "use job recover with the pinned repo to finish the ref update")
+                _apply_proved_wave(job, record, digest, attempts, recovered=live_result is None)
+    except (JobError, ij.IntegrateError, LeaseError, test_receipts.ReceiptError, verify_local.VerifyError,
+            OSError, KeyError, TypeError) as exc:
+        raise JobError("wave_reconciliation_required", f"Wave {wave_id} requires reconciliation: {exc}",
+                       "Inspect the preserved request, result and repository before retrying.") from exc
 
-    named = str(record.get("wave_id") or wave_id)
-    if named != wave_id:
-        raise JobError(
-            "wave_evidence_mismatch",
-            f"wave record {wave_id} names itself {named!r}",
-            "Inspect the waves directory by hand; do not integrate again.",
-        )
-    head = str(record.get("head_sha") or "")
-    if not _is_sha(head):
-        raise JobError(
-            "wave_evidence_invalid",
-            f"accepted wave {wave_id} does not name a full commit",
-            "Inspect the wave record; an incomplete acceptance is not evidence.",
-        )
-    listed = record.get("attempts")
-    if not isinstance(listed, (list, tuple)) or not listed:
-        raise JobError(
-            "wave_evidence_invalid",
-            f"accepted wave {wave_id} lists no attempts",
-            "Inspect the wave record; an acceptance with no attempts is not evidence.",
-        )
+    return True
+
+
+def _apply_proved_wave(job: dict, record: Mapping[str, Any], digest: str, attempts: list[str], *, recovered: bool) -> None:
+    integration = job["integration"]
+    wave = _wave_number(integration.get("wave", 1))
+    selected, head = record["wave_id"], record["head_sha"]
+    actor = "recovery" if recovered else "reconciler"
+    evidence = f"{'recovered ' if recovered else ''}accepted wave {selected} at {head}"
     pending = [task for task in job.get("tasks") or [] if task.get("state") in {"verified", "integrating"}]
-    integrated = sorted(str((task.get("attempts") or [None])[-1]) for task in pending)
-    if sorted(str(item) for item in listed) != integrated:
-        raise JobError(
-            "wave_evidence_mismatch",
-            f"accepted wave {wave_id} integrates {sorted(str(item) for item in listed)}, "
-            f"which is not this job's pending verification {integrated}",
-            "Inspect the wave record and the job; do not integrate again.",
-        )
-
     for task in pending:
         task_id = str(task.get("task_id") or "")
         if task.get("state") == "verified":
-            transition(job, task_id, "integrating", actor="recovery",
-                       reason=f"wave {wave_id} was already accepted")
-        transition(job, task_id, "accepted", actor="recovery",
-                   reason=f"adopted accepted wave {wave_id} after a crash",
-                   evidence=f"recovered wave {wave_id} at {head[:12]}")
+            transition(job, task_id, "integrating", actor=actor, reason=evidence)
+        transition(job, task_id, "accepted", actor=actor, reason=evidence, evidence=evidence)
 
     integration.update(
         accepted_waves=[
-            *settled,
+            *(integration.get("accepted_waves") or []),
             {
                 "wave": wave,
                 "at": str(record.get("at") or ""),
-                "evidence": f"recovered accepted wave {wave_id} at {head}",
+                "evidence": evidence,
                 "commit": head,
-                "recovered": True,
+                "wave_id": selected,
+                "attempts": attempts,
+                "request_identity_digest": digest,
+                "recovered": recovered,
             },
         ],
         wave=wave + 1,
-        wave_id=_wave_id(job_id, wave + 1),
+        wave_id=_wave_id(job["job_id"], wave + 1),
         attempts=0,
         state="pending",
         last_commit=head,
-        recovered={"wave": wave, "wave_id": wave_id, "head_sha": head,
-                   "at": str(record.get("at") or "")},
+        evidence=evidence,
     )
-    return True
+    if recovered:
+        integration["recovered"] = {"wave": wave, "wave_id": selected, "head_sha": head, "at": record["at"]}
 
 
 def load_job(state_dir: Path, job_id: str, *, recover: bool = True) -> dict[str, Any]:

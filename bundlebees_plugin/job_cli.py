@@ -63,13 +63,8 @@ def _last_accepted_head(job: Mapping[str, Any]) -> str:
     return head or str(integration.get("last_commit") or "")
 
 
-def _restore_ref(repo: Path, ref: str, head: str) -> str:
-    """Point the durable integration ref at the accepted head, or report why not.
-
-    A repository that does not exist here has no ref to repair; a repository
-    that refuses the update is a refusal, because the next wave would otherwise
-    build on the wrong base.
-    """
+def _check_history_ref(repo: Path, ref: str, head: str) -> str:
+    """Recorded job history is not permission to create or rewind a ref."""
     inside = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-dir"],
                             capture_output=True, text=True)
     if inside.returncode != 0:
@@ -78,15 +73,8 @@ def _restore_ref(repo: Path, ref: str, head: str) -> str:
                              capture_output=True, text=True)
     if current.returncode == 0 and current.stdout.strip() == head:
         return head
-    updated = subprocess.run(["git", "-C", str(repo), "update-ref", ref, head],
-                             capture_output=True, text=True)
-    if updated.returncode != 0:
-        raise JobCliError(
-            "integration_ref_unrestored",
-            f"could not restore {ref} to {head[:12]}: {updated.stderr.strip()[:200]}",
-            "Repair the repository refs; the next wave must build on the accepted commit.",
-        )
-    return head
+    raise JobCliError("wave_reconciliation_required", "The integration ref differs from the published job history.",
+                      "Reconcile the ref and history; automatic ref repair requires a pending, proved handoff.")
 
 
 def recover(
@@ -110,22 +98,19 @@ def recover(
 
     * the integration boundary — a wave record published before the job was
       saved is adopted and the durable ``refs/bb/integrated/<job>`` ref is
-      restored from it. Corrupt evidence raises its own code
-      (``wave_malformed``/``wave_unreadable``); it is never read as permission to
-      integrate again;
+      restored only from a verified handoff at its original predecessor. Missing
+      or conflicting evidence requires explicit reconciliation;
     * a rejected task — the durable request is printed, or a decision file
       (``decision_file``) / the deterministic adapter (``adapter="deterministic"``)
       is *recorded*. Recording never applies the decision: the next ``job tick``
       does that, exactly once.
     """
     job = jobs.load_job(state_dir, job_id, recover=False)
-    adopted = jobs.recover_integration(state_dir, job)
-    if adopted:
-        jobs.save_job(state_dir, job)
+    adopted = jobs.recover_integration(state_dir, job, repo=repo, persist=True)
     head = _last_accepted_head(job)
     restored = ""
     if head and repo is not None:
-        restored = _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+        restored = _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     recovered = (job.get("integration") or {}).get("recovered") or {}
 
     requests = recovery.list_requests(state_dir, job_id)
@@ -434,11 +419,11 @@ def tick(
     # closed before anything else: adopt the accepted record, persist it, and
     # point the durable ref back at the accepted head so a restart can neither
     # integrate the same work twice nor build the next wave on the wrong base.
-    if jobs.recover_integration(state_dir, job):
-        jobs.save_job(state_dir, job)
+    jobs.recover_integration(state_dir, job, repo=repo, suite_command=suite_command, runner=runner,
+                             persist=True)
     head = _last_accepted_head(job)
     if head and Path(repo).exists():
-        _restore_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
+        _check_history_ref(Path(repo), integrate_job.integration_ref(str(job_id)), head)
     job = _hydrate_contracts(state_dir, job, repo)
 
     from . import provision_bind
@@ -491,7 +476,7 @@ def tick(
         adapter = provision_bind.BoundLauncher(adapter, bindings, validators)
 
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
-        from . import acdd_cli
+        from . import acdd_cli, cli, sandbox
 
         task = ctx.get("task") or {}
         attempt_id = str(ctx.get("attempt_id") or "")
@@ -534,9 +519,12 @@ def tick(
 
         lease_record = leases.load_lease(state_dir, attempt_id)
         declared = bool((lease_record.get("brief") or {}).get("contract"))
+        acdd_state = None
 
         def preflight(patch_files: list[str]) -> object:
-            return acdd_cli.verify_preflight(lease_record, state_dir, patch_files)
+            nonlocal acdd_state
+            acdd_state = acdd_cli.verify_preflight(lease_record, state_dir, patch_files)
+            return acdd_state
 
         try:
             record = verify_local.verify_and_commit(
@@ -555,13 +543,17 @@ def tick(
                 acdd_preflight=preflight,
                 contract_declared=declared,
             )
+            if acdd_state and any(ac['verification'] == 'test' for ac in acdd_state['contract']['acceptance_criteria']):
+                acdd_cli.candidate_green(state_dir, acdd_state, repo, record['sha'], runner or verify_local.sandbox_runner)
+        except (cli.CliError, sandbox.SandboxUnavailable) as exc:
+            return {'ok': False, 'evidence': f'{exc.code}: {exc.error}'}
         except verify_local.VerifyError as exc:
             return {"ok": False, "evidence": _failure_evidence(exc, tests)}
         return {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}
 
     def integrator(job_doc: Mapping[str, Any]) -> Mapping[str, Any]:
         try:
-            result = integrate_job.integrate(
+            return integrate_job.integrate(
                 state_dir,
                 job_doc,
                 repo,
@@ -570,14 +562,12 @@ def tick(
             )
         except (integrate_job.IntegrateError, Exception) as exc:  # noqa: BLE001 - reported as a failed wave
             return {"ok": False, "evidence": f"integration error: {exc}"}
-        commit = ""
-        ref = result.get("integration_ref")
-        if ref:
-            import subprocess as _sp
 
-            head = _sp.run(["git", "-C", str(repo), "rev-parse", str(ref)], capture_output=True, text=True)
-            commit = head.stdout.strip() if head.returncode == 0 else ""
-        return {"ok": bool(result.get("ok")), "evidence": str(result.get("evidence") or ""), "commit": commit}
+    def accept_integration(job_doc: dict, verdict: Mapping[str, Any]) -> None:
+        if not jobs.recover_integration(state_dir, job_doc, repo=repo, suite_command=suite_command, runner=runner,
+                                        live_result=verdict, persist=True):
+            raise jobs.JobError("wave_reconciliation_required", "Live integration has no matching sealed acceptance.",
+                                "Inspect the wave and its handoff receipts.")
 
     result = reconcile.tick(
         state_dir,
@@ -585,6 +575,7 @@ def tick(
         launcher=adapter,
         verifier=verifier,
         integrator=integrator,
+        accept_integration=accept_integration,
         binder=binder,
         now=now,
     )
@@ -670,7 +661,8 @@ def status(state_dir: Path, job_id: str) -> dict[str, Any]:
     }
 
 
-def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False) -> dict[str, Any]:
+def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bool = False,
+           rails_db=None, rails_anchors=None) -> dict[str, Any]:
     """Write and print the job acceptance report, bound to a RETURN packet.
 
     The shallow report at ``jobs/<job>.report.json`` keeps its keys and gains a
@@ -685,7 +677,7 @@ def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bo
     """
 
     if verify:
-        return return_report.verify(state_dir, job_id, repo=repo)
+        return return_report.verify(state_dir, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
 
     job = jobs.load_job(state_dir, job_id)
     rows = []
@@ -701,7 +693,7 @@ def report(state_dir: Path, job_id: str, *, repo: Path | None = None, verify: bo
                 "verified": bool((record or {}).get("ok")),
             }
         )
-    manifest = return_report.build(state_dir, job_id, repo=repo)
+    manifest = return_report.build(state_dir, job_id, repo=repo, rails_db=rails_db, rails_anchors=rails_anchors)
     payload = {
         "job_id": job_id,
         "goal": job.get("goal", {}),
@@ -854,6 +846,9 @@ def add_parsers(subparsers: Any) -> None:
                      help="Repository used to prove every recorded verification commit exists.")
     rep.add_argument("--verify", action="store_true",
                      help="Rebuild the RETURN from durable state and compare evidence_digest; writes nothing.")
+    rep.add_argument('--rails-anchors', type=Path, metavar='FILE',
+                     help='Attach/verify Rails evidence using independently enrolled heads and criterion selections '
+                          'from FILE against the configured local rails_db.')
     rep.set_defaults(command="job", job_handler="report")
 
     repo = subparsers.add_parser(
@@ -1319,11 +1314,16 @@ def cmd_job(ctx: Any, args: Any, *, state_dir: Path, client_factory, provisioner
 
         if handler == "report":
             repo = Path(args.repo) if getattr(args, "repo", None) else None
-            if getattr(args, "verify", False):
-                result = report(state_dir, job_id, repo=repo, verify=True)
-                print(json.dumps(result, indent=2, sort_keys=True))
-                return 0 if result.get("ok") else 1
-            print(json.dumps(report(state_dir, job_id, repo=repo), indent=2, sort_keys=True))
+            anchors = getattr(args, 'rails_anchors', None)
+            opts = {}
+            if anchors is not None:
+                setting = getattr(ctx, 'get_config', lambda key, default: config.get(key, default))
+                if setting('rails_read_scope', None):
+                    raise JobCliError('rails_evidence_refused', 'This profile restricts Rails reads.',
+                                      'Use the coordinator reporting profile to verify full chains.')
+                opts.update(rails_anchors=anchors, rails_db=setting('rails_db', None))
+            result = report(state_dir, job_id, repo=repo, verify=getattr(args, 'verify', False), **opts)
+            print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
         raise JobCliError("invalid_argument", "unknown job command", "Use authorize, create, status, tick, note, agent-pending or report.")

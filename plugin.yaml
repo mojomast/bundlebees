@@ -43,6 +43,26 @@ requires_env:
       Configure it in Hermes secrets. Never paste the value into chat.
     secret: true
 config_schema:
+  rails_db:
+    type: str
+    default: ''
+    description: Absolute local ledger path. Setting this additionally registers bundlebees_rails, a bounded read-only tool in this profile. provides_tools lists the default toolset.
+  rails_import_sources:
+    type: str
+    default: ''
+    description: Comma-separated explicit CLI import ownership (bundlebees,outbox,queue,hermes,launcher). Empty disables imports.
+  rails_hermes_db:
+    type: str
+    default: ''
+    description: Local read-only Hermes session database for explicit imports.
+  rails_session_aliases:
+    type: str
+    default: '{}'
+    description: JSON mapping of enrolled session IDs to public aliases. Never defaults to every session.
+  rails_launcher_chain:
+    type: str
+    default: ''
+    description: Pinned public worker chain ID on the existing configured launcher transport.
   gitleaks_path:
     type: str
     default: ''

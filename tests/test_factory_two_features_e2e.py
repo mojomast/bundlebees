@@ -365,7 +365,7 @@ class TwoIndependentFeaturesThroughDriver(unittest.TestCase):
         manifest = return_report.build(self.fx.state, job_id, repo=self.fx.tmp / "work")
         verified = return_report.verify(self.fx.state, job_id, repo=self.fx.tmp / "work")
         self.assertTrue(verified["ok"], verified)
-        self.assertEqual(manifest["schema"], "rizzstack.return/1")
+        self.assertEqual(manifest["schema"], "bundlebees.job-report/1")  # packet-free factory jobs
         self.assertEqual(manifest["receiver_decision"]["status"], "pending")
         self.assertIsNone(manifest["receiver_decision"]["decided_by"])
         statuses = {row["id"]: row["status"] for row in manifest["acceptance"]}
