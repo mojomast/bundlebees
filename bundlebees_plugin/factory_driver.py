@@ -17,12 +17,16 @@ most one active turn.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import fnmatch
 import hashlib
 import importlib
 import inspect
 import json
 import os
+import select
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -48,11 +52,16 @@ from . import work_scheduler
 __all__ = [
     "FactoryDriver",
     "FactoryError",
+    "FactoryService",
+    "InboxEventWatcher",
     "WakeCoalescer",
     "action_id_for_event",
     "deterministic_handler",
     "load_tick",
     "main",
+    "read_dispatch_approval",
+    "read_shared_cap",
+    "record_dispatch_approval",
     "run_once",
     "run_pass",
     "startup_reconcile",
@@ -68,11 +77,18 @@ WAKE_ACTION_DIR = "wake-actions"
 ACTION_DIR = "actions"
 WORK_RETRY_DIR = "work-retries"
 JOB_LOCK_DIR = "job-locks"
+DISPATCH_APPROVAL_DIR = "dispatch-approvals"
+DISPATCH_APPROVAL_SCHEMA = "bundlebees.factory-dispatch-approval/1"
 DEFAULT_SESSION = "coordinator"
 DEFAULT_WAKE_TTL_S = 900.0
 DEFAULT_WAKE_BACKOFF_S = 5.0
 MAX_WAKE_BACKOFF_S = 300.0
 MAX_WORK_ATTEMPTS = 2
+#: The event wait is bounded even when inotify exists, so a missed or coalesced
+#: filesystem notification never stalls the loop forever.
+DEFAULT_SERVICE_INTERVAL_S = 30.0
+#: Polling fallback used only when inotify is unavailable in this sandbox.
+DEFAULT_SERVICE_POLL_S = 0.25
 _TERMINAL_TASK_STATES = frozenset({"accepted", "rejected", "failed", "superseded"})
 
 
@@ -181,6 +197,112 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise FactoryError("state_corrupt", f"{path} is not a JSON object", "Inspect it by hand.")
     return value
+
+
+def _approval_key(work_id: Any) -> str:
+    text = str(work_id if work_id is not None else "").strip()
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if len(text) <= 96 and text and text not in {".", ".."} and all(ch in allowed for ch in text):
+        return text
+    return "work-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+
+
+def dispatch_approval_path(state_dir: Any, work_id: Any) -> Path:
+    return _factory_dir(state_dir) / DISPATCH_APPROVAL_DIR / f"{_approval_key(work_id)}.json"
+
+
+def record_dispatch_approval(
+    state_dir: Any,
+    work_id: Any,
+    *,
+    job_id: Any = "",
+    scope: Any = (),
+    approved: bool = True,
+    by: str = "owner",
+    now: Any = None,
+) -> dict[str, Any]:
+    """Record the durable pre-approval one scheduler item needs before dispatch.
+
+    The record is inert unless ``approved`` is exactly ``True`` and its scope
+    is a readable list.  The service refuses to dispatch anything else.
+    """
+
+    identifier = _approval_key(work_id)
+    if isinstance(scope, (list, tuple, set)):
+        globs: Any = [str(item) for item in scope if str(item).strip()]
+    elif scope is None:
+        globs = []
+    else:
+        # Preserve an explicitly malformed scope so the reader can fail closed.
+        globs = scope
+    body = {
+        "schema": DISPATCH_APPROVAL_SCHEMA,
+        "work_id": str(work_id if work_id is not None else ""),
+        "approval_key": identifier,
+        "job_id": str(job_id or ""),
+        "approved": bool(approved),
+        "scope": globs,
+        "approved_by": str(by or ""),
+        "approved_at": _iso(now),
+    }
+    _write_json(dispatch_approval_path(state_dir, work_id), body)
+    return body
+
+
+def read_dispatch_approval(state_dir: Any, work_id: Any) -> dict[str, Any] | None:
+    """Read one pre-approval record; unreadable state is a typed refusal."""
+
+    path = dispatch_approval_path(state_dir, work_id)
+    try:
+        body = _read_json(path)
+    except FactoryError as exc:
+        raise FactoryError(
+            "approval_unreadable",
+            f"the dispatch approval for {work_id!r} is unreadable: {exc.message}",
+            "Repair or remove the approval record; the driver never guesses consent.",
+        ) from exc
+    if body is None:
+        return None
+    if str(body.get("schema") or "") != DISPATCH_APPROVAL_SCHEMA:
+        raise FactoryError(
+            "approval_unreadable",
+            f"the dispatch approval for {work_id!r} is not schema {DISPATCH_APPROVAL_SCHEMA!r}",
+            "Rewrite the approval with record_dispatch_approval.",
+        )
+    stored = str(body.get("work_id") or "")
+    if stored and stored != str(work_id):
+        raise FactoryError(
+            "approval_unreadable",
+            f"the dispatch approval at {path} names {stored!r}, not {work_id!r}",
+            "Refuse it; an approval never carries to another work item.",
+        )
+    return body
+
+
+def read_shared_cap(state_dir: Any = None) -> int:
+    """Read the shared bee cap (12) from the single authority for it.
+
+    ``grants.GLOBAL_MAX_BEES`` is the shared cap.  A missing, non-integer or
+    non-positive value is not a reason to dispatch without a bound.
+    """
+
+    from . import grants as grants_mod
+
+    value = getattr(grants_mod, "GLOBAL_MAX_BEES", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise FactoryError(
+            "cap_unreadable",
+            f"the shared bee cap is not a readable positive integer: {value!r}",
+            "Restore grants.GLOBAL_MAX_BEES; the service never dispatches without a cap.",
+        )
+    return int(value)
+
+
+def _scope_allows(scope: Sequence[str], lease_files: Sequence[str]) -> bool:
+    return all(
+        any(fnmatch.fnmatch(str(path), str(pattern)) for pattern in scope)
+        for path in lease_files
+    )
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -554,6 +676,162 @@ class WakeCoalescer:
             if isinstance(raw, str) and raw:
                 found.append(raw)
         return sorted(set(found))
+
+
+# ---------------------------------------------------------------------------
+# Inbox wake-up
+# ---------------------------------------------------------------------------
+
+
+class InboxEventWatcher:
+    """Wake on a landing written under ``events/inbox/<subscriber>/``.
+
+    Linux inotify is used when the running kernel and libc expose it.  The
+    watcher also returns immediately when an inbox JSON file is already
+    pending, so a record written before the loop started is never missed.  On
+    a platform without inotify it degrades to a short bounded poll instead of
+    pretending the filesystem can notify it.
+    """
+
+    _MASK = 0x00000002 | 0x00000008 | 0x00000080 | 0x00000100 | 0x00000200 | 0x00000400
+
+    def __init__(
+        self,
+        state_dir: Any,
+        *,
+        interval_s: float = DEFAULT_SERVICE_POLL_S,
+        subscribers: Sequence[str] | None = None,
+    ) -> None:
+        self.state = _state_path(state_dir)
+        self.interval_s = max(0.01, float(interval_s))
+        self.subscribers = list(subscribers) if subscribers is not None else None
+        self._fd = -1
+        self._libc: Any = None
+        self._add_watch: Any = None
+        self._watches: set[str] = set()
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            init.argtypes = [ctypes.c_int]
+            init.restype = ctypes.c_int
+            add = libc.inotify_add_watch
+            add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            add.restype = ctypes.c_int
+            flags = getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+            fd = int(init(flags))
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1 refused")
+            self._libc = libc
+            self._add_watch = add
+            self._fd = fd
+        except Exception:  # noqa: BLE001 - any missing inotify means poll
+            self._fd = -1
+            self._libc = None
+            self._add_watch = None
+        self._refresh_watches()
+
+    @property
+    def uses_inotify(self) -> bool:
+        return self._fd >= 0
+
+    def _inbox_root(self) -> Path:
+        return self.state / event_consumer.EVENTS_DIR / event_consumer.INBOX_DIR
+
+    def _candidate_dirs(self) -> list[Path]:
+        root = self._inbox_root()
+        found: list[Path] = [root]
+        if root.is_dir():
+            for child in sorted(root.iterdir(), key=lambda item: item.name):
+                if child.is_dir() and not child.name.startswith("."):
+                    found.append(child)
+        return found
+
+    def _refresh_watches(self) -> None:
+        if self._fd < 0 or self._add_watch is None:
+            return
+        for directory in self._candidate_dirs():
+            if not directory.is_dir():
+                continue
+            key = str(directory)
+            if key in self._watches:
+                continue
+            result = self._add_watch(
+                self._fd, key.encode("utf-8"), ctypes.c_uint32(self._MASK)
+            )
+            if result >= 0:
+                self._watches.add(key)
+
+    def _read_events(self) -> bool:
+        if self._fd < 0:
+            return False
+        saw = False
+        while True:
+            try:
+                chunk = os.read(self._fd, 4096)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            saw = True
+        if saw:
+            self._refresh_watches()
+        return saw
+
+    def _pending_event(self) -> bool:
+        for directory in self._candidate_dirs():
+            if not directory.is_dir():
+                continue
+            try:
+                for path in directory.iterdir():
+                    if path.is_file() and path.suffix == ".json" and not path.name.startswith("."):
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until an inbox event arrives, the timeout elapses or poll fires."""
+
+        if self._fd < 0:
+            time.sleep(self.interval_s if timeout is None else min(self.interval_s, max(0.0, timeout)))
+            return True
+        if self._pending_event():
+            return True
+        self._refresh_watches()
+        if self._pending_event():
+            return True
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                ready, _, _ = select.select([self._fd], [], [], remaining)
+            except (OSError, ValueError):
+                return self._pending_event()
+            if ready:
+                self._read_events()
+                return True
+            if deadline is None or time.monotonic() >= deadline:
+                return False
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+        self._watches.clear()
+
+    def __enter__(self) -> "InboxEventWatcher":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive fd cleanup
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1190,7 +1468,9 @@ class FactoryDriver:
             return result
         return handler
 
-    def _drive_work(self, work_id: str, job_id: str) -> dict[str, Any]:
+    def _drive_work(
+        self, work_id: str, job_id: str, *, max_active: int | None = None
+    ) -> dict[str, Any]:
         """Claim one scheduler item, then run the protected job tick."""
 
         if not work_id:
@@ -1210,7 +1490,14 @@ class FactoryDriver:
             return {"work_state": "failed", "failure": retry}
         owner = self._owner_for(work_id)
         try:
-            work_scheduler.claim(self.state, work_id, owner, str(self.state), now=self.now)
+            work_scheduler.claim(
+                self.state,
+                work_id,
+                owner,
+                str(self.state),
+                now=self.now,
+                max_active=max_active,
+            )
         except work_scheduler.SchedulerError as exc:
             if exc.code == "work_done":
                 self._clear_work_failure(work_id)
@@ -1692,7 +1979,7 @@ class FactoryDriver:
                 failures.append(outcome["failure"])
         return failures
 
-    def run_pass(self) -> dict[str, Any]:
+    def run_pass(self, *, advance_work: bool = True) -> dict[str, Any]:
         self._driven_this_pass = set()
         startup = self._ensure_startup()
         self._recover_work_claims()
@@ -1781,8 +2068,14 @@ class FactoryDriver:
             event_results.append(entry)
 
         failures: list[dict[str, Any]] = []
-        failures.extend(self._advance_event_work(event_results))
-        failures.extend(self._advance_ready_work())
+        if advance_work:
+            failures.extend(self._advance_event_work(event_results))
+            failures.extend(self._advance_ready_work())
+        else:
+            # Service mode dispatches through its own approval/cap gate. The
+            # generic advance path must not claim anything behind that gate.
+            for entry in event_results:
+                entry.setdefault("work_state", "service_gated")
         wake_results = self._deliver_wakes()
 
         campaign_result: dict[str, Any] | None = None
@@ -1844,6 +2137,429 @@ class FactoryDriver:
 
     def run_once(self) -> dict[str, Any]:
         return self.run_pass()
+
+
+class FactoryService:
+    """Event-driven service mode around one :class:`FactoryDriver`.
+
+    One pass drains the completion consumer, runs the durable driver pass
+    without its generic auto-dispatch, then asks the work scheduler for ready
+    items and dispatches only the ones a readable pre-approval, the shared bee
+    cap and the planning-slot limits allow.  Anything that needs judgment
+    (missing/unreadable approval, scope, cap or limits) stops the dispatch and
+    requests one coalesced Hermes wake through the existing gateway path.
+    """
+
+    def __init__(
+        self,
+        driver: FactoryDriver,
+        *,
+        subscribers: Sequence[str] | None = None,
+        completion_subscribers: Sequence[str] | None = None,
+        interval_s: float = DEFAULT_SERVICE_INTERVAL_S,
+        poll_s: float = DEFAULT_SERVICE_POLL_S,
+        watcher: Any = None,
+        session: str | None = None,
+        cap_reader: Any = None,
+        limits_reader: Any = None,
+    ) -> None:
+        self.driver = driver
+        self.subscribers = list(subscribers) if subscribers is not None else None
+        self.completion_subscribers = (
+            list(completion_subscribers)
+            if completion_subscribers is not None
+            else [event_consumer.DEFAULT_COMPLETION_SUBSCRIBER]
+        )
+        self.interval_s = max(0.01, float(interval_s))
+        self.poll_s = max(0.01, float(poll_s))
+        self.session = _raw_session(session) if session else ""
+        self._cap_reader = cap_reader or read_shared_cap
+        self._limits_reader = limits_reader or work_scheduler.planning_limits
+        self.watcher = watcher or InboxEventWatcher(
+            driver.state, interval_s=self.poll_s, subscribers=self.subscribers
+        )
+        self.passes = 0
+        self.last_result: dict[str, Any] | None = None
+        self._closed = False
+
+    @property
+    def state(self) -> Path:
+        return self.driver.state
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.watcher, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> "FactoryService":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    # -- completion consumer -------------------------------------------------
+
+    def drain_completions(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for subscriber in self.completion_subscribers:
+            name = _safe_session(subscriber)
+            for _ in range(1000):
+                outcome = event_consumer.consume_completions(
+                    self.state, subscriber=name, now=self.driver.now
+                )
+                if outcome is None or outcome.get("duplicate"):
+                    break
+                results.append(dict(outcome))
+                if str(outcome.get("state") or "") != "acked":
+                    break
+        return results
+
+    # -- pre-approval, cap and planning-slot gate ---------------------------
+
+    @staticmethod
+    def _job_id_mapping(state: Path, work_id: str) -> str:
+        path = state / "factory" / "work-jobs" / f"{work_id}.json"
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise FactoryError(
+                "job_unreadable",
+                f"the job mapping for {work_id!r} is unreadable: {exc}",
+                "Restore factory/work-jobs before dispatching this item.",
+            ) from exc
+        job_id = str(body.get("job_id") or "") if isinstance(body, Mapping) else ""
+        if not job_id:
+            raise FactoryError(
+                "job_unreadable",
+                f"the job mapping for {work_id!r} names no job",
+                "Restore factory/work-jobs before dispatching this item.",
+            )
+        return job_id
+
+    def _evaluate_item(
+        self,
+        item: Mapping[str, Any],
+        *,
+        cap: int,
+        limits: Mapping[str, int],
+        items: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        work_id = str(item.get("work_id") or "")
+        try:
+            approval = read_dispatch_approval(self.state, work_id)
+        except FactoryError as exc:
+            return {"allowed": False, "reason": "approval_unreadable", "detail": exc.message}
+        if approval is None:
+            return {"allowed": False, "reason": "approval_absent", "detail": "no pre-approval record"}
+        if approval.get("approved") is not True:
+            return {"allowed": False, "reason": "not_preapproved", "detail": "approved is not true"}
+        scope = approval.get("scope")
+        if not isinstance(scope, list) or not scope:
+            return {"allowed": False, "reason": "scope_unreadable", "detail": "scope is not a readable list"}
+        if not all(isinstance(entry, str) and entry.strip() for entry in scope):
+            return {"allowed": False, "reason": "scope_unreadable", "detail": "scope has a non-string entry"}
+        lease_files = [str(path) for path in item.get("lease_files") or ()]
+        if not _scope_allows(scope, lease_files):
+            return {
+                "allowed": False,
+                "reason": "out_of_scope",
+                "detail": f"{lease_files!r} is not covered by {scope!r}",
+            }
+        mapped_job = str(approval.get("job_id") or "")
+        if mapped_job:
+            try:
+                expected = self._job_id_mapping(self.state, work_id)
+            except FactoryError as exc:
+                return {"allowed": False, "reason": "job_unreadable", "detail": exc.message}
+            if expected != mapped_job:
+                return {
+                    "allowed": False,
+                    "reason": "approval_unreadable",
+                    "detail": f"approval names job {mapped_job!r}, mapping names {expected!r}",
+                }
+        active_total = sum(1 for entry in items if entry.get("status") == "claimed")
+        if str(item.get("kind") or "") in work_scheduler.PLANNING_KINDS:
+            active_planning = sum(
+                1
+                for entry in items
+                if entry.get("status") == "claimed"
+                and str(entry.get("kind") or "") in work_scheduler.PLANNING_KINDS
+            )
+            if active_planning >= int(limits["planning_max_active"]):
+                return {
+                    "allowed": False,
+                    "reason": "planning_slots_exhausted",
+                    "detail": f"{active_planning} planning item(s) already active",
+                }
+        if active_total >= cap:
+            return {
+                "allowed": False,
+                "reason": "capacity_exhausted",
+                "detail": f"{active_total} active item(s) already use the shared cap of {cap}",
+            }
+        return {"allowed": True, "reason": "allowed", "cap": cap, "limits": dict(limits)}
+
+    # -- judgment wake -------------------------------------------------------
+
+    def _wake_target(self) -> tuple[str, str]:
+        session = self.session or (
+            (self.subscribers or self.driver.subscribers_for_pass()) or [DEFAULT_SESSION]
+        )[0]
+        subscriber = (
+            (self.subscribers or self.driver.subscribers_for_pass()) or [DEFAULT_SESSION]
+        )[0]
+        return _raw_session(session), _safe_session(subscriber)
+
+    def request_judgment_wake(
+        self,
+        *,
+        reason: str,
+        item: Mapping[str, Any] | None = None,
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Request one coalesced gateway wake for a dispatch that needs judgment."""
+
+        session, subscriber = self._wake_target()
+        work_id = str((item or {}).get("work_id") or "")
+        job_id = str((item or {}).get("job_id") or "")
+        seed = json.dumps(
+            {"session": session, "reason": reason, "work_id": work_id, "detail": detail},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        event = {
+            "specversion": "1.0",
+            "id": "factory-judgment-" + hashlib.sha256(seed).hexdigest()[:24],
+            "source": "bundlebees.factory-service",
+            "type": "bundlebees.factory.judgment/1",
+            "time": _iso(self.driver.now),
+            "session": session,
+            "data": {
+                "coordinator": {"identity": subscriber, "session": session},
+                "reason": str(reason),
+                "work_id": work_id,
+                "job_id": job_id,
+                "detail": str(detail)[:500],
+            },
+        }
+        wake_events = self.state / "factory" / "wake-events"
+        wake_events.mkdir(parents=True, exist_ok=True)
+        _write_json(wake_events / f"{self.driver.wake.key_for(session)}.json", event)
+        wake = self.driver.wake.request_wake(
+            session, now=self.driver.now, subscriber=subscriber
+        )
+        deliveries = self.driver._deliver_wakes()  # noqa: SLF001 - one durable wake path
+        return {
+            "requested": True,
+            "reason": str(reason),
+            "session": session,
+            "session_key": self.driver.wake.key_for(session),
+            "generation": int(wake.get("generation") or 0),
+            "delivered": sum(1 for entry in deliveries if entry.get("delivered")),
+            "deliveries": deliveries,
+        }
+
+    # -- dispatch ------------------------------------------------------------
+
+    def dispatch_eligible(self) -> dict[str, Any]:
+        dispatched: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        wake: dict[str, Any] | None = None
+        try:
+            if not work_scheduler.ready_items(self.state):
+                return {
+                    "dispatched": 0,
+                    "dispatched_items": dispatched,
+                    "blocked": blocked,
+                    "wake": None,
+                    "errors": errors,
+                    "cap": None,
+                    "limits": {},
+                }
+        except Exception as exc:  # noqa: BLE001 - a broken queue needs a human
+            wake = self.request_judgment_wake(
+                reason="scheduler_unreadable",
+                detail=str(getattr(exc, "message", "") or exc),
+            )
+            blocked.append({"reason": "scheduler_unreadable", "detail": str(exc)})
+            return {
+                "dispatched": 0,
+                "dispatched_items": dispatched,
+                "blocked": blocked,
+                "wake": wake,
+                "errors": errors,
+            }
+        try:
+            cap = int(self._cap_reader(self.state))
+            if cap < 1:
+                raise FactoryError("cap_unreadable", f"shared cap {cap} is below one")
+        except Exception as exc:  # noqa: BLE001 - any unreadable cap fails closed
+            wake = self.request_judgment_wake(
+                reason="cap_unreadable",
+                detail=str(getattr(exc, "message", "") or exc),
+            )
+            return {
+                "dispatched": 0,
+                "dispatched_items": dispatched,
+                "blocked": [{"reason": "cap_unreadable", "detail": str(exc)}],
+                "wake": wake,
+                "errors": errors,
+            }
+        try:
+            limits = self._limits_reader()
+            for name in ("planning_max_active", "max_active", "reserved_for_landing"):
+                int(limits[name])
+        except Exception as exc:  # noqa: BLE001 - unreadable limits fail closed
+            wake = self.request_judgment_wake(
+                reason="limits_unreadable",
+                detail=str(getattr(exc, "message", "") or exc),
+            )
+            return {
+                "dispatched": 0,
+                "dispatched_items": dispatched,
+                "blocked": [{"reason": "limits_unreadable", "detail": str(exc)}],
+                "wake": wake,
+                "errors": errors,
+            }
+
+        # A generous bound: every successful claim removes one ready item, so
+        # this only prevents a pathological loop, never caps normal work.
+        for _ in range(1000):
+            if len(dispatched) >= cap:
+                blocked.append(
+                    {"reason": "capacity_exhausted", "detail": f"shared cap of {cap} reached"}
+                )
+                break
+            try:
+                ready = work_scheduler.ready_items(self.state)
+                items = work_scheduler.list_items(self.state)
+            except Exception as exc:  # noqa: BLE001 - a broken queue needs a human
+                wake = self.request_judgment_wake(
+                    reason="scheduler_unreadable",
+                    detail=str(getattr(exc, "message", "") or exc),
+                )
+                blocked.append({"reason": "scheduler_unreadable", "detail": str(exc)})
+                break
+            candidates = [
+                item
+                for item in ready
+                if str(item.get("work_id") or "") not in self.driver._driven_this_pass
+            ]
+            if not candidates:
+                break
+            item = candidates[0]
+            work_id = str(item.get("work_id") or "")
+            verdict = self._evaluate_item(item, cap=cap, limits=limits, items=items)
+            if not verdict.get("allowed"):
+                blocked.append({"work_id": work_id, **verdict})
+                reason = str(verdict.get("reason") or "")
+                if reason in {"capacity_exhausted", "planning_slots_exhausted"}:
+                    break
+                wake = self.request_judgment_wake(
+                    reason=reason,
+                    item=item,
+                    detail=str(verdict.get("detail") or ""),
+                )
+                break
+            try:
+                job_id = self._job_id_mapping(self.state, work_id)
+            except FactoryError as exc:
+                blocked.append({"work_id": work_id, "reason": "job_unreadable", "detail": exc.message})
+                wake = self.request_judgment_wake(
+                    reason="job_unreadable", item=item, detail=exc.message
+                )
+                break
+            outcome = self.driver._drive_work(  # noqa: SLF001 - the driver owns the tick
+                work_id, job_id, max_active=cap
+            )
+            state_name = str(outcome.get("work_state") or "")
+            failure = outcome.get("failure") if isinstance(outcome.get("failure"), Mapping) else {}
+            if state_name == "skipped" and str(failure.get("code") or "") == "capacity_exhausted":
+                blocked.append({"work_id": work_id, "reason": "capacity_exhausted"})
+                break
+            if state_name in {"claimed", "done"}:
+                dispatched.append({"work_id": work_id, "job_id": job_id, "state": state_name})
+                continue
+            if state_name in {"retryable", "failed"}:
+                dispatched.append(
+                    {"work_id": work_id, "job_id": job_id, "state": state_name, "outcome": outcome}
+                )
+                wake = self.request_judgment_wake(
+                    reason="dispatch_failed",
+                    item=item,
+                    detail=str(failure.get("message") or state_name),
+                )
+                break
+            blocked.append(
+                {
+                    "work_id": work_id,
+                    "reason": str(failure.get("code") or state_name or "not_dispatched"),
+                    "detail": str(failure.get("message") or ""),
+                }
+            )
+            break
+        return {
+            "dispatched": len(dispatched),
+            "dispatched_items": dispatched,
+            "blocked": blocked,
+            "wake": wake,
+            "errors": errors,
+            "cap": cap,
+            "limits": dict(limits),
+        }
+
+    # -- loop ----------------------------------------------------------------
+
+    def run_pass(self) -> dict[str, Any]:
+        self.passes += 1
+        errors: list[dict[str, str]] = []
+        try:
+            completions = self.drain_completions()
+        except Exception as exc:  # noqa: BLE001 - one completion store must not stop the loop
+            completions = []
+            errors.append({"stage": "completions", "error": type(exc).__name__})
+        try:
+            driven = self.driver.run_pass(advance_work=False)
+        except Exception as exc:  # noqa: BLE001
+            driven = {"events": [], "errors": [{"stage": "driver", "error": type(exc).__name__}]}
+            errors.append({"stage": "driver", "error": type(exc).__name__})
+        dispatch = self.dispatch_eligible()
+        result = {
+            "passes": self.passes,
+            "completions": completions,
+            "events": driven.get("events", []),
+            "driver": driven,
+            "dispatch": dispatch,
+            "wake": dispatch.get("wake"),
+            "errors": list(driven.get("errors") or []) + errors + list(dispatch.get("errors") or []),
+        }
+        self.last_result = result
+        return result
+
+    def wait_for_event(self, timeout: float | None = None) -> bool:
+        return bool(self.watcher.wait(self.interval_s if timeout is None else timeout))
+
+    def serve(
+        self,
+        *,
+        max_passes: int | None = None,
+        startup_pass: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        if startup_pass:
+            self.run_pass()
+        while max_passes is None or self.passes < max_passes:
+            if stop_event is not None and stop_event.is_set():
+                break
+            self.wait_for_event(self.interval_s)
+            if stop_event is not None and stop_event.is_set():
+                break
+            self.run_pass()
+        return self.last_result or {}
 
 
 def run_pass(
@@ -1975,6 +2691,11 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="run one pass and exit")
     mode.add_argument("--interval", nargs="?", const=1.0, type=float, default=None,
                       metavar="SECONDS", help="poll forever at this interval (default: 1.0)")
+    mode.add_argument("--service", action="store_true",
+                      help="run the event-driven service loop (inotify inbox wake)")
+    parser.add_argument("--service-interval", type=float, default=DEFAULT_SERVICE_INTERVAL_S,
+                        metavar="SECONDS",
+                        help="maximum wait before an idle service pass (default: 30)")
     parser.add_argument("--max-passes", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
@@ -2055,6 +2776,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         result = driver.run_pass()
         print(json.dumps(result, sort_keys=True, default=str))
+        return 0
+
+    if args.service:
+        service = FactoryService(
+            driver,
+            subscribers=subscribers,
+            interval_s=max(0.01, float(args.service_interval)),
+        )
+        try:
+            result = service.serve(max_passes=args.max_passes)
+            print(json.dumps(result, sort_keys=True, default=str))
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            service.close()
         return 0
 
     interval = max(0.0, float(args.interval if args.interval is not None else 1.0))
