@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import brief as _brief_mod
+from . import coverage as _coverage
 from . import delivery as _delivery
 from . import campaign_cli
 from . import job_cli
@@ -203,6 +204,12 @@ def _build_parser(parser: Any) -> Any:
         help="Plugin data directory for verify-results (defaults to Hermes plugin data).",
     )
     verify.set_defaults(command="verify")
+
+    coverage_cmd = subparsers.add_parser("coverage", help="Classify queued backlog tasks against open/merged PRs (read-only).")
+    coverage_cmd.add_argument("--backlog", required=True)
+    coverage_cmd.add_argument("--candidates", required=True)
+    coverage_cmd.add_argument("--json", action="store_true")
+    coverage_cmd.set_defaults(command="coverage")
     reviewer = subparsers.add_parser("reviewer", help="Enrolled reviewer identities for signed REVIEW evidence.")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
     rv_enroll = reviewer_sub.add_parser("enroll", help="Create (or adopt) a reviewer key and record the identity.")
@@ -399,6 +406,29 @@ def _cmd_reviewer(ctx: Any, args: Any) -> int:
     return 2
 
 
+def _cmd_coverage(ctx: Any, args: Any) -> int:
+    import json as _json
+    backlog = _json.loads(Path(args.backlog).read_text(encoding="utf-8"))
+    raw = _json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+    tasks = []
+    for row in backlog.get("slices") or backlog.get("tasks") or []:
+        brief = row.get("brief") or {}
+        tasks.append(_coverage.Task.build(
+            task_id=str(row.get("id") or row.get("task_id")), repo=str(row.get("project") or row.get("repo") or ""),
+            assigned_files=brief.get("assigned_files") or row.get("assigned_files") or [],
+            tests=brief.get("tests") or row.get("tests") or [], contract=str(brief.get("source_rev") or ""),
+            status=str(row.get("status") or ""), attempt_ids=row.get("attempt_ids") or [],
+            attempt_states=row.get("attempt_states") or {},
+            blocked_by=[d for d in (row.get("depends_on") or []) if d],
+            superseded_by=str(row.get("superseded_by") or "")))
+    candidates = [_coverage.Candidate.build(repo=str(c["repo"]), number=int(c["number"]), head_sha=str(c.get("head_sha") or ""),
+                  merged=bool(c.get("merged")), files=c.get("files") or [], evidence=str(c.get("evidence") or ""),
+                  supersedes=c.get("supersedes") or ()) for c in raw]
+    report = _coverage.reconcile(tasks, candidates)
+    _print(_json.dumps(report, indent=1, sort_keys=True) if getattr(args, "json", False) else _coverage.format_table(report))
+    return 0
+
+
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
@@ -411,6 +441,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_owner(ctx, args)
         if command == "reviewer":
             return _cmd_reviewer(ctx, args)
+        if command == "coverage":
+            return _cmd_coverage(ctx, args)
         if command == "verify":
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
