@@ -957,6 +957,32 @@ def _classify(
     return UNVERIFIED, evidence, unrun, limitation
 
 
+def _tdd_criteria(state_dir: Path, contract: Any, contract_sha: str) -> dict[str, str]:
+    """The tdd evidence is the single source of truth for contract criteria.
+
+    Owner decision 2026-11-17: the RETURN's acceptance map reads the tdd acceptance report
+    instead of re-deriving criterion statuses from attempt records, because two resolvers
+    disagreed (the canary's AC-005 read "NOT RUN" in the RETURN while the tdd report had it
+    passed from the integration record). Unreadable evidence yields {} (never a guess).
+    """
+    if not isinstance(contract, Mapping):
+        return {}
+    contract_id = str(contract.get("id") or "")
+    if not contract_id:
+        return {}
+    try:
+        key = leases.evidence_key(Path(state_dir))
+        records = tdd.load_records(Path(state_dir), contract_id, key)
+        report = tdd.acceptance_report(contract, contract_sha, records)
+    except Exception:  # noqa: BLE001 - missing/unreadable evidence means "no truth to apply"
+        return {}
+    out: dict[str, str] = {}
+    for ac_id, item in (report.get("criteria") or {}).items():
+        if isinstance(item, Mapping):
+            out[str(ac_id)] = str(item.get("status") or "")
+    return out
+
+
 def _acceptance(
     state_dir: Path,
     tasks: Sequence[Mapping[str, Any]],
@@ -979,7 +1005,21 @@ def _acceptance(
         _found, problem = _read_verify(state, latest) if latest else (None, "missing")
         if record is not None:
             problem = ""
+        tdd_truth = _tdd_criteria(state, contract, contract_sha)
         for criterion in _criteria_rows(task):
+            truth = tdd_truth.get(str(criterion["id"]))
+            if truth in ("passed", "failed", "not run", "blocked"):
+                status = {"passed": PASS, "failed": FAIL, "not run": NOT_RUN, "blocked": BLOCKED}[truth]
+                rows.append({
+                    "id": criterion["id"],
+                    "statement": criterion["statement"],
+                    "tests": list(criterion["tests"]),
+                    "status": status,
+                    "evidence": [f"tdd evidence ({contract.get('id') if isinstance(contract, Mapping) else ''})"],
+                    "_unrun": "" if status != NOT_RUN else "tdd evidence reports not run",
+                    "_limitation": "resolved from the tdd acceptance report (single source of truth)",
+                })
+                continue
             status, evidence, unrun, limitation = _classify(
                 criterion,
                 task=task,
