@@ -5,3 +5,5 @@
 031d78be384a4cd7cbb2a51248b7a3360288028f:tests/test_security.py:aws-access-token:43
 # False positive: an earlier revision of this comment quoted that same fake placeholder.
 03681f33a07eb0d7a89966f92b917c96d09f65de:.gitleaksignore:aws-access-token:3
+# False positive on another branch: CI fetches all refs, so a docs example on feat/factory-driver-service-mode is scanned here.
+1151fb47859aa74139c2fd288c4f7bbf1854c9f3:docs/factory-driver-service.md:generic-api-key:44

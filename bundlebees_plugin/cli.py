@@ -100,12 +100,65 @@ def _print(message: str = "") -> None:
     print(scrub(message))
 
 
-def _print_sha(sha: str | None) -> None:
+def _literal_branch(value: Any) -> str | None:
+    """Return *value* only when it is a fully validated branch name.
+
+    The branch must match the same grammar ``_safe_branch`` enforces, and a
+    branch that is itself secret-shaped is never echoed literally.
+    """
+    if not isinstance(value, str):
+        return None
+    if not _BRANCH_RE.fullmatch(value):
+        return None
+    if ".." in value or value.endswith("/") or value.endswith(".") or "//" in value:
+        return None
+    if looks_like_secret(value):
+        return None
+    return value
+
+
+def _literal_state_path(value: Any, state_dir: Path) -> str | None:
+    """Return *value* only when it resolves strictly inside *state_dir*."""
+    if not isinstance(value, (str, Path)):
+        return None
+    text = str(value)
+    if not text or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        return None
+    try:
+        root = Path(state_dir).expanduser().resolve()
+        resolved = Path(text).expanduser().resolve()
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not relative.parts:
+        return None
+    return str(resolved)
+
+
+def _print_branch(value: Any, suffix: str = "") -> None:
+    """Print a validated branch literally; anything else keeps full scrubbing."""
+    branch = _literal_branch(value)
+    if branch is not None:
+        print(f"branch: {branch}{suffix}")
+    else:
+        _print(f"branch: {value}{suffix}")
+
+
+def _print_state_path(label: str, value: Any, state_dir: Path) -> None:
+    """Print a state-directory path literally; outside paths stay redacted."""
+    literal = _literal_state_path(value, state_dir)
+    if literal is not None:
+        print(f"{label}: {literal}")
+    else:
+        _print(f"{label}: {value}")
+
+
+def _print_sha(sha: str | None, label: str = "sha") -> None:
     """Print a validated commit digest without passing it through scrub()."""
     if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
-        print(f"sha: {sha}")
+        print(f"{label}: {sha}")
     else:
-        print("sha: unavailable")
+        print(f"{label}: unavailable")
 
 
 def _print_error(exc: CliError) -> None:
@@ -314,6 +367,57 @@ def _build_parser(parser: Any) -> Any:
     status_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     status_cmd.set_defaults(command="status")
 
+    factory_hook = subparsers.add_parser(
+        "factory-hook",
+        help="Run one factory pass only when a new completed attempt is seen.",
+    )
+    factory_hook.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    factory_hook.add_argument("--queue", default=None, help="Queue JSON file (default: <state>/queue.json).")
+    factory_hook.add_argument(
+        "--attempts-file",
+        default=None,
+        help="Read the scout's attempts document from this JSON file instead of the launcher.",
+    )
+    factory_hook.add_argument(
+        "--lock-wait",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for an overlapping scout hook (default: 0, coalesce immediately).",
+    )
+    factory_hook.add_argument("--launcher-outbox", default=None, help="Local landing outbox for a non-launcher tick.")
+    factory_hook.add_argument(
+        "--subscriber", action="append", dest="subscribers", default=[],
+        help="Event subscriber to drain (repeatable).",
+    )
+    factory_hook.add_argument("--tick", default=None, help="Worker tick as module:callable.")
+    factory_hook.add_argument("--launcher-url", default=None, help="Launcher base URL override.")
+    factory_hook.add_argument("--repo", default=None, help="Local repository for the real job tick.")
+    factory_hook.add_argument("--gitleaks", default=None, help="gitleaks binary for a real tick.")
+    factory_hook.add_argument(
+        "--suite-command", nargs=argparse.REMAINDER, default=None,
+        help="Integration suite command, last option (default: python -m pytest -q).",
+    )
+    factory_hook.add_argument("--provisioning", action="store_true", help="Bind the configured provisioning client.")
+    factory_hook.add_argument("--provisioning-host", default=None, help="Expected provisioning host policy label.")
+    factory_hook.add_argument("--campaign-id", default=None, help="Campaign checkpoint to reconcile on the pass.")
+    factory_hook.set_defaults(command="factory-hook")
+    board_sync_cmd = subparsers.add_parser(
+        "board-sync",
+        help="Reflect bee/PR lifecycle state onto the Hermes kanban board via the public CLI.",
+    )
+    board_sync_cmd.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Compare live cards against durable state and repair only the difference.",
+    )
+    board_sync_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print intended kanban commands and change nothing.",
+    )
+    board_sync_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    board_sync_cmd.set_defaults(command="board-sync")
+
     from . import rails_cli
     rails_cli.add_parsers(subparsers)
     ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
@@ -343,6 +447,34 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
     _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
            f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
     return 0 if not result["errors"] else 2
+
+
+def _cmd_board_sync(ctx: Any, args: Any) -> int:
+    """Reflect durable lifecycle events onto kanban through the public CLI."""
+    from . import board_sync as _board_sync
+
+    state_dir = _state_dir(ctx, args)
+    sync = _board_sync.BoardSync(
+        _board_sync.default_runner,
+        state_dir,
+        events=lambda: _board_sync.default_events(state_dir),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    summary = sync.reconcile() if getattr(args, "reconcile", False) else sync.apply()
+    if getattr(args, "dry_run", False):
+        for argv in summary.get("intended") or []:
+            _print("would run: " + " ".join(str(part) for part in argv))
+    _print(
+        "board-sync: "
+        f"cards={summary.get('cards', 0)} created={len(summary.get('created') or [])} "
+        f"updated={len(summary.get('updated') or [])} comments={len(summary.get('comments') or [])} "
+        f"skipped={len(summary.get('skipped') or [])} errors={len(summary.get('errors') or [])}"
+    )
+    for item in summary.get("errors") or []:
+        _print(f"error: {item.get('action')}: {item.get('error')}")
+    if summary.get("refused"):
+        return 2
+    return 0 if summary.get("ok") else 2
 
 
 def _cmd_owner(ctx: Any, args: Any) -> int:
@@ -466,6 +598,10 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_attempts(ctx, args)
         if command == "status":
             return _cmd_status(ctx, args)
+        if command == "factory-hook":
+            return _cmd_factory_hook(ctx, args)
+        if command == "board-sync":
+            return _cmd_board_sync(ctx, args)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
@@ -491,7 +627,7 @@ def _dispatch(ctx: Any, args: Any) -> int:
             "invalid_argument",
             "unknown bundlebees command",
             "Use one of: verify, integrate, lease, metrics, deploy, doctor, "
-            "contract, tdd, job, repo, campaign, attempts, status.",
+            "contract, tdd, job, repo, campaign, attempts, status, factory-hook.",
         )
     except CliError as exc:
         _print_error(exc)
@@ -720,6 +856,9 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             and not looks_like_secret(attempt_id)
         ):
             clean["attempt_id"] = attempt_id
+        validated_branch = _literal_branch(row.get("branch"))
+        if validated_branch is not None:
+            clean["branch"] = validated_branch
         rows.append(clean)
     return rows
 
@@ -751,6 +890,131 @@ def _cmd_status(ctx: Any, args: Any) -> int:
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Interim scout -> factory-driver hook
+# ---------------------------------------------------------------------------
+
+
+def _factory_hook_attempts(ctx: Any, args: Any) -> Any:
+    """The scout's attempt view, or the launcher's, never a stale snapshot."""
+
+    from . import scout_hook
+
+    explicit = getattr(args, "attempts_file", None)
+    if explicit:
+        return scout_hook.load_attempts_file(explicit)
+    client = _client_for(ctx, args)
+    for name in ("attempts", "attempts_raw"):
+        method = getattr(client, name, None)
+        if callable(method):
+            return method()
+    raise CliError(
+        "unsupported_operation",
+        "the configured adapter cannot list attempts",
+        "Configure the launcher adapter or pass --attempts-file from the scout.",
+    )
+
+
+def _factory_hook_driver_pass(ctx: Any, args: Any, state_dir: Path) -> dict[str, Any]:
+    """Run exactly one normal factory-driver pass with the owner's settings."""
+
+    from . import factory_driver
+    from . import queue as queue_mod
+
+    config = _config(ctx)
+    launcher_url = str(
+        getattr(args, "launcher_url", None) or config.get("launcher_url") or ""
+    ).strip()
+    repo_arg = str(getattr(args, "repo", None) or config.get("worktree") or "").strip()
+    tick = factory_driver.load_tick(getattr(args, "tick", None))
+    client = None
+    if launcher_url:
+        client = _client_for(ctx, args)
+
+    if tick is None:
+        if repo_arg and not launcher_url:
+            raise CliError(
+                "not_configured",
+                "--repo requires a launcher URL for a dispatch-capable factory pass",
+                "Set the launcher URL in bundlebees settings, pass --launcher-url, or name a --tick.",
+            )
+        if launcher_url and repo_arg and client is not None:
+            from .execution import SandboxRunner, scanner
+
+            scanner_path = scanner(config, getattr(args, "gitleaks", None))
+            if not scanner_path:
+                raise CliError(
+                    "not_configured",
+                    "--gitleaks or GITLEAKS is required for a real factory tick",
+                    "Configure gitleaks_path, pass --gitleaks, or name a --tick.",
+                )
+            provisioner = None
+            if getattr(args, "provisioning", False):
+                from . import provisioning as provisioning_mod
+
+                provisioner = provisioning_mod.from_client(
+                    {
+                        "provisioning": {
+                            "enabled": True,
+                            "host": getattr(args, "provisioning_host", None) or None,
+                        }
+                    },
+                    client,
+                )
+            tick = factory_driver.make_job_tick(
+                state_dir,
+                client=client,
+                repo=Path(repo_arg),
+                gitleaks=scanner_path,
+                suite_command=getattr(args, "suite_command", None),
+                runner=SandboxRunner(config),
+                provisioner=provisioner,
+                expect_host=getattr(args, "provisioning_host", None),
+            )
+
+    if tick is None:
+        tick = factory_driver.mechanical_tick(state_dir)
+
+    queue_arg = getattr(args, "queue", None)
+    queue_path = Path(queue_arg) if queue_arg else state_dir / "queue.json"
+    driver_options: dict[str, Any] = {
+        "tick": tick,
+        # The worker-local outbox is only for a non-launcher pass; production
+        # landing comes from the authenticated export through the same client.
+        "launcher_outbox": getattr(args, "launcher_outbox", None) if client is None else None,
+        "subscribers": getattr(args, "subscribers", None) or None,
+    }
+    if client is not None:
+        driver_options["landing_client"] = client
+    driver = factory_driver.FactoryDriver(
+        state_dir,
+        queue_mod.JsonQueue(queue_path),
+        campaign_id=getattr(args, "campaign_id", None),
+        **driver_options,
+    )
+    return driver.run_pass()
+
+
+def _cmd_factory_hook(ctx: Any, args: Any) -> int:
+    """Trigger one pilot pass for a newly completed attempt; no-op otherwise."""
+
+    from . import scout_hook
+
+    try:
+        state_dir = _state_dir(ctx, args)
+        result = scout_hook.run_hook(
+            state_dir,
+            lambda: _factory_hook_attempts(ctx, args),
+            run_pass=lambda: _factory_hook_driver_pass(ctx, args, state_dir),
+            lock_wait_s=float(getattr(args, "lock_wait", 0.0) or 0.0),
+        )
+    except scout_hook.ScoutHookError as exc:
+        _print_error(CliError(exc.code, exc.error, exc.fix))
+        return scout_hook.EXIT_ERROR
+    print(json.dumps(result, sort_keys=True, default=str))
+    return scout_hook.EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -2146,6 +2410,9 @@ def _write_verify_result(
         payload["error"] = _clip_verify_reason(str(error))
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
+    validated_branch = _literal_branch(branch)
+    if validated_branch is not None:
+        clean["branch"] = validated_branch
     if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
         clean["evidence"]["source_rev"] = source_rev
     for key in ("patch_sha256", "result_sha256"):
@@ -2296,8 +2563,8 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
 
     _print("bundlebees verify --commit-local")
     _print(f"attempt: {attempt_id}")
-    _print(f"commit: {record['sha']}")
-    _print(f"branch: {record['branch']} (local only, not pushed)")
+    _print_sha(record["sha"], label="commit")
+    _print_branch(record["branch"], " (local only, not pushed)")
     _print(f"files: {', '.join(record['files'])}")
     return 0
 
@@ -2479,14 +2746,14 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
             _print(f"attempt: {attempt_id}")
-            _print(f"branch: {branch}")
+            _print_branch(branch)
             _print(f"files: {', '.join(files)}")
             _print(f"tests: {', '.join(tests)}")
             _print(f"sandbox: {evidence.get('backend')}")
             _print_digest("patch_sha256", evidence.get("patch_sha256"))
             acdd_cli.print_mode(acdd_state, green)
             _print("result: dry-run passed; nothing was committed or pushed")
-            _print(f"verify result: {target}")
+            _print_state_path("verify result", target, state_dir)
             if kanban_id:
                 _print(
                     f"suggested: hermes kanban comment {kanban_id} "
@@ -2530,7 +2797,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
 
         _print("bundlebees verify")
         _print(f"attempt: {attempt_id}")
-        _print(f"branch: {branch}")
+        _print_branch(branch)
         _print_sha(sha)
         _print(f"files: {', '.join(files)}")
         _print(f"tests: {', '.join(tests)}")
@@ -2550,7 +2817,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             except Exception as exc:  # noqa: BLE001
                 _print(f"pr: pending - the platform refused or lacked access ({exc}); "
                        "run `hermes bundlebees deliver` to converge")
-        _print(f"verify result: {target}")
+        _print_state_path("verify result", target, state_dir)
         _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")
         suggested = (
             f'hermes kanban comment {kanban_id} '
@@ -2882,7 +3149,7 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
     integration = acdd_cli.record_integration(state_dir, contract_items, workdir, suite, record.get("head_sha"))
     _print("bundlebees integrate")
     _print(f"wave: {record.get('wave_id')}")
-    _print(f"branch: {branch}")
+    _print_branch(branch)
     _print_sha(record.get("head_sha"))
     _print(f"attempts: {', '.join(record.get('attempts') or [])}")
     for attempt, problem in sorted((record.get("problems") or {}).items()):
