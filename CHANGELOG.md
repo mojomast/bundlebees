@@ -148,6 +148,41 @@ one pull request.
   reproducibly by `scripts/vendor_rails.py` against
   `contrib/rizzstack_rails/vendor-manifest.json`; acceptance lives in
   `tests/test_rails_ledger.py` (35 tests).
+- **Factory-hook bridge (`hermes bundlebees factory-hook`):** the
+  repository-side bridge turns an attempt the 2-minute scout observes reaching
+  a terminal state into exactly one ordinary factory-driver pass instead of
+  waiting for the beat. A durable watermark records the handled attempt ids so
+  re-running over unchanged state is a no-op; a non-blocking `flock` coalesces
+  overlapping invocations (the loser reports `coalesced` and runs nothing); a
+  failed pass leaves the watermark unadvanced so the next tick retries; and
+  the 30-minute heartbeat remains the heartbeat backstop. Wiring it into the
+  live scout script or any cron entry is an explicit owner action — the hook
+  installs nothing. See `docs/scout-hook.md`.
+- **Durable completion event in the coordinator inbox:** a terminal landing now
+  publishes one completion event into the coordinator inbox before the source acknowledgement,
+  so a crash or a failed source ack cannot lose the
+  completion; a write failure raises and leaves the landing unacked for a
+  retry. Delivery is deduplicated by event id (a duplicate returns
+  `duplicate: True` and never calls the handler), the model is at-least-once
+  with one accepted decision, and a handler failure gets one bounded retry
+  before the event is marked failed. See `docs/event-consumer.md`.
+- **Factory driver service mode:** the resident service wakes on the inbox
+  (inotify, with a bounded poll fallback) instead of polling for landings,
+  drains the completion consumer, and dispatches an eligible scheduler item
+  only when a durable pre-approval, a readable scope list covering every
+  leased file, the shared bee cap and the scheduler's planning limits all
+  allow it. Anything missing or unreadable means no dispatch plus a durable
+  judgment and one coalesced wake through `WakeCoalescer` and
+  `notify_coordinator`. The shipped unit is a template and documentation only
+  — not installed, enabled or started. See `docs/factory-driver-service.md`.
+- **Board-stock low signal comments on change, not once per episode:** while
+  the ready column is low, the beat or the service pass posts one board comment
+  whenever the observation changes — the state, ready count, free
+  slots, shortfall or board — rather than once per low episode; identical repeats
+  do not comment again, and a recovery followed by a new shortfall starts a new episode.
+  The
+  comment still states the numbers and that the factory only observes; it
+  never creates, moves, approves or dispatches work. See `docs/board-stock.md`.
 ### Fixed
 
 - **The landing-event composition no longer collides with the coordinator
