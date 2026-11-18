@@ -192,6 +192,92 @@ def test_record_lease_fails_closed_on_a_set_but_unusable_pin(
 
 
 # ---------------------------------------------------------------------------
+# A sandboxed run records the lease from the payload it was actually served
+# ---------------------------------------------------------------------------
+
+
+def _stage_served_payload(root: Path) -> Path:
+    """The sandbox copy's staged payload for PAYLOAD_NAME, with a marker file."""
+    staged = root / sandbox._SANDBOX_PAYLOAD_DIR / PAYLOAD_NAME
+    (staged / "tools").mkdir(parents=True)
+    (staged / "tools" / "recovery.py").write_text(MARKER_TEXT, encoding="utf-8")
+    return staged
+
+
+def test_record_lease_accepts_the_served_relative_payload(tmp_path, monkeypatch):
+    """The served relative form resolves to the staged payload, not a refusal.
+
+    A test that runs inside the verify sandbox calls the dispatch chokepoint
+    with the child env it was given: ``WORKFLOW_SRC`` names the staged copy
+    relatively because the jail's cwd is the copy. Recording a lease there must
+    digest that staged tree (byte-identical to the source tree) instead of
+    failing the run with ``payload_source_invalid``.
+    """
+    _no_payload_env(monkeypatch)
+    staged = _stage_served_payload(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        PAYLOAD_NAME, f"./{sandbox._SANDBOX_PAYLOAD_DIR}/{PAYLOAD_NAME}"
+    )
+
+    record = leases.record_lease(tmp_path / "state", "att-payload-served", _brief())
+
+    assert record["brief"]["payload"] == dispatch.payload_digest(
+        {PAYLOAD_NAME: str(staged)}
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Anything that is not the staged entry for THIS payload name stays a
+        # refused relative path: the absolute requirement itself is unchanged.
+        "./.bundlebees-payload/HYVV_SRC",
+        "./.bundlebees-payload/../escape",
+        "./elsewhere/WORKFLOW_SRC",
+        ".bundlebees-payload",
+        "relative/checkouts",
+    ],
+)
+def test_served_relative_payload_outside_the_staged_entry_fails_closed(
+    tmp_path, monkeypatch, value
+):
+    _no_payload_env(monkeypatch)
+    _stage_served_payload(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(PAYLOAD_NAME, value)
+
+    with pytest.raises(dispatch.PayloadError) as excinfo:
+        leases.record_lease(tmp_path / "state", "att-payload-served-2", _brief())
+
+    assert excinfo.value.code == "payload_source_invalid"
+    assert not (tmp_path / "state" / "leases" / "att-payload-served-2.json").exists()
+
+
+def test_served_relative_payload_that_escapes_the_copy_fails_closed(
+    tmp_path, monkeypatch
+):
+    """A staged-name symlink pointing outside the copy is not a served payload."""
+    _no_payload_env(monkeypatch)
+    outside = tmp_path / "outside" / PAYLOAD_NAME
+    (outside / "tools").mkdir(parents=True)
+    (outside / "tools" / "recovery.py").write_text(MARKER_TEXT, encoding="utf-8")
+    staged_root = tmp_path / "work" / sandbox._SANDBOX_PAYLOAD_DIR
+    staged_root.mkdir(parents=True)
+    (staged_root / PAYLOAD_NAME).symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(tmp_path / "work")
+    monkeypatch.setenv(
+        PAYLOAD_NAME, f"./{sandbox._SANDBOX_PAYLOAD_DIR}/{PAYLOAD_NAME}"
+    )
+
+    with pytest.raises(dispatch.PayloadError) as excinfo:
+        leases.record_lease(tmp_path / "state", "att-payload-served-3", _brief())
+
+    assert excinfo.value.code == "payload_source_invalid"
+    assert not (tmp_path / "state" / "leases" / "att-payload-served-3.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # SERVING half: every runner-driven sandbox run serves the payload
 # ---------------------------------------------------------------------------
 

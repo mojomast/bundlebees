@@ -137,9 +137,16 @@ The wiring has three halves, all behind one chokepoint per half:
    into the record's brief, inside the HMAC. With the pins unset the key is
    absent (never an empty manifest), so leases stay byte-identical to the
    previous format on a coordinator that serves nothing. A pin that is set
-   but unusable (missing directory, relative path, NUL) fails dispatch closed
-   with the named `dispatch.PayloadError` (`payload_source_missing`,
-   `payload_source_invalid`) and no lease is written.
+   but unusable (missing directory, a bare relative path, NUL) fails dispatch
+   closed with the named `dispatch.PayloadError` (`payload_source_missing`,
+   `payload_source_invalid`) and no lease is written. The one relative form
+   that is accepted is the served one: inside the sandbox the child env names
+   the staged entry `./.bundlebees-payload/<name>`, and `dispatch` resolves
+   exactly that entry under the process's own payload directory. Code running
+   in the sandbox (a bee's own tests calling `record_lease`) therefore records
+   the staged tree — byte-identical to the source tree — instead of failing.
+   Anything else relative (`../`, another name, a bare path, a symlink out of
+   the copy) keeps the absolute-path refusal.
 2. **Verify binds it** (`cli._cmd_verify`). Before any test runs, the lease's
    recorded manifest is checked against the sources this coordinator serves
    now via `dispatch.lease_payload(record)`. A mismatch — the stale-pin

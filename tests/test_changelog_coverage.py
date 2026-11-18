@@ -565,6 +565,21 @@ CAMPAIGN_PRS: tuple[dict[str, object], ...] = (
             "idempotently",
         ),
     },
+    {
+        # fix/served-payload-relative-source: a sandboxed run records the lease
+        # from the payload it was actually served. The one accepted relative
+        # value is the staged entry for that payload name under the process's
+        # own .bundlebees-payload directory; every other relative path keeps
+        # the absolute-path refusal.
+        "pr": 123,
+        "name": "served relative payload resolves before the refusal",
+        "keywords": (
+            "record the lease for the payload it was served",
+            "absolute-path requirement is unchanged",
+            "staged entry for that payload name",
+            "symlink out of the copy",
+        ),
+    },
     # The docs-sync companion that adds the four rows below is intended for a
     # SQUASH merge. A squash subject ("...(#N)") never matches
     # MERGE_SUBJECT_RE, so the guard does not count that merge and no registry
