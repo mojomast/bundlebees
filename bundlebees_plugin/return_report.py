@@ -1148,23 +1148,6 @@ def _acceptance(
             problem = ""
         tdd_truth = _tdd_criteria(state, contract, contract_sha)
         for criterion in _criteria_rows(task):
-            truth = tdd_truth.get(str(criterion["id"])) or {}
-            verdict = truth.get("status") if isinstance(truth, Mapping) else ""
-            if verdict in ("passed", "failed", "not run", "blocked"):
-                status = {"passed": PASS, "failed": FAIL, "not run": NOT_RUN, "blocked": BLOCKED}[verdict]
-                cited = truth.get("evidence") if isinstance(truth, Mapping) else ""
-                label = f"tdd evidence ({contract.get('id') if isinstance(contract, Mapping) else ''})"
-                rows.append({
-                    "id": criterion["id"],
-                    "statement": criterion["statement"],
-                    "tests": list(criterion["tests"]),
-                    "status": status,
-                    # The record path is its own element: callers and tests match on membership.
-                    "evidence": [cited] if cited else [label],
-                    "_unrun": "" if status != NOT_RUN else "tdd evidence reports not run",
-                    "_limitation": "resolved from the tdd acceptance report (single source of truth)",
-                })
-                continue
             status, evidence, unrun, limitation = _classify(
                 criterion,
                 task=task,
@@ -1174,6 +1157,19 @@ def _acceptance(
                 waves=waves,
                 state_dir=state,
             )
+            # tdd evidence fills GAPS only (owner decision): it resolves a criterion the
+            # attempt/wave derivation could not judge, and never overrides a PASS or FAIL the
+            # attempts already established. Overriding was wrong in the other direction - a
+            # failed suite and a failed gitleaks scan both came out PASS.
+            truth = (tdd_truth.get(str(criterion["id"])) or {}) if tdd_truth else {}
+            verdict = truth.get("status") if isinstance(truth, Mapping) else ""
+            cited = truth.get("evidence") if isinstance(truth, Mapping) else ""
+            if status in (NOT_RUN, UNVERIFIED) and verdict in ("passed", "failed"):
+                status = PASS if verdict == "passed" else FAIL
+                if cited:
+                    evidence = [cited]
+                limitation = "resolved from the tdd acceptance report" + (f" ({limitation})" if limitation else "")
+                unrun = ""
             rows.append(
                 {
                     "id": criterion["id"],
