@@ -663,6 +663,70 @@ def produce_verify_evidence(
     return {"ok": True, "fence_seq": int(fence), "evidence": evidence, "record": verify_record}
 
 
+def _enqueue_research_for_failure(
+    state: Any,
+    attempt_id: str,
+    produced: Mapping[str, Any],
+    action_record: Mapping[str, Any],
+) -> None:
+    """Best-effort RESEARCH-BEFORE-RETRY trigger for a non-accepted verify.
+
+    The verify result is already durably completed by the caller. This helper
+    never raises and never mutates that result: an enqueue refusal is itself a
+    typed ``queue_unavailable`` answer, and the failure record written here
+    still marks the failure as needing research.
+    """
+
+    try:
+        from . import research_gate
+    except Exception:  # noqa: BLE001 - the verify record is already written
+        return
+
+    payload = action_record.get("payload") if isinstance(action_record, Mapping) else {}
+    payload = payload if isinstance(payload, Mapping) else {}
+    result = action_record.get("result") if isinstance(action_record, Mapping) else {}
+    result = result if isinstance(result, Mapping) else {}
+    failure: dict[str, Any] = {
+        "kind": "verify",
+        "code": str(produced.get("code") or result.get("code") or "verify_error"),
+        "message": str(produced.get("message") or result.get("message") or ""),
+        "fix": str(produced.get("fix") or result.get("fix") or ""),
+        "attempt_id": attempt_id,
+        "failing_tests": produced.get("failing_tests") or payload.get("tests") or [],
+        "versions": produced.get("versions") or {},
+        "repo": str(payload.get("repo") or ""),
+    }
+    try:
+        lease_record = leases.load_lease(state, attempt_id)
+        retry_of = (lease_record.get("brief") or {}).get("retry_of")
+        if retry_of:
+            failure["retry_of"] = str(retry_of)
+    except Exception:  # noqa: BLE001 - lineage falls back to the attempt id
+        pass
+
+    workflow_ref = str((action_record.get("workflow_ref") if isinstance(action_record, Mapping) else "") or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", workflow_ref):
+        workflow_ref = None
+
+    outcome: Mapping[str, Any] | None = None
+    try:
+        outcome = research_gate.enqueue_research(
+            state,
+            failure,
+            repo=str(payload.get("repo") or ""),
+            workflow_ref=workflow_ref,
+        )
+    except Exception:  # noqa: BLE001 - never let research enqueue escape the trigger
+        outcome = None
+    if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+        # The queue may be unavailable; still leave durable evidence that this
+        # failure needs research. Both writes are best-effort.
+        try:
+            research_gate.record_failure(state, failure)
+        except Exception:  # noqa: BLE001 - the verify record remains authoritative
+            pass
+
+
 def publish_verify_result(state: Any, attempt_id: str, produced: Mapping[str, Any], *, now: Any = None) -> dict[str, Any]:
     """Complete the verify item with the produced result, on its fence.
 
@@ -703,6 +767,11 @@ def publish_verify_result(state: Any, attempt_id: str, produced: Mapping[str, An
         )
     except coordinator_actions.ActionError as exc:
         raise VerifyWorkersError(exc.code, exc.message, exc.fix) from exc
+    if not result["ok"]:
+        # RESEARCH-BEFORE-RETRY trigger: one research item per failure shape
+        # and lineage. It runs after the verify record is written and never
+        # changes that record.
+        _enqueue_research_for_failure(state, attempt_id, produced, record)
     return {"ok": bool(result["ok"]), "result": result, "action": record,
             "evidence": result.get("verify_evidence")}
 

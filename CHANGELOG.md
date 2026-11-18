@@ -251,6 +251,12 @@ one pull request.
   client cap. Every ordinary response keeps the 1 MiB `MAX_RESPONSE_BYTES`
   limit, and a result over the new ceiling still refuses with
   `response_too_large`.
+- **Verify output and its durable records keep their own evidence.** `verify`
+  now prints its own validated branch, the verify-result path and the commit sha
+  literally instead of `[redacted]`, and writes the same validated branch,
+  the source revision and the result digests into the durable
+  `verify-results/<attempt>.json` record; untrusted text, including
+  worker-supplied values, stays scrubbed.
 
 ### Security
 - **Verify worktree integrity:** every git worktree-add site in `verify`
@@ -422,6 +428,12 @@ one pull request.
   with `mixed_test_targets` instead of silently dropping a target, a missing
   Node runtime refuses with `node_runner_unavailable`, and the test evidence
   records `evidence.runner/test_argv` so the exact command is auditable.
+- **Changelog coverage guard:** `tests/test_changelog_coverage.py` reads the
+  merge history and fails a full-history run when a merged campaign PR since #43
+  has no registry row, or when a registered row's keywords are absent from
+  this Unreleased section; a non-feature merge still needs an explicit
+  exclusion reason, and a checkout without merge commits falls back to the
+  pinned snapshot set.
 
 ### Changed
 
