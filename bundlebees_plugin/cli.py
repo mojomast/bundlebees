@@ -1953,6 +1953,45 @@ def _commit_changes(workdir: Path, attempt_id: str, files: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_VERIFY_REASON_LIMIT = 2000
+_VERIFY_REASON_CLIP = "...[clipped]"
+
+
+def _clip_verify_reason(text: str) -> str:
+    if len(text) <= _VERIFY_REASON_LIMIT:
+        return text
+    return text[: _VERIFY_REASON_LIMIT - len(_VERIFY_REASON_CLIP)] + _VERIFY_REASON_CLIP
+
+
+def _verify_refusal_reason(
+    exc: BaseException,
+    *,
+    state_dir: Path,
+    workdir: Path | None = None,
+    repo: Path | None = None,
+) -> str:
+    """Refusal text with operator path prefixes replaced and output bounded."""
+    text = str(getattr(exc, "error", exc) or "")
+    prefixes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, value in (("<state_dir>", state_dir), ("<workdir>", workdir), ("<repo>", repo)):
+        if value is None:
+            continue
+        candidates = {str(value)}
+        try:
+            candidates.add(str(Path(str(value)).expanduser().resolve()))
+        except OSError:
+            pass
+        for candidate in sorted(candidates, key=len, reverse=True):
+            candidate = candidate.rstrip("/\\")
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                prefixes.append((candidate, label))
+    for prefix, label in sorted(prefixes, key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(prefix, label)
+    return _clip_verify_reason(text)
+
+
 def _write_verify_result(
     state_dir: Path,
     attempt_id: str,
@@ -1963,6 +2002,8 @@ def _write_verify_result(
     files: list[str],
     tests: list[str],
     evidence: Mapping[str, Any] | None = None,
+    code: str | None = None,
+    error: str | None = None,
 ) -> Path:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = Path(contain_path(f"verify-results/{attempt_id}.json", str(state_dir)))
@@ -1977,6 +2018,10 @@ def _write_verify_result(
         "at": _now(),
         "evidence": dict(evidence or {}),
     }
+    if code is not None:
+        payload["code"] = str(code)
+    if error is not None:
+        payload["error"] = _clip_verify_reason(str(error))
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
     if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
@@ -2145,8 +2190,16 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
     files: list[str] = []
     tests: list[str] = []
     sha: str | None = None
+    workdir: Path | None = None
+    repo: Path | None = None
     run_id = "default"
     evidence: dict[str, Any] = {}
+    repo_value = config.get("repo_path")
+    if repo_value:
+        try:
+            repo = Path(str(repo_value)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            repo = Path(str(repo_value)).expanduser()
 
     try:
         # 1. Lease authority: only the coordinator record written at dispatch.
@@ -2392,10 +2445,12 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                     _print("warning: the kanban comment command returned non-zero; the board was not changed by verify itself")
         return 0
     except CliError as exc:
+        reason = _verify_refusal_reason(exc, state_dir=state_dir, workdir=workdir, repo=repo)
         try:
             _write_verify_result(
                 state_dir, attempt_id, ok=False, sha=sha, branch=branch,
                 files=files, tests=tests, evidence=evidence,
+                code=str(exc.code), error=reason,
             )
         except Exception:  # noqa: BLE001 - preserve the original CLI error
             pass
