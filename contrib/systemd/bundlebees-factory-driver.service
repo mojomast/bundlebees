@@ -1,0 +1,18 @@
+[Unit]
+Description=Bundlebees factory driver (event-driven service)
+Documentation=file://%h/rizzstack/bundlebees/docs/factory-driver-service.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rizzstack/bundlebees
+EnvironmentFile=-%h/.config/bundlebees/factory-driver.env
+ExecStart=%h/rizzstack/.venv/bin/python -m bundlebees_plugin.factory_driver --state %h/.hermes/plugin-data/bundlebees --queue %h/.hermes/plugin-data/bundlebees/queue.json --service --service-interval 30
+Restart=on-failure
+RestartSec=10
+Nice=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -136,6 +136,36 @@ def _safe_id(value: Any, what: str) -> str:
     return text
 
 
+def planning_limits() -> dict[str, int]:
+    """The bounded concurrency and the planning reservation, as readable ints.
+
+    A dispatch decision that cannot read these limits must not guess: it fails
+    closed and asks a human (or Hermes) instead of claiming work.
+    """
+
+    try:
+        max_active = int(MAX_ACTIVE)
+        reserved = int(RESERVED_FOR_LANDING)
+    except (TypeError, ValueError) as exc:
+        raise SchedulerError(
+            "limits_unreadable",
+            "the planning-slot limits are not readable integers",
+            "Restore work_scheduler.MAX_ACTIVE and RESERVED_FOR_LANDING.",
+        ) from exc
+    if max_active < 1 or reserved < 0:
+        raise SchedulerError(
+            "limits_unreadable",
+            f"the planning-slot limits are invalid (MAX_ACTIVE={max_active}, "
+            f"RESERVED_FOR_LANDING={reserved})",
+            "Restore non-negative, positive scheduler limits.",
+        )
+    return {
+        "max_active": max_active,
+        "reserved_for_landing": reserved,
+        "planning_max_active": max(1, max_active - reserved),
+    }
+
+
 def _now_iso(now: Any) -> str:
     epoch = now() if callable(now) else now
     if epoch is None:
@@ -953,6 +983,7 @@ __all__ = [
     "MAX_ACTIVE",
     "RESERVED_FOR_LANDING",
     "SchedulerError",
+    "planning_limits",
     "queue_path",
     "add_item",
     "list_items",
