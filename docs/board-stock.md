@@ -66,7 +66,9 @@ One durable record per observation:
 
 `revision` increments only when `state`, `ready_approved`, `free_slots`,
 `shortfall` or `board` changes, so a consumer can tell a fresh observation from
-a new episode. The file is written atomically (`0600` in a `0700` directory);
+the previous one. An *episode* is not every change: it starts at the first low
+observation, or when a low observation follows a recovery, and ends at the next
+recovery. The file is written atomically (`0600` in a `0700` directory);
 it carries no paths, hosts, URLs or tokens — the board label is accepted only
 if it matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 
