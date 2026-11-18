@@ -367,6 +367,23 @@ def _build_parser(parser: Any) -> Any:
     status_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     status_cmd.set_defaults(command="status")
 
+    board_sync_cmd = subparsers.add_parser(
+        "board-sync",
+        help="Reflect bee/PR lifecycle state onto the Hermes kanban board via the public CLI.",
+    )
+    board_sync_cmd.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Compare live cards against durable state and repair only the difference.",
+    )
+    board_sync_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print intended kanban commands and change nothing.",
+    )
+    board_sync_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    board_sync_cmd.set_defaults(command="board-sync")
+
     from . import rails_cli
     rails_cli.add_parsers(subparsers)
     ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
@@ -396,6 +413,34 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
     _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
            f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
     return 0 if not result["errors"] else 2
+
+
+def _cmd_board_sync(ctx: Any, args: Any) -> int:
+    """Reflect durable lifecycle events onto kanban through the public CLI."""
+    from . import board_sync as _board_sync
+
+    state_dir = _state_dir(ctx, args)
+    sync = _board_sync.BoardSync(
+        _board_sync.default_runner,
+        state_dir,
+        events=lambda: _board_sync.default_events(state_dir),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    summary = sync.reconcile() if getattr(args, "reconcile", False) else sync.apply()
+    if getattr(args, "dry_run", False):
+        for argv in summary.get("intended") or []:
+            _print("would run: " + " ".join(str(part) for part in argv))
+    _print(
+        "board-sync: "
+        f"cards={summary.get('cards', 0)} created={len(summary.get('created') or [])} "
+        f"updated={len(summary.get('updated') or [])} comments={len(summary.get('comments') or [])} "
+        f"skipped={len(summary.get('skipped') or [])} errors={len(summary.get('errors') or [])}"
+    )
+    for item in summary.get("errors") or []:
+        _print(f"error: {item.get('action')}: {item.get('error')}")
+    if summary.get("refused"):
+        return 2
+    return 0 if summary.get("ok") else 2
 
 
 def _cmd_owner(ctx: Any, args: Any) -> int:
@@ -519,6 +564,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_attempts(ctx, args)
         if command == "status":
             return _cmd_status(ctx, args)
+        if command == "board-sync":
+            return _cmd_board_sync(ctx, args)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":
