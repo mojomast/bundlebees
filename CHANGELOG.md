@@ -230,6 +230,27 @@ one pull request.
   into a generic conflict — pinned end to end: a host 409
   `{"error": "quota_exhausted"}` travels the real HTTP path and the provisioner
   refuses with that exact code before a journal entry is written.
+- **`attempts`/`status` count only live work as in-flight.** A dispatched
+  attempt with no recorded outcome is now `expired` once the 12-hour idle
+  window passes, and a `verified` result is no longer in flight because the bee
+  has already finished and the result awaits acceptance. On a real 414-lease
+  store this took the reported `in_flight` count from 297 (with zero bees
+  running) to 6, so the fleet view no longer reports finished and abandoned
+  dispatches as active bees.
+- **Verify records its durable delivery intent before the push.** `verify` now
+  defines the lease's `source_rev` as the base revision before it writes the
+  delivery outbox row, so the intent carries the verified base and the PR
+  obligation is never lost to a `NameError`. The earlier
+  `name 'base' is not defined` failure happened after the push and silently
+  suppressed PR creation; the record now reaches `pushed` (and the eager relay
+  opens the PR) or stays pending for `hermes bundlebees deliver`.
+- **Verbose attempt results read up to a bounded 24 MiB.** One attempt's result
+  document (and the attempt detail that can carry it) is read with
+  `MAX_RESULT_BYTES`, matching Orbit's 8 MiB artifact cap plus JSON-escaping
+  headroom, instead of being refused with `response_too_large` at the old 1 MiB
+  client cap. Every ordinary response keeps the 1 MiB `MAX_RESPONSE_BYTES`
+  limit, and a result over the new ceiling still refuses with
+  `response_too_large`.
 
 ### Security
 - **Verify worktree integrity:** every git worktree-add site in `verify`
@@ -375,6 +396,32 @@ one pull request.
   schedule artifact left to drop — while the existing 10-minute heartbeat
   stays as the backstop and the multi-bee sweep, not the primary wait.
   Status: design document only; no code changes.
+- **Every attempt row carries the dispatch `job_id`.** The fleet view now reads
+  the job from the brief (falling back to the lease record) and adds `repo`
+  only from what the brief or lease actually names — the project label is never
+  substituted for a repository — so a row that previously rendered
+  "Job unknown" can be traced back to its job and bound into a Rails timeline.
+  On the real store 17 of 414 leases named a job; rows whose brief predates the
+  field stay honestly null.
+- **Secret scan reads tar archives instead of failing closed on size.** An
+  oversize tar (`.tar`, `.tar.gz`, `.tgz`) is compared member by member against
+  the base blob and only the added member lines are scanned, so an archive over
+  the 2 MB file cap no longer refuses on every changed file. An unparseable
+  archive, an unsafe member path, or a single member over the scan cap still
+  fails closed with no evidence, and a 64 MiB decompression bound keeps a small
+  gzip from exhausting coordinator memory.
+- **Verify refusals record a machine code and a scrubbed reason.** When
+  `verify` refuses, `verify-results/<attempt>.json` now carries the refusal's
+  stable `code` and a bounded, scrubbed `error` reason with operator
+  state/worktree/repo path prefixes replaced, instead of `ok: false` with
+  all-null evidence and no diagnosable cause. The original CLI error is
+  preserved even when the record write itself fails.
+- **Verify selects a Node runner for Node test targets.** Existing
+  `.mjs`/`.cjs`/`.js` test files run under `node --test` while pytest remains
+  the default for Python targets; a mixed or unrecognised target set refuses
+  with `mixed_test_targets` instead of silently dropping a target, a missing
+  Node runtime refuses with `node_runner_unavailable`, and the test evidence
+  records `evidence.runner/test_argv` so the exact command is auditable.
 
 ### Changed
 
