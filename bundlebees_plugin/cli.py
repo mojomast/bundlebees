@@ -203,6 +203,19 @@ def _build_parser(parser: Any) -> Any:
     )
     verify.set_defaults(command="verify")
 
+    owner = subparsers.add_parser("owner", help="Enrolled owner authority for board/feedback writes (E2/E5).")
+    owner_sub = owner.add_subparsers(dest="owner_command", required=True)
+    ow_enroll = owner_sub.add_parser("enroll", help="Create (or adopt) an owner key and record its authority.")
+    ow_enroll.add_argument("--name", required=True)
+    ow_enroll.add_argument("--scope", default="board,feedback", help="Comma-separated scopes (board,feedback,rail_clear,approve).")
+    ow_enroll.add_argument("--expires", default="never", help="ISO-8601 date or never.")
+    ow_enroll.add_argument("--key-file", default=None)
+    ow_enroll.add_argument("--state-dir", default=None)
+    ow_enroll.set_defaults(command="owner")
+    ow_list = owner_sub.add_parser("list", help="List enrolled owner authorities (read-only).")
+    ow_list.add_argument("--state-dir", default=None)
+    ow_list.set_defaults(command="owner")
+
     deliver = subparsers.add_parser(
         "deliver",
         help="Reconcile pending deliveries: open missing PRs for verified branches (idempotent).",
@@ -306,9 +319,45 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
     return 0 if not result["errors"] else 2
 
 
+def _cmd_owner(ctx: Any, args: Any) -> int:
+    """Enrolled owner authority (rizzstack.owner-authority/1)."""
+    from . import owners as _owners
+    state_dir = _state_dir(ctx, args)
+    sub = getattr(args, "owner_command", None)
+    if sub == "enroll":
+        try:
+            record = _owners.enroll(state_dir, args.name,
+                                    scope=[s for s in str(args.scope).split(",") if s.strip()],
+                                    expires=getattr(args, "expires", "never"),
+                                    key_path=getattr(args, "key_file", None))
+        except _owners.OwnerAuthorityError as exc:
+            raise _as_cli_error(exc)
+        _print("bundlebees owner enroll")
+        _print(f"owner: {record['name']}")
+        _print(f"key_id: {record['key_id']}")
+        _print(f"scope: {', '.join(record['scope'])}")
+        _print(f"expires_at: {record['expires_at']}")
+        _print(f"key_file: {record['key_path']} (0600; the key never leaves this file)")
+        return 0
+    if sub == "list":
+        directory = state_dir / "owners"
+        rows = sorted(directory.glob("*.json")) if directory.exists() else []
+        if not rows:
+            _print("owner: none enrolled")
+            return 0
+        for path in rows:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            _print(f"{record.get('name')}  key_id={record.get('key_id')}  scope={','.join(record.get('scope') or [])}")
+        return 0
+    _print("owner: unknown subcommand")
+    return 2
+
+
 def _dispatch(ctx: Any, args: Any) -> int:
     command = getattr(args, "command", None)
     try:
+        if command == "owner":
+            return _cmd_owner(ctx, args)
         if command == "verify":
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
