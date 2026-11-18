@@ -20,7 +20,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from bundlebees_plugin import cli, grants, leases
+from bundlebees_plugin import attribution, cli, grants, leases
 from bundlebees_plugin.brief import validate_brief
 from tests.fakes import FakeCtx, load_plugin, secret_scope
 
@@ -47,6 +47,8 @@ ROW_FIELDS = {
     "state",
     "branch",
     "model",
+    "route",
+    "attributed_model",
     "project",
     "job_id",
     "repo",
@@ -101,6 +103,33 @@ def _lease(
     if repo is not None:
         brief["repo"] = repo
     return leases.record_lease(state, attempt_id, validate_brief(brief), now=now)
+
+
+def _attribution_intent(
+    state: Path,
+    attempt_id: str,
+    *,
+    route: str | None = "zoo",
+    model: str | None = "zoo:glm-5.3-flash",
+    job_id: str = "job-attributed",
+    project: str = "proj-attributed",
+) -> dict:
+    intent = attribution.intent_for(
+        endpoint="http://127.0.0.1:47922",
+        worker_id="worker-1",
+        ledger_chain="chain-1",
+        job_id=job_id,
+        project=project,
+        contract="contract-1",
+        revision="b" * 40,
+    )
+    if route is not None:
+        intent["route"] = route
+    if model is not None:
+        intent["model"] = model
+    record = attribution.record_intent(state, intent)
+    attribution.bind_attempt(state, record["intent_id"], attempt_id)
+    return record
 
 
 def _verify_result(state: Path, attempt_id: str, *, ok: bool, at: str) -> None:
@@ -480,6 +509,78 @@ def test_a_failed_outcome_past_the_ttl_stays_failed(tmp_path: Path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Dispatch route comes only from a verified attribution intent
+# ---------------------------------------------------------------------------
+
+
+def test_a_verified_attribution_reports_its_route_and_model(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-routed", now=CREATED_A)
+    _attribution_intent(state, "att-routed", route="zoo", model="zoo:glm-5.3-flash")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["route"] == "zoo"
+    assert row["attributed_model"] == "zoo:glm-5.3-flash"
+
+
+def test_a_missing_attribution_record_leaves_both_null(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-unattributed", now=CREATED_A, model="brief-model")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    # The brief's model is not a route and never becomes the attributed model.
+    assert row["model"] == "brief-model"
+    assert row["route"] is None
+    assert row["attributed_model"] is None
+
+
+def test_a_tampered_attribution_leaves_both_null(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-tampered", now=CREATED_A)
+    record = _attribution_intent(state, "att-tampered", route="zoo", model="zoo:glm-5.3-flash")
+    path = state / "attribution" / f"{record['intent_id']}.json"
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["route"] = "go"
+    tampered["model"] = "go:other"
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["route"] is None
+    assert row["attributed_model"] is None
+
+
+def test_an_adopted_attempt_leaves_both_null(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-adopted", now=CREATED_A)
+    _attribution_intent(state, "att-other", route="zoo", model="zoo:glm-5.3-flash")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["route"] is None
+    assert row["attributed_model"] is None
+
+
+def test_an_ambiguous_attribution_leaves_both_null(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-ambiguous", now=CREATED_A)
+    _attribution_intent(state, "att-ambiguous", route="zoo", model="zoo:glm-5.3-flash")
+    _attribution_intent(state, "att-ambiguous", route="go", model="go:other")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+
+    assert row["route"] is None
+    assert row["attributed_model"] is None
+
+
+# ---------------------------------------------------------------------------
 # Read-only guarantee
 # ---------------------------------------------------------------------------
 
@@ -489,6 +590,7 @@ def test_the_views_leave_the_store_byte_for_byte_unchanged(tmp_path: Path, capsy
     _lease(state, "att-a", now=CREATED_A)
     _verify_result(state, "att-a", ok=True, at=VERIFIED_AT)
     _accepted_wave(state, "w1", "att-a", at=ACCEPTED_AT)
+    _attribution_intent(state, "att-a")
     before = _snapshot(state)
 
     assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
