@@ -16,8 +16,9 @@ Prior art this module deliberately reuses instead of replacing:
 * :mod:`bundlebees_plugin.gate_watcher` — the decision queue. An
   environment-problem verdict becomes a backlog slice plus an owner decision
   record there; it never becomes a retry.
-* :mod:`bundlebees_plugin.verify_workers.publish_verify_result` — the trigger
-  point for a non-accepted verify outcome.
+* :mod:`bundlebees_plugin.verify_workers.publish_verify_result` — the intended
+  trigger point for a non-accepted verify outcome, though that path is not
+  wired into any production flow yet.
 * :meth:`bundlebees_plugin.tools._dispatch` — the retry gate, after
   ``validate_brief`` and before any launcher call.
 

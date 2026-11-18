@@ -1,3 +1,7 @@
+> **NOT WIRED.** No production path (beat, factory driver, tools, CLI) calls
+> this module; it is kept for research_gate's verify-result publishing path and
+> its tests, and may be removed or wired in cleanup phase 6.
+
 # Verify-worker bees: parallel verification on the action queue
 
 `bundlebees_plugin/verify_workers.py` makes per-attempt verification a
