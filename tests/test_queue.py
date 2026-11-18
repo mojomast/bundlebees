@@ -169,6 +169,95 @@ class QueueTests(unittest.TestCase):
         )
         self.assertEqual(queue.get("f1").job_id, "job_1")
 
+    # -- one id, one card ---------------------------------------------------
+
+    def test_a_features_map_card_body_id_must_match_its_map_key(self):
+        for field in ("feature_id", "id"):
+            with self.subTest(field=field):
+                self._write_live_envelope(
+                    {"f1": {field: "f2", "repo": "mojomast/a", "job_id": "job_1"}}
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertIn("f1", str(caught.exception))
+                self.assertIn("f2", str(caught.exception))
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_a_features_map_card_body_id_may_restate_its_key_after_stripping(self):
+        for body in (
+            {"repo": "mojomast/a", "job_id": "job_1"},
+            {"feature_id": " f1 ", "repo": "mojomast/a", "job_id": "job_1"},
+            {"id": "f1 ", "repo": "mojomast/a", "job_id": "job_1"},
+            {"feature_id": " f1 ", "id": "f1", "repo": "mojomast/a", "job_id": "job_1"},
+        ):
+            with self.subTest(body=body):
+                self._write_live_envelope({"f1": body})
+
+                items = Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual([item.feature_id for item in items], ["f1"])
+                self.assertEqual(items[0].job_id, "job_1")
+
+    def test_a_features_list_refuses_two_cards_with_the_same_feature_id(self):
+        for cards in (
+            [{"feature_id": "f1", "job_id": "j1"}, {"feature_id": "f1", "job_id": "j2"}],
+            [{"feature_id": "f1", "job_id": "j1"}, {"id": " f1 ", "job_id": "j2"}],
+            [{"id": "f1", "job_id": "j1"}, {"id": "f1", "job_id": "j2"}],
+        ):
+            with self.subTest(cards=cards):
+                self._write_live_envelope(cards)
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertIn("f1", str(caught.exception))
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_a_features_list_with_unique_ids_still_accepts_the_id_fallback(self):
+        self._write_live_envelope(
+            [
+                {"feature_id": "f1", "job_id": "j1"},
+                {"id": "f2", "job_id": "j2"},
+            ]
+        )
+
+        items = Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual([item.feature_id for item in items], ["f1", "f2"])
+
+    def test_set_status_refuses_an_identity_violation_without_writing(self):
+        documents = (
+            {
+                "schema": "bundlebees.queue/1",
+                "generated_at": "2026-11-18T04:27:23Z",
+                "note": "live-shaped queue",
+                "features": {"f1": {"feature_id": "f2", "job_id": "job_1"}},
+            },
+            {
+                "schema": "bundlebees.queue/1",
+                "generated_at": "2026-11-18T04:27:23Z",
+                "note": "live-shaped queue",
+                "features": [
+                    {"feature_id": "f1", "job_id": "job_1"},
+                    {"feature_id": "f1", "job_id": "job_2"},
+                ],
+            },
+        )
+        for document in documents:
+            with self.subTest(features=document["features"]):
+                self.path.write_text(json.dumps(document))
+                before = self.path.read_bytes()
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).set_status("f1", "running")
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(self.path.read_bytes(), before, "a refused document must not be rewritten")
+
     def test_a_features_list_card_without_a_usable_id_is_a_typed_refusal(self):
         for body in ({"repo": "r", "job_id": "j"}, {"feature_id": "", "id": "  "}):
             with self.subTest(card=body):
