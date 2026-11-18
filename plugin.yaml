@@ -171,6 +171,18 @@ config_schema:
       UNSAFE. Permit verify_isolation=unshare, which isolates network and
       PIDs but leaves the coordinator's filesystem readable. Never picked
       by auto. Env BUNDLEBEES_ALLOW_WEAK_UNSHARE=1 does the same.
+  attribution_worker_id:
+    type: string
+    default: ""
+    description: >-
+      The enrolled worker identity recorded in the pre-dispatch attribution intent for
+      canary projects. The launcher's public health does not advertise it.
+  attribution_ledger_chain:
+    type: string
+    default: ""
+    description: >-
+      The worker's enrolled ledger chain recorded in the pre-dispatch attribution intent
+      for canary projects. The launcher's public health does not advertise it.
   attribution_canary_projects:
     type: list
     default: []
