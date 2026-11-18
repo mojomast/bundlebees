@@ -1,4 +1,8 @@
-"""Verify-worker bees: per-attempt verification as dispatchable queue actions.
+"""NOT WIRED: no production path (beat, factory driver, tools, CLI) calls this
+module. It is kept for research_gate's verify-result publishing path and its
+tests, and may be removed or wired in cleanup phase 6.
+
+Verify-worker bees: per-attempt verification as dispatchable queue actions.
 
 Verification was the last big serial stage of the coordinator pipeline: the
 tick's verifier closure ran ``verify_local.verify_and_commit`` in-beat, one
@@ -93,6 +97,7 @@ except ImportError:  # pragma: no cover - a platform without flock cannot bound 
     fcntl = None  # type: ignore[assignment]
 
 __all__ = [
+    "WIRED",
     "EVIDENCE_SCHEMA",
     "REQUEST_SCHEMA",
     "ACTION_KIND",
@@ -128,6 +133,9 @@ __all__ = [
     "resolve_mode",
     "dispatch_verification",
 ]
+
+#: No production path imports this module; see the module docstring.
+WIRED = False
 
 EVIDENCE_SCHEMA = "bundlebees.verify-evidence/1"
 REQUEST_SCHEMA = "bundlebees.verify-request/1"
