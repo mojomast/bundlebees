@@ -502,3 +502,27 @@ def test_systemd_verify_still_flags_a_missing_interpreter(tmp_path: Path):
         "the interpreter substitution would then hide real breakage"
     )
     assert "no-such-python" in (completed.stderr or "") + (completed.stdout or "")
+
+
+def test_the_shipped_unit_turns_the_reconciliation_sweep_on():
+    """Kyle, 2026-11-18: the reconciliation sweep is ON in the deploy the cleanup ships.
+
+    The CLI default stays off (opt-in flag); the shipped unit opts in, with the
+    1800 s default rate limit, so the backstop runs at most every 30 minutes.
+    """
+    import shlex
+
+    from bundlebees_plugin import factory_driver
+
+    path = _unit_path()
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read(path, encoding="utf-8")
+    argv = shlex.split(parser.get("Service", "ExecStart"))
+    assert "--sweep" in argv, "the shipped unit must pass --sweep"
+    module_at = argv.index("bundlebees_plugin.factory_driver")
+    args = factory_driver._parser().parse_args(argv[module_at + 1:])
+    assert args.sweep is True
+    assert args.sweep_interval_s == factory_driver.DEFAULT_SWEEP_INTERVAL_S == 1800
+    # The flag alone never turns the sweep on in the library: it stays opt-in.
+    assert factory_driver._parser().parse_args([]).sweep is False
