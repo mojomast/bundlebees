@@ -305,6 +305,15 @@ _DRY_RUN_GUARD_SPLIT_NON = re.compile(
 )
 
 
+def _dry_run_guard_nfkc_fold_contains_whitespace(character: str) -> bool:
+    return any(
+        folded.isspace()
+        or unicodedata.category(folded)
+        in _DRY_RUN_GUARD_SPLIT_SOURCE_CATEGORIES
+        for folded in unicodedata.normalize("NFKC", character)
+    )
+
+
 def _map_dry_run_guard_split_sources(text: str) -> str:
     mapped: list[str] = []
     for character in text:
@@ -314,10 +323,10 @@ def _map_dry_run_guard_split_sources(text: str) -> str:
         ):
             mapped.append(_DRY_RUN_GUARD_SPLIT_MARKER)
             continue
-        if (
-            character != " "
-            and unicodedata.category(character)
+        if character != " " and (
+            unicodedata.category(character)
             in _DRY_RUN_GUARD_SPLIT_SOURCE_CATEGORIES
+            or _dry_run_guard_nfkc_fold_contains_whitespace(character)
         ):
             mapped.append(_DRY_RUN_GUARD_SPLIT_MARKER)
             continue
@@ -584,6 +593,111 @@ DRY_RUN_NEVER_CANONICAL_ZS_SPLIT_DECOY_IDS = (
     "n-on-literal-u-e000",
     "no-literal-u-e001",
     "n-on-literal-u-e001",
+)
+DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_CODEPOINTS = (
+    "\u00a8",
+    "\u00af",
+    "\u00b4",
+    "\u00b8",
+    "\u02d8",
+    "\u02d9",
+    "\u02da",
+    "\u02db",
+    "\u02dc",
+    "\u02dd",
+    "\u037a",
+    "\u0384",
+    "\u0385",
+    "\u1fbd",
+    "\u1fbf",
+    "\u1fc0",
+    "\u1fc1",
+    "\u1fcd",
+    "\u1fce",
+    "\u1fcf",
+    "\u1fdd",
+    "\u1fde",
+    "\u1fdf",
+    "\u1fed",
+    "\u1fee",
+    "\u1ffd",
+    "\u1ffe",
+    "\u2017",
+    "\u203e",
+    "\u309b",
+    "\u309c",
+    "\ufc5e",
+    "\ufc5f",
+    "\ufc60",
+    "\ufc61",
+    "\ufc62",
+    "\ufc63",
+    "\ufdfa",
+    "\ufdfb",
+    "\ufe49",
+    "\ufe4a",
+    "\ufe4b",
+    "\ufe4c",
+    "\ufe70",
+    "\ufe72",
+    "\ufe74",
+    "\ufe76",
+    "\ufe78",
+    "\ufe7a",
+    "\ufe7c",
+    "\ufe7e",
+    "\uffe3",
+)
+DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_DECOYS = tuple(
+    f"A {left}{codepoint}{right} dry run never writes or replaces the canonical record."
+    for codepoint in DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_CODEPOINTS
+    for left, right in (("no", "n"), ("n", "on"))
+)
+DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_DECOY_IDS = tuple(
+    f"{shape}-u{ord(codepoint):04x}"
+    for codepoint in DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_CODEPOINTS
+    for shape in ("no-n", "n-on")
+)
+DRY_RUN_NEVER_CANONICAL_ZS_SPACE_CODEPOINTS = (
+    "\u00a0",
+    "\u2000",
+    "\u2001",
+    "\u2002",
+    "\u2003",
+    "\u2004",
+    "\u2005",
+    "\u2006",
+    "\u2007",
+    "\u2008",
+    "\u2009",
+    "\u200a",
+    "\u202f",
+    "\u205f",
+    "\u3000",
+)
+DRY_RUN_NEVER_CANONICAL_ZS_SPACE_DECOYS = tuple(
+    f"A {left}{codepoint}{right} dry run never writes or replaces the canonical record."
+    for codepoint in DRY_RUN_NEVER_CANONICAL_ZS_SPACE_CODEPOINTS
+    for left, right in (("no", "n"), ("n", "on"))
+)
+DRY_RUN_NEVER_CANONICAL_ZS_SPACE_DECOY_IDS = tuple(
+    f"{shape}-u{ord(codepoint):04x}"
+    for codepoint in DRY_RUN_NEVER_CANONICAL_ZS_SPACE_CODEPOINTS
+    for shape in ("no-n", "n-on")
+)
+DRY_RUN_NEVER_CANONICAL_NFKC_NON_SPACE_FOLD_CONTROLS = (
+    ("\ufb03", "noffin"),
+    ("\u00bd", "no1/2n"),
+    ("\uff21", "noAn"),
+    ("\u2075", "no5n"),
+    ("\u33a1", "nom2n"),
+)
+DRY_RUN_NEVER_CANONICAL_NFKC_NON_SPACE_FOLD_CONTROL_IDS = (
+    "ligature-ffi-u-fb03",
+    "vulgar-half-u-00bd",
+    "fullwidth-a-u-ff21",
+    "superscript-five-u-2075",
+    "squared-m2-u-33a1",
 )
 DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOYS = (
     "A non\ue000dry run never writes or replaces the canonical record.",
@@ -964,6 +1078,60 @@ def test_never_canonical_pin_rejects_non_ascii_whitespace_split_decoys(
     subject: str,
 ) -> None:
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_NFKC_SPACE_FOLD_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_nfkc_space_fold_decoys(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_ZS_SPACE_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_ZS_SPACE_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_zs_space_regression_decoys(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    ("codepoint", "expected"),
+    DRY_RUN_NEVER_CANONICAL_NFKC_NON_SPACE_FOLD_CONTROLS,
+    ids=DRY_RUN_NEVER_CANONICAL_NFKC_NON_SPACE_FOLD_CONTROL_IDS,
+)
+def test_never_canonical_split_sources_ignore_non_space_nfkc_folds(
+    codepoint: str,
+    expected: str,
+) -> None:
+    subject = f"no{codepoint}n"
+    mapped = _map_dry_run_guard_split_sources(subject)
+    assert mapped == subject, repr(mapped)
+    assert _DRY_RUN_GUARD_SPLIT_MARKER not in mapped
+    assert not any(
+        folded.isspace()
+        or unicodedata.category(folded)
+        in _DRY_RUN_GUARD_SPLIT_SOURCE_CATEGORIES
+        for folded in unicodedata.normalize("NFKC", codepoint)
+    ), f"U+{ord(codepoint):04X} folds to whitespace"
+    folded = unicodedata.normalize("NFKC", mapped).replace("\u2044", "/")
+    assert folded == expected, repr(folded)
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(
+        f"A {subject} dry run never writes or replaces the canonical record."
+    ), subject
+
+
+def test_never_canonical_pin_accepts_a_ligature_fold_subject() -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(
+        "A no\ufb03n dry run never writes or replaces the canonical record."
+    )
 
 
 @pytest.mark.parametrize(
