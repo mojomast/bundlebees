@@ -285,8 +285,10 @@ DRY_RUN_SUBJECT_SEPARATORS = (
     "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 )
 _DRY_RUN_GUARD_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf"})
+_DRY_RUN_GUARD_SPLIT_SOURCE_CATEGORIES = frozenset({"Zs", "Zl", "Zp"})
 _DRY_RUN_GUARD_BOUNDARY_MARKER = "\ue000"
 _DRY_RUN_GUARD_CC_MARKER = "\ue001"
+_DRY_RUN_GUARD_SPLIT_MARKER = _DRY_RUN_GUARD_CC_MARKER
 _DRY_RUN_GUARD_SEPARATOR_RUN = re.compile(
     rf"[{re.escape(DRY_RUN_SUBJECT_SEPARATORS)}]+"
 )
@@ -297,15 +299,34 @@ _DRY_RUN_GUARD_NON_WORD_RUN = re.compile(
 _DRY_RUN_GUARD_DOT_BOUNDARY = re.compile(r"(?<=\w)\.(?= )")
 _DRY_RUN_GUARD_SLASH_BOUNDARY = re.compile(r"(?<=\w)/(?=\w)")
 _DRY_RUN_GUARD_SPLIT_NON = re.compile(
-    rf"\b(?:n[{re.escape(_DRY_RUN_GUARD_CC_MARKER)}]*on"
-    rf"|no[{re.escape(_DRY_RUN_GUARD_CC_MARKER)}]*n)\b",
+    rf"\b(?:n[{re.escape(_DRY_RUN_GUARD_SPLIT_MARKER)}]*on"
+    rf"|no[{re.escape(_DRY_RUN_GUARD_SPLIT_MARKER)}]*n)\b",
     re.IGNORECASE,
 )
 
 
+def _map_dry_run_guard_split_sources(text: str) -> str:
+    mapped: list[str] = []
+    for character in text:
+        if character in (
+            _DRY_RUN_GUARD_BOUNDARY_MARKER,
+            _DRY_RUN_GUARD_CC_MARKER,
+        ):
+            mapped.append(_DRY_RUN_GUARD_SPLIT_MARKER)
+            continue
+        if (
+            character != " "
+            and unicodedata.category(character)
+            in _DRY_RUN_GUARD_SPLIT_SOURCE_CATEGORIES
+        ):
+            mapped.append(_DRY_RUN_GUARD_SPLIT_MARKER)
+            continue
+        mapped.append(character)
+    return "".join(mapped)
+
+
 def _normalize_dry_run_guard_text(text: str) -> str:
-    text = text.replace(_DRY_RUN_GUARD_BOUNDARY_MARKER, " ")
-    text = text.replace(_DRY_RUN_GUARD_CC_MARKER, " ")
+    text = _map_dry_run_guard_split_sources(text)
     text = _DRY_RUN_GUARD_DOT_BOUNDARY.sub(
         _DRY_RUN_GUARD_BOUNDARY_MARKER, text
     )
@@ -318,15 +339,15 @@ def _normalize_dry_run_guard_text(text: str) -> str:
         category = unicodedata.category(character)
         if category in _DRY_RUN_GUARD_STRIPPED_CATEGORIES:
             if category == "Cc" and character.isspace():
-                guarded.append(_DRY_RUN_GUARD_CC_MARKER)
+                guarded.append(_DRY_RUN_GUARD_SPLIT_MARKER)
             continue
         guarded.append(character)
     normalized = "".join(guarded)
-    normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
     normalized = _DRY_RUN_GUARD_NON_WORD_RUN.sub(" ", normalized)
-    normalized = " ".join(normalized.split())
     normalized = _DRY_RUN_GUARD_SPLIT_NON.sub("non", normalized)
-    normalized = normalized.replace(_DRY_RUN_GUARD_CC_MARKER, " ")
+    normalized = normalized.replace(_DRY_RUN_GUARD_SPLIT_MARKER, " ")
+    normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
+    normalized = " ".join(normalized.split())
     return " ".join(normalized.split())
 
 
@@ -511,6 +532,58 @@ DRY_RUN_NEVER_CANONICAL_SPLIT_DECOY_IDS = (
     "no-vertical-tab-n",
     "no-form-feed-n",
     "n-line-feed-on",
+)
+DRY_RUN_NEVER_CANONICAL_ZS_SPLIT_DECOYS = (
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no　n dry run never writes or replaces the canonical record.",
+    "A n　on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A no n dry run never writes or replaces the canonical record.",
+    "A n on dry run never writes or replaces the canonical record.",
+    "A non dry run never writes or replaces the canonical record.",
+    "A non dry run never writes or replaces the canonical record.",
+    "A non dry run never writes or replaces the canonical record.",
+    "A non dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_ZS_SPLIT_DECOY_IDS = (
+    "no-nbsp-u00a0",
+    "n-on-nbsp-u00a0",
+    "no-ogham-space-u1680",
+    "n-on-ogham-space-u1680",
+    "no-en-quad-u2000",
+    "n-on-en-quad-u2000",
+    "no-em-space-u2003",
+    "n-on-em-space-u2003",
+    "no-thin-space-u2009",
+    "n-on-thin-space-u2009",
+    "no-figure-space-u2007",
+    "n-on-figure-space-u2007",
+    "no-narrow-nbsp-u202f",
+    "n-on-narrow-nbsp-u202f",
+    "no-ideographic-space-u3000",
+    "n-on-ideographic-space-u3000",
+    "no-line-separator-u2028",
+    "n-on-line-separator-u2028",
+    "no-paragraph-separator-u2029",
+    "n-on-paragraph-separator-u2029",
+    "no-literal-u-e000",
+    "n-on-literal-u-e000",
+    "no-literal-u-e001",
+    "n-on-literal-u-e001",
 )
 DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOYS = (
     "A non\ue000dry run never writes or replaces the canonical record.",
@@ -880,6 +953,17 @@ def test_never_canonical_pin_rejects_the_split_negation_decoys(
     subject: str,
 ) -> None:
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_ZS_SPLIT_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_ZS_SPLIT_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_non_ascii_whitespace_split_decoys(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
 
 
 @pytest.mark.parametrize(
