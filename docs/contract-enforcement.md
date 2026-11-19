@@ -8,6 +8,19 @@ is resolved through `bundlebees_plugin/settings.py`. The gate module is
 `contract_gate.py` — `dispatch.py` in the same package is the unrelated
 lease-payload server and plays no part in enforcement.
 
+## Live path: report-only
+
+The live dispatch path (`tools._dispatch_acdd`) still enforces the frozen-hash
+and brief-vs-contract checks unchanged. Its provenance and acceptance-id checks
+run in **report-only** mode: the `acdd` block gains
+`gate={mode: report_only, would_refuse, acceptance_ids, provenance}` and the
+findings are appended to `<state>/contract-gate/report-only.jsonl`. Nothing is
+refused by them, and enforcement stays off until Kyle enables it.
+
+`contract_gate.gate()` and `contract_gate.dispatch()` are **not** called by the
+live path. `python3 -m bundlebees_plugin.contract_gate check BRIEF.json` is a
+dry-run operator tool: it reports what enforcement would decide.
+
 ## Where the flag lives
 
 `require_contract` is **durable configuration**, not session state. It is read
@@ -59,10 +72,11 @@ rollout. Any other profile stays legacy until its owner sets the flag.
 
 ## The dispatch gate
 
-`contract_gate.gate(brief, config=...)` runs before any launcher call and returns
-the `acdd` envelope block, or raises `ContractRefusal`. `contract_gate.dispatch(
-brief, config=..., send=...)` refuses first and only then performs the send,
-so a refused brief never reaches the launcher. The CLI dry run is
+`contract_gate.gate(brief, config=...)` returns the `acdd` envelope block, or
+raises `ContractRefusal`. `contract_gate.dispatch(brief, config=..., send=...)`
+refuses first and only then performs the send, so a refused brief never reaches
+the launcher. Neither is called by the live dispatch path (see above); this
+section describes the dry-run and future-enforcement tool. The CLI dry run is
 `python3 -m bundlebees_plugin.contract_gate check BRIEF.json` (exit 0 admitted,
 exit 1 refused, the refusal JSON on stdout; an unreadable brief file refuses
 with `brief_invalid` instead of a traceback).
@@ -79,7 +93,7 @@ All refusal text is scrubbed the same way tool envelopes are.
 
 ## Validation before dispatch
 
-An attached contract is checked, in order, before dispatch:
+An attached contract is checked, in order, by the gate's dry run:
 
 | Refusal code | Meaning | Fix |
 |---|---|---|
@@ -103,13 +117,15 @@ Two checks deserve their own paragraphs:
   checkout's `HEAD` exactly — the same pin `job` creation seals — and a packet
   whose `contract_sha256` (or embedded contract body) belongs to a different
   contract is refused as `contract_changed`. Unresolvable provenance fails
-  closed; it never passes on a maybe.
+  closed in the dry run; it never passes on a maybe. On the live path these
+  provenance findings are report-only.
 - **Acceptance-id consistency.** Every artifact that names acceptance ids —
   the packet's `acceptance_ids`, the brief's acceptance criteria, and any
   verification evidence records' `criteria` — must draw only on ids the frozen
   contract defines, and the packet must carry the contract's complete id set.
   An invented id would bind evidence to nothing; a dropped one would leave a
-  criterion silently unjudged.
+  criterion silently unjudged. On the live path this check is report-only too;
+  it is enforced only in the dry run.
 
 Lease and scope checks speak in **exact file paths, never directories**: a
 lease entry like `docs/` is not a lease, and scope verification requires the
@@ -158,5 +174,6 @@ contract is always enforced there (`contract_invalid`, `contract_not_frozen`,
 and `require_contract: true` there refuses contract-free briefs with
 `contract_missing`. This module's enforced-scope refusal is `contract_required`
 — same semantics (no contract in an enforced scope), distinct code, so
-evidence can tell the two layers apart. Both refuse before any launcher call;
-neither can be satisfied by anything the worker returns later.
+evidence can tell the two layers apart. In the live path only `tools.py`'s gate
+runs; `contract_gate` is the dry-run/operator tool (see "Live path:
+report-only"), so its refusals are not applied there.

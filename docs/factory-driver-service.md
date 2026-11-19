@@ -35,26 +35,31 @@ and owns the dispatch gate itself. `--service` passes are flag-gated for the
 ready-column observation described below; unset, the pass result and the
 filesystem are unchanged.
 
-## Triggers: events first, the heartbeat last
+## Triggers: events first, the sweep backstop last
 
-The 30-minute heartbeat is **the reconcile safety net only; it is no longer the
-primary trigger**. In order:
+The Hermes 30-minute heartbeat does **not** call `beat.beat()`; it is an LLM
+prompt job that works the campaign plan's slices and the merge stream. The
+reconcile safety net is the driver's own opt-in, rate-limited `--sweep`
+backstop. In order:
 
 1. **Landing event (seconds).** A bee landing writes a completion event into
    `events/inbox/<subscriber>/`; the driver service wakes on it (inotify, with
    a bounded poll fallback) and runs one pass. This is the primary path.
 2. **Scout hook (about 2 minutes).** When the resident service is not running,
-   the 2-minute scout can call the hook so a completed attempt triggers exactly
-   one driver pass instead of waiting for the beat. The hook is a trigger, not
+   the 2-minute scout turns a finished (terminal) attempt into an immediate
+   factory pass, and the driver ingests the landing. The hook is a trigger, not
    a second driver.
-3. **Heartbeat (30 minutes).** `beat.beat()` reconciles what the push triggers
-   missed: the completed-attempt sweep, the merge stream, and the flag-gated
-   ready-column observation. It repairs state; it is not what normally starts a
-   landing's verification or dispatch.
+3. **Reconciliation backstop (`--sweep`).** Started with `--sweep`, each driver
+   pass may run `beat.beat()` — the launcher-vs-origin diff — as a
+   **classify-only** backstop, at most once per `--sweep-interval-s` (default
+   1800 s). The last-run marker is `factory/sweep-last.json`. It is off by
+   default and never starts a landing's verification or dispatch.
 
-An idle beat turn is therefore expected and healthy. A landing that only the
-beat noticed is a defect in the event path, and the beat report shows the
-attempt age that made it visible.
+Every pass result carries a `sweep` key: `not_configured` when `--sweep` is
+off, `skipped` (reason `interval`, with `next_in_s`) while the rate limit
+holds, otherwise the beat report. An empty sweep is therefore expected and
+healthy. A landing that only the sweep noticed is a defect in the event path,
+and the sweep report shows the attempt age that made it visible.
 
 ## Ready-column stocking (flag-gated)
 
