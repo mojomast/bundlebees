@@ -57,6 +57,19 @@ backstop. In order:
    passes `--sweep`, so the deployed service runs it. It never starts a
    landing's verification or dispatch.
 
+The sweep is classify-only end to end: the driver calls
+`beat_reconciliation.sweep(..., processor=None, record=False, claim=False)`
+directly, so it writes no sweep record or claim files and never runs the
+board-stock duty (which can post a kanban comment). Its only file is the
+rate-limit marker; a future-dated marker (clock skew) is ignored. The launcher
+is read through `launcher_adapter.LauncherAdapter`, and the origin view runs
+`git ls-remote` with `child_env()` and `GIT_TERMINAL_PROMPT=0` in the
+`--repo` checkout, which must be a local checkout whose origin the service user
+can reach without a prompt. No PR view is wired: the report says
+`pr_view: "unavailable"` and lists ledger records that say "pushed, no PR yet"
+under `unverified` rather than as gaps. A pushed branch with no ledger record is
+skipped as `branch_on_origin`.
+
 Every pass result carries a `sweep` key: `not_configured` when `--sweep` is
 off, `skipped` (reason `interval`, with `next_in_s`) while the rate limit
 holds, otherwise the beat report. An empty sweep is therefore expected and

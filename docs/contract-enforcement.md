@@ -15,7 +15,12 @@ and brief-vs-contract checks unchanged. Its provenance and acceptance-id checks
 run in **report-only** mode: the `acdd` block gains
 `gate={mode: report_only, would_refuse, acceptance_ids, provenance}` and the
 findings are appended to `<state>/contract-gate/report-only.jsonl`. Nothing is
-refused by them, and enforcement stays off until Kyle enables it.
+refused by them. There is no setting for this: the mode is the constant
+`CONTRACT_GATE_MODE = "report_only"` in `bundlebees_plugin/tools.py`, so
+turning enforcement on is a deliberate, reviewed code change. Findings rotate to
+`report-only.jsonl.1` once the log passes 1 MiB. The pinned workflow HEAD is
+cached per process for 30 s and git is given 5 s, so dispatch never waits on a
+slow checkout; an unresolvable checkout is still `provenance_unavailable`.
 
 `contract_gate.gate()` and `contract_gate.dispatch()` are **not** called by the
 live path. `python3 -m bundlebees_plugin.contract_gate check BRIEF.json` is a
