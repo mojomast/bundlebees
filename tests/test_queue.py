@@ -204,6 +204,68 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual([item.feature_id for item in items], ["f1"])
                 self.assertEqual(items[0].job_id, "job_1")
 
+    def test_a_features_map_refuses_two_keys_that_strip_to_the_same_id(self):
+        first = {"schema": "bundlebees.queue/1", "features": {"f1": {"job_id": "j1"}, " f1 ": {"job_id": "j2"}}}
+        second = {"schema": "bundlebees.queue/1", "features": {" f1 ": {"job_id": "j2"}, "f1": {"job_id": "j1"}}}
+        for document in (first, second):
+            for action in ("list", "get"):
+                with self.subTest(features=document["features"], action=action):
+                    self.path.write_text(json.dumps(document))
+                    before = self.path.read_bytes()
+                    queue = Q.JsonQueue(self.path)
+
+                    with self.assertRaises(Q.QueueError) as caught:
+                        if action == "list":
+                            queue.list_items()
+                        else:
+                            queue.get("f1")
+
+                    self.assertEqual(caught.exception.code, "queue_invalid")
+                    self.assertIn("'f1'", str(caught.exception))
+                    self.assertIn("' f1 '", str(caught.exception))
+                    self.assertIn("'f1'", caught.exception.message)
+                    self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+                    self.assertIn("rename or remove", caught.exception.fix)
+                    self.assertEqual(self.path.read_bytes(), before, "a refused document must not be rewritten")
+
+    def test_a_features_map_accepts_a_padded_key_that_does_not_collide(self):
+        self._write_live_envelope({" f2 ": {"job_id": "j2"}, "f3": {"job_id": "j3"}})
+
+        items = Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual([item.feature_id for item in items], ["f2", "f3"])
+
+    def test_a_flat_map_keeps_raw_keys_distinct_when_only_padding_differs(self):
+        self.path.write_text(
+            json.dumps({" f1 ": {"job_id": "j1"}, "f1": {"job_id": "j2"}})
+        )
+        queue = Q.JsonQueue(self.path)
+
+        items = queue.list_items()
+
+        self.assertEqual([item.feature_id for item in items], [" f1 ", "f1"])
+        self.assertEqual(queue.get(" f1 ").job_id, "j1")
+        self.assertEqual(queue.get("f1").job_id, "j2")
+
+    def test_the_features_list_duplicate_id_refusal_keeps_its_existing_message(self):
+        self._write_live_envelope(
+            [{"feature_id": "f1", "job_id": "j1"}, {"id": " f1 ", "job_id": "j2"}]
+        )
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertEqual(
+            str(caught.exception),
+            "queue feature 'f1' appears more than once (indices 0 and 1)",
+        )
+        self.assertEqual(
+            caught.exception.fix,
+            "Repair the queue file: remove or rename the duplicate 'f1' card so each "
+            "feature id appears once.",
+        )
+
     def test_a_features_list_refuses_two_cards_with_the_same_feature_id(self):
         for cards in (
             [{"feature_id": "f1", "job_id": "j1"}, {"feature_id": "f1", "job_id": "j2"}],
@@ -1660,6 +1722,13 @@ class QueueIdentityDocsTests(unittest.TestCase):
     def test_a_blank_or_non_string_declared_id_is_ignored(self):
         self.assertIn(
             "A blank or non-string `feature_id`/`id` is not an identity and is ignored.",
+            self.section,
+        )
+
+    def test_features_map_keys_that_differ_only_in_padding_are_refused_as_ambiguous(self):
+        self.assertIn(
+            "In the features-map shape the trimmed key is the id, so two keys that differ "
+            "only in padding resolve to one id and are refused as ambiguous.",
             self.section,
         )
 

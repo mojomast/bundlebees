@@ -76,7 +76,9 @@ exactly as written. A card body may omit `feature_id`/`id` or restate that id.
 Any differing declared `feature_id`/`id` refuses the whole document with
 `queue_invalid`; a refused document is never partially read. A blank map key is
 refused. Ids are compared after trimming surrounding whitespace, but trimming
-does not merge two map keys that differ only in surrounding padding. A blank or
+does not merge two map keys that differ only in surrounding padding. In the
+features-map shape the trimmed key is the id, so two keys that differ only in
+padding resolve to one id and are refused as ambiguous. A blank or
 non-string `feature_id`/`id` is not an identity and is ignored. Keep keys
 unpadded: the flat-map entry id is the key as written.
 
