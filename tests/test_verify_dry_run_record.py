@@ -370,6 +370,7 @@ DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non\u2015dry run never writes or replaces the canonical record.",
     "A non\u2212dry run never writes or replaces the canonical record.",
     "A non\uff0ddry run never writes or replaces the canonical record.",
+    "A non  dry run never writes or replaces the canonical record.",
 )
 DECOY_CORPUS = (
     "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
