@@ -352,6 +352,12 @@ DRY_RUN_NEVER_CANONICAL_SUBJECTS = (
     "A dry\u2014run never writes or replaces the canonical record.",
     "A dry  run never writes or replaces the canonical record.",
 )
+DRY_RUN_NEVER_CANONICAL_EXTENDED_SUBJECTS = (
+    "A dry\u2012run never writes or replaces the canonical record.",
+    "A dry\u2015run never writes or replaces the canonical record.",
+    "A dry\u2212run never writes or replaces the canonical record.",
+    "A dry\uff0drun never writes or replaces the canonical record.",
+)
 DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non-dry-run never writes or replaces the canonical record.",
     "A non dry run never writes or replaces the canonical record.",
@@ -623,6 +629,17 @@ def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
     "subject", DRY_RUN_NEVER_CANONICAL_SUBJECTS, ids=range(len(DRY_RUN_NEVER_CANONICAL_SUBJECTS))
 )
 def test_never_canonical_pin_accepts_the_subject_table(subject: str) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_EXTENDED_SUBJECTS,
+    ids=["figure-dash", "horizontal-bar", "minus-sign", "fullwidth-hyphen"],
+)
+def test_never_canonical_pin_accepts_the_extended_separator_subjects(
+    subject: str,
+) -> None:
     assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
 
 
@@ -1154,6 +1171,14 @@ def test_skill_reference_row_pin_rejects_a_prose_flag_cell(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     row = _row_with_first_cell(" Run with --dry-run to preview ")
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_prose_letters_after_a_flag_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" `--dry-run` use this to preview ")
     with pytest.raises(AssertionError, match="missing"):
         _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
 
