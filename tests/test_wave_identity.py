@@ -33,11 +33,16 @@ class WaveIdentity(unittest.TestCase):
             (waves / "w1.json").write_text(json.dumps({"attempts": ["att_1"], "head_sha": "a" * 40}))
 
             before = (waves / "w1.json").read_bytes()
-            for job_id, attempt in (("job_a", "att_1"), ("job_b", "att_2")):
-                with self.assertRaises(integrate_job.IntegrateError) as refused:
-                    integrate_job.adopt_legacy_wave(Path(tmp), wave=f"{job_id}.w1", legacy="w1", attempts=[attempt])
-                self.assertEqual(refused.exception.code, "wave_reconciliation_required")
-                self.assertFalse((waves / f"{job_id}.w1.json").exists())
+            with self.assertRaises(integrate_job.IntegrateError) as refused:
+                integrate_job.adopt_legacy_wave(Path(tmp), wave="job_a.w1", legacy="w1", attempts=["att_1"])
+            self.assertEqual(refused.exception.code, "wave_reconciliation_required")
+            # A record whose attempts are provably another job's is foreign: it
+            # still cannot be adopted, and it must not refuse this job either.
+            self.assertIsNone(
+                integrate_job.adopt_legacy_wave(Path(tmp), wave="job_b.w1", legacy="w1", attempts=["att_2"])
+            )
+            self.assertFalse((waves / "job_a.w1.json").exists())
+            self.assertFalse((waves / "job_b.w1.json").exists())
             self.assertEqual((waves / "w1.json").read_bytes(), before)
 
     def test_an_existing_per_job_record_is_never_overwritten(self):
