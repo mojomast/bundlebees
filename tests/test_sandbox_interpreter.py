@@ -23,6 +23,21 @@ import yaml
 
 from bundlebees_plugin import sandbox
 
+#: ``run_in_sandbox`` reads these two git facts before the wrapper to decide whether the workdir
+#: is a checkout whose HEAD must be staged. They are part of the exact call sequence, not noise.
+_GIT_METADATA_READS = ("--is-bare-repository", "--show-toplevel")
+
+
+def _is_git_metadata_read(command: list[str]) -> bool:
+    """True for the two named git metadata reads, and nothing else git-shaped."""
+    return (
+        len(command) == 5
+        and command[0] == "git"
+        and command[1] == "-C"
+        and command[3] == "rev-parse"
+        and command[4] in _GIT_METADATA_READS
+    )
+
 
 def _exe(path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +111,7 @@ class TestRunInSandbox:
         self.work.mkdir()
         self.probes: list[int] = []      # what the faked jail reports, in order
         self.calls: list[list[str]] = []
+        self.git_reads: list[list[str]] = []
 
         class Done:
             def __init__(self, returncode=0):
@@ -104,7 +120,10 @@ class TestRunInSandbox:
                 self.stderr = ""
 
         def fake_run(command, **kwargs):
-            command = list(command)
+            command = [str(part) for part in command]
+            if _is_git_metadata_read(command):
+                self.git_reads.append(command)
+                return Done()
             if any("test -x" in str(part) for part in command):
                 return Done(self.probes.pop(0) if self.probes else 1)
             self.calls.append(command)
@@ -113,13 +132,15 @@ class TestRunInSandbox:
         monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
 
     def _run(self, argv=None):
-        return sandbox.run_in_sandbox(
+        result = sandbox.run_in_sandbox(
             self.work,
             list(argv or [sys.executable, "-c", "print(1)"]),
             backend="firejail",
             probe=lambda name: True,
             which=lambda name: "/usr/bin/" + name,
         )
+        assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        return result
 
     def test_a_hidden_interpreter_refuses_before_running_the_command(self):
         self.probes = [1]
@@ -129,6 +150,7 @@ class TestRunInSandbox:
         assert "verify_python" in caught.value.fix
         assert "no suitable" in caught.value.error  # names the wrapper message it replaces
         assert self.calls == []
+        assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
 
     def test_a_visible_interpreter_runs_unchanged(self):
         self.probes = [0]
@@ -153,6 +175,7 @@ class TestRunInSandbox:
             self._run()
         assert caught.value.code == "sandbox_interpreter_hidden"
         assert self.calls == []
+        assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
 
     def test_a_visible_configured_interpreter_is_used_as_is(self, monkeypatch):
         monkeypatch.setenv(sandbox.PYTHON_ENV, self.outer)
