@@ -280,7 +280,9 @@ SKILL_REFERENCE_DOC = (
 DECOY_SKILL_REFERENCE_DOC = SKILL_REFERENCE_DOC
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
-DRY_RUN_SUBJECT_SEPARATORS = "- \u00a0\u2010\u2011\u2013\u2014"
+DRY_RUN_SUBJECT_SEPARATORS = (
+    "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
+)
 DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
     rf"(?<!non[{DRY_RUN_SUBJECT_SEPARATORS}])(?<!non  )"
     rf"dry[{DRY_RUN_SUBJECT_SEPARATORS}\s]+runs?\b.{{0,240}}?"
@@ -321,6 +323,8 @@ OVERBROAD_DRY_RUN_FORMS = (
     "writes only verify-results/dry-run/<attempt_id>.json",
     "Dry runs write only `verify-results/dry-run/<attempt_id>.json`",
     "Dry run writes only `verify-results/dry-run/<attempt_id>.json`",
+    "Dry runs write only: `verify-results/dry-run/<attempt_id>.json`",
+    "Dry runs write only to `verify-results/dry-run/<attempt_id>.json`",
 )
 CHANGELOG_CRASH_SPLIT = (
     "A failed replace in `cli._write_verify_result` leaves the previous record "
@@ -347,6 +351,12 @@ DRY_RUN_NEVER_CANONICAL_SUBJECTS = (
     "A dry\u2013run never writes or replaces the canonical record.",
     "A dry\u2014run never writes or replaces the canonical record.",
     "A dry  run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_EXTENDED_SUBJECTS = (
+    "A dry\u2012run never writes or replaces the canonical record.",
+    "A dry\u2015run never writes or replaces the canonical record.",
+    "A dry\u2212run never writes or replaces the canonical record.",
+    "A dry\uff0drun never writes or replaces the canonical record.",
 )
 DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non-dry-run never writes or replaces the canonical record.",
@@ -406,11 +416,14 @@ def _doc_paragraphs(path: Path) -> list[str]:
 
 def _normalized_overbroad_text(text: str) -> str:
     normalized = text.casefold().replace("`", "").replace("*", "")
-    normalized = re.sub(r"[-\u2010\u2011\u2013\u2014]", " ", normalized)
+    normalized = re.sub(
+        r"[-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d]", " ", normalized
+    )
     return " ".join(normalized.split())
 
 
-_DRY_RUN_CELL_ALIASES = ("--dry-run", "-n")
+_DRY_RUN_CELL_ALIASES = ("--dry-run",)
+_DRY_RUN_CELL_SUFFIX = re.compile(r"^(?:[\s\W_]|\([^()]*\)|\[[^\[\]]*\])*$")
 
 
 def _clean_flag_cell(cell: str) -> str:
@@ -419,10 +432,19 @@ def _clean_flag_cell(cell: str) -> str:
 
 
 def _cell_declares_dry_run(cell: str) -> bool:
-    return any(
+    cleaned = _clean_flag_cell(cell)
+    if any(
         part.strip() in _DRY_RUN_CELL_ALIASES
-        for part in _clean_flag_cell(cell).split(",")
-    )
+        for part in cleaned.split(",")
+    ):
+        return True
+    if not cleaned.startswith("--dry-run"):
+        return False
+    return bool(_DRY_RUN_CELL_SUFFIX.fullmatch(cleaned[len("--dry-run"):]))
+
+
+def _cell_is_flag_token(cell: str) -> bool:
+    return bool(re.fullmatch(r"-{1,2}[a-z][\w-]*", _clean_flag_cell(cell)))
 
 
 def _cell_mentions_dry_run_flag(cell: str) -> bool:
@@ -433,7 +455,7 @@ def _cell_mentions_dry_run_flag(cell: str) -> bool:
 
 def _skill_reference_dry_run_row(document: str) -> str:
     first_cell_rows: list[str] = []
-    non_first_cell_rows: list[str] = []
+    non_first_cell_rows: list[tuple[str, str]] = []
     for line in document.splitlines():
         stripped = line.strip()
         if not stripped.startswith("|"):
@@ -446,9 +468,12 @@ def _skill_reference_dry_run_row(document: str) -> str:
         if _cell_declares_dry_run(cells[0]):
             first_cell_rows.append(line)
         elif any(_cell_mentions_dry_run_flag(cell) for cell in cells[1:]):
-            non_first_cell_rows.append(line)
+            non_first_cell_rows.append((line, cells[0]))
     if not first_cell_rows:
-        if non_first_cell_rows:
+        if any(
+            not _cell_is_flag_token(first_cell)
+            for _line, first_cell in non_first_cell_rows
+        ):
             raise AssertionError(
                 "the skill reference has a --dry-run flag row but the flag is not "
                 "in the first cell; the --dry-run flag must be in the first cell"
@@ -604,6 +629,17 @@ def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
     "subject", DRY_RUN_NEVER_CANONICAL_SUBJECTS, ids=range(len(DRY_RUN_NEVER_CANONICAL_SUBJECTS))
 )
 def test_never_canonical_pin_accepts_the_subject_table(subject: str) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_EXTENDED_SUBJECTS,
+    ids=["figure-dash", "horizontal-bar", "minus-sign", "fullwidth-hyphen"],
+)
+def test_never_canonical_pin_accepts_the_extended_separator_subjects(
+    subject: str,
+) -> None:
     assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
 
 
@@ -993,9 +1029,7 @@ def test_skill_reference_row_pin_accepts_a_bold_flag_cell(
     _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
 
 
-@pytest.mark.parametrize(
-    "first_cell", ["--dry-run", "-n"], ids=["long-alias", "short-alias"]
-)
+@pytest.mark.parametrize("first_cell", ["--dry-run"], ids=["long-alias"])
 def test_skill_reference_row_pin_accepts_an_alias_flag_cell(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_cell: str
 ) -> None:
@@ -1050,4 +1084,101 @@ def test_skill_reference_row_pin_negative_control_decoy_global(
     with pytest.raises(pytest.fail.Exception, match="DID NOT RAISE"):
         with pytest.raises(AssertionError, match="overbroad"):
             TestVerifyRecordDocs().test_skill_reference_dry_run_flag_row_scopes_the_side_record()
+
+
+def _first_cell_of_row(line: str) -> str:
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return ""
+    cells = stripped.split("|")[1:]
+    if cells and not cells[-1].strip():
+        cells = cells[:-1]
+    return cells[0] if cells else ""
+
+
+def test_shipped_skill_reference_without_its_dry_run_row_reports_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    document = SKILL_REFERENCE_DOC.read_text(encoding="utf-8")
+    lines = document.splitlines()
+    kept = [
+        line
+        for line in lines
+        if not _cell_declares_dry_run(_first_cell_of_row(line))
+    ]
+    assert len(kept) == len(lines) - 1
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(
+            monkeypatch, tmp_path, "\n".join(kept) + "\n"
+        )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "Dry\u2012runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry\u2015runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry\uff0druns write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry\u2212runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry runs write only: `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry runs write only to `verify-results/dry-run/<attempt_id>.json`.",
+    ],
+    ids=[
+        "figure-dash",
+        "horizontal-bar",
+        "fullwidth-hyphen",
+        "minus-sign",
+        "colon-form",
+        "write-only-to",
+    ],
+)
+def test_skill_reference_row_pin_rejects_extended_overbroad_forms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+) -> None:
+    row = _row_with_suffix(suffix)
+    with pytest.raises(AssertionError, match="overbroad"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_a_bare_short_alias_flag_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" -n ")
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_accepts_a_combined_alias_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" `--dry-run`, `-n` ")
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+@pytest.mark.parametrize(
+    "first_cell",
+    [" `--dry-run` (preview) ", " `--dry-run`, ", " **`--dry-run`** "],
+    ids=["parenthetical-note", "trailing-punctuation", "bold-marker"],
+)
+def test_skill_reference_row_pin_accepts_decorated_flag_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_cell: str
+) -> None:
+    row = _row_with_first_cell(first_cell)
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_a_prose_flag_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" Run with --dry-run to preview ")
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_prose_letters_after_a_flag_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" `--dry-run` use this to preview ")
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
 
