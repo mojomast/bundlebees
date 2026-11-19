@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -2465,7 +2466,15 @@ def _write_verify_result(
         if dry_run
         else f"verify-results/{attempt_id}.json"
     )
-    target = Path(contain_path(relative, str(state_dir)))
+    try:
+        target = Path(contain_path(relative, str(state_dir)))
+    except ValueError as exc:
+        raise CliError(
+            "state_dir_uncontained",
+            f"verify record {relative} resolves outside the state directory root <state_dir>",
+            "Point --state-dir at a directory you own, and remove or repair the offending "
+            "symlink or entry under verify-results.",
+        ) from exc
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "attempt_id": attempt_id,
@@ -2501,12 +2510,36 @@ def _write_verify_result(
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
-    text = json.dumps(clean, indent=2, sort_keys=True) + "\n"
-    target.write_text(text, encoding="utf-8")
+    data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    tmp_path: str | None = None
+    handle = None
     try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        tmp_path = handle.name
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target)
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return target
 
 
@@ -2918,6 +2951,12 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 files=files, tests=tests, evidence=evidence,
                 code=str(exc.code), error=reason, dry_run=dry_run,
             )
+        except CliError as record_exc:
+            if record_exc.code == "state_dir_uncontained":
+                print(
+                    f"warning: verify record was NOT written (code {record_exc.code})",
+                    file=sys.stderr,
+                )
         except Exception:  # noqa: BLE001 - preserve the original CLI error
             pass
         if exc.code not in ("lease_missing", "lease_tampered", "lease_invalid"):

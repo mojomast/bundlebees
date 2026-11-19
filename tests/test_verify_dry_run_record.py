@@ -502,3 +502,156 @@ def test_flags_alone_keep_their_existing_routes(
     )
     assert cli._dispatch(ctx, dry_args) == 0
     assert calls == ["commit_local", "dry_run"]
+
+
+def _plant_outside(state: Path, tmp_path: Path) -> Path:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    results = state / "verify-results"
+    results.mkdir(parents=True, exist_ok=True)
+    return outside
+
+
+def _plant_dry_run_symlink(state: Path, tmp_path: Path) -> Path:
+    outside = _plant_outside(state, tmp_path)
+    try:
+        (state / "verify-results" / "dry-run").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    return outside
+
+
+def test_green_dry_run_refuses_a_symlinked_side_record_directory(
+    tmp_path: Path, green_sandbox: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo, _remote, base_sha = _repo(tmp_path)
+    state = tmp_path / "state"
+    _lease(state, base_sha)
+    outside = _plant_dry_run_symlink(state, tmp_path)
+    client = FakeClient(_result(IN_LEASE_PATCH, base_rev=base_sha))
+
+    rc = _invoke(_ctx(client), _verify_argv(repo, state, "--dry-run"))
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc != 0
+    assert "state_dir_uncontained" in output
+    assert "internal_error" not in output
+    assert not (state / "verify-results" / f"{ATTEMPT_ID}.json").exists()
+    assert list(outside.iterdir()) == []
+    assert not _side_record(state).exists()
+
+
+def test_refused_dry_run_warns_when_the_side_record_is_uncontained(
+    tmp_path: Path, green_sandbox: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo, _remote, base_sha = _repo(tmp_path)
+    state = tmp_path / "state"
+    _lease(state, base_sha)
+    official = _seed_official(state)
+    before_sha, before_mtime = _snapshot(official)
+    outside = _plant_dry_run_symlink(state, tmp_path)
+    client = FakeClient(_result(OUT_OF_LEASE_PATCH, base_rev=base_sha))
+
+    rc = _invoke(_ctx(client), _verify_argv(repo, state, "--dry-run"))
+
+    captured = capsys.readouterr()
+    warnings = [line for line in captured.err.splitlines() if line.startswith("warning:")]
+    assert rc != 0
+    assert "scope_violation" in captured.out
+    assert "internal_error" not in captured.out
+    assert len(warnings) == 1
+    assert "state_dir_uncontained" in warnings[0]
+    assert "NOT written" in warnings[0]
+    assert _sha256(official) == before_sha
+    assert official.stat().st_mtime_ns == before_mtime
+    assert list(outside.iterdir()) == []
+    assert not _side_record(state).exists()
+
+
+def test_atomic_record_write_keeps_the_previous_target_when_replace_fails(
+    tmp_path: Path, green_sandbox: None, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, _remote, base_sha = _repo(tmp_path)
+    state = tmp_path / "state"
+    _lease(state, base_sha)
+    side = _side_record(state)
+    side.parent.mkdir(parents=True, exist_ok=True)
+    original = b'{"attempt_id": "att-1", "ok": true, "seeded": true}\n'
+    side.write_bytes(original)
+    before_sha, before_mtime = _snapshot(side)
+
+    def fail_replace(src, dst):
+        raise OSError("replace refused")
+
+    monkeypatch.setattr(cli.os, "replace", fail_replace)
+    client = FakeClient(_result(IN_LEASE_PATCH, base_rev=base_sha))
+
+    rc = _invoke(_ctx(client), _verify_argv(repo, state, "--dry-run"))
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc != 0
+    assert "internal_error" in output or "replace refused" in output
+    assert _sha256(side) == before_sha
+    assert side.stat().st_mtime_ns == before_mtime
+    assert side.read_bytes() == original
+    assert sorted(p.name for p in side.parent.iterdir()) == [side.name]
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["canonical", "side"])
+def test_containment_refusal_is_typed_for_both_record_paths(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    state = tmp_path / "state"
+    outside = _plant_outside(state, tmp_path)
+    try:
+        if dry_run:
+            (state / "verify-results" / "dry-run").symlink_to(outside, target_is_directory=True)
+            relative = f"verify-results/dry-run/{ATTEMPT_ID}.json"
+            escaped = outside / f"{ATTEMPT_ID}.json"
+        else:
+            (state / "verify-results" / f"{ATTEMPT_ID}.json").symlink_to(
+                outside / "escaped.json"
+            )
+            relative = f"verify-results/{ATTEMPT_ID}.json"
+            escaped = outside / "escaped.json"
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(cli.CliError) as excinfo:
+        cli._write_verify_result(
+            state, ATTEMPT_ID, ok=True, sha=None, branch=BRANCH,
+            files=["src/a.py"], tests=["tests/test_sample.py"], dry_run=dry_run,
+        )
+
+    assert excinfo.value.code == "state_dir_uncontained"
+    assert relative in excinfo.value.error
+    assert "state dir" in excinfo.value.error.lower()
+    assert "remove or repair" in excinfo.value.fix.lower()
+    assert not escaped.exists()
+    assert not list(state.rglob("*.tmp"))
+
+
+def test_successful_verify_records_leave_no_temp_artifacts(
+    tmp_path: Path, green_sandbox: None
+) -> None:
+    repo, _remote, base_sha = _repo(tmp_path)
+    state = tmp_path / "state"
+    _lease(state, base_sha)
+    client = FakeClient(_result(IN_LEASE_PATCH, base_rev=base_sha))
+    argv = _verify_argv(repo, state, "--dry-run")
+
+    assert _invoke(_ctx(client), argv) == 0
+    side_dir = _side_record(state).parent
+    assert sorted(p.name for p in side_dir.iterdir()) == [f"{ATTEMPT_ID}.json"]
+    assert not list(state.rglob("*.tmp"))
+
+    _git(repo, "reset", "--hard", base_sha)
+    assert _invoke(_ctx(client), _verify_argv(repo, state)) == 0
+    canonical = state / "verify-results" / f"{ATTEMPT_ID}.json"
+    assert canonical.exists()
+    assert sorted(p.name for p in side_dir.iterdir()) == [f"{ATTEMPT_ID}.json"]
+    assert not list(state.rglob("*.tmp"))
+
