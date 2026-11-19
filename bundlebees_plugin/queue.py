@@ -115,11 +115,12 @@ class JsonQueue:
     Identity follows one id, one card. A features-list card resolves its id
     from ``feature_id`` and then ``id``; a card that declares both must use the
     same non-blank id for both, and two cards may not resolve to the same
-    non-blank id. In the features-as-map shape the map key is authoritative: a
-    card body may omit ``feature_id``/``id``, or restate the key (surrounding
-    whitespace is ignored), but a body id that names a different feature is
-    refused. Both violations are a ``queue_invalid`` :class:`QueueError` that
-    names the conflicting ids and carries a repair hint.
+    non-blank id. In the features-as-map and flat-map shapes the map key is
+    authoritative: a card body may omit ``feature_id``/``id``, or restate the
+    key (surrounding whitespace is ignored), but a body id that names a
+    different feature is refused. All such violations are a ``queue_invalid``
+    :class:`QueueError` that names the conflicting ids and carries a repair
+    hint.
 
     Read-time id syntax is not validated here: an id such as ``"feat/1"`` is
     accepted by this reader and is only refused later by :class:`QueueStore`
@@ -244,7 +245,17 @@ class JsonQueue:
                     f"queue item {feature_id!r} is not an object",
                     "Repair the queue file: every item must be a JSON object.",
                 )
-            entries.append((str(feature_id), body))
+            raw_key = str(feature_id)
+            key = raw_key.strip()
+            for body_id in cls._declared_body_ids(body):
+                if body_id != key:
+                    raise QueueError(
+                        "queue_invalid",
+                        f"queue feature {key!r} carries body id {body_id!r}",
+                        f"Repair the queue file: the {key!r} card must use {key!r} as its "
+                        f"feature_id/id, or move the {body_id!r} card under that key.",
+                    )
+            entries.append((raw_key, body))
         return entries
 
     def _save(self, data: Any) -> None:
