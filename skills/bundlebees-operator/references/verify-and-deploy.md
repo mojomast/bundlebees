@@ -63,12 +63,15 @@ What verify does, in order:
 
 Verify writes `verify-results/<attempt_id>.json` with `attempt_id`, `ok`,
 `sha`, `branch`, `files`, `tests`, `at`, and `evidence` (`source_rev`,
-`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`). A non-dry-run
+`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`); a refusal adds
+`code` and `error`. A non-dry-run
 verify writes `verify-results/<attempt_id>.json` whether it passes or refuses;
 a refusal records `ok: false` with a `code` and `error`, and replaces any
-earlier canonical record for that attempt. A dry run writes its preview to
-`verify-results/dry-run/<attempt_id>.json` only and never writes or replaces
-the canonical record. It also appends a `verify` event to
+earlier canonical record for that attempt. `verify --commit-local` is the
+exception: it writes the canonical record only when it commits; a commit-local
+refusal writes no record and leaves any earlier one in place. A dry run writes
+its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes
+or replaces the canonical record. It also appends a `verify` event to
 `metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside the repo.
 
 ## Contract-first (ACDD) work
