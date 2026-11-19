@@ -1,9 +1,10 @@
 """A dry run previews a verification; it never replaces the official record.
 
 Every case drives the real ``cli._cmd_verify`` with a temporary lease/worktree,
-a fake client and a hermetic sandbox runner. The canonical
-``verify-results/<attempt>.json`` belongs to a committing verify; dry-run
-evidence goes to ``verify-results/dry-run/<attempt>.json``.
+a fake client and a hermetic sandbox runner. A non-dry-run ``verify
+<attempt_id>`` writes the canonical ``verify-results/<attempt>.json`` on green
+or refusal; a dry run writes only ``verify-results/dry-run/<attempt>.json``,
+and ``--commit-local`` writes the canonical record only when it commits.
 """
 
 from __future__ import annotations
@@ -277,9 +278,52 @@ SKILL_REFERENCE_DOC = (
 )
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
+STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
+DRY_RUN_SIDE_RECORD_PIN = re.compile(
+    rf"{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?(?:writes only|only)"
+    rf"[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
+    rf"|{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
+    rf"[^.]{{0,80}}?\bonly\b",
+    re.IGNORECASE,
+)
+DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
+    rf"{STANDALONE_DRY_RUN}\b.{{0,240}}?never writes or replaces"
+    rf".{{0,80}}?canonical record",
+    re.IGNORECASE,
+)
+COMMIT_LOCAL_EXCEPTION_PINS = (
+    re.compile(r"`?verify --commit-local`? is the exception", re.IGNORECASE),
+    re.compile(r"writes? the canonical record only when it commits", re.IGNORECASE),
+    re.compile(r"commit-local refusal writes no record", re.IGNORECASE),
+    re.compile(
+        r"leaves? (?:any )?earlier (?:one|canonical record) in place",
+        re.IGNORECASE,
+    ),
+)
+SKILL_REFUSAL_KEYS_PIN = re.compile(
+    r"(?:refusal|refused|refuses)[^.]{0,80}(?:adds?|includes?|appends?)"
+    r"[^.]{0,60}`?code`?[^.]{0,30}`?error`?",
+    re.IGNORECASE,
+)
+GREEN_RECORD_KEYS = (
+    "attempt_id",
+    "ok",
+    "sha",
+    "branch",
+    "files",
+    "tests",
+    "at",
+    "evidence",
+)
+
 
 def _doc_text(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").split())
+
+
+def _doc_paragraphs(path: Path) -> list[str]:
+    raw = path.read_text(encoding="utf-8")
+    return [" ".join(block.split()) for block in re.split(r"\n\s*\n", raw) if block.strip()]
 
 
 class TestVerifyRecordDocs:
@@ -305,16 +349,49 @@ class TestVerifyRecordDocs:
             text,
             re.IGNORECASE,
         ), f"{path.name} does not say a refusal replaces the canonical record"
-        assert re.search(
-            r"dry[- ]run.{0,200}verify-results/dry-run/<attempt_id>\.json",
-            text,
-            re.IGNORECASE,
-        ), f"{path.name} does not name the dry-run side record"
-        assert re.search(
-            r"dry[- ]run.{0,240}never writes or replaces.{0,80}canonical record",
-            text,
-            re.IGNORECASE,
+        paragraphs = _doc_paragraphs(path)
+        side_record = "verify-results/dry-run/<attempt_id>.json"
+        assert any(
+            side_record in paragraph and DRY_RUN_SIDE_RECORD_PIN.search(paragraph)
+            for paragraph in paragraphs
+        ), f"{path.name} does not name the dry-run side record as the only dry-run output"
+        assert any(
+            side_record in paragraph and DRY_RUN_NEVER_CANONICAL_PIN.search(paragraph)
+            for paragraph in paragraphs
         ), f"{path.name} does not say a dry run never writes or replaces the canonical record"
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_document_states_the_commit_local_exception(self, path: Path) -> None:
+        text = _doc_text(path)
+        missing = [pin.pattern for pin in COMMIT_LOCAL_EXCEPTION_PINS if not pin.search(text)]
+        assert not missing, (
+            f"{path.name} does not say a commit-local refusal writes no record "
+            f"and leaves any earlier one in place: {missing}"
+        )
+
+    def test_skill_reference_enumerates_the_refusal_keys(self) -> None:
+        paragraphs = _doc_paragraphs(SKILL_REFERENCE_DOC)
+        shape = [
+            paragraph
+            for paragraph in paragraphs
+            if "Verify writes `verify-results/<attempt_id>.json`" in paragraph
+        ]
+        assert len(shape) == 1, "the skill reference must have one record-shape paragraph"
+        for key in GREEN_RECORD_KEYS:
+            assert f"`{key}`" in shape[0], f"the record shape does not name {key}"
+        assert SKILL_REFUSAL_KEYS_PIN.search(shape[0]), (
+            "the record shape does not explicitly add code and error for a refusal"
+        )
+
+
+def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
+    decoy = (
+        "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
+        "passes or refuses; it never writes or replaces the dry-run canonical record at "
+        "`verify-results/dry-run/<attempt_id>.json`."
+    )
+    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy)
 
 
 def _verify_parser():
