@@ -25,7 +25,7 @@ Flags:
 | `--workdir <path>` | Existing clean worktree to use. Confined; no path escape. |
 | `--tests <name> ...` | Run these named tests. Repeated flags append their targets. |
 | `--commit-local` | Verify in an isolated worktree and create a local commit on `bb-verify/<attempt_id>`; never pushes. Cannot be combined with `--dry-run`; the pair is refused rather than interpreted. |
-| `--dry-run` | Apply the patch and run tests, then stop before any push. Dry-run evidence goes to `verify-results/dry-run/<attempt_id>.json` and never replaces the attempt record. Cannot be combined with `--commit-local`; the pair is refused rather than interpreted. |
+| `--dry-run` | Apply the patch and run tests, then stop before any push. A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes or replaces the canonical record. Cannot be combined with `--commit-local`; the pair is refused rather than interpreted. |
 | `--kanban-comment <text>` | Opt-in: after a green run, suggest or post a comment through the public kanban CLI. |
 
 What verify does, in order:
