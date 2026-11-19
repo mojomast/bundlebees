@@ -278,11 +278,35 @@ SKILL_REFERENCE_DOC = (
 )
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
-STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
+STANDALONE_DRY_RUN = (
+    r"(?<!non[ \-\u2010-\u2015])"
+    r"(?<!non [\-\u2010-\u2015])"
+    r"(?<!non[ ][\-\u2010-\u2015] )"
+    r"(?<!non[\-\u2010-\u2015] )"
+    r"(?<!non\t )"
+    r"(?<!non  )"
+    r"(?<!non\t)"
+    r"dry[ -]runs?\b"
+)
+SIDE_RECORD_PATH = r"verify-results/dry-run/<attempt_id>\.json"
+SIDE_RECORD_PATH_TEXT = "verify-results/dry-run/<attempt_id>.json"
+SIDE_RECORD_GAP_FORBIDDEN = (
+    r"(?:nothing|never|unless|when|after|before|if|no\s+longer|not"
+    r"|dry[ -]runs?|writes?)"
+)
 DRY_RUN_SIDE_RECORD_PIN = re.compile(
-    rf"{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?(?:writes only|only)"
+    rf"{STANDALONE_DRY_RUN}\b"
+    rf"(?:\s+now)?\s+writes?\s+"
+    rf"(?:(?!{SIDE_RECORD_GAP_FORBIDDEN}\b|`?{SIDE_RECORD_PATH})[^.;]){{0,40}}?"
+    rf"`?{SIDE_RECORD_PATH}`?(?:\s+only\b)?",
+    re.IGNORECASE,
+)
+
+BASE_STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
+BASE_DRY_RUN_SIDE_RECORD_PIN = re.compile(
+    rf"{BASE_STANDALONE_DRY_RUN}\b[^.]{{0,200}}?(?:writes only|only)"
     rf"[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
-    rf"|{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
+    rf"|{BASE_STANDALONE_DRY_RUN}\b[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
     rf"[^.]{{0,80}}?\bonly\b",
     re.IGNORECASE,
 )
@@ -392,6 +416,174 @@ def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
     )
     assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy)
+
+
+SUBJECT_CASES = (
+    ("singular-and-plural-space", "A dry run and Dry runs are standalone subjects.", True),
+    ("singular-and-plural-hyphen", "A dry-run and Dry-runs are standalone subjects.", True),
+    ("non-space", "A non dry run verify writes a record.", False),
+    ("non-hyphen", "A non-dry-run verify writes a record.", False),
+    ("non-en-dash", "A non\u2013dry-run verify writes a record.", False),
+    ("non-em-dash", "A non\u2014dry-run verify writes a record.", False),
+    ("non-spaced-hyphen", "A non - dry run verify writes a record.", False),
+    ("non-spaced-en-dash", "A non \u2013 dry run verify writes a record.", False),
+    ("non-spaced-em-dash", "A non \u2014 dry run verify writes a record.", False),
+    ("non-figure-dash", "A non\u2010dry-run verify writes a record.", False),
+    ("non-non-breaking-hyphen", "A non\u2011dry-run verify writes a record.", False),
+    ("non-space-before-en-dash", "A non \u2013dry-run verify writes a record.", False),
+    ("non-em-dash-before-space", "A non\u2014 dry run verify writes a record.", False),
+    ("non-double-space", "A non  dry run verify writes a record.", False),
+)
+
+
+@pytest.mark.parametrize(
+    "name, text, expected",
+    SUBJECT_CASES,
+    ids=[case[0] for case in SUBJECT_CASES],
+)
+def test_standalone_dry_run_subject_table(
+    name: str, text: str, expected: bool
+) -> None:
+    assert bool(re.search(STANDALONE_DRY_RUN, text, re.IGNORECASE)) is expected
+
+
+REVIEWER_DECOYS = (
+    (
+        "nothing_and_a_second_writer",
+        "A dry run writes nothing, and a committing verify writes "
+        "verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "does_not_write",
+        "A dry run doesn't write verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "will_not_write",
+        "A dry run won't write verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "fails_to_write",
+        "A dry run fails to write verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "no_longer_writes",
+        "A dry run no longer writes verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "previews_what_a_committing_verify_writes",
+        "A dry run previews the output that a committing verify writes to "
+        "verify-results/dry-run/<attempt_id>.json.",
+    ),
+    (
+        "shows_nothing_unless_the_operator_writes",
+        "A dry run shows nothing unless the operator writes "
+        "verify-results/dry-run/<attempt_id>.json.",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "name, decoy",
+    REVIEWER_DECOYS,
+    ids=[case[0] for case in REVIEWER_DECOYS],
+)
+def test_side_record_pin_rejects_a_reviewer_decoy(name: str, decoy: str) -> None:
+    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+
+
+def test_side_record_pin_rejects_the_prints_only_decoy() -> None:
+    decoy = (
+        "A dry run only prints and never writes "
+        "verify-results/dry-run/<attempt_id>.json."
+    )
+    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+
+
+def test_side_record_pin_rejects_the_committing_verify_decoy() -> None:
+    decoy = (
+        "A dry run only previews; only a committing verify writes "
+        "verify-results/dry-run/<attempt_id>.json."
+    )
+    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+    assert not DRY_RUN_SIDE_RECORD_PIN.search(
+        "only a committing verify writes verify-results/dry-run/<attempt_id>.json."
+    )
+
+
+def test_dry_run_never_canonical_pin_rejects_the_dash_decoy() -> None:
+    decoy = (
+        "A non\u2013dry-run verify never writes or replaces the canonical record."
+    )
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy)
+
+
+SHIPPED_SIDE_RECORD_SENTENCES = (
+    "A dry run writes only `verify-results/dry-run/<attempt_id>.json`",
+    "A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` only",
+)
+
+
+def test_shipped_documents_satisfy_the_strengthened_side_record_pin() -> None:
+    for path in REFERENCE_DOCS:
+        paragraphs = _doc_paragraphs(path)
+        assert any(
+            SIDE_RECORD_PATH_TEXT in paragraph
+            and DRY_RUN_SIDE_RECORD_PIN.search(paragraph)
+            for paragraph in paragraphs
+        ), f"{path.name} no longer states that a dry run writes the side record"
+        for policy in (DRY_RUN_SIDE_RECORD_PIN, DRY_RUN_NEVER_CANONICAL_PIN):
+            assert policy.search(_doc_text(path)), f"{path.name} lost a dry-run policy"
+
+
+def test_new_side_record_pin_is_strictly_stronger_than_the_base_pin() -> None:
+    for name, decoy in REVIEWER_DECOYS:
+        assert not BASE_DRY_RUN_SIDE_RECORD_PIN.search(decoy), name
+        assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy), name
+
+    base_accepts = (
+        "A dry run only prints and never writes "
+        "verify-results/dry-run/<attempt_id>.json.",
+        "A dry run only previews; only a committing verify writes "
+        "verify-results/dry-run/<attempt_id>.json.",
+    )
+    for decoy in base_accepts:
+        assert BASE_DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+        assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
+
+    for sentence in SHIPPED_SIDE_RECORD_SENTENCES:
+        assert BASE_DRY_RUN_SIDE_RECORD_PIN.search(sentence)
+        assert DRY_RUN_SIDE_RECORD_PIN.search(sentence)
+
+
+def test_changelog_crash_debris_sentence_is_corrected() -> None:
+    text = _doc_text(CHANGELOG_DOC)
+    assert not re.search(
+        r"crash or failed replace.{0,200}?no temporary file behind",
+        text,
+        re.IGNORECASE,
+    )
+    assert re.search(
+        r"hard process kill.{0,200}?\.<record>\.\*\.tmp", text, re.IGNORECASE
+    )
+    assert re.search(r"no reader reads", text, re.IGNORECASE)
+
+    bullet = next(
+        paragraph
+        for paragraph in _doc_paragraphs(CHANGELOG_DOC)
+        if "Verify records refuse uncontained state paths" in paragraph
+    )
+    for token in (
+        "0600",
+        "os.replace",
+        "byte-identical",
+        "failed write or replace",
+        "finally",
+    ):
+        assert token in bullet, f"the crash-durability bullet no longer documents {token}"
+    assert "cli._write_verify_result" in bullet
+    assert "verify_local._write_record" in bullet
+    assert "commit-local" in bullet
+    assert re.search(r"says nothing about|does not cover", bullet, re.IGNORECASE)
 
 
 def _verify_parser():
