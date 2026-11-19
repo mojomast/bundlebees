@@ -113,7 +113,8 @@ class JsonQueue:
     unsupported rather than guessed at.
 
     Identity follows one id, one card. A features-list card resolves its id
-    from ``feature_id`` and then ``id``; two cards may not resolve to the same
+    from ``feature_id`` and then ``id``; a card that declares both must use the
+    same non-blank id for both, and two cards may not resolve to the same
     non-blank id. In the features-as-map shape the map key is authoritative: a
     card body may omit ``feature_id``/``id``, or restate the key (surrounding
     whitespace is ignored), but a body id that names a different feature is
@@ -204,6 +205,15 @@ class JsonQueue:
                         "queue_invalid",
                         f"queue feature at index {index} is not an object",
                         "Repair the queue file: every feature must be a JSON object.",
+                    )
+                declared_ids = cls._declared_body_ids(body)
+                if len(declared_ids) == 2 and declared_ids[0] != declared_ids[1]:
+                    raise QueueError(
+                        "queue_invalid",
+                        f"queue feature at index {index} declares feature_id "
+                        f"{declared_ids[0]!r} and id {declared_ids[1]!r}",
+                        f"Repair the queue file: make the card's feature_id and id name the "
+                        f"same feature ({declared_ids[0]!r} or {declared_ids[1]!r}), or remove one.",
                     )
                 feature_id = body.get("feature_id")
                 if not isinstance(feature_id, str) or not feature_id.strip():
@@ -641,6 +651,14 @@ def _reconcile_diverged_cards(
             detail = (
                 "the claim record says ready_for_review but the job is not accepted; "
                 "refusing to mark the card reviewed"
+            )
+        elif record_state not in STATES:
+            # A corrupt or hand-edited record must never invent a card status
+            # that eligibility/backlog consumers do not model.
+            settled_state = "blocked"
+            detail = (
+                "claim record state is not a queue state and was not copied to the "
+                f"card: {record_state!r}"
             )
         else:
             settled_state = record_state
