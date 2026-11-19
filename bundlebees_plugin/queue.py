@@ -153,6 +153,16 @@ class JsonQueue:
                 declared.append(value.strip())
         return declared
 
+    @staticmethod
+    def _raw_declared_body_ids(body: Mapping[str, Any]) -> list[str]:
+        """Non-blank ids exactly as written, ``feature_id`` before ``id``."""
+        declared = []
+        for field in ("feature_id", "id"):
+            value = body.get(field)
+            if isinstance(value, str) and value.strip():
+                declared.append(value)
+        return declared
+
     @classmethod
     def _entries(cls, data: Any) -> list[tuple[str, Mapping[str, Any]]]:
         """``(feature_id, card)`` pairs for either supported document shape."""
@@ -247,14 +257,33 @@ class JsonQueue:
                 )
             raw_key = str(feature_id)
             key = raw_key.strip()
-            for body_id in cls._declared_body_ids(body):
-                if body_id != key:
-                    raise QueueError(
-                        "queue_invalid",
-                        f"queue feature {key!r} carries body id {body_id!r}",
-                        f"Repair the queue file: the {key!r} card must use {key!r} as its "
-                        f"feature_id/id, or move the {body_id!r} card under that key.",
-                    )
+            if not key:
+                raise QueueError(
+                    "queue_invalid",
+                    "a queue feature id is blank",
+                    "Repair the queue file: every feature needs a feature_id or id.",
+                )
+            differing = [
+                body_id
+                for body_id in cls._raw_declared_body_ids(body)
+                if body_id.strip() != key
+            ]
+            if len(differing) == 1:
+                body_id = differing[0]
+                raise QueueError(
+                    "queue_invalid",
+                    f"queue feature {raw_key!r} carries body id {body_id!r}",
+                    f"Repair the queue file: the {raw_key!r} card must use {raw_key!r} as its "
+                    f"feature_id/id, or move the {body_id!r} card under that key.",
+                )
+            if differing:
+                body_id, other_id = differing[0], differing[1]
+                raise QueueError(
+                    "queue_invalid",
+                    f"queue feature {raw_key!r} carries body ids {body_id!r} and {other_id!r}",
+                    f"Repair the queue file: the {raw_key!r} card must use {raw_key!r} as its "
+                    f"feature_id/id, or move the {body_id!r} and {other_id!r} cards under those keys.",
+                )
             entries.append((raw_key, body))
         return entries
 

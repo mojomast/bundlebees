@@ -365,6 +365,95 @@ class QueueTests(unittest.TestCase):
                 )
                 self.assertFalse((self.tmp / "queue.json.tmp").exists())
 
+    def test_a_flat_map_blank_or_whitespace_key_is_refused(self):
+        for document in (
+            {"": {"feature_id": "f1", "repo": "r", "job_id": "j1"}},
+            {"   ": {"feature_id": "f1", "repo": "r", "job_id": "j1"}},
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                before = hashlib.sha256(self.path.read_bytes()).hexdigest()
+                queue = Q.JsonQueue(self.path)
+
+                for action in ("list", "set_status"):
+                    with self.subTest(action=action):
+                        with self.assertRaises(Q.QueueError) as caught:
+                            if action == "list":
+                                queue.list_items()
+                            else:
+                                queue.set_status("f1", "running")
+
+                        self.assertEqual(caught.exception.code, "queue_invalid")
+                        self.assertEqual(str(caught.exception), "a queue feature id is blank")
+                        self.assertEqual(
+                            caught.exception.fix,
+                            "Repair the queue file: every feature needs a feature_id or id.",
+                        )
+                        self.assertEqual(
+                            hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                            before,
+                            "a refused document must not be rewritten",
+                        )
+                        self.assertFalse((self.tmp / "queue.json.tmp").exists())
+
+    def test_a_flat_map_identity_refusal_quotes_raw_key_and_raw_body_id(self):
+        for field in ("feature_id", "id"):
+            with self.subTest(field=field):
+                self.path.write_text(
+                    json.dumps(
+                        {" f1 ": {field: " f2 ", "repo": "r", "job_id": "j1"}}
+                    )
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), "queue feature ' f1 ' carries body id ' f2 '")
+                self.assertIn("' f1 '", caught.exception.fix)
+                self.assertIn("' f2 '", caught.exception.fix)
+
+    def test_a_flat_map_refusal_names_both_differing_declared_ids(self):
+        for document, expected_message, expected_ids in (
+            (
+                {"f1": {"feature_id": "f2", "id": "f3", "repo": "r", "job_id": "j1"}},
+                "queue feature 'f1' carries body ids 'f2' and 'f3'",
+                ("'f2'", "'f3'"),
+            ),
+            (
+                {" f1 ": {"feature_id": " f2 ", "id": " f3 ", "repo": "r", "job_id": "j1"}},
+                "queue feature ' f1 ' carries body ids ' f2 ' and ' f3 '",
+                ("' f2 '", "' f3 '"),
+            ),
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), expected_message)
+                for expected_id in expected_ids:
+                    self.assertIn(expected_id, caught.exception.fix)
+
+    def test_flat_map_identity_comparison_stays_stripped_and_ignores_non_strings(self):
+        for document in (
+            {" f1 ": {"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+            {"f1": {"feature_id": 7, "id": None, "repo": "r", "job_id": "j1", "status": "queued"}},
+            {"f1": {"feature_id": "", "id": 7, "repo": "r", "job_id": "j1", "status": "queued"}},
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                items = queue.list_items()
+
+                self.assertEqual([item.feature_id for item in items], [next(iter(document))])
+
+                queue.set_status(next(iter(document)), "running", {"job_id": "j1"})
+                self.assertEqual(queue.list_items()[0].status, "running")
+
     def test_flat_map_accepted_documents_match_the_3932e10_baseline(self):
         baseline = {
             "no_body_ids": (
