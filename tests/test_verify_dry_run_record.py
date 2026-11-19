@@ -285,44 +285,49 @@ DRY_RUN_SUBJECT_SEPARATORS = (
     "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 )
 _DRY_RUN_GUARD_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf"})
-_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS = "./"
 _DRY_RUN_GUARD_BOUNDARY_MARKER = "\ue000"
+_DRY_RUN_GUARD_CC_MARKER = "\ue001"
 _DRY_RUN_GUARD_SEPARATOR_RUN = re.compile(
     rf"[{re.escape(DRY_RUN_SUBJECT_SEPARATORS)}]+"
 )
 _DRY_RUN_GUARD_NON_WORD_RUN = re.compile(
-    rf"(?:[^\w{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}]|_)+"
+    rf"(?:[^\w{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}"
+    rf"{re.escape(_DRY_RUN_GUARD_CC_MARKER)}]|_)+"
 )
-_DRY_RUN_GUARD_DOT_BOUNDARY = re.compile(r"(?<=\w)\.(?=\s)")
+_DRY_RUN_GUARD_DOT_BOUNDARY = re.compile(r"(?<=\w)\.(?= )")
 _DRY_RUN_GUARD_SLASH_BOUNDARY = re.compile(r"(?<=\w)/(?=\w)")
 _DRY_RUN_GUARD_SPLIT_NON = re.compile(
-    rf"\b(?:n[{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}\s]*on"
-    rf"|no[{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}\s]*n)\b",
+    rf"\b(?:n[{re.escape(_DRY_RUN_GUARD_CC_MARKER)}]*on"
+    rf"|no[{re.escape(_DRY_RUN_GUARD_CC_MARKER)}]*n)\b",
     re.IGNORECASE,
 )
 
 
 def _normalize_dry_run_guard_text(text: str) -> str:
+    text = text.replace(_DRY_RUN_GUARD_BOUNDARY_MARKER, " ")
+    text = text.replace(_DRY_RUN_GUARD_CC_MARKER, " ")
+    text = _DRY_RUN_GUARD_DOT_BOUNDARY.sub(
+        _DRY_RUN_GUARD_BOUNDARY_MARKER, text
+    )
+    text = _DRY_RUN_GUARD_SLASH_BOUNDARY.sub(
+        _DRY_RUN_GUARD_BOUNDARY_MARKER, text
+    )
     normalized = unicodedata.normalize("NFKC", text)
     guarded: list[str] = []
     for character in normalized:
         category = unicodedata.category(character)
         if category in _DRY_RUN_GUARD_STRIPPED_CATEGORIES:
             if category == "Cc" and character.isspace():
-                guarded.append(" ")
+                guarded.append(_DRY_RUN_GUARD_CC_MARKER)
             continue
         guarded.append(character)
     normalized = "".join(guarded)
-    normalized = _DRY_RUN_GUARD_DOT_BOUNDARY.sub(
-        _DRY_RUN_GUARD_BOUNDARY_MARKER, normalized
-    )
-    normalized = _DRY_RUN_GUARD_SLASH_BOUNDARY.sub(
-        _DRY_RUN_GUARD_BOUNDARY_MARKER, normalized
-    )
     normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
     normalized = _DRY_RUN_GUARD_NON_WORD_RUN.sub(" ", normalized)
     normalized = " ".join(normalized.split())
-    return _DRY_RUN_GUARD_SPLIT_NON.sub("non", normalized)
+    normalized = _DRY_RUN_GUARD_SPLIT_NON.sub("non", normalized)
+    normalized = normalized.replace(_DRY_RUN_GUARD_CC_MARKER, " ")
+    return " ".join(normalized.split())
 
 
 class _NormalizedPin:
@@ -506,6 +511,51 @@ DRY_RUN_NEVER_CANONICAL_SPLIT_DECOY_IDS = (
     "no-vertical-tab-n",
     "no-form-feed-n",
     "n-line-feed-on",
+)
+DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOYS = (
+    "A non\ue000dry run never writes or replaces the canonical record.",
+    "A non\ue000 dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOY_IDS = (
+    "literal-sentinel-tight",
+    "literal-sentinel-space",
+)
+DRY_RUN_NEVER_CANONICAL_NONASCII_SPACE_DECOYS = (
+    "A non.\u00a0dry run never writes or replaces the canonical record.",
+    "A non.\u2003dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_NONASCII_SPACE_DECOY_IDS = (
+    "dot-nbsp",
+    "dot-em-space",
+)
+DRY_RUN_NEVER_CANONICAL_DOT_TAB_DECOYS = (
+    "A non.\tdry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_POSITIVES = (
+    "Use -n on dry runs; they never write or replace the canonical record.",
+    "Pass `-n` on dry runs and they never write or replace the canonical record.",
+    "There is no N dry run that never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_POSITIVE_IDS = (
+    "hyphen-n-on",
+    "backticked-n-on",
+    "no-N",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_CONTROLS = (
+    "There is no normal dry run that never writes or replaces the canonical record.",
+    "There is no new dry run that never writes or replaces the canonical record.",
+    "There is no-notch dry run that never writes or replaces the canonical record.",
+    "Turn on dry runs; they never write or replace the canonical record.",
+    "Run on dry runs; they never write or replace the canonical record.",
+    "An on dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_CONTROL_IDS = (
+    "no-normal",
+    "no-new",
+    "no-notch",
+    "turn-on",
+    "run-on",
+    "an-on",
 )
 DECOY_CORPUS = (
     "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
@@ -830,6 +880,74 @@ def test_never_canonical_pin_rejects_the_split_negation_decoys(
     subject: str,
 ) -> None:
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_LITERAL_SENTINEL_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_literal_boundary_sentinel_decoys(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_NONASCII_SPACE_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_NONASCII_SPACE_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_a_dot_before_non_ascii_space(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_DOT_TAB_DECOYS,
+    ids=("dot-tab",),
+)
+def test_never_canonical_pin_rejects_a_dot_before_tab(subject: str) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_SPLIT_POSITIVES,
+    ids=DRY_RUN_NEVER_CANONICAL_SPLIT_POSITIVE_IDS,
+)
+def test_never_canonical_pin_accepts_split_negation_positives(
+    subject: str,
+) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_SPLIT_CONTROLS,
+    ids=DRY_RUN_NEVER_CANONICAL_SPLIT_CONTROL_IDS,
+)
+def test_never_canonical_pin_accepts_split_negation_controls(
+    subject: str,
+) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+def test_shipped_docs_contain_no_literal_guard_markers(path: Path) -> None:
+    raw = path.read_text(encoding="utf-8")
+    assert "\ue000" not in raw, f"{path.name} contains a literal U+E000"
+    assert "\ue001" not in raw, f"{path.name} contains a literal U+E001"
+
+
+def test_the_dead_sentence_boundary_constant_is_gone() -> None:
+    module = sys.modules[__name__]
+    removed_name = "_DRY_RUN_GUARD_" + "SENTENCE_BOUNDARY_CHARACTERS"
+    assert not hasattr(module, removed_name)
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert removed_name not in source
 
 
 def test_dry_run_decoy_corpus_is_rejected_and_the_changelog_clause_matches() -> None:
