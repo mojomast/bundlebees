@@ -278,18 +278,86 @@ SKILL_REFERENCE_DOC = (
 )
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
-STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
-DRY_RUN_SIDE_RECORD_PIN = re.compile(
-    rf"{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?(?:writes only|only)"
-    rf"[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
-    rf"|{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
-    rf"[^.]{{0,80}}?\bonly\b",
-    re.IGNORECASE,
+# The side-record gate is a snapshot, not a prose regex: it accepts exactly the
+# shipped clause and nothing else. A rewording, true or false, fails until a
+# human deliberately updates the expected string here.
+EXPECTED_SIDE_RECORD_CLAUSES = {
+    README_DOC: (
+        "A dry run writes only `verify-results/dry-run/<attempt_id>.json` and "
+        "never writes or replaces the canonical record."
+    ),
+    CHANGELOG_DOC: (
+        "A dry run writes only `verify-results/dry-run/<attempt_id>.json` with "
+        "`dry_run: true`"
+    ),
+    SKILL_REFERENCE_DOC: (
+        "A dry run writes its preview to "
+        "`verify-results/dry-run/<attempt_id>.json` only and never writes or "
+        "replaces the canonical record"
+    ),
+}
+
+# The never-canonical pin still uses a subject regex. It accepts every shipped
+# spelling (singular/plural across space, NBSP, hyphen, en/em dash, U+2010,
+# U+2011, and double spaces) while rejecting a "non-" prefix.
+DRY_RUN_SEPARATORS = r"\s\u00a0\u2010\u2011\u2012\u2013\u2014-"
+STANDALONE_DRY_RUN = (
+    rf"(?<!non[{DRY_RUN_SEPARATORS}])dry[{DRY_RUN_SEPARATORS}]+runs?"
 )
 DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
     rf"{STANDALONE_DRY_RUN}\b.{{0,240}}?never writes or replaces"
     rf".{{0,80}}?canonical record",
     re.IGNORECASE,
+)
+
+# #152 rejected negation paraphrases and #153 rejected object-displacement and
+# tail-condition lies. The snapshot gate rejects them because none contains the
+# exact shipped clause, not because a regex happens to classify them.
+SEVEN_NEGATION_DECOYS = (
+    "A dry run does not write or replace the canonical record.",
+    "A dry run never replaces the canonical record.",
+    "A dry run does not replace the canonical record.",
+    "A dry run never writes the canonical record.",
+    "A dry run does not write the canonical record.",
+    "A dry run doesn't write or replace the canonical record.",
+    "A dry run never writes or replaces the official record.",
+)
+NINE_FALSE_SHAPES = (
+    "A dry run writes a note saying the side record is at "
+    "`verify-results/dry-run/<attempt_id>.json` with `dry_run: true`",
+    "A dry run writes over `verify-results/dry-run/<attempt_id>.json` with nothing",
+    "A dry run writes a pointer to `verify-results/dry-run/<attempt_id>.json` and "
+    "not the record",
+    "A dry run writes the canonical record and a copy at "
+    "`verify-results/dry-run/<attempt_id>.json`",
+    "A dry run writes 0 bytes to `verify-results/dry-run/<attempt_id>.json`",
+    "A dry run writes only `verify-results/dry-run/<attempt_id>.json` only after "
+    "a successful commit",
+    "A dry run writes only `verify-results/dry-run/<attempt_id>.json` only if the "
+    "run passes",
+    "A dry run writes only `verify-results/dry-run/<attempt_id>.json` only on failure",
+    "A dry run writes only `verify-results/dry-run/<attempt_id>.json` never",
+)
+DRY_RUN_SUBJECT_FORMS = (
+    "dry run",
+    "dry runs",
+    "dry-run",
+    "dry-runs",
+    "dry\u00a0run",
+    "dry\u00a0runs",
+    "dry\u2010run",
+    "dry\u2011run",
+    "dry\u2013run",
+    "dry\u2014run",
+    "dry  run",
+    "dry  runs",
+)
+NON_DRY_RUN_SUBJECT_FORMS = (
+    "non-dry run",
+    "non-dry-run",
+    "non dry run",
+    "non\u00a0dry run",
+    "non\u2013dry run",
 )
 COMMIT_LOCAL_EXCEPTION_PINS = (
     re.compile(r"`?verify --commit-local`? is the exception", re.IGNORECASE),
@@ -332,6 +400,18 @@ class TestVerifyRecordDocs:
             assert "only a committing verify" not in _doc_text(path).lower(), path
 
     @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_document_contains_the_exact_side_record_clause(self, path: Path) -> None:
+        clause = EXPECTED_SIDE_RECORD_CLAUSES[path]
+        text = _doc_text(path)
+        assert clause in text, (
+            f"{path.name} does not contain the exact side-record clause {clause!r}; "
+            "update the expected clause deliberately if the shipped wording changes"
+        )
+        assert any(clause in paragraph for paragraph in _doc_paragraphs(path)), (
+            f"{path.name} only contains the side-record clause across paragraph boundaries"
+        )
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
     def test_document_states_the_refusal_truth(self, path: Path) -> None:
         text = _doc_text(path)
         assert re.search(
@@ -351,10 +431,6 @@ class TestVerifyRecordDocs:
         ), f"{path.name} does not say a refusal replaces the canonical record"
         paragraphs = _doc_paragraphs(path)
         side_record = "verify-results/dry-run/<attempt_id>.json"
-        assert any(
-            side_record in paragraph and DRY_RUN_SIDE_RECORD_PIN.search(paragraph)
-            for paragraph in paragraphs
-        ), f"{path.name} does not name the dry-run side record as the only dry-run output"
         assert any(
             side_record in paragraph and DRY_RUN_NEVER_CANONICAL_PIN.search(paragraph)
             for paragraph in paragraphs
@@ -390,8 +466,39 @@ def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
         "passes or refuses; it never writes or replaces the dry-run canonical record at "
         "`verify-results/dry-run/<attempt_id>.json`."
     )
-    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy)
+    for clause in EXPECTED_SIDE_RECORD_CLAUSES.values():
+        assert clause not in decoy
+
+
+@pytest.mark.parametrize("subject", DRY_RUN_SUBJECT_FORMS)
+def test_never_canonical_pin_accepts_every_dry_run_subject(subject: str) -> None:
+    sentence = f"A {subject} never writes or replaces the canonical record."
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(sentence), sentence
+
+
+@pytest.mark.parametrize("subject", NON_DRY_RUN_SUBJECT_FORMS)
+def test_never_canonical_pin_rejects_non_dry_run_subjects(subject: str) -> None:
+    sentence = f"A {subject} never writes or replaces the canonical record."
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(sentence), sentence
+
+
+def test_false_shapes_do_not_contain_the_expected_changelog_clause() -> None:
+    clause = EXPECTED_SIDE_RECORD_CLAUSES[CHANGELOG_DOC]
+    for decoy in SEVEN_NEGATION_DECOYS + NINE_FALSE_SHAPES:
+        assert clause not in decoy, decoy
+
+
+def test_changelog_crash_debris_sentence_is_corrected() -> None:
+    text = _doc_text(CHANGELOG_DOC)
+    assert "0600" in text
+    assert "os.replace" in text
+    assert "byte-identical" in text
+    assert "removes the temporary file in a `finally` block" in text
+    assert "that go through `cli._write_verify_result`" in text
+    assert "not the canonical write in `verify_local._write_record`" in text
+    assert "no `try`/`finally` cleanup" in text
+    assert "no temporary file behind" not in text
 
 
 def _verify_parser():
