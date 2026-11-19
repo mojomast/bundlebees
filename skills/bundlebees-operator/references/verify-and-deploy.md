@@ -138,6 +138,10 @@ If verify or integrate is red:
 | `scope_violation` | The bee exceeded its lease. Stop; no repair dispatch until the user decides. |
 | `tests_tampered` / `red_missing` / `red_incomplete` / `contract_*` | ACDD stop. Report the code; the fix is the user's (restore tests, record RED, re-freeze). Never weaken an approved test. |
 | `sandbox_unavailable` | Install bubblewrap (or firejail). Do not suggest the unsafe local or weak unshare overrides on a shared or credentialed host. |
+| `sandbox_git_broken` | The worktree has a `.git` entry git cannot resolve. Repair or remove it, then re-dispatch; verify refuses rather than run without a revision. |
+| `sandbox_git_head_unresolved` | HEAD does not resolve to a commit (unborn branch or missing ref). Resolve it with `git rev-parse HEAD`, then re-dispatch. |
+| `sandbox_git_head_unwritable` | The disposable copy could not be written while staging `.git/HEAD`, config, refs or objects. Make the sandbox copy writable and retry. |
+| `sandbox_git_head_unsupported` | HEAD is a 64-hex revision the jail cannot represent (it stages only 40-hex SHA-1). Re-run from a checkout whose HEAD is a 40-hex SHA-1 commit. |
 | `tests_failed` | Report the test names and output tail; ask whether to dispatch a fresh narrow brief. |
 | `secret_detected` | Stop immediately. Do not echo the matched value. |
 | `integration_required` | Run integrate for the wave first. |
