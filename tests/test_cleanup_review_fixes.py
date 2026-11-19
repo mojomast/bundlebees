@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import board_stock, contracts, factory_driver, tools
+from bundlebees_plugin import board_stock, contracts, factory_driver, leases, tools
 from bundlebees_plugin.client import LauncherClient
 
 T0 = 1_800_000_000.0
@@ -82,6 +82,14 @@ def _repo_with_origin(tmp_path: Path, branches=()) -> Path:
     return work
 
 
+def _lease_gap(state: Path) -> None:
+    """Production resolves the branch from the coordinator lease written at dispatch."""
+    leases.record_lease(state, "att-gap", {
+        "objective": "gap fixture", "source_rev": "a" * 40, "branch": "bee/gap",
+        "assigned_files": ["x.py"], "acceptance": {"criteria": ["AC-001: x"], "tests": ["tests/test_x.py"]},
+    })
+
+
 def _queue(tmp_path: Path) -> Path:
     path = tmp_path / "queue.json"
     path.write_text(json.dumps({"items": {}}), encoding="utf-8")
@@ -106,6 +114,7 @@ class TestSweepThroughTheRealClient:
         client = LauncherClient(launcher_url, token=TOKEN)
         repo = _repo_with_origin(tmp_path)
         views = factory_driver.sweep_views_for(client, repo)
+        _lease_gap(tmp_path / "state")
         result = _driver(tmp_path / "state", tmp_path, {"t": T0}, sweep_views=views).run_pass()
         sweep = _sweep(result["sweep"])
         assert sweep["status"] == "ok", sweep
@@ -164,6 +173,7 @@ class TestPrViewUnavailable:
         repo = _repo_with_origin(tmp_path, branches=["bee/gap"])
         views = factory_driver.sweep_views_for(client, repo)
         assert "open_prs" not in views or views["open_prs"] is None
+        _lease_gap(tmp_path / "state")
         result = _driver(tmp_path / "state", tmp_path, {"t": T0}, sweep_views=views).run_pass()
         sweep = _sweep(result["sweep"])
         assert sweep["pr_view"] == "unavailable"
@@ -196,6 +206,8 @@ class TestGateRecorder:
 class TestPinnedHeadCache:
     def test_s4_head_is_cached_briefly_and_git_timeout_is_short(self, tmp_path, monkeypatch):
         repo = _repo_with_origin(tmp_path)
+        (repo / "tools").mkdir()
+        (repo / "tools" / "feature_packet.py").write_text("# fixture\n", encoding="utf-8")
         monkeypatch.setenv("WORKFLOW_SRC", str(repo))
         contracts._reset_workflow_ref_cache()
         calls = []
