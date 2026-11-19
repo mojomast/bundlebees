@@ -61,6 +61,8 @@
     "at": {"type": "string", "minLength": 1},
     "log_path": {"type": "string"},
     "notes": {"type": "string"},
+    "prev_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the canonical JSON (sorted keys, compact separators, ASCII) of the previous record in this history, signature included. null for sequence 1."},
+    "sequence": {"type": "integer", "minimum": 1, "description": "Signer-assigned position in this contract's history: 1, 2, 3... with no gaps or repeats. It is inside the signed body, so it orders records written in the same second. Without it, same-second order is unproven."},
     "signature": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional coordinator HMAC-SHA256 over the canonical record without this field. bundlebees signs with a key derived from its private lease key; the reference demo signs with a demo key kept in its run directory (teaching only)."}
   },
   "additionalProperties": true
