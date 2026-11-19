@@ -525,4 +525,4 @@ def test_the_shipped_unit_turns_the_reconciliation_sweep_on():
     assert args.sweep is True
     assert args.sweep_interval_s == factory_driver.DEFAULT_SWEEP_INTERVAL_S == 1800
     # The flag alone never turns the sweep on in the library: it stays opt-in.
-    assert factory_driver._parser().parse_args(["--state", "state"]).sweep is False
+    assert factory_driver._parser().parse_args(["--state", "state", "--once"]).sweep is False
