@@ -56,11 +56,13 @@ def test_verify_dry_run_prints_validated_branch_and_path_literally(
 
     assert rc == 0, out
     assert f"branch: {BRANCH}" in out
-    target = (state / "verify-results" / f"{ATTEMPT_ID}.json").resolve()
+    target = (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").resolve()
     assert f"verify result: {target}" in out
+    assert not (state / "verify-results" / f"{ATTEMPT_ID}.json").exists()
 
     record = json.loads(target.read_text(encoding="utf-8"))
     assert record["branch"] == BRANCH
+    assert record["dry_run"] is True
 
     rc = _invoke(_ctx(FakeClient()), ["attempts", "--state-dir", str(state)])
     rows = json.loads(capsys.readouterr().out)["attempts"]

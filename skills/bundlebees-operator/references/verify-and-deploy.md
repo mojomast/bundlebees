@@ -24,7 +24,8 @@ Flags:
 | positional `attempt_id` | The attempt returned by `bundlebees_dispatch`. |
 | `--workdir <path>` | Existing clean worktree to use. Confined; no path escape. |
 | `--tests <name> ...` | Run these named tests. Repeated flags append their targets. |
-| `--dry-run` | Apply the patch and run tests, then stop before any push. |
+| `--commit-local` | Verify in an isolated worktree and create a local commit on `bb-verify/<attempt_id>`; never pushes. Cannot be combined with `--dry-run`; the pair is refused rather than interpreted. |
+| `--dry-run` | Apply the patch and run tests, then stop before any push. A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes or replaces the canonical record. Cannot be combined with `--commit-local`; the pair is refused rather than interpreted. |
 | `--kanban-comment <text>` | Opt-in: after a green run, suggest or post a comment through the public kanban CLI. |
 
 What verify does, in order:
@@ -62,9 +63,17 @@ What verify does, in order:
 
 Verify writes `verify-results/<attempt_id>.json` with `attempt_id`, `ok`,
 `sha`, `branch`, `files`, `tests`, `at`, and `evidence` (`source_rev`,
-`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`). It also appends a
-`verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside
-the repo.
+`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`); a refusal adds
+`code` and `error`. A non-dry-run
+verify writes `verify-results/<attempt_id>.json` whether it passes or refuses;
+a refusal records `ok: false` with a `code` and `error`, and replaces any
+earlier canonical record for that attempt. `verify --commit-local` is the
+exception: it writes the canonical record only when it commits; a commit-local
+refusal writes no record and leaves any earlier one in place. A dry run writes
+its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes
+or replaces the canonical record. Once its lease loads, a dry run also appends
+a `verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths
+outside the repo.
 
 ## Contract-first (ACDD) work
 

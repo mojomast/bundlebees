@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -227,10 +228,16 @@ def _build_parser(parser: Any) -> Any:
         default=None,
         help="Clean git worktree to use. Defaults to the configured worktree.",
     )
-    verify.add_argument(
+    verify_flags = verify.add_mutually_exclusive_group()
+    verify_flags.add_argument(
         "--commit-local",
         action="store_true",
         help="Verify in an isolated worktree and create a local commit; never push.",
+    )
+    verify_flags.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Apply and test without committing or pushing.",
     )
     verify.add_argument(
         "--branch",
@@ -243,11 +250,6 @@ def _build_parser(parser: Any) -> Any:
         action="extend",
         default=None,
         help="Test targets to run. Defaults to the brief's named tests.",
-    )
-    verify.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Apply and test without committing or pushing.",
     )
     verify.add_argument(
         "--kanban-comment",
@@ -634,6 +636,14 @@ def _dispatch(ctx: Any, args: Any) -> int:
         if command == "coverage":
             return _cmd_coverage(ctx, args)
         if command == "verify":
+            if getattr(args, "commit_local", False) and getattr(args, "dry_run", False):
+                raise CliError(
+                    "invalid_argument",
+                    "--commit-local and --dry-run cannot be combined",
+                    "Run `hermes bundlebees verify <attempt_id> --commit-local` for a "
+                    "local commit, or `hermes bundlebees verify <attempt_id> --dry-run` "
+                    "for a preview.",
+                )
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
             return _cmd_verify(ctx, args)
@@ -2448,9 +2458,23 @@ def _write_verify_result(
     evidence: Mapping[str, Any] | None = None,
     code: str | None = None,
     error: str | None = None,
+    dry_run: bool = False,
 ) -> Path:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = Path(contain_path(f"verify-results/{attempt_id}.json", str(state_dir)))
+    relative = (
+        f"verify-results/dry-run/{attempt_id}.json"
+        if dry_run
+        else f"verify-results/{attempt_id}.json"
+    )
+    try:
+        target = Path(contain_path(relative, str(state_dir)))
+    except ValueError as exc:
+        raise CliError(
+            "state_dir_uncontained",
+            f"verify record {relative} resolves outside the state directory root <state_dir>",
+            "Point --state-dir at a directory you own, and remove or repair the offending "
+            "symlink or entry under verify-results.",
+        ) from exc
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "attempt_id": attempt_id,
@@ -2466,6 +2490,8 @@ def _write_verify_result(
         payload["code"] = str(code)
     if error is not None:
         payload["error"] = _clip_verify_reason(str(error))
+    if dry_run:
+        payload["dry_run"] = True
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
     validated_branch = _literal_branch(branch)
@@ -2484,12 +2510,36 @@ def _write_verify_result(
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
-    text = json.dumps(clean, indent=2, sort_keys=True) + "\n"
-    target.write_text(text, encoding="utf-8")
+    data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    tmp_path: str | None = None
+    handle = None
     try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        tmp_path = handle.name
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target)
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return target
 
 
@@ -2799,7 +2849,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         if dry_run:
             target = _write_verify_result(
                 state_dir, attempt_id, ok=True, sha=None, branch=branch,
-                files=files, tests=tests, evidence=evidence,
+                files=files, tests=tests, evidence=evidence, dry_run=True,
             )
             _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
@@ -2899,8 +2949,14 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _write_verify_result(
                 state_dir, attempt_id, ok=False, sha=sha, branch=branch,
                 files=files, tests=tests, evidence=evidence,
-                code=str(exc.code), error=reason,
+                code=str(exc.code), error=reason, dry_run=dry_run,
             )
+        except CliError as record_exc:
+            if record_exc.code == "state_dir_uncontained":
+                print(
+                    f"warning: verify record was NOT written (code {record_exc.code})",
+                    file=sys.stderr,
+                )
         except Exception:  # noqa: BLE001 - preserve the original CLI error
             pass
         if exc.code not in ("lease_missing", "lease_tampered", "lease_invalid"):
