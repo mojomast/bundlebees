@@ -7,6 +7,8 @@ user namespaces are disabled). The worktree is always a ``tmp_path``.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -603,3 +605,116 @@ def test_real_sandbox_hides_the_sentinel_env(tmp_path: Path, monkeypatch: pytest
 
     assert "sentinel-do-not-leak" not in result["output_tail"]
     assert "ABSENT" in result["output_tail"]
+
+
+# ---------------------------------------------------------------------------
+# A checkout's HEAD survives the copy (without its history)
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    """Run git in *cwd* with a hermetic identity; return stripped stdout."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Sandbox Probe",
+            "GIT_AUTHOR_EMAIL": "sandbox@example.invalid",
+            "GIT_COMMITTER_NAME": "Sandbox Probe",
+            "GIT_COMMITTER_EMAIL": "sandbox@example.invalid",
+        }
+    )
+    done = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert done.returncode == 0, f"git {' '.join(args)} failed: {done.stderr}"
+    return done.stdout.strip()
+
+
+def _make_checkout(root: Path) -> str:
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-q", "-m", "first commit")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def test_stage_git_head_stages_a_minimal_detached_head(tmp_path: Path):
+    source = tmp_path / "checkout"
+    sha = _make_checkout(source)
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    assert sandbox.stage_git_head(copy_dir, source) == sha
+
+    git_dir = copy_dir / ".git"
+    assert (git_dir / "HEAD").read_text(encoding="utf-8") == sha + "\n"
+    assert (git_dir / "config").read_text(encoding="utf-8") == (
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+    )
+    assert (git_dir / "objects").is_dir()
+    assert list((git_dir / "objects").iterdir()) == []
+    assert (git_dir / "refs").is_dir()
+    assert list((git_dir / "refs").iterdir()) == []
+    assert sorted(entry.name for entry in git_dir.iterdir()) == [
+        "HEAD",
+        "config",
+        "objects",
+        "refs",
+    ]
+    assert not (git_dir / "logs").exists()
+    # The staged HEAD is resolvable in the copy, which is what code_rev_of reads.
+    done = subprocess.run(
+        ["git", "-C", str(copy_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == sha
+
+
+def test_stage_git_head_leaves_a_plain_tree_without_git(tmp_path: Path):
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "file.txt").write_text("plain\n", encoding="utf-8")
+
+    # A bare repository and a directory inside a checkout are not checkouts of
+    # their own either; none of them may leave a .git behind.
+    checkout = tmp_path / "checkout"
+    _make_checkout(checkout)
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "--bare", "-q", str(checkout), str(bare))
+    inside = checkout / "subdir"
+    inside.mkdir()
+
+    for source in (plain, bare, inside):
+        assert sandbox.stage_git_head(copy_dir, source) is None
+        assert not (copy_dir / ".git").exists()
+
+
+def test_stage_git_head_leaves_an_empty_or_unborn_repository_without_git(tmp_path: Path):
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    empty = tmp_path / "empty"
+    (empty / ".git").mkdir(parents=True)
+    broken = tmp_path / "broken"
+    (broken / ".git").mkdir(parents=True)
+    (broken / ".git" / "HEAD").write_text("not a ref\n", encoding="utf-8")
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    _git(unborn, "init", "-q")
+
+    for source in (empty, broken, unborn):
+        assert sandbox.stage_git_head(copy_dir, source) is None
+        assert not (copy_dir / ".git").exists()

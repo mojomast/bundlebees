@@ -668,6 +668,83 @@ def _remove_staged_entry(path: Path) -> None:
         shutil.rmtree(path)
 
 
+_GIT_HEAD_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_STAGED_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+
+
+def _head_sha_of_checkout(source: Path) -> str | None:
+    """Resolve *source*'s HEAD to a 40-hex sha, or ``None`` when it has none.
+
+    A detached HEAD and a loose branch ref are read straight from the
+    checkout, so the caller learns the commit without writing anything. An
+    unborn branch (its ref does not exist yet) has no commit and resolves to
+    ``None``; packed refs and a linked-worktree ``.git`` file fall back to git.
+    """
+    git_dir = source / ".git"
+    try:
+        if git_dir.is_dir() and not git_dir.is_symlink():
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            if _GIT_HEAD_RE.fullmatch(head):
+                return head.lower()
+            if head.startswith("ref:"):
+                name = head[4:].strip()
+                if name.startswith("refs/") and ".." not in name.split("/"):
+                    ref = git_dir / name
+                    try:
+                        value = ref.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        value = ""
+                    if _GIT_HEAD_RE.fullmatch(value):
+                        return value.lower()
+    except (OSError, UnicodeDecodeError):
+        pass
+    try:
+        done = _run_git(source, "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (done.stdout or "").strip()
+    if done.returncode == 0 and _GIT_HEAD_RE.fullmatch(value):
+        return value.lower()
+    return None
+
+
+def stage_git_head(copy_dir: Path, source: Path) -> str | None:
+    """Stage only a detached HEAD into *copy_dir* when *source* is a git checkout.
+
+    The copy gets exactly what git needs to name the revision: ``.git/HEAD``
+    holding the resolved 40-hex sha, a ``.git/config`` declaring a non-bare
+    format-0 repository, and empty ``.git/refs`` and ``.git/objects``
+    directories. No objects, history, refs, tags, remotes, logs, hooks or
+    alternates are copied, and the source path never appears. A plain
+    directory, a bare repository, an unborn HEAD, a broken ``.git`` and a
+    directory inside another repository all leave no ``.git`` behind.
+
+    Returns the staged sha, or ``None`` when nothing was staged.
+    """
+    destination = Path(copy_dir) / ".git"
+    _remove_staged_entry(destination)
+    root = Path(source).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+    try:
+        kind, _detail = _git_source_kind(root)
+    except OSError:
+        return None
+    if kind != "checkout":
+        return None
+    sha = _head_sha_of_checkout(root)
+    if sha is None:
+        return None
+    destination.mkdir(parents=True)
+    (destination / "refs").mkdir()
+    (destination / "objects").mkdir()
+    (destination / "HEAD").write_text(sha + "\n", encoding="utf-8")
+    (destination / "config").write_text(_STAGED_GIT_CONFIG, encoding="utf-8")
+    return sha
+
+
 def _stage_git_checkout(name: str, source: Path, destination: Path) -> None:
     """Serve *source* as a single-commit checkout at the same HEAD.
 
@@ -972,6 +1049,9 @@ def run_in_sandbox(
     tmp = root / "tmp"
     try:
         shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
+        # The copy leaves out .git, but a checkout must still name its revision in-jail
+        # (trial_harness.code_rev_of reads git HEAD). A plain worktree gets no .git.
+        stage_git_head(copy_dir, source)
         home.mkdir(parents=True, exist_ok=True)
         tmp.mkdir(parents=True, exist_ok=True)
 

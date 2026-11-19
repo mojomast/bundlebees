@@ -31,6 +31,21 @@ import pytest
 
 from bundlebees_plugin import sandbox
 
+#: ``run_in_sandbox`` reads these two git facts before the wrapper to decide whether the workdir
+#: is a checkout whose HEAD must be staged. They are part of the exact call sequence, not noise.
+_GIT_METADATA_READS = ("--is-bare-repository", "--show-toplevel")
+
+
+def _is_git_metadata_read(command: list[str]) -> bool:
+    """True for the two named git metadata reads, and nothing else git-shaped."""
+    return (
+        len(command) == 5
+        and command[0] == "git"
+        and command[1] == "-C"
+        and command[3] == "rev-parse"
+        and command[4] in _GIT_METADATA_READS
+    )
+
 
 def _executable(path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,6 +59,7 @@ class TestEvidencePath:
     def _fake_jail(self, monkeypatch):
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
+        self.git_reads: list[list[str]] = []
 
         class Done:
             returncode = 0
@@ -51,7 +67,11 @@ class TestEvidencePath:
             stderr = ""
 
         def fake_run(command, **kwargs):
-            self.calls.append([str(part) for part in command])
+            command = [str(part) for part in command]
+            if _is_git_metadata_read(command):
+                self.git_reads.append(command)
+                return Done()
+            self.calls.append(command)
             self.envs.append(dict(kwargs.get("env") or {}))
             return Done()
 
@@ -61,7 +81,7 @@ class TestEvidencePath:
         self.interpreter = _executable(self.work.parent / (self.work.name + "-py") / "bin" / "python")
 
     def _run(self, backend: str):
-        return sandbox.run_in_sandbox(
+        result = sandbox.run_in_sandbox(
             self.work,
             [sys.executable, "-B", "-c", "print(1)", "{evidence}/collected.json", "tests/test_a.py"],
             backend=backend,
@@ -70,6 +90,8 @@ class TestEvidencePath:
             probe=lambda name: True,
             which=lambda name: "/usr/bin/" + name,
         )
+        assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        return result
 
     def test_firejail_gets_a_relative_evidence_path(self):
         self._run("firejail")
@@ -139,6 +161,7 @@ class TestTiktokenCachePath:
     def _fake_jail(self, monkeypatch, tmp_path: Path):
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
+        self.git_reads: list[list[str]] = []
         self.seen: list[dict] = []  # state of the staged copy at the moment each call ran
 
         class Done:
@@ -147,7 +170,11 @@ class TestTiktokenCachePath:
             stderr = ""
 
         def fake_run(command, **kwargs):
-            self.calls.append([str(part) for part in command])
+            command = [str(part) for part in command]
+            if _is_git_metadata_read(command):
+                self.git_reads.append(command)
+                return Done()
+            self.calls.append(command)
             self.envs.append(dict(kwargs.get("env") or {}))
             staged = Path(kwargs.get("cwd") or ".") / sandbox._SANDBOX_TIKTOKEN_DIR
             self.seen.append(
@@ -180,7 +207,7 @@ class TestTiktokenCachePath:
         )
 
     def _run(self, backend: str, **kw):
-        return sandbox.run_in_sandbox(
+        result = sandbox.run_in_sandbox(
             self.work,
             ["/bin/true"],
             backend=backend,
@@ -189,6 +216,8 @@ class TestTiktokenCachePath:
             which=lambda name: "/usr/bin/" + name,
             **kw,
         )
+        assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        return result
 
     def _jail_visible(self, value: str) -> bool:
         """The env value is either the relative staged path or a host path the jail still sees."""
