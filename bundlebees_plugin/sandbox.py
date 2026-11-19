@@ -668,6 +668,58 @@ def _remove_staged_entry(path: Path) -> None:
         shutil.rmtree(path)
 
 
+#: A detached HEAD carries only the resolved commit id, never a branch ref.
+_GIT_HEAD_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GIT_CONFIG_MINIMAL = (
+    "[core]\n"
+    "\trepositoryformatversion = 0\n"
+    "\tbare = false\n"
+)
+
+
+def _resolved_git_head(source: Path) -> str:
+    """Return the checkout's 40-hex HEAD, or ``""`` when it cannot be resolved."""
+    try:
+        kind, _detail = _git_source_kind(source)
+        if kind != "checkout":
+            return ""
+        done = _run_git(source, "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    value = done.stdout.strip()
+    return value if _GIT_HEAD_RE.fullmatch(value) else ""
+
+
+def stage_git_head(copy_dir: Path, source: Path) -> bool:
+    """Stage a minimal detached HEAD into the copy of a resolvable git checkout.
+
+    The copy only needs enough repository metadata for a read-only
+    ``git rev-parse HEAD`` to answer the source revision: ``.git/HEAD`` holds
+    the resolved 40-hex commit id, ``.git/config`` is the minimal non-bare
+    configuration, and ``.git/refs`` / ``.git/objects`` are empty directories.
+    No objects, history, refs or logs are copied. A source that is not a git
+    checkout, or whose HEAD cannot be resolved, leaves the copy without a
+    ``.git`` exactly as before -- a revision is never fabricated.
+    """
+    git_dir = Path(copy_dir) / ".git"
+    sha = _resolved_git_head(Path(source).resolve())
+    if not sha:
+        _remove_staged_entry(git_dir)
+        return False
+    _remove_staged_entry(git_dir)
+    try:
+        (git_dir / "refs").mkdir(parents=True)
+        (git_dir / "objects").mkdir()
+        (git_dir / "HEAD").write_text(f"{sha}\n", encoding="utf-8")
+        (git_dir / "config").write_text(_GIT_CONFIG_MINIMAL, encoding="utf-8")
+    except OSError:
+        _remove_staged_entry(git_dir)
+        return False
+    return True
+
+
 def _stage_git_checkout(name: str, source: Path, destination: Path) -> None:
     """Serve *source* as a single-commit checkout at the same HEAD.
 
@@ -972,6 +1024,7 @@ def run_in_sandbox(
     tmp = root / "tmp"
     try:
         shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
+        stage_git_head(copy_dir, source)
         home.mkdir(parents=True, exist_ok=True)
         tmp.mkdir(parents=True, exist_ok=True)
 

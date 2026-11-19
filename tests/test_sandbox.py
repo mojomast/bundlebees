@@ -7,6 +7,10 @@ user namespaces are disabled). The worktree is always a ``tmp_path``.
 
 from __future__ import annotations
 
+import configparser
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +31,88 @@ def _no_probe(name: str) -> bool:
 def _write_script(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Sandbox Probe",
+            "GIT_AUTHOR_EMAIL": "sandbox@example.invalid",
+            "GIT_COMMITTER_NAME": "Sandbox Probe",
+            "GIT_COMMITTER_EMAIL": "sandbox@example.invalid",
+        }
+    )
+    done = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert done.returncode == 0, f"git {' '.join(args)} failed: {done.stderr}"
+    return done.stdout.strip()
+
+
+def _make_git_checkout(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-q")
+    (root / "marker.txt").write_text("head marker\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "first commit")
+    return root
+
+
+# Reads the copied ``.git`` only; it must never depend on ``git`` being installed
+# inside the jail.
+_GIT_VERDICT_SCRIPT = r"""
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+git = root / ".git"
+
+
+def read_text(path):
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+refs = git / "refs"
+objects = git / "objects"
+ref_files = sorted(path for path in refs.rglob("*") if path.is_file()) if refs.is_dir() else []
+verdict = {
+    "git_exists": git.exists(),
+    "git_entries": sorted(entry.name for entry in git.iterdir()) if git.is_dir() else None,
+    "head": (read_text(git / "HEAD") or "").strip() or None,
+    "config": read_text(git / "config"),
+    "refs_files": [str(path.relative_to(git)) for path in ref_files],
+    "refs_contents": [path.read_text(encoding="utf-8") for path in ref_files],
+    "objects_entries": sorted(entry.name for entry in objects.iterdir()) if objects.is_dir() else None,
+    "logs_exists": (git / "logs").exists(),
+}
+evidence = Path(sys.argv[1])
+evidence.mkdir(parents=True, exist_ok=True)
+(evidence / "git-verdict.json").write_text(json.dumps(verdict), encoding="utf-8")
+"""
+
+
+def _sandbox_git_verdict(source: Path) -> dict:
+    result = sandbox.run_in_sandbox(
+        source,
+        [sys.executable, "-c", _GIT_VERDICT_SCRIPT, "{evidence}"],
+        backend="auto",
+        allow_unsafe_local=True,
+        which=_no_backends,
+        probe=_no_probe,
+        collect_file="git-verdict.json",
+    )
+    assert result["exit_code"] == 0, result
+    verdict = result["collected"]
+    assert verdict is not None, result
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +549,64 @@ def test_run_in_sandbox_ignores_preplanted_evidence(tmp_path: Path):
 
     assert result["exit_code"] == 0
     assert result["junit"] is None
+
+
+def test_run_in_sandbox_stages_only_a_minimal_detached_head(tmp_path: Path):
+    source = _make_git_checkout(tmp_path / "source")
+    source_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "tag", "probe-tag")
+    _git(source, "branch", "probe-branch")
+
+    verdict = _sandbox_git_verdict(source)
+
+    assert verdict["git_exists"] is True
+    assert verdict["git_entries"] == ["HEAD", "config", "objects", "refs"]
+    assert verdict["head"] == source_head
+    assert len(source_head) == 40
+
+    parser = configparser.ConfigParser()
+    parser.read_string(verdict["config"])
+    assert parser.getint("core", "repositoryformatversion") == 0
+    assert parser.getboolean("core", "bare") is False
+
+    assert verdict["objects_entries"] == []
+    assert verdict["logs_exists"] is False
+    assert verdict["refs_files"] == []
+    assert verdict["refs_contents"] == []
+
+
+def test_run_in_sandbox_leaves_no_git_when_source_is_not_a_checkout(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "marker.txt").write_text("not a checkout\n", encoding="utf-8")
+
+    verdict = _sandbox_git_verdict(plain)
+
+    assert verdict["git_exists"] is False
+    assert verdict["head"] is None
+    assert verdict["config"] is None
+    assert verdict["objects_entries"] is None
+    assert verdict["logs_exists"] is False
+
+
+def test_run_in_sandbox_leaves_no_git_when_head_cannot_be_resolved(tmp_path: Path):
+    empty_git = tmp_path / "empty-git"
+    empty_git.mkdir()
+    (empty_git / ".git").mkdir()
+    (empty_git / "marker.txt").write_text("broken .git\n", encoding="utf-8")
+
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    _git(unborn, "init", "-q")
+    (unborn / "marker.txt").write_text("no commit yet\n", encoding="utf-8")
+
+    for source in (empty_git, unborn):
+        verdict = _sandbox_git_verdict(source)
+        assert verdict["git_exists"] is False, source
+        assert verdict["head"] is None, source
+        assert verdict["config"] is None, source
+        assert verdict["objects_entries"] is None, source
+        assert verdict["logs_exists"] is False, source
 
 
 def test_run_in_sandbox_scrubs_output(tmp_path: Path):
