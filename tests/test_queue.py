@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import unittest
 from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from bundlebees_plugin import job as jobs
 from bundlebees_plugin import job_cli
 from bundlebees_plugin import provision_bind as B
 from bundlebees_plugin import provisioning as P
@@ -229,6 +232,49 @@ class QueueTests(unittest.TestCase):
 
         self.assertEqual([item.feature_id for item in items], ["f1", "f2"])
 
+    def test_a_features_list_card_with_conflicting_feature_id_and_id_is_refused(self):
+        conflicting = {"feature_id": "f1", "id": "f2", "repo": "mojomast/a", "job_id": "job_1"}
+        self._write_live_envelope([conflicting])
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertIn("f1", str(caught.exception))
+        self.assertIn("f2", str(caught.exception))
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+        document = {
+            "schema": "bundlebees.queue/1",
+            "generated_at": "2026-11-18T04:27:23Z",
+            "note": "live-shaped queue",
+            "features": [conflicting],
+        }
+        self.path.write_text(json.dumps(document))
+        before = self.path.read_bytes()
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).set_status("f1", "running")
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertEqual(self.path.read_bytes(), before, "a refused document must not be rewritten")
+
+    def test_a_features_list_card_with_agreeing_or_single_ids_still_resolves(self):
+        for body in (
+            {"feature_id": "f1", "job_id": "job_1"},
+            {"id": "f1", "job_id": "job_1"},
+            {"feature_id": " f1 ", "id": "f1", "job_id": "job_1"},
+            {"feature_id": "f1", "id": "   ", "job_id": "job_1"},
+            {"feature_id": "   ", "id": "f1", "job_id": "job_1"},
+        ):
+            with self.subTest(body=body):
+                self._write_live_envelope([body])
+
+                items = Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual([item.feature_id for item in items], ["f1"])
+                self.assertEqual(items[0].job_id, "job_1")
+
     def test_set_status_refuses_an_identity_violation_without_writing(self):
         documents = (
             {
@@ -257,6 +303,509 @@ class QueueTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.code, "queue_invalid")
                 self.assertEqual(self.path.read_bytes(), before, "a refused document must not be rewritten")
+
+    # -- flat map identity --------------------------------------------------
+
+    def test_a_flat_map_card_body_id_must_match_its_map_key(self):
+        for field in ("feature_id", "id"):
+            with self.subTest(field=field):
+                self.path.write_text(
+                    json.dumps({"f1": {field: "f2", "repo": "mojomast/a", "job_id": "job_1"}})
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertIn("f1", str(caught.exception))
+                self.assertIn("f2", str(caught.exception))
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_a_flat_map_card_with_both_body_ids_differing_from_its_key_is_refused(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "f1": {
+                        "feature_id": "f2",
+                        "id": "f3",
+                        "repo": "mojomast/a",
+                        "job_id": "job_1",
+                    }
+                }
+            )
+        )
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertIn("f1", str(caught.exception))
+        self.assertIn("f2", str(caught.exception))
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_set_status_refuses_a_flat_map_identity_violation_without_writing(self):
+        documents = (
+            {"f1": {"feature_id": "f2", "repo": "mojomast/a", "job_id": "job_1"}},
+            {"f1": {"id": "f2", "repo": "mojomast/a", "job_id": "job_1"}},
+            {"f1": {"feature_id": "f2", "id": "f3", "job_id": "job_1"}},
+        )
+        for document in documents:
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                before = hashlib.sha256(self.path.read_bytes()).hexdigest()
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).set_status("f1", "running")
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(
+                    hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                    before,
+                    "a refused document must not be rewritten",
+                )
+                self.assertFalse((self.tmp / "queue.json.tmp").exists())
+
+    def test_a_flat_map_blank_or_whitespace_key_is_refused(self):
+        for document in (
+            {"": {"feature_id": "f1", "repo": "r", "job_id": "j1"}},
+            {"   ": {"feature_id": "f1", "repo": "r", "job_id": "j1"}},
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                before = hashlib.sha256(self.path.read_bytes()).hexdigest()
+                queue = Q.JsonQueue(self.path)
+
+                for action in ("list", "set_status"):
+                    with self.subTest(action=action):
+                        with self.assertRaises(Q.QueueError) as caught:
+                            if action == "list":
+                                queue.list_items()
+                            else:
+                                queue.set_status("f1", "running")
+
+                        self.assertEqual(caught.exception.code, "queue_invalid")
+                        self.assertEqual(str(caught.exception), "a queue feature id is blank")
+                        self.assertEqual(
+                            caught.exception.fix,
+                            "Repair the queue file: every feature needs a feature_id or id.",
+                        )
+                        self.assertEqual(
+                            hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                            before,
+                            "a refused document must not be rewritten",
+                        )
+                        self.assertFalse((self.tmp / "queue.json.tmp").exists())
+
+    def test_a_flat_map_identity_refusal_quotes_raw_key_and_raw_body_id(self):
+        for field in ("feature_id", "id"):
+            with self.subTest(field=field):
+                self.path.write_text(
+                    json.dumps(
+                        {" f1 ": {field: " f2 ", "repo": "r", "job_id": "j1"}}
+                    )
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), "queue feature ' f1 ' carries body id ' f2 '")
+                self.assertIn("' f1 '", caught.exception.fix)
+                self.assertIn("' f2 '", caught.exception.fix)
+
+    def test_a_flat_map_refusal_names_both_differing_declared_ids(self):
+        for document, expected_message, expected_ids in (
+            (
+                {"f1": {"feature_id": "f2", "id": "f3", "repo": "r", "job_id": "j1"}},
+                "queue feature 'f1' carries body ids 'f2' and 'f3'",
+                ("'f2'", "'f3'"),
+            ),
+            (
+                {" f1 ": {"feature_id": " f2 ", "id": " f3 ", "repo": "r", "job_id": "j1"}},
+                "queue feature ' f1 ' carries body ids ' f2 ' and ' f3 '",
+                ("' f2 '", "' f3 '"),
+            ),
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), expected_message)
+                for expected_id in expected_ids:
+                    self.assertIn(expected_id, caught.exception.fix)
+
+    def test_flat_map_identity_comparison_stays_stripped_and_ignores_non_strings(self):
+        for document in (
+            {" f1 ": {"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+            {"f1": {"feature_id": 7, "id": None, "repo": "r", "job_id": "j1", "status": "queued"}},
+            {"f1": {"feature_id": "", "id": 7, "repo": "r", "job_id": "j1", "status": "queued"}},
+        ):
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                items = queue.list_items()
+
+                self.assertEqual([item.feature_id for item in items], [next(iter(document))])
+
+                queue.set_status(next(iter(document)), "running", {"job_id": "j1"})
+                self.assertEqual(queue.list_items()[0].status, "running")
+
+    def test_flat_map_accepted_documents_match_the_3932e10_baseline(self):
+        baseline = {
+            "no_body_ids": (
+                {"f1": {"repo": "r", "job_id": "j1", "depends_on": [], "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "depends_on": [],
+                        "evidence": {"job_id": "j1"},
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "both_equal": (
+                {"f1": {"feature_id": "f1", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "both_equal_padded_body": (
+                {
+                    "f1": {
+                        "feature_id": " f1 ",
+                        "id": "f1  ",
+                        "repo": "r",
+                        "job_id": "j1",
+                        "status": "queued",
+                    }
+                },
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": " f1 ",
+                        "id": "f1  ",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "padded_key_no_body": (
+                {" f1 ": {"repo": "r", "job_id": "j1", "status": "queued"}},
+                [(" f1 ", "r", "j1", "", (), "queued")],
+                {
+                    " f1 ": {
+                        "evidence": {"job_id": "j1"},
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "padded_key_both_equal": (
+                {" f1 ": {"feature_id": "f1", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [(" f1 ", "r", "j1", "", (), "queued")],
+                {
+                    " f1 ": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "only_feature_id": (
+                {"f1": {"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "only_id": (
+                {"f1": {"id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "blank_feature_id_id_match": (
+                {"f1": {"feature_id": "   ", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "   ",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "blank_id_feature_id_match": (
+                {"f1": {"feature_id": "f1", "id": "   ", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "   ",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+        }
+        for name, (document, expected_items, expected_written) in baseline.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                self.assertEqual(
+                    [
+                        (item.feature_id, item.repo, item.job_id, item.title, item.depends_on, item.status)
+                        for item in queue.list_items()
+                    ],
+                    expected_items,
+                )
+
+                queue.set_status(next(iter(document)), "running", {"job_id": "j1"})
+                written = re.sub(
+                    r'"updated_at": "[^"]+"', '"updated_at": "<ts>"', self.path.read_text()
+                )
+                self.assertEqual(written, json.dumps(expected_written, indent=2, sort_keys=True))
+
+    def test_nested_feature_shapes_match_the_3932e10_baseline(self):
+        accepted = {
+            "map_no_body": (
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "g",
+                    "note": "n",
+                    "features": {
+                        "f1": {"repo": "r", "job_id": "j1", "status": "queued", "depends_on": []}
+                    },
+                },
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "g",
+                    "note": "n",
+                    "features": {
+                        "f1": {
+                            "depends_on": [],
+                            "evidence": {"job_id": "j1"},
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    },
+                },
+            ),
+            "map_restate": (
+                {
+                    "schema": "bundlebees.queue/1",
+                    "features": {
+                        "f1": {
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    },
+                },
+                {
+                    "schema": "bundlebees.queue/1",
+                    "features": {
+                        "f1": {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    },
+                },
+            ),
+            "list_feature_id": (
+                {"features": [{"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}]},
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_id": (
+                {"features": [{"id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}]},
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_agreeing": (
+                {
+                    "features": [
+                        {
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    ]
+                },
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_blank_one": (
+                {
+                    "features": [
+                        {
+                            "feature_id": "f1",
+                            "id": "   ",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    ]
+                },
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": "f1",
+                            "id": "   ",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+        }
+        for name, (document, expected_written) in accepted.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                self.assertEqual(
+                    [
+                        (item.feature_id, item.repo, item.job_id, item.title, item.depends_on, item.status)
+                        for item in queue.list_items()
+                    ],
+                    [("f1", "r", "j1", "", (), "queued")],
+                )
+
+                queue.set_status("f1", "running", {"job_id": "j1"})
+                written = re.sub(
+                    r'"updated_at": "[^"]+"', '"updated_at": "<ts>"', self.path.read_text()
+                )
+                self.assertEqual(written, json.dumps(expected_written, indent=2, sort_keys=True))
+
+        refused = {
+            "map_mismatch": (
+                {"features": {"f1": {"feature_id": "f2", "repo": "r", "job_id": "j1"}}},
+                "queue feature 'f1' carries body id 'f2'",
+                "Repair the queue file: the 'f1' card must use 'f1' as its feature_id/id, "
+                "or move the 'f2' card under that key.",
+            ),
+            "list_conflicting_ids": (
+                {"features": [{"feature_id": "f1", "id": "f2", "repo": "r", "job_id": "j1"}]},
+                "queue feature at index 0 declares feature_id 'f1' and id 'f2'",
+                "Repair the queue file: make the card's feature_id and id name the same "
+                "feature ('f1' or 'f2'), or remove one.",
+            ),
+            "list_duplicate_ids": (
+                {
+                    "features": [
+                        {"feature_id": "f1", "job_id": "j1"},
+                        {"id": " f1 ", "job_id": "j2"},
+                    ]
+                },
+                "queue feature 'f1' appears more than once (indices 0 and 1)",
+                "Repair the queue file: remove or rename the duplicate 'f1' card so each "
+                "feature id appears once.",
+            ),
+        }
+        for name, (document, expected_message, expected_fix) in refused.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), expected_message)
+                self.assertEqual(caught.exception.fix, expected_fix)
 
     def test_a_features_list_card_without_a_usable_id_is_a_typed_refusal(self):
         for body in ({"repo": "r", "job_id": "j"}, {"feature_id": "", "id": "  "}):
@@ -613,6 +1162,32 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(Q.QueueStore(self.tmp).read("f1"))
         self.assertEqual(self.queue.get("f1").status, "queued")
 
+    def test_a_non_job_error_from_tick_propagates_and_leaves_both_claimed(self):
+        for active in (False, True):
+            with self.subTest(active=active), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                card_status = "claimed" if active else "queued"
+                path.write_text(json.dumps({"f1": card("f1", status=card_status)}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                if active:
+                    store.claim("f1", job_id="job_1")
+
+                def tick(job_id):
+                    raise RuntimeError("worker crashed")
+
+                with mock.patch.object(Q, "_load_job_or_none",
+                                       lambda state_dir, job_id: {"job_id": job_id}):
+                    with self.assertRaises(RuntimeError) as caught:
+                        Q.run_once(tmp, queue, tick=tick)
+
+                self.assertEqual(str(caught.exception), "worker crashed")
+                self.assertEqual(queue.get("f1").status, "claimed")
+                record = store.read("f1")
+                self.assertIsNotNone(record)
+                self.assertEqual(record["state"], "claimed")
+
     # -- a typed provisioning refusal blocks the card instead of crashing ---
 
     def test_a_provisioning_refusal_on_a_new_card_reports_and_blocks_it(self):
@@ -681,6 +1256,354 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.queue.get("f1").status, "blocked")
         self.assertEqual(self.queue.get("f2").status, "queued")
         self.assertEqual(Q.QueueStore(self.tmp).read("f1")["state"], "blocked")
+
+    # -- a card may diverge from its durable record -------------------------
+
+    def _diverged(self, record_state, *, detail="tick refused: JobError wave_reconciliation_required",
+                  card_status="claimed", record_extra=None):
+        """A card status that disagrees with its already-written store record."""
+        record = {"state": record_state, "job_id": "job_1", "detail": detail}
+        record.update(record_extra or {})
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", record)
+        self.queue.set_status("f1", card_status, {"job_id": "job_1"})
+        return store
+
+    def _card_body(self):
+        return json.loads(self.path.read_text())["f1"]
+
+    def test_a_diverged_claimed_card_is_reconciled_from_its_blocked_record(self):
+        store = self._diverged("blocked")
+        called = []
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "reconciling a terminal record must not tick it")
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(result["reconciled"][0]["feature"], "f1")
+        self.assertEqual(result["reconciled"][0]["state"], "blocked")
+        self.assertIn("wave_reconciliation_required", result["detail"])
+        self.assertIn("wave_reconciliation_required", self._card_body()["evidence"]["detail"])
+        self.assertEqual(store.read("f1")["state"], "blocked",
+                         "the reconciliation reports the existing record; it does not rewrite it")
+
+        before = self.path.read_text()
+        again = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+        self.assertEqual(again["action"], "idle")
+        self.assertEqual(self.path.read_text(), before,
+                         "a second pass must not rewrite an already-reconciled card")
+
+    def test_reconciliation_bounds_the_record_detail_on_the_card(self):
+        detail = "D" * 1000
+        self._diverged("blocked", detail=detail)
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        card_detail = self._card_body()["evidence"]["detail"]
+        self.assertEqual(len(card_detail), 400)
+        self.assertEqual(card_detail, detail[:400])
+
+    def test_reconciliation_reports_failed_and_needs_approval_record_states(self):
+        for state in ("failed", "needs_approval"):
+            with self.subTest(state=state), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({"f1": card("f1", status="claimed")}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                store.write("f1", {"state": state, "job_id": "job_1",
+                                   "detail": f"{state} by contract"})
+
+                result = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+                self.assertEqual(result["action"], "reconciled")
+                self.assertEqual(result["status"], state)
+                self.assertEqual(result["reconciled"][0]["state"], state)
+                self.assertIn("by contract", result["detail"])
+                self.assertEqual(queue.get("f1").status, state)
+                self.assertEqual(store.read("f1")["state"], state,
+                                 "the record state remains the source of truth")
+
+    def test_a_ready_for_review_record_only_reviews_the_card_when_the_job_is_accepted(self):
+        # Choice: a ready_for_review record is trusted only when the existing
+        # _job_accepted rules agree. When they do not, the card is blocked (not
+        # left at claimed) and the record is left untouched; it is never moved
+        # to review on the record's word alone.
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({"f1": card("f1", status="claimed")}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                store.write("f1", {"state": "ready_for_review", "job_id": "job_1",
+                                   "detail": "review requested"})
+
+                with mock.patch.object(Q, "_job_accepted",
+                                       lambda state_dir, job_id, accepted=accepted: accepted):
+                    result = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+                expected = "ready_for_review" if accepted else "blocked"
+                self.assertEqual(result["action"], "reconciled")
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(queue.get("f1").status, expected)
+                self.assertEqual(store.read("f1")["state"], "ready_for_review")
+                if accepted:
+                    self.assertIn("review requested", result["detail"])
+                else:
+                    self.assertIn("not accepted", result["detail"])
+
+    def test_reconciliation_leaves_a_genuinely_active_record_alone(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_1"], "an active record is advanced, never reconciled")
+        self.assertEqual(result["action"], "running")
+        self.assertNotIn("reconciled", result)
+        self.assertEqual(self.queue.get("f1").status, "running")
+
+    def test_a_terminal_record_is_not_ticked_while_active_work_advances(self):
+        self.path.write_text(json.dumps({
+            "f1": card("f1", status="claimed"),
+            "f2": card("f2", job_id="job_2", status="claimed"),
+        }))
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "blocked", "job_id": "job_1",
+                           "detail": "tick refused: JobError wave_reconciliation_required"})
+        store.write("f2", {"state": "running", "job_id": "job_2"})
+        called = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_2"], "only the genuinely active job is ticked")
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(result["feature"], "f2")
+        self.assertEqual(result["reconciled"][0]["feature"], "f1")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        self.assertEqual(store.read("f1")["state"], "blocked")
+
+    def test_reconciliation_does_not_repair_an_unreadable_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.path("f1").write_text("{")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(caught.exception.code, "queue_state_corrupt")
+        self.assertEqual(self.queue.get("f1").status, "claimed")
+
+    def test_reconciliation_treats_a_permission_denied_record_as_state_unreadable(self):
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        record_path = store.path("f1")
+        real_read_text = Path.read_text
+
+        def deny_record_read(path, *args, **kwargs):
+            if path == record_path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", deny_record_read):
+            with self.assertRaises(Q.QueueError) as caught:
+                Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(caught.exception.code, "queue_state_unreadable")
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+        self.assertEqual(self.queue.get("f1").status, "claimed")
+        self.assertEqual(store.read("f1")["state"], "claimed")
+
+    def test_reconciliation_maps_an_unknown_record_state_to_blocked(self):
+        store = self._diverged("done")
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [])
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reconciled"][0]["record_state"], "done")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        card_body = self._card_body()
+        self.assertEqual(card_body["status"], "blocked")
+        self.assertIn(card_body["status"], Q.STATES)
+        self.assertIn("done", card_body["evidence"]["detail"])
+        self.assertIn("not copied", card_body["evidence"]["detail"])
+        self.assertLessEqual(len(card_body["evidence"]["detail"]), 400)
+        self.assertEqual(store.read("f1")["state"], "done",
+                         "the reconciliation reports the existing record; it does not rewrite it")
+
+    def test_reconciliation_bounds_an_unknown_record_state_detail(self):
+        unknown_state = "Z" * 1000
+        self._diverged(unknown_state)
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "reconciled")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        detail = self._card_body()["evidence"]["detail"]
+        self.assertEqual(len(detail), 400)
+        self.assertIn("not copied", detail)
+
+    def test_reconciliation_preserves_a_features_envelope_and_its_other_cards(self):
+        target = {"feature_id": "f1", "repo": "mojomast/a", "job_id": "job_1",
+                  "status": "claimed"}
+        other = {"feature_id": "f2", "repo": "mojomast/b", "job_id": "job_2",
+                 "title": "Second", "status": "ready_for_review"}
+        document = {
+            "schema": "bundlebees.queue/1",
+            "generated_at": "2026-11-18T04:27:23Z",
+            "note": "live-shaped queue",
+            "unknown": {"keep": ["these", "values"]},
+            "features": [target, other],
+        }
+        self.path.write_text(json.dumps(document))
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "blocked", "job_id": "job_1",
+                           "detail": "tick refused: wave reconciliation required"})
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [])
+        self.assertEqual(result["action"], "reconciled")
+        body = json.loads(self.path.read_text())
+        self.assertEqual(body["schema"], document["schema"])
+        self.assertEqual(body["generated_at"], document["generated_at"])
+        self.assertEqual(body["note"], document["note"])
+        self.assertEqual(body["unknown"], document["unknown"])
+        self.assertNotIn("f1", body, "a document-shaped queue must not be rewritten as a flat map")
+        self.assertEqual(body["features"][1], other, "a non-target card must be untouched")
+        self.assertEqual(json.dumps(body["features"][1], sort_keys=True),
+                         json.dumps(other, sort_keys=True))
+        self.assertEqual(body["features"][0]["status"], "blocked")
+        self.assertEqual(body["features"][0]["evidence"]["detail"],
+                         "tick refused: wave reconciliation required")
+
+    def test_a_claimed_card_without_a_record_keeps_its_existing_outcome(self):
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(called, [])
+        self.assertEqual(self.queue.get("f1").status, "claimed",
+                         "a missing record is not a divergence to repair")
+
+    def test_a_claimed_card_with_an_unrepresentable_id_has_no_record_to_reconcile(self):
+        self.path.write_text(json.dumps({"feat/1": card("feat/1", status="claimed")}))
+        queue = Q.JsonQueue(self.path)
+
+        result = Q.run_once(self.tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(queue.get("feat/1").status, "claimed")
+
+    # -- a typed job refusal settles the card and its record ----------------
+
+    def _assert_blocked_by_job_error(self, result, store, *, code, message):
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["code"], code)
+        self.assertIn(code, result["detail"])
+        self.assertIn(message, result["detail"])
+        self.assertEqual(self.queue.get("f1").status, "blocked")
+        record = store.read("f1")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["evidence"]["error"], code)
+        self.assertIn(message, record["detail"])
+        self.assertIn(message, record["evidence"]["detail"])
+
+    def test_a_job_error_from_an_active_tick_blocks_the_card_and_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        def tick(job_id):
+            called.append(job_id)
+            raise jobs.JobError("wave_reconciliation_required",
+                                "the wave record diverged", "Reconcile the wave.")
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=tick)
+
+        self.assertEqual(called, ["job_1"])
+        self._assert_blocked_by_job_error(
+            result, store, code="wave_reconciliation_required",
+            message="the wave record diverged")
+
+    def test_a_job_error_from_the_fresh_claim_tick_blocks_the_card_and_record(self):
+        called = []
+
+        def tick(job_id):
+            called.append(job_id)
+            raise jobs.JobError("wave_reconciliation_required",
+                                "the wave record diverged", "Reconcile the wave.")
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=tick)
+
+        self.assertEqual(called, ["job_1"])
+        self._assert_blocked_by_job_error(
+            result, Q.QueueStore(self.tmp), code="wave_reconciliation_required",
+            message="the wave record diverged")
+
+    def test_a_job_error_from_the_active_claim_load_blocks_the_card_and_record(self):
+        store = Q.QueueStore(self.tmp)
+        store.claim("f1", job_id="job_1")
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+        called = []
+
+        def corrupt(state_dir, job_id):
+            raise jobs.JobError("job_invalid", "job document could not be read",
+                                "Inspect it by hand.")
+
+        with mock.patch.object(Q, "_load_job_or_none", corrupt):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "a corrupt active job is not ticked")
+        self._assert_blocked_by_job_error(
+            result, store, code="job_invalid", message="job document could not be read")
+
+    def test_a_job_error_from_the_fresh_claim_load_blocks_the_card_and_record(self):
+        called = []
+
+        def corrupt(state_dir, job_id):
+            raise jobs.JobError("job_invalid", "job document could not be read",
+                                "Inspect it by hand.")
+
+        with mock.patch.object(Q, "_load_job_or_none", corrupt):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, [], "a corrupt fresh job is not ticked")
+        self._assert_blocked_by_job_error(
+            result, Q.QueueStore(self.tmp), code="job_invalid",
+            message="job document could not be read")
 
 
 if __name__ == "__main__":

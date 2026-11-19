@@ -186,6 +186,17 @@ one pull request.
   never creates, moves, approves or dispatches work. See `docs/board-stock.md`.
 ### Fixed
 
+- **A stale legacy wave record no longer blocks another job's wave 1.**
+  `wave_reconciliation_required` fired whenever `waves/w1.json` existed,
+  because every job's wave 1 carries that bare legacy alias — so a record left
+  by an unrelated job or a standalone integration refused every later job's
+  dispatch and integration. Recovery and integration now treat a legacy record
+  as foreign when its sealed identity names another job or when its recorded
+  attempts do not overlap this job's attempts: it is neither adopted nor
+  allowed to block. Shared-attempt, empty and unreadable evidence still fails
+  closed with the same refusal (`bundlebees_plugin/job.py`,
+  `bundlebees_plugin/integrate_job.py`, `tests/test_legacy_wave_scope.py`).
+
 - **A sandboxed run can record the lease for the payload it was served.**
   `dispatch.collect_payload` refused the served relative form
   (`./.bundlebees-payload/WORKFLOW_SRC`) that the sandbox child env carries, so
