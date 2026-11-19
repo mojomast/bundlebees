@@ -670,6 +670,16 @@ def _remove_staged_entry(path: Path) -> None:
 
 _GIT_HEAD_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STAGED_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+_FIX_GIT_HEAD_UNRESOLVED = (
+    "Resolve the checkout's HEAD to a commit (git rev-parse HEAD) before "
+    "dispatching; an unborn branch or missing ref has no revision to stage, "
+    "so the jail would run without evidence of the code revision."
+)
+_FIX_GIT_HEAD_UNWRITABLE = (
+    "Make the disposable sandbox copy writable while staging .git/HEAD, "
+    ".git/config and .git/refs and .git/objects; without them the child "
+    "cannot name the revision it ran."
+)
 
 
 def _head_sha_of_checkout(source: Path) -> str | None:
@@ -708,7 +718,9 @@ def _head_sha_of_checkout(source: Path) -> str | None:
     return None
 
 
-def stage_git_head(copy_dir: Path, source: Path) -> str | None:
+def stage_git_head(
+    copy_dir: Path, source: Path, *, kind: str | None = None
+) -> str | None:
     """Stage only a detached HEAD into *copy_dir* when *source* is a git checkout.
 
     The copy gets exactly what git needs to name the revision: ``.git/HEAD``
@@ -719,6 +731,13 @@ def stage_git_head(copy_dir: Path, source: Path) -> str | None:
     directory, a bare repository, an unborn HEAD, a broken ``.git`` and a
     directory inside another repository all leave no ``.git`` behind.
 
+    ``kind`` may be the already-computed :func:`_git_source_kind` classification
+    so a caller that must distinguish those cases does not classify twice.
+
+    Only the revision name is usable in the jail: with no objects or index,
+    ``git rev-parse HEAD`` is guaranteed to work, but ``git status``,
+    ``git log`` and ``git diff`` are not (they need objects, refs or an index).
+
     Returns the staged sha, or ``None`` when nothing was staged.
     """
     destination = Path(copy_dir) / ".git"
@@ -728,10 +747,11 @@ def stage_git_head(copy_dir: Path, source: Path) -> str | None:
         root = root.resolve()
     except OSError:
         pass
-    try:
-        kind, _detail = _git_source_kind(root)
-    except OSError:
-        return None
+    if kind is None:
+        try:
+            kind, _detail = _git_source_kind(root)
+        except OSError:
+            return None
     if kind != "checkout":
         return None
     sha = _head_sha_of_checkout(root)
@@ -1051,7 +1071,33 @@ def run_in_sandbox(
         shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
         # The copy leaves out .git, but a checkout must still name its revision in-jail
         # (trial_harness.code_rev_of reads git HEAD). A plain worktree gets no .git.
-        stage_git_head(copy_dir, source)
+        # Classify once here so a broken checkout is refused and a resolvable one is
+        # staged, rather than both silently producing no .git.
+        kind, detail = _git_source_kind(source)
+        if kind == "broken":
+            raise SandboxUnavailable(
+                f"the worktree at {source} has a .git entry git cannot resolve"
+                + (f": {detail}" if detail else ""),
+                f"Repair or remove the broken .git entry at {source / '.git'}; a "
+                "checkout whose revision cannot be named is refused instead of run "
+                "without it.",
+                code="sandbox_git_broken",
+            )
+        try:
+            sha = stage_git_head(copy_dir, source, kind=kind)
+        except OSError as exc:
+            raise SandboxUnavailable(
+                f"could not stage .git in the sandbox copy: {exc}",
+                _FIX_GIT_HEAD_UNWRITABLE,
+                code="sandbox_git_head_unwritable",
+            ) from exc
+        if kind == "checkout" and sha is None:
+            raise SandboxUnavailable(
+                f"the git checkout at {source} has a HEAD that does not resolve to a "
+                "commit (unborn branch or missing ref)",
+                _FIX_GIT_HEAD_UNRESOLVED,
+                code="sandbox_git_head_unresolved",
+            )
         home.mkdir(parents=True, exist_ok=True)
         tmp.mkdir(parents=True, exist_ok=True)
 

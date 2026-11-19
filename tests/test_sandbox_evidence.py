@@ -91,6 +91,7 @@ class TestEvidencePath:
             which=lambda name: "/usr/bin/" + name,
         )
         assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        assert [c[2] for c in self.git_reads] == [str(self.work)] * len(self.git_reads), self.git_reads
         return result
 
     def test_firejail_gets_a_relative_evidence_path(self):
@@ -217,6 +218,7 @@ class TestTiktokenCachePath:
             **kw,
         )
         assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        assert [c[2] for c in self.git_reads] == [str(self.work)] * len(self.git_reads), self.git_reads
         return result
 
     def _jail_visible(self, value: str) -> bool:

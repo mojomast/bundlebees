@@ -140,6 +140,7 @@ class TestRunInSandbox:
             which=lambda name: "/usr/bin/" + name,
         )
         assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        assert [c[2] for c in self.git_reads] == [str(self.work)] * len(self.git_reads), self.git_reads
         return result
 
     def test_a_hidden_interpreter_refuses_before_running_the_command(self):
@@ -151,6 +152,7 @@ class TestRunInSandbox:
         assert "no suitable" in caught.value.error  # names the wrapper message it replaces
         assert self.calls == []
         assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        assert [c[2] for c in self.git_reads] == [str(self.work)] * len(self.git_reads), self.git_reads
 
     def test_a_visible_interpreter_runs_unchanged(self):
         self.probes = [0]
@@ -176,6 +178,7 @@ class TestRunInSandbox:
         assert caught.value.code == "sandbox_interpreter_hidden"
         assert self.calls == []
         assert [c[4] for c in self.git_reads] == list(_GIT_METADATA_READS), self.git_reads
+        assert [c[2] for c in self.git_reads] == [str(self.work)] * len(self.git_reads), self.git_reads
 
     def test_a_visible_configured_interpreter_is_used_as_is(self, monkeypatch):
         monkeypatch.setenv(sandbox.PYTHON_ENV, self.outer)
