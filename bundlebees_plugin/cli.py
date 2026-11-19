@@ -227,10 +227,16 @@ def _build_parser(parser: Any) -> Any:
         default=None,
         help="Clean git worktree to use. Defaults to the configured worktree.",
     )
-    verify.add_argument(
+    verify_flags = verify.add_mutually_exclusive_group()
+    verify_flags.add_argument(
         "--commit-local",
         action="store_true",
         help="Verify in an isolated worktree and create a local commit; never push.",
+    )
+    verify_flags.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Apply and test without committing or pushing.",
     )
     verify.add_argument(
         "--branch",
@@ -243,11 +249,6 @@ def _build_parser(parser: Any) -> Any:
         action="extend",
         default=None,
         help="Test targets to run. Defaults to the brief's named tests.",
-    )
-    verify.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Apply and test without committing or pushing.",
     )
     verify.add_argument(
         "--kanban-comment",
@@ -634,6 +635,14 @@ def _dispatch(ctx: Any, args: Any) -> int:
         if command == "coverage":
             return _cmd_coverage(ctx, args)
         if command == "verify":
+            if getattr(args, "commit_local", False) and getattr(args, "dry_run", False):
+                raise CliError(
+                    "invalid_argument",
+                    "--commit-local and --dry-run cannot be combined",
+                    "Run `hermes bundlebees verify <attempt_id> --commit-local` for a "
+                    "local commit, or `hermes bundlebees verify <attempt_id> --dry-run` "
+                    "for a preview.",
+                )
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
             return _cmd_verify(ctx, args)
