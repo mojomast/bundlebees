@@ -52,8 +52,10 @@ backstop. In order:
 3. **Reconciliation backstop (`--sweep`).** Started with `--sweep`, each driver
    pass may run `beat.beat()` — the launcher-vs-origin diff — as a
    **classify-only** backstop, at most once per `--sweep-interval-s` (default
-   1800 s). The last-run marker is `factory/sweep-last.json`. It is off by
-   default and never starts a landing's verification or dispatch.
+   1800 s). The last-run marker is `factory/sweep-last.json`. The CLI flag is
+   off by default; the shipped unit `contrib/systemd/bundlebees-factory-driver.service`
+   passes `--sweep`, so the deployed service runs it. It never starts a
+   landing's verification or dispatch.
 
 Every pass result carries a `sweep` key: `not_configured` when `--sweep` is
 off, `skipped` (reason `interval`, with `next_in_s`) while the rate limit
