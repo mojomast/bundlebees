@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import execution, metrics, sandbox
+from .pins import HYVV_PIN, LAUNCHER_PIN, WORKFLOW_PIN
 from .provisioning import CAPABILITY_PATH, Capabilities, ProvisionIncompatible
 from .security import UnsafeURLError, child_env, config_flag, scrub, validate_url
 
@@ -73,10 +74,6 @@ ASPECTS: tuple[str, ...] = ("checkout", "origin_main", "installed_package", "gat
 #: The aspects --check-parity compares against the reviewed revision.
 PARITY_ASPECTS: tuple[str, ...] = ("installed_package", "gateway_loaded", "deployed_runtime")
 _PARITY_BAD = frozenset({"stale", "incompatible"})
-
-WORKFLOW_PIN = "9c69d3a987ea9544a77cdd9b5a259904eb36f006"
-HYVV_PIN = "8ffaf73000974e0ba273c72fca42e07b79c38106"
-LAUNCHER_PIN = "0.1.16"
 
 _ORIGIN_MAIN_REFS: tuple[str, ...] = (
     "refs/remotes/origin/main",
