@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -301,6 +303,420 @@ class QueueTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.code, "queue_invalid")
                 self.assertEqual(self.path.read_bytes(), before, "a refused document must not be rewritten")
+
+    # -- flat map identity --------------------------------------------------
+
+    def test_a_flat_map_card_body_id_must_match_its_map_key(self):
+        for field in ("feature_id", "id"):
+            with self.subTest(field=field):
+                self.path.write_text(
+                    json.dumps({"f1": {field: "f2", "repo": "mojomast/a", "job_id": "job_1"}})
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertIn("f1", str(caught.exception))
+                self.assertIn("f2", str(caught.exception))
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_a_flat_map_card_with_both_body_ids_differing_from_its_key_is_refused(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "f1": {
+                        "feature_id": "f2",
+                        "id": "f3",
+                        "repo": "mojomast/a",
+                        "job_id": "job_1",
+                    }
+                }
+            )
+        )
+
+        with self.assertRaises(Q.QueueError) as caught:
+            Q.JsonQueue(self.path).list_items()
+
+        self.assertEqual(caught.exception.code, "queue_invalid")
+        self.assertIn("f1", str(caught.exception))
+        self.assertIn("f2", str(caught.exception))
+        self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_set_status_refuses_a_flat_map_identity_violation_without_writing(self):
+        documents = (
+            {"f1": {"feature_id": "f2", "repo": "mojomast/a", "job_id": "job_1"}},
+            {"f1": {"id": "f2", "repo": "mojomast/a", "job_id": "job_1"}},
+            {"f1": {"feature_id": "f2", "id": "f3", "job_id": "job_1"}},
+        )
+        for document in documents:
+            with self.subTest(document=document):
+                self.path.write_text(json.dumps(document))
+                before = hashlib.sha256(self.path.read_bytes()).hexdigest()
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).set_status("f1", "running")
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(
+                    hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                    before,
+                    "a refused document must not be rewritten",
+                )
+                self.assertFalse((self.tmp / "queue.json.tmp").exists())
+
+    def test_flat_map_accepted_documents_match_the_3932e10_baseline(self):
+        baseline = {
+            "no_body_ids": (
+                {"f1": {"repo": "r", "job_id": "j1", "depends_on": [], "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "depends_on": [],
+                        "evidence": {"job_id": "j1"},
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "both_equal": (
+                {"f1": {"feature_id": "f1", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "both_equal_padded_body": (
+                {
+                    "f1": {
+                        "feature_id": " f1 ",
+                        "id": "f1  ",
+                        "repo": "r",
+                        "job_id": "j1",
+                        "status": "queued",
+                    }
+                },
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": " f1 ",
+                        "id": "f1  ",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "padded_key_no_body": (
+                {" f1 ": {"repo": "r", "job_id": "j1", "status": "queued"}},
+                [(" f1 ", "r", "j1", "", (), "queued")],
+                {
+                    " f1 ": {
+                        "evidence": {"job_id": "j1"},
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "padded_key_both_equal": (
+                {" f1 ": {"feature_id": "f1", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [(" f1 ", "r", "j1", "", (), "queued")],
+                {
+                    " f1 ": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "only_feature_id": (
+                {"f1": {"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "only_id": (
+                {"f1": {"id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "blank_feature_id_id_match": (
+                {"f1": {"feature_id": "   ", "id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "   ",
+                        "id": "f1",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+            "blank_id_feature_id_match": (
+                {"f1": {"feature_id": "f1", "id": "   ", "repo": "r", "job_id": "j1", "status": "queued"}},
+                [("f1", "r", "j1", "", (), "queued")],
+                {
+                    "f1": {
+                        "evidence": {"job_id": "j1"},
+                        "feature_id": "f1",
+                        "id": "   ",
+                        "job_id": "j1",
+                        "repo": "r",
+                        "status": "running",
+                        "updated_at": "<ts>",
+                    }
+                },
+            ),
+        }
+        for name, (document, expected_items, expected_written) in baseline.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                self.assertEqual(
+                    [
+                        (item.feature_id, item.repo, item.job_id, item.title, item.depends_on, item.status)
+                        for item in queue.list_items()
+                    ],
+                    expected_items,
+                )
+
+                queue.set_status(next(iter(document)), "running", {"job_id": "j1"})
+                written = re.sub(
+                    r'"updated_at": "[^"]+"', '"updated_at": "<ts>"', self.path.read_text()
+                )
+                self.assertEqual(written, json.dumps(expected_written, indent=2, sort_keys=True))
+
+    def test_nested_feature_shapes_match_the_3932e10_baseline(self):
+        accepted = {
+            "map_no_body": (
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "g",
+                    "note": "n",
+                    "features": {
+                        "f1": {"repo": "r", "job_id": "j1", "status": "queued", "depends_on": []}
+                    },
+                },
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "g",
+                    "note": "n",
+                    "features": {
+                        "f1": {
+                            "depends_on": [],
+                            "evidence": {"job_id": "j1"},
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    },
+                },
+            ),
+            "map_restate": (
+                {
+                    "schema": "bundlebees.queue/1",
+                    "features": {
+                        "f1": {
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    },
+                },
+                {
+                    "schema": "bundlebees.queue/1",
+                    "features": {
+                        "f1": {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    },
+                },
+            ),
+            "list_feature_id": (
+                {"features": [{"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}]},
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_id": (
+                {"features": [{"id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}]},
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_agreeing": (
+                {
+                    "features": [
+                        {
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    ]
+                },
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": " f1 ",
+                            "id": "f1",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+            "list_blank_one": (
+                {
+                    "features": [
+                        {
+                            "feature_id": "f1",
+                            "id": "   ",
+                            "repo": "r",
+                            "job_id": "j1",
+                            "status": "queued",
+                        }
+                    ]
+                },
+                {
+                    "features": [
+                        {
+                            "evidence": {"job_id": "j1"},
+                            "feature_id": "f1",
+                            "id": "   ",
+                            "job_id": "j1",
+                            "repo": "r",
+                            "status": "running",
+                            "updated_at": "<ts>",
+                        }
+                    ]
+                },
+            ),
+        }
+        for name, (document, expected_written) in accepted.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(self.path)
+
+                self.assertEqual(
+                    [
+                        (item.feature_id, item.repo, item.job_id, item.title, item.depends_on, item.status)
+                        for item in queue.list_items()
+                    ],
+                    [("f1", "r", "j1", "", (), "queued")],
+                )
+
+                queue.set_status("f1", "running", {"job_id": "j1"})
+                written = re.sub(
+                    r'"updated_at": "[^"]+"', '"updated_at": "<ts>"', self.path.read_text()
+                )
+                self.assertEqual(written, json.dumps(expected_written, indent=2, sort_keys=True))
+
+        refused = {
+            "map_mismatch": (
+                {"features": {"f1": {"feature_id": "f2", "repo": "r", "job_id": "j1"}}},
+                "queue feature 'f1' carries body id 'f2'",
+                "Repair the queue file: the 'f1' card must use 'f1' as its feature_id/id, "
+                "or move the 'f2' card under that key.",
+            ),
+            "list_conflicting_ids": (
+                {"features": [{"feature_id": "f1", "id": "f2", "repo": "r", "job_id": "j1"}]},
+                "queue feature at index 0 declares feature_id 'f1' and id 'f2'",
+                "Repair the queue file: make the card's feature_id and id name the same "
+                "feature ('f1' or 'f2'), or remove one.",
+            ),
+            "list_duplicate_ids": (
+                {
+                    "features": [
+                        {"feature_id": "f1", "job_id": "j1"},
+                        {"id": " f1 ", "job_id": "j2"},
+                    ]
+                },
+                "queue feature 'f1' appears more than once (indices 0 and 1)",
+                "Repair the queue file: remove or rename the duplicate 'f1' card so each "
+                "feature id appears once.",
+            ),
+        }
+        for name, (document, expected_message, expected_fix) in refused.items():
+            with self.subTest(name=name):
+                self.path.write_text(json.dumps(document))
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), expected_message)
+                self.assertEqual(caught.exception.fix, expected_fix)
 
     def test_a_features_list_card_without_a_usable_id_is_a_typed_refusal(self):
         for body in ({"repo": "r", "job_id": "j"}, {"feature_id": "", "id": "  "}):
