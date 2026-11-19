@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from bundlebees_plugin import sandbox
+from bundlebees_plugin.security import scrub
 from tests.fakes import require_sandbox_interpreter
 
 
@@ -968,10 +969,7 @@ def test_run_in_sandbox_classifies_before_copying_a_broken_checkout(
     assert calls == []
 
 
-def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_truthful_message(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    work = tmp_path / "sha256"
+def _sha256_checkout(work: Path) -> str:
     work.mkdir()
     _git(work, "init", "-q", "--object-format=sha256")
     (work / "tracked.txt").write_text("tracked\n", encoding="utf-8")
@@ -979,6 +977,85 @@ def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_truthful_message(
     _git(work, "commit", "-q", "-m", "first commit")
     sha = _git(work, "rev-parse", "HEAD")
     assert len(sha) == 64 and all(char in "0123456789abcdef" for char in sha)
+    return sha
+
+
+def _unsupported_head_message(source: Path, revision: str) -> str:
+    return (
+        f"the git checkout at {source} has a 64-hex revision in HEAD ({revision}) "
+        "that the sandbox cannot stage; only a 40-hex SHA-1 revision is "
+        "representable in the jail's .git/HEAD (a 64-hex HEAD is most often a "
+        "SHA-256 object-format repository)"
+    )
+
+
+def _unsupported_head_fix() -> str:
+    return (
+        "Re-run the verification from a checkout whose HEAD is a 40-hex SHA-1 "
+        "commit. A 64-hex HEAD (most often a SHA-256 object-format repository) is "
+        "refused rather than staged without a revision the jail can name; the "
+        "sandbox stages only a 40-hex SHA-1 revision into .git/HEAD."
+    )
+
+
+def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_truthful_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "sha256"
+    sha = _sha256_checkout(work)
+    source = work.resolve()
+    calls: list[list[str]] = []
+
+    real_copytree = sandbox.shutil.copytree
+    real_mkdir = Path.mkdir
+    copies: list[Path] = []
+    git_seen_during_copy: list[bool] = []
+    staged_git_dirs: list[Path] = []
+
+    def copytree(src, dst, *args, **kwargs):
+        result = real_copytree(src, dst, *args, **kwargs)
+        destination = Path(dst)
+        copies.append(destination)
+        git_seen_during_copy.append(
+            (destination / ".git").exists() or (destination / ".git").is_symlink()
+        )
+        return result
+
+    def mkdir(self, *args, **kwargs):
+        if self.name == ".git":
+            staged_git_dirs.append(self)
+        return real_mkdir(self, *args, **kwargs)
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    monkeypatch.setattr(sandbox.shutil, "copytree", copytree)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    # A 64-hex HEAD is refused before anything is staged: the copy itself never
+    # carries .git and no .git directory is created while staging.
+    assert len(copies) == 1
+    assert git_seen_during_copy == [False]
+    assert staged_git_dirs == []
+
+    assert str(caught.value) == scrub(_unsupported_head_message(source, sha))
+    assert caught.value.fix == _unsupported_head_fix()
+    assert "64" in str(caught.value)
+    assert "40" in caught.value.fix or "SHA-1" in caught.value.fix
+    assert "unborn" not in str(caught.value)
+    assert "unborn" not in caught.value.fix
+    assert calls == []
+
+
+def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_distinct_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "sha256"
+    _sha256_checkout(work)
     calls: list[list[str]] = []
 
     def observe(command, kwargs):
@@ -989,9 +1066,57 @@ def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_truthful_message(
     with pytest.raises(sandbox.SandboxUnavailable) as caught:
         _run_through_fake_jail(work)
 
-    assert caught.value.code == "sandbox_git_head_unresolved"
+    assert caught.value.code == "sandbox_git_head_unsupported"
+    assert calls == []
+
+
+def test_run_in_sandbox_refuses_a_sha1_checkout_whose_head_is_64_hex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "sha1-with-64-hex-head"
+    _make_checkout(work)
+    revision = "0123456789abcdef" * 4
+    (work / ".git" / "HEAD").write_text(revision + "\n", encoding="utf-8")
+    source = work.resolve()
+    calls: list[list[str]] = []
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert caught.value.code == "sandbox_git_head_unsupported"
+    assert str(caught.value) == scrub(_unsupported_head_message(source, revision))
+    assert caught.value.fix == _unsupported_head_fix()
     assert "64" in str(caught.value)
     assert "40" in caught.value.fix or "SHA-1" in caught.value.fix
     assert "unborn" not in str(caught.value)
     assert "unborn" not in caught.value.fix
     assert calls == []
+
+
+def test_run_in_sandbox_reads_the_sha256_head_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "sha256"
+    _sha256_checkout(work)
+    reads: list[Path] = []
+    real_read = sandbox._head_revision_of_checkout
+
+    def read_once(source):
+        reads.append(source)
+        return real_read(source)
+
+    def observe(command, kwargs):
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    monkeypatch.setattr(sandbox, "_head_revision_of_checkout", read_once)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert len(reads) == 1
+    assert caught.value.code == "sandbox_git_head_unsupported"

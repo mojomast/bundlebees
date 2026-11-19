@@ -676,11 +676,11 @@ _FIX_GIT_HEAD_UNRESOLVED = (
     "dispatching; an unborn branch or missing ref has no revision to stage, "
     "so the jail would run without evidence of the code revision."
 )
-_FIX_GIT_HEAD_SHA256 = (
-    "Re-run the verification from a SHA-1 checkout (git init without "
-    "--object-format=sha256). The sandbox stages only a 40-hex SHA-1 revision "
-    "into .git/HEAD, so a 64-hex SHA-256 HEAD is refused rather than staged "
-    "without a revision the jail can name."
+_FIX_GIT_HEAD_UNSUPPORTED = (
+    "Re-run the verification from a checkout whose HEAD is a 40-hex SHA-1 "
+    "commit. A 64-hex HEAD (most often a SHA-256 object-format repository) is "
+    "refused rather than staged without a revision the jail can name; the "
+    "sandbox stages only a 40-hex SHA-1 revision into .git/HEAD."
 )
 _FIX_GIT_HEAD_UNWRITABLE = (
     "Make the disposable sandbox copy writable while staging .git/HEAD, "
@@ -727,12 +727,41 @@ def _head_revision_of_checkout(source: Path) -> str | None:
     return None
 
 
-def _head_sha_of_checkout(source: Path) -> str | None:
-    """Resolve *source*'s HEAD to a 40-hex sha, or ``None`` when it has none."""
-    revision = _head_revision_of_checkout(source)
-    if revision is not None and _GIT_HEAD_RE.fullmatch(revision):
-        return revision
-    return None
+def _stage_git_head(
+    copy_dir: Path, source: Path, *, kind: str | None = None
+) -> tuple[str | None, str | None]:
+    """Stage a checkout's detached HEAD and return ``(staged_sha, revision)``.
+
+    *revision* is the one HEAD resolution the caller may also use to explain a
+    refusal, so an unsupported 64-hex revision is read once rather than twice.
+    *staged_sha* is that revision when it is a representable 40-hex SHA-1, and
+    ``None`` otherwise (including when nothing was staged at all).
+    """
+    destination = Path(copy_dir) / ".git"
+    _remove_staged_entry(destination)
+    root = Path(source).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+    if kind is None:
+        try:
+            kind, _detail = _git_source_kind(root)
+        except OSError:
+            return None, None
+    if kind != "checkout":
+        return None, None
+    revision = _head_revision_of_checkout(root)
+    if revision is None:
+        return None, None
+    if not _GIT_HEAD_RE.fullmatch(revision):
+        return None, revision
+    destination.mkdir(parents=True)
+    (destination / "refs").mkdir()
+    (destination / "objects").mkdir()
+    (destination / "HEAD").write_text(revision + "\n", encoding="utf-8")
+    (destination / "config").write_text(_STAGED_GIT_CONFIG, encoding="utf-8")
+    return revision, revision
 
 
 def stage_git_head(
@@ -757,28 +786,7 @@ def stage_git_head(
 
     Returns the staged sha, or ``None`` when nothing was staged.
     """
-    destination = Path(copy_dir) / ".git"
-    _remove_staged_entry(destination)
-    root = Path(source).expanduser()
-    try:
-        root = root.resolve()
-    except OSError:
-        pass
-    if kind is None:
-        try:
-            kind, _detail = _git_source_kind(root)
-        except OSError:
-            return None
-    if kind != "checkout":
-        return None
-    sha = _head_sha_of_checkout(root)
-    if sha is None:
-        return None
-    destination.mkdir(parents=True)
-    (destination / "refs").mkdir()
-    (destination / "objects").mkdir()
-    (destination / "HEAD").write_text(sha + "\n", encoding="utf-8")
-    (destination / "config").write_text(_STAGED_GIT_CONFIG, encoding="utf-8")
+    sha, _revision = _stage_git_head(copy_dir, source, kind=kind)
     return sha
 
 
@@ -1053,6 +1061,10 @@ def run_in_sandbox(
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
+    *workdir* is ``expanduser()``-expanded, consistent with :func:`stage_payload`:
+    a literal directory named ``~`` resolves to ``$HOME``, while an unexpandable
+    ``~nosuchuser`` raises ``RuntimeError`` before any copy is made.
+
     With *collect_file*, the JSON object the child wrote to
     ``{evidence}/<collect_file>`` is returned as ``collected`` (bounded,
     regular file only, ``None`` when absent or malformed).
@@ -1106,7 +1118,7 @@ def run_in_sandbox(
             )
         shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
         try:
-            sha = stage_git_head(copy_dir, source, kind=kind)
+            sha, revision = _stage_git_head(copy_dir, source, kind=kind)
         except OSError as exc:
             raise SandboxUnavailable(
                 f"could not stage .git in the sandbox copy: {exc}",
@@ -1114,14 +1126,14 @@ def run_in_sandbox(
                 code="sandbox_git_head_unwritable",
             ) from exc
         if kind == "checkout" and sha is None:
-            revision = _head_revision_of_checkout(source)
             if revision is not None and _GIT_SHA256_HEAD_RE.fullmatch(revision):
                 raise SandboxUnavailable(
-                    f"the git checkout at {source} has a 64-hex SHA-256 HEAD "
+                    f"the git checkout at {source} has a 64-hex revision in HEAD "
                     f"({revision}) that the sandbox cannot stage; only a 40-hex "
-                    "SHA-1 revision is representable in the jail's .git/HEAD",
-                    _FIX_GIT_HEAD_SHA256,
-                    code="sandbox_git_head_unresolved",
+                    "SHA-1 revision is representable in the jail's .git/HEAD (a "
+                    "64-hex HEAD is most often a SHA-256 object-format repository)",
+                    _FIX_GIT_HEAD_UNSUPPORTED,
+                    code="sandbox_git_head_unsupported",
                 )
             raise SandboxUnavailable(
                 f"the git checkout at {source} has a HEAD that does not resolve to a "
