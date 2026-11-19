@@ -243,8 +243,13 @@ def test_verify_dry_run_applies_lease_runs_test_and_does_not_push(
     assert "tests/test_sample.py" in out
     assert "src/a.py" in out
 
-    payload = json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
-    assert set(payload) == {"attempt_id", "ok", "sha", "branch", "files", "tests", "at", "evidence"}
+    payload = json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
+    assert set(payload) == {
+        "attempt_id", "ok", "sha", "branch", "files", "tests", "at", "evidence", "dry_run",
+    }
+    assert payload["dry_run"] is True
     assert payload["evidence"]["exit_code"] == 0
     assert payload["evidence"]["source_rev"] == base_sha
     assert payload["evidence"]["diffstat"] == {"files": 1, "added": 1, "deleted": 0}
@@ -279,7 +284,9 @@ def test_verify_rejects_out_of_lease_file(
         _git(remote, "rev-parse", f"refs/heads/{BRANCH}").stdout.strip()
         == base_sha
     )
-    payload = json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
+    payload = json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
     assert payload["ok"] is False
 
 
@@ -303,8 +310,11 @@ def test_verify_secret_scan_blocks_output_and_state(
         _git(remote, "rev-parse", f"refs/heads/{BRANCH}").stdout.strip()
         == base_sha
     )
-    state_text = (state / "verify-results" / f"{ATTEMPT_ID}.json").read_text()
+    state_text = (
+        state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json"
+    ).read_text()
     assert secret not in state_text
+    assert not (state / "verify-results" / f"{ATTEMPT_ID}.json").exists()
 
 
 def test_verify_refuses_main_as_push_target(
@@ -571,7 +581,9 @@ def test_doctor_reports_refused_unshare(
 
 
 def _verify_result(state: Path) -> dict:
-    return json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
+    return json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
 
 
 def test_verify_ignores_worker_claimed_scope_and_rejects_out_of_scope_patch(

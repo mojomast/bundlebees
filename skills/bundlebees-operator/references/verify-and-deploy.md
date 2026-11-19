@@ -24,7 +24,7 @@ Flags:
 | positional `attempt_id` | The attempt returned by `bundlebees_dispatch`. |
 | `--workdir <path>` | Existing clean worktree to use. Confined; no path escape. |
 | `--tests <name> ...` | Run these named tests. Repeated flags append their targets. |
-| `--dry-run` | Apply the patch and run tests, then stop before any push. |
+| `--dry-run` | Apply the patch and run tests, then stop before any push. Evidence goes only to `verify-results/dry-run/<attempt_id>.json` and never replaces the attempt record. |
 | `--kanban-comment <text>` | Opt-in: after a green run, suggest or post a comment through the public kanban CLI. |
 
 What verify does, in order:
@@ -60,11 +60,13 @@ What verify does, in order:
 8. Print a summary with the SHA, tests, files and sandbox backend, and a note
    that the wave is not accepted until integrate passes.
 
-Verify writes `verify-results/<attempt_id>.json` with `attempt_id`, `ok`,
-`sha`, `branch`, `files`, `tests`, `at`, and `evidence` (`source_rev`,
-`backend`, `exit_code`, `junit`, `diffstat`, `duration_s`). It also appends a
-`verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside
-the repo.
+Only a committing verify writes `verify-results/<attempt_id>.json` with
+`attempt_id`, `ok`, `sha`, `branch`, `files`, `tests`, `at`, and `evidence`
+(`source_rev`, `backend`, `exit_code`, `junit`, `diffstat`, `duration_s`); a
+`--dry-run` writes the same shape plus `"dry_run": true` to
+`verify-results/dry-run/<attempt_id>.json` and never replaces it. Verify also
+appends a `verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths
+outside the repo.
 
 ## Contract-first (ACDD) work
 

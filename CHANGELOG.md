@@ -186,6 +186,12 @@ one pull request.
   never creates, moves, approves or dispatches work. See `docs/board-stock.md`.
 ### Fixed
 
+- **A verify dry run no longer overwrites the attempt's official record.** Every
+  `--dry-run` outcome now writes only `verify-results/dry-run/<attempt_id>.json`
+  (marked `"dry_run": true`), leaving the canonical
+  `verify-results/<attempt_id>.json` byte-identical, so a preview can never
+  replace evidence from a committing verify.
+
 - **A stale legacy wave record no longer blocks another job's wave 1.**
   `wave_reconciliation_required` fired whenever `waves/w1.json` existed,
   because every job's wave 1 carries that bare legacy alias — so a record left

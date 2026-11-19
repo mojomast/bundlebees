@@ -1,8 +1,9 @@
 """The on-disk verify refusal record must say *why* verify refused.
 
 Each case drives the real ``cli._cmd_verify`` failure path with a fake client
-and a real temporary lease/worktree, then reads ``verify-results/<attempt>.json``
-from disk. No network, launcher, or remote push is involved.
+and a real temporary lease/worktree, then reads
+``verify-results/dry-run/<attempt>.json`` from disk. No network, launcher, or
+remote push is involved.
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ def _no_payload_pins(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _record(state: Path) -> dict:
-    return json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
+    return json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
 
 
 def _flagged_patch(planted_value: str) -> str:
@@ -148,7 +151,8 @@ def test_success_record_keeps_its_shape(tmp_path: Path, monkeypatch: pytest.Monk
     assert rc == 0
     record = _record(state)
     assert record["ok"] is True
-    assert {"attempt_id", "ok", "sha", "branch", "files", "tests", "at", "evidence"} <= set(record)
+    assert {"attempt_id", "ok", "sha", "branch", "files", "tests", "at", "evidence", "dry_run"} <= set(record)
+    assert record["dry_run"] is True
     assert record["attempt_id"] == ATTEMPT_ID
     assert record["branch"] == "feat/x"
     assert record["sha"] is None

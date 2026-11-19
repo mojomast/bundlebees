@@ -2448,9 +2448,15 @@ def _write_verify_result(
     evidence: Mapping[str, Any] | None = None,
     code: str | None = None,
     error: str | None = None,
+    dry_run: bool = False,
 ) -> Path:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = Path(contain_path(f"verify-results/{attempt_id}.json", str(state_dir)))
+    relative = (
+        f"verify-results/dry-run/{attempt_id}.json"
+        if dry_run
+        else f"verify-results/{attempt_id}.json"
+    )
+    target = Path(contain_path(relative, str(state_dir)))
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "attempt_id": attempt_id,
@@ -2466,6 +2472,8 @@ def _write_verify_result(
         payload["code"] = str(code)
     if error is not None:
         payload["error"] = _clip_verify_reason(str(error))
+    if dry_run:
+        payload["dry_run"] = True
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
     validated_branch = _literal_branch(branch)
@@ -2799,7 +2807,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         if dry_run:
             target = _write_verify_result(
                 state_dir, attempt_id, ok=True, sha=None, branch=branch,
-                files=files, tests=tests, evidence=evidence,
+                files=files, tests=tests, evidence=evidence, dry_run=dry_run,
             )
             _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
@@ -2899,7 +2907,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             _write_verify_result(
                 state_dir, attempt_id, ok=False, sha=sha, branch=branch,
                 files=files, tests=tests, evidence=evidence,
-                code=str(exc.code), error=reason,
+                code=str(exc.code), error=reason, dry_run=dry_run,
             )
         except Exception:  # noqa: BLE001 - preserve the original CLI error
             pass
