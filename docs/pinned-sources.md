@@ -122,10 +122,19 @@ The coordinator's pinned checkouts live in the coordinator home, which every
 strong sandbox wrapper hides (`firejail --private=<copy>` mounts the disposable
 copy over the home and `--private-tmp` replaces `/tmp` and `/var/tmp`). A
 payload addressed at its absolute host path is ENOENT inside the jail, so
-serving is *staging*, never env transport: `sandbox.stage_payload` copies each
+serving is *staging*, never env transport: `sandbox.stage_payload` stages each
 source into the sandbox copy and the child env names it by the relative path
-`./.bundlebees-payload/<name>`. The host checkout path never appears in the
-child env, and on a masking wrapper it does not even exist inside the jail.
+`./.bundlebees-payload/<name>`. A payload source that is itself a non-bare git
+checkout is served as a single-commit checkout at the **same** HEAD: the staged
+directory is a git checkout whose `git rev-parse HEAD` equals the source's, so
+tests that load the pin as a git checkout run in-jail. The served copy carries
+no history beyond that commit, no tags, no remotes and no coordinator paths (the
+fetch metadata that would name the source is removed), while the source working
+tree -- including uncommitted and untracked files -- is copied as-is. A source
+that is not a git checkout is served as a plain file copy, and a git source that
+cannot be staged as a checkout fails closed (`payload_unservable`) rather than
+degrading to a plain copy. The host checkout path never appears in the child
+env, and on a masking wrapper it does not even exist inside the jail.
 
 The wiring has three halves, all behind one chokepoint per half:
 
