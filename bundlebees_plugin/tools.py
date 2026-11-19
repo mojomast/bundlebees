@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -24,6 +26,7 @@ from .client import (
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
 from . import contract as _contract
+from . import contracts as _contracts
 from . import attribution as _attribution
 from . import leases as _leases
 from . import metrics as _metrics
@@ -64,6 +67,9 @@ _RUNNING_STATES = {"running", "working", "active", "started"}
 # step with agent_consumer.TOOL_TERMINAL_STATES (imported lazily in
 # _tool_write_back to avoid a module-import cycle).
 _TOOL_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted"}
+# The contract gate's provenance/acceptance checks run in the live dispatch path
+# for visibility only; enforcement is off until the owner enables it.
+CONTRACT_GATE_MODE = "report_only"
 
 _FIX_PROJECT = (
     "The owner must add this project to the launcher config and restart the "
@@ -415,6 +421,94 @@ def _record_dispatch(state_dir: Path | None, attempt_id: Any, brief: Mapping[str
     return {"lease_recorded": True}
 
 
+def _contract_criterion_ids(contract: Mapping[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for criterion in contract.get("acceptance_criteria") or []:
+        if isinstance(criterion, Mapping) and isinstance(criterion.get("id"), str):
+            ids.append(criterion["id"])
+    return ids
+
+
+def _report_only_gate(
+    validated: Mapping[str, Any], brief: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Run the provenance/acceptance checks as report-only findings.
+
+    Nothing here can refuse the dispatch: a :class:`ContractRefusal` becomes a
+    would-refuse entry, and any other exception becomes a ``gate_error`` entry.
+    """
+    packet = brief.get("packet")
+    evidence = brief.get("evidence")
+    would_refuse: list[dict[str, Any]] = []
+    provenance: Any = None
+    try:
+        provenance = _contracts.check_provenance(validated, packet=packet)
+    except _contracts.ContractRefusal as exc:
+        would_refuse.append({"code": exc.code, "error": exc.error, "field": exc.field})
+    except Exception as exc:  # noqa: BLE001 - report-only must never refuse
+        would_refuse.append(
+            {"code": "gate_error", "error": scrub(str(exc)), "field": None}
+        )
+    acceptance_ids = _contract_criterion_ids(validated)
+    try:
+        acceptance_ids = _contracts.check_acceptance_ids(
+            validated, brief=brief, packet=packet, evidence=evidence
+        )
+    except _contracts.ContractRefusal as exc:
+        would_refuse.append({"code": exc.code, "error": exc.error, "field": exc.field})
+    except Exception as exc:  # noqa: BLE001 - report-only must never refuse
+        would_refuse.append(
+            {"code": "gate_error", "error": scrub(str(exc)), "field": None}
+        )
+    return {
+        "mode": CONTRACT_GATE_MODE,
+        "would_refuse": would_refuse,
+        "acceptance_ids": acceptance_ids,
+        "provenance": provenance,
+    }
+
+
+def _record_gate_findings(
+    state_dir: Path | None, brief: Mapping[str, Any], acdd: Mapping[str, Any]
+) -> None:
+    """Append report-only findings to ``<state_dir>/contract-gate/report-only.jsonl``.
+
+    Best effort: a recording failure must never block or fail the dispatch.
+    """
+    gate = acdd.get("gate")
+    if state_dir is None or not isinstance(gate, Mapping):
+        return
+    findings = gate.get("would_refuse")
+    if not isinstance(findings, list) or not findings:
+        return
+    at = datetime.now(timezone.utc).isoformat()
+    contract_id = acdd.get("contract_id")
+    contract_sha256 = acdd.get("contract_sha256")
+    project = brief.get("project")
+    directory = Path(state_dir) / "contract-gate"
+    path = directory / "report-only.jsonl"
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            for finding in findings:
+                if not isinstance(finding, Mapping):
+                    continue
+                record = {
+                    "at": at,
+                    "mode": CONTRACT_GATE_MODE,
+                    "contract_id": contract_id,
+                    "contract_sha256": contract_sha256,
+                    "project": project,
+                    "code": finding.get("code"),
+                    "error": finding.get("error"),
+                    "field": finding.get("field"),
+                }
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        return
+
+
 def _dispatch_acdd(
     brief: Mapping[str, Any], require_contract: bool
 ) -> dict[str, Any] | str:
@@ -447,6 +541,7 @@ def _dispatch_acdd(
         "contract_id": validated.get("id"),
         "contract_sha256": digest,
         "tdd_applicable": bool(tdd.get("applicable")) if isinstance(tdd, Mapping) else False,
+        "gate": _report_only_gate(validated, brief),
     }
 
 
@@ -512,6 +607,8 @@ def _dispatch(
             "the plugin data directory is unavailable, so the coordinator lease cannot be recorded",
             "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
         )
+
+    _record_gate_findings(state_dir, brief, acdd)
 
     project = brief.get("project")
     if isinstance(project, str) and project:

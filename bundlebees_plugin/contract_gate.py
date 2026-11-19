@@ -1,16 +1,16 @@
-"""The ``require_contract`` dispatch gate (reliability campaign F2).
+"""Dry-run CLI over :func:`bundlebees_plugin.contracts.pre_dispatch`.
 
-This module is the enforcement boundary a dispatcher calls *before* any
-launcher call. :func:`gate` refuses with a machine-readable
-:class:`ContractRefusal` (``contract_required`` and friends) or returns the
-``acdd`` envelope block; :func:`dispatch` refuses first and only then performs
-the send, so a refused brief never reaches the launcher.
+This module is an operator tool, not the live dispatch path. It exposes the
+fail-closed gate helpers (:func:`gate`, :func:`dispatch`,
+:func:`enforcement_config`) and ``python3 -m bundlebees_plugin.contract_gate
+check BRIEF.json``, which prints the machine-readable envelope a dispatch
+decision would be made from.
 
-Configuration is durable: :func:`enforcement_config` resolves the flag through
-``bundlebees_plugin.settings`` — the active execution profile's plugin settings
-or the repository's Hermes profile file — never from session state and never
-from the brief. A restart re-reads the same configuration and re-derives the
-same decision, which is what makes enforcement survive restarts and recovery.
+The live provenance and acceptance-id checks run report-only inside
+``bundlebees_plugin.tools._dispatch_acdd``: they record what would have been
+refused without refusing. Enforcement is off until the owner enables it; a
+restart re-reads the same durable configuration through
+``bundlebees_plugin.settings``.
 """
 
 from __future__ import annotations
