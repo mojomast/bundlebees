@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -89,6 +90,77 @@ def _make_checkout(checkout: Path, *, workflow: bool = True) -> Path:
 def _tree_digest(root: Path) -> str:
     """Mirror of ``dispatch._tree_digest`` for local expectations."""
     return dispatch.payload_digest({"WORKFLOW_SRC": str(root)})[PAYLOAD_NAME]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    """Run git in *cwd* with a hermetic identity; return stripped stdout."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Payload Probe",
+            "GIT_AUTHOR_EMAIL": "payload@example.invalid",
+            "GIT_COMMITTER_NAME": "Payload Probe",
+            "GIT_COMMITTER_EMAIL": "payload@example.invalid",
+        }
+    )
+    done = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert done.returncode == 0, f"git {' '.join(args)} failed: {done.stderr}"
+    return done.stdout.strip()
+
+
+def _make_git_checkout(root: Path, *, commits: int = 2) -> Path:
+    """A real non-bare checkout with the workflow markers and *commits* commits."""
+    _make_checkout(root)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "first commit")
+    for index in range(1, commits):
+        (root / f"change-{index}.txt").write_text(f"change {index}\n", encoding="utf-8")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", f"commit {index}")
+    return root
+
+
+def _tree_entries(root: Path) -> dict[str, tuple[str, object]]:
+    """Map every served path to its bytes or symlink target, skipping ignored names."""
+    entries: dict[str, tuple[str, object]] = {}
+
+    def visit(directory: Path, prefix: str) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            if entry.name in sandbox.PAYLOAD_IGNORED_NAMES:
+                continue
+            path = Path(entry.path)
+            relative = f"{prefix}{entry.name}"
+            if entry.is_symlink():
+                entries[relative] = ("link", os.readlink(path))
+            elif entry.is_dir(follow_symlinks=False):
+                visit(path, f"{relative}/")
+            elif entry.is_file(follow_symlinks=False):
+                entries[relative] = ("file", path.read_bytes())
+
+    visit(root, "")
+    return entries
+
+
+def _files_containing(root: Path, needle: str) -> list[Path]:
+    """Regular files under *root* (including ``.git``) whose bytes contain *needle*."""
+    matches: list[Path] = []
+    for directory, _dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            path = Path(directory) / filename
+            if path.is_symlink() or not path.is_file():
+                continue
+            if needle.encode("utf-8") in path.read_bytes():
+                matches.append(path)
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +273,14 @@ def test_payload_digest_binds_the_served_bytes(tmp_path: Path):
 
 
 def test_stage_payload_stages_relative_and_leaves_history_out(tmp_path: Path):
-    checkout = _make_checkout(tmp_path / "pinned")
-    (checkout / ".git").mkdir()
-    (checkout / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    """The two-case contract: a real checkout is served as a single-commit repo."""
+
+    # Case 1: a real non-bare checkout becomes a checkout at the same commit,
+    # carrying no history, tags or remotes.
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    head = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "tag", "probe-tag")
+    _git(checkout, "remote", "add", "origin", str(tmp_path / "nowhere"))
     link = checkout / "tools" / "linked.py"
     link.symlink_to("recovery.py")
     copy_dir = tmp_path / "copy"
@@ -216,11 +293,179 @@ def test_stage_payload_stages_relative_and_leaves_history_out(tmp_path: Path):
     assert (staged / "tools" / "recovery.py").read_text(encoding="utf-8") == MARKER_TEXT
     assert (staged / "tools" / "linked.py").is_symlink()
     assert os.readlink(staged / "tools" / "linked.py") == "recovery.py"
-    assert not (staged / ".git").exists()
-    assert (checkout / ".git" / "HEAD").is_file()
+    assert (staged / ".git").is_dir()
+    assert _git(staged, "rev-parse", "HEAD") == head
+    assert _git(staged, "rev-list", "--count", "HEAD") == "1"
+    assert _git(staged, "tag", "-l") == ""
+    assert _git(staged, "remote") == ""
     assert _tree_digest(staged) == _tree_digest(checkout)
 
     assert sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)}) == served
+
+    # Case 2: a source that is not a git checkout is still a plain copy.
+    plain = _make_checkout(tmp_path / "plain")
+    plain_link = plain / "tools" / "linked.py"
+    plain_link.symlink_to("recovery.py")
+
+    plain_served = sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(plain)})
+
+    assert plain_served == {PAYLOAD_NAME: f"./{PAYLOAD_DIR}/{PAYLOAD_NAME}"}
+    plain_staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+    assert (plain_staged / "tools" / "recovery.py").read_text(encoding="utf-8") == MARKER_TEXT
+    assert (plain_staged / "tools" / "linked.py").is_symlink()
+    assert os.readlink(plain_staged / "tools" / "linked.py") == "recovery.py"
+    assert not (plain_staged / ".git").exists()
+    assert _tree_digest(plain_staged) == _tree_digest(plain)
+    assert sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(plain)}) == plain_served
+
+
+def test_stage_payload_serves_a_git_source_as_a_single_commit_checkout(tmp_path: Path):
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    source_head = _git(checkout, "rev-parse", "HEAD")
+    parent = _git(checkout, "rev-parse", "HEAD^")
+    _git(checkout, "tag", "v-probe")
+    _git(checkout, "remote", "add", "origin", str(tmp_path / "coordinator-remote"))
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+    staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+
+    staged_head = _git(staged, "rev-parse", "HEAD")
+    assert staged_head == source_head
+    assert len(staged_head) == 40
+    assert all(character in "0123456789abcdef" for character in staged_head)
+    assert _git(staged, "rev-list", "--count", "HEAD") == "1"
+
+    parent_check = subprocess.run(
+        ["git", "-C", str(staged), "cat-file", "-e", f"{parent}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    assert parent_check.returncode != 0, "the parent commit must not exist in the staged store"
+
+    assert _git(staged, "tag", "-l") == ""
+    assert _git(staged, "remote") == ""
+    for line in _git(staged, "for-each-ref", "--format=%(refname) %(objectname)").splitlines():
+        _refname, objectname = line.split(" ", 1)
+        assert objectname == staged_head, "a ref names a commit other than the checked-out HEAD"
+
+
+def test_stage_payload_preserves_the_git_working_tree_and_symlinks(tmp_path: Path):
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    (checkout / "tools" / "recovery.py").write_text(MARKER_TEXT + "# modified\n", encoding="utf-8")
+    (checkout / "tools" / "untracked.txt").write_text("untracked payload\n", encoding="utf-8")
+    (checkout / "tools" / "linked.py").symlink_to("recovery.py")
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+    staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+
+    assert _tree_entries(staged) == _tree_entries(checkout)
+    assert (staged / "tools" / "recovery.py").read_text(encoding="utf-8") == (
+        MARKER_TEXT + "# modified\n"
+    )
+    assert (staged / "tools" / "untracked.txt").read_text(encoding="utf-8") == (
+        "untracked payload\n"
+    )
+    assert (staged / "tools" / "linked.py").is_symlink()
+    assert os.readlink(staged / "tools" / "linked.py") == "recovery.py"
+
+
+def test_stage_payload_git_checkout_leaks_no_host_path(tmp_path: Path):
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    _git(checkout, "tag", "v-probe")
+    _git(checkout, "remote", "add", "origin", str(tmp_path / "coordinator-remote"))
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    before = dispatch.payload_digest({PAYLOAD_NAME: str(checkout)})
+    sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+    after = dispatch.payload_digest({PAYLOAD_NAME: str(checkout)})
+    staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+
+    assert before == after, "staging must not change the dispatched payload digest"
+    assert _files_containing(staged, str(checkout)) == []
+    config = (staged / ".git" / "config").read_text(encoding="utf-8")
+    assert "[remote" not in config
+    assert "url" not in config.lower()
+    assert str(checkout) not in config
+
+
+def test_stage_payload_non_git_source_is_a_plain_copy(tmp_path: Path):
+    source = _make_checkout(tmp_path / "plain")
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    served = sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(source)})
+    staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+
+    assert served == {PAYLOAD_NAME: f"./{PAYLOAD_DIR}/{PAYLOAD_NAME}"}
+    assert not (staged / ".git").exists()
+    assert _tree_entries(staged) == _tree_entries(source)
+    assert _tree_digest(staged) == _tree_digest(source)
+
+
+def test_stage_payload_refuses_a_bare_git_source(tmp_path: Path):
+    work = _make_git_checkout(tmp_path / "work")
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "--bare", "-q", str(work), str(bare))
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+        sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(bare)})
+
+    assert excinfo.value.code == "payload_unservable"
+    assert PAYLOAD_NAME in excinfo.value.error
+    assert bare.name in excinfo.value.error
+    assert excinfo.value.fix
+    assert not (copy_dir / PAYLOAD_DIR / PAYLOAD_NAME).exists()
+
+
+def test_stage_payload_refuses_when_git_checkout_staging_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    real_run = sandbox.subprocess.run
+
+    def failing_fetch(command, *args, **kwargs):
+        if any(str(part) == "fetch" for part in command):
+            raise OSError("simulated fetch failure")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", failing_fetch)
+
+    with pytest.raises(sandbox.SandboxUnavailable) as excinfo:
+        sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+
+    assert excinfo.value.code == "payload_unservable"
+    assert PAYLOAD_NAME in excinfo.value.error
+    assert checkout.name in excinfo.value.error
+    assert excinfo.value.fix
+    assert not (copy_dir / PAYLOAD_DIR / PAYLOAD_NAME).exists()
+
+
+def test_stage_payload_is_idempotent_for_git_sources(tmp_path: Path):
+    checkout = _make_git_checkout(tmp_path / "pinned")
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+
+    sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+    staged = copy_dir / PAYLOAD_DIR / PAYLOAD_NAME
+    head = _git(staged, "rev-parse", "HEAD")
+    digest = _tree_digest(staged)
+    (staged / "stale-from-first-stage.txt").write_text("stale\n", encoding="utf-8")
+
+    sandbox.stage_payload(copy_dir, {PAYLOAD_NAME: str(checkout)})
+
+    assert _git(staged, "rev-parse", "HEAD") == head
+    assert _tree_digest(staged) == digest
+    assert not (staged / "stale-from-first-stage.txt").exists()
+    assert _tree_entries(staged) == _tree_entries(checkout)
 
 
 def test_stage_payload_fails_closed(tmp_path: Path):
