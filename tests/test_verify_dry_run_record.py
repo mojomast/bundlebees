@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -283,10 +284,39 @@ REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 DRY_RUN_SUBJECT_SEPARATORS = (
     "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 )
-DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
-    rf"(?<!non[{DRY_RUN_SUBJECT_SEPARATORS}])(?<!non  )"
-    rf"dry[{DRY_RUN_SUBJECT_SEPARATORS}\s]+runs?\b.{{0,240}}?"
-    rf"never write[s]? or replace[s]?\b.{{0,80}}?canonical record",
+_DRY_RUN_GUARD_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf"})
+_DRY_RUN_GUARD_SEPARATOR_RUN = re.compile(
+    rf"[{re.escape(DRY_RUN_SUBJECT_SEPARATORS)}]+"
+)
+_DRY_RUN_GUARD_NON_WORD_RUN = re.compile(r"[\W_]+")
+
+
+def _normalize_dry_run_guard_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character)
+        not in _DRY_RUN_GUARD_STRIPPED_CATEGORIES
+    )
+    normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
+    normalized = _DRY_RUN_GUARD_NON_WORD_RUN.sub(" ", normalized)
+    return " ".join(normalized.split())
+
+
+class _NormalizedPin:
+    def __init__(self, pattern: str, flags: int = 0) -> None:
+        self.pattern = pattern
+        self._regex = re.compile(pattern, flags)
+
+    def search(self, text: str) -> re.Match[str] | None:
+        return self._regex.search(_normalize_dry_run_guard_text(text))
+
+
+DRY_RUN_NEVER_CANONICAL_PIN = _NormalizedPin(
+    r"(?<!non)(?<!non )"
+    r"dry\s+runs?\b.{0,240}?"
+    r"never write[s]? or replace[s]?\b.{0,80}?canonical record",
     re.IGNORECASE,
 )
 EXPECTED_SIDE_RECORD_CLAUSES = {
@@ -371,6 +401,20 @@ DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non\u2212dry run never writes or replaces the canonical record.",
     "A non\uff0ddry run never writes or replaces the canonical record.",
     "A non  dry run never writes or replaces the canonical record.",
+    "A non\tdry run never writes or replaces the canonical record.",
+    "A non   dry run never writes or replaces the canonical record.",
+    "A non\u200bdry run never writes or replaces the canonical record.",
+    "A non\u00addry run never writes or replaces the canonical record.",
+    "A non\u2018dry run never writes or replaces the canonical record.",
+    "A non\u2019dry run never writes or replaces the canonical record.",
+    "A non\u2043dry run never writes or replaces the canonical record.",
+    "A non\ufe58dry run never writes or replaces the canonical record.",
+    "A non\ufe63dry run never writes or replaces the canonical record.",
+    "A non\uff3edry run never writes or replaces the canonical record.",
+    "A non - dry run never writes or replaces the canonical record.",
+    "A non- dry run never writes or replaces the canonical record.",
+    "A non--dry run never writes or replaces the canonical record.",
+    "A non\u2013\u00a0dry run never writes or replaces the canonical record.",
 )
 DECOY_CORPUS = (
     "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
