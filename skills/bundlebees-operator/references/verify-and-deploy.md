@@ -71,8 +71,9 @@ earlier canonical record for that attempt. `verify --commit-local` is the
 exception: it writes the canonical record only when it commits; a commit-local
 refusal writes no record and leaves any earlier one in place. A dry run writes
 its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes
-or replaces the canonical record. It also appends a `verify` event to
-`metrics/<run_id>.jsonl`. No hosts, tokens, or paths outside the repo.
+or replaces the canonical record. Once its lease loads, a dry run also appends
+a `verify` event to `metrics/<run_id>.jsonl`. No hosts, tokens, or paths
+outside the repo.
 
 ## Contract-first (ACDD) work
 

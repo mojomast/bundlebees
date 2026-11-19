@@ -279,17 +279,74 @@ SKILL_REFERENCE_DOC = (
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
 STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
-DRY_RUN_SIDE_RECORD_PIN = re.compile(
-    rf"{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?(?:writes only|only)"
-    rf"[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
-    rf"|{STANDALONE_DRY_RUN}\b[^.]{{0,200}}?verify-results/dry-run/<attempt_id>\.json"
-    rf"[^.]{{0,80}}?\bonly\b",
-    re.IGNORECASE,
-)
 DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
     rf"{STANDALONE_DRY_RUN}\b.{{0,240}}?never writes or replaces"
     rf".{{0,80}}?canonical record",
     re.IGNORECASE,
+)
+EXPECTED_SIDE_RECORD_CLAUSES = {
+    "README.md": (
+        "A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` "
+        "only and never writes or replaces the canonical record"
+    ),
+    "CHANGELOG.md": (
+        "A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` "
+        "only, with `dry_run: true`, and never writes or replaces the canonical record"
+    ),
+    "verify-and-deploy.md": (
+        "A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` "
+        "only and never writes or replaces the canonical record"
+    ),
+}
+METRICS_DISCLOSURE = (
+    "Once its lease loads, a dry run also appends a `verify` event to "
+    "`metrics/<run_id>.jsonl`."
+)
+UNQUALIFIED_METRICS_DISCLOSURES = (
+    "It also appends a `verify` event to `metrics/<run_id>.jsonl`.",
+    "It also appends a `verify` event to metrics/<run_id>.jsonl:",
+)
+OVERBROAD_DRY_RUN_FORMS = (
+    "Dry-run evidence is written to",
+    "Dry-run evidence goes to",
+    "now writes only `verify-results/dry-run/<attempt_id>.json`",
+    "writes only `verify-results/dry-run/<attempt_id>.json`",
+    "writes only verify-results/dry-run/<attempt_id>.json",
+)
+CHANGELOG_CRASH_SPLIT = (
+    "A failed replace in `cli._write_verify_result` leaves the previous record "
+    "byte-identical and removes the temporary file in a `finally` block. A crash "
+    "can leave the temporary file behind: the previous record stays byte-identical "
+    "until the atomic rename."
+)
+CHANGELOG_CLEANUP_SCOPE = (
+    "That cleanup covers the canonical and dry-run writes that go through "
+    "`cli._write_verify_result`, not the canonical write in "
+    "`verify_local._write_record`, which has no `try`/`finally` cleanup."
+)
+CHANGELOG_ATOMIC_WRITE = (
+    "Both record writes serialise the unchanged JSON bytes to a same-directory 0600 "
+    "temporary file, fsync it, and `os.replace` it"
+)
+DRY_RUN_NEVER_CANONICAL_SUBJECTS = (
+    "A dry run never writes or replaces the canonical record.",
+    "A dry-run never writes or replaces the canonical record.",
+    "Dry run never writes or replaces the canonical record.",
+    "Dry-run never writes or replaces the canonical record.",
+    "A dry run (green or refused) never writes or replaces the canonical record.",
+    "A dry run never writes or replaces the earlier canonical record.",
+    "A dry run writes its preview only and never writes or replaces the canonical record.",
+    "`verify --dry-run` never writes or replaces the canonical record.",
+    "A dry run, green or refused, never writes or replaces any canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_DECOYS = (
+    "A non-dry-run verify never writes or replaces the canonical record.",
+    "Non-dry-run verify never writes or replaces the canonical record.",
+    "A non-dry-run run never writes or replaces the canonical record.",
+    "The non-dry-run mode never writes or replaces the canonical record.",
+    "This non-dry-run never writes or replaces the canonical record.",
+    "Any non-dry-run never writes or replaces the canonical record.",
+    "non-dry-run: never writes or replaces the canonical record.",
 )
 COMMIT_LOCAL_EXCEPTION_PINS = (
     re.compile(r"`?verify --commit-local`? is the exception", re.IGNORECASE),
@@ -352,13 +409,63 @@ class TestVerifyRecordDocs:
         paragraphs = _doc_paragraphs(path)
         side_record = "verify-results/dry-run/<attempt_id>.json"
         assert any(
-            side_record in paragraph and DRY_RUN_SIDE_RECORD_PIN.search(paragraph)
-            for paragraph in paragraphs
-        ), f"{path.name} does not name the dry-run side record as the only dry-run output"
-        assert any(
             side_record in paragraph and DRY_RUN_NEVER_CANONICAL_PIN.search(paragraph)
             for paragraph in paragraphs
         ), f"{path.name} does not say a dry run never writes or replaces the canonical record"
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_document_pins_its_exact_dry_run_side_record_clause(self, path: Path) -> None:
+        expected = EXPECTED_SIDE_RECORD_CLAUSES[path.name]
+        assert expected in _doc_text(path), (
+            f"{path.name} does not contain the exact scoped dry-run side-record clause"
+        )
+        assert any(expected in paragraph for paragraph in _doc_paragraphs(path)), (
+            f"{path.name} does not keep the exact scoped dry-run side-record clause "
+            "inside one paragraph"
+        )
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_document_states_the_metrics_disclosure(self, path: Path) -> None:
+        assert METRICS_DISCLOSURE in _doc_text(path), (
+            f"{path.name} does not carry the qualified metrics disclosure"
+        )
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_unqualified_metrics_disclosure_is_absent(self, path: Path) -> None:
+        text = _doc_text(path)
+        for unqualified in UNQUALIFIED_METRICS_DISCLOSURES:
+            assert unqualified not in text, (
+                f"{path.name} still carries the unqualified metrics disclosure"
+            )
+        if path == README_DOC:
+            raw = path.read_text(encoding="utf-8")
+            assert not (
+                "It also appends a `verify`" in raw
+                and "event to metrics/<run_id>.jsonl" in raw
+            ), "README.md still carries the unqualified metrics sentence in the bash block"
+
+    @pytest.mark.parametrize("path", (README_DOC, CHANGELOG_DOC), ids=lambda path: path.name)
+    def test_document_rejects_overbroad_dry_run_forms(self, path: Path) -> None:
+        text = _doc_text(path)
+        for form in OVERBROAD_DRY_RUN_FORMS:
+            assert form not in text, (
+                f"{path.name} still uses the overbroad dry-run form: {form}"
+            )
+
+    def test_changelog_splits_the_crash_and_failed_replace_sentence(self) -> None:
+        text = _doc_text(CHANGELOG_DOC)
+        assert CHANGELOG_CRASH_SPLIT in text, (
+            "CHANGELOG.md does not split the crash and failed-replace sentence"
+        )
+        assert CHANGELOG_CLEANUP_SCOPE in text, (
+            "CHANGELOG.md does not scope the cleanup to cli._write_verify_result"
+        )
+        assert CHANGELOG_ATOMIC_WRITE in text, (
+            "CHANGELOG.md does not state the atomic write without the chmod conjunct"
+        )
+        assert "A crash or failed replace" not in text
+        assert "no temporary file behind" not in text
+        assert "fsync, chmod" not in text
 
     @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
     def test_document_states_the_commit_local_exception(self, path: Path) -> None:
@@ -390,8 +497,21 @@ def test_dry_run_pins_reject_a_non_dry_run_only_decoy() -> None:
         "passes or refuses; it never writes or replaces the dry-run canonical record at "
         "`verify-results/dry-run/<attempt_id>.json`."
     )
-    assert not DRY_RUN_SIDE_RECORD_PIN.search(decoy)
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy)
+
+
+@pytest.mark.parametrize(
+    "subject", DRY_RUN_NEVER_CANONICAL_SUBJECTS, ids=range(len(DRY_RUN_NEVER_CANONICAL_SUBJECTS))
+)
+def test_never_canonical_pin_accepts_the_subject_table(subject: str) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject", DRY_RUN_NEVER_CANONICAL_DECOYS, ids=range(len(DRY_RUN_NEVER_CANONICAL_DECOYS))
+)
+def test_never_canonical_pin_rejects_the_negation_decoys(subject: str) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
 
 
 def _verify_parser():
