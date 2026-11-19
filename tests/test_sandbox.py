@@ -858,3 +858,140 @@ def test_run_in_sandbox_refuses_when_git_staging_cannot_write(
     assert caught.value.code == "sandbox_git_head_unwritable"
     assert ".git" in caught.value.fix
     assert calls == []
+
+
+def test_run_in_sandbox_leaves_a_plain_directory_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "plain"
+    work.mkdir()
+    (work / "file.txt").write_text("plain\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def observe(command, kwargs):
+        copy_dir = Path(kwargs["cwd"])
+        seen["git"] = (copy_dir / ".git").exists() or (copy_dir / ".git").is_symlink()
+        seen["file"] = (copy_dir / "file.txt").read_text(encoding="utf-8")
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    result = _run_through_fake_jail(work)
+
+    assert result["exit_code"] == 0
+    assert seen["git"] is False
+    assert seen["file"] == "plain\n"
+
+
+def test_run_in_sandbox_leaves_a_bare_repository_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checkout = tmp_path / "checkout"
+    _make_checkout(checkout)
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "--bare", "-q", str(checkout), str(bare))
+    seen: dict[str, object] = {}
+
+    def observe(command, kwargs):
+        copy_dir = Path(kwargs["cwd"])
+        seen["git"] = (copy_dir / ".git").exists() or (copy_dir / ".git").is_symlink()
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    result = _run_through_fake_jail(bare)
+
+    assert result["exit_code"] == 0
+    assert seen["git"] is False
+
+
+def test_run_in_sandbox_stages_a_checkout_reached_by_a_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "co"
+    sha = _make_checkout(source)
+    seen: dict[str, object] = {}
+
+    def observe(command, kwargs):
+        seen["head"] = (Path(kwargs["cwd"]) / ".git" / "HEAD").read_text(encoding="utf-8")
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    monkeypatch.chdir(tmp_path)
+    result = _run_through_fake_jail(Path("co"))
+
+    assert result["exit_code"] == 0
+    assert seen["head"] == sha + "\n"
+
+
+def test_run_in_sandbox_stages_a_checkout_reached_through_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "co"
+    sha = _make_checkout(source)
+    link = tmp_path / "co-link"
+    link.symlink_to(source, target_is_directory=True)
+    seen: dict[str, object] = {}
+
+    def observe(command, kwargs):
+        seen["head"] = (Path(kwargs["cwd"]) / ".git" / "HEAD").read_text(encoding="utf-8")
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    result = _run_through_fake_jail(link)
+
+    assert result["exit_code"] == 0
+    assert seen["head"] == sha + "\n"
+
+
+def test_run_in_sandbox_classifies_before_copying_a_broken_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "broken"
+    (work / ".git").mkdir(parents=True)
+    (work / ".git" / "HEAD").write_text("not a ref\n", encoding="utf-8")
+    calls: list[object] = []
+    real_copytree = sandbox.shutil.copytree
+
+    def copytree(*args, **kwargs):
+        calls.append(args)
+        return real_copytree(*args, **kwargs)
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    monkeypatch.setattr(sandbox.shutil, "copytree", copytree)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert caught.value.code == "sandbox_git_broken"
+    assert calls == []
+
+
+def test_run_in_sandbox_refuses_a_sha256_checkout_with_a_truthful_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "sha256"
+    work.mkdir()
+    _git(work, "init", "-q", "--object-format=sha256")
+    (work / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _git(work, "add", "tracked.txt")
+    _git(work, "commit", "-q", "-m", "first commit")
+    sha = _git(work, "rev-parse", "HEAD")
+    assert len(sha) == 64 and all(char in "0123456789abcdef" for char in sha)
+    calls: list[list[str]] = []
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert caught.value.code == "sandbox_git_head_unresolved"
+    assert "64" in str(caught.value)
+    assert "40" in caught.value.fix or "SHA-1" in caught.value.fix
+    assert "unborn" not in str(caught.value)
+    assert "unborn" not in caught.value.fix
+    assert calls == []

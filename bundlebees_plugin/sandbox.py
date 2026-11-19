@@ -669,11 +669,18 @@ def _remove_staged_entry(path: Path) -> None:
 
 
 _GIT_HEAD_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GIT_SHA256_HEAD_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _STAGED_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
 _FIX_GIT_HEAD_UNRESOLVED = (
     "Resolve the checkout's HEAD to a commit (git rev-parse HEAD) before "
     "dispatching; an unborn branch or missing ref has no revision to stage, "
     "so the jail would run without evidence of the code revision."
+)
+_FIX_GIT_HEAD_SHA256 = (
+    "Re-run the verification from a SHA-1 checkout (git init without "
+    "--object-format=sha256). The sandbox stages only a 40-hex SHA-1 revision "
+    "into .git/HEAD, so a 64-hex SHA-256 HEAD is refused rather than staged "
+    "without a revision the jail can name."
 )
 _FIX_GIT_HEAD_UNWRITABLE = (
     "Make the disposable sandbox copy writable while staging .git/HEAD, "
@@ -682,19 +689,19 @@ _FIX_GIT_HEAD_UNWRITABLE = (
 )
 
 
-def _head_sha_of_checkout(source: Path) -> str | None:
-    """Resolve *source*'s HEAD to a 40-hex sha, or ``None`` when it has none.
+def _head_revision_of_checkout(source: Path) -> str | None:
+    """Resolve *source*'s HEAD to a 40- or 64-hex revision, or ``None``.
 
     A detached HEAD and a loose branch ref are read straight from the
-    checkout, so the caller learns the commit without writing anything. An
-    unborn branch (its ref does not exist yet) has no commit and resolves to
+    checkout, so the caller learns the revision without writing anything. An
+    unborn branch (its ref does not exist yet) has no revision and resolves to
     ``None``; packed refs and a linked-worktree ``.git`` file fall back to git.
     """
     git_dir = source / ".git"
     try:
         if git_dir.is_dir() and not git_dir.is_symlink():
             head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-            if _GIT_HEAD_RE.fullmatch(head):
+            if _GIT_HEAD_RE.fullmatch(head) or _GIT_SHA256_HEAD_RE.fullmatch(head):
                 return head.lower()
             if head.startswith("ref:"):
                 name = head[4:].strip()
@@ -704,7 +711,7 @@ def _head_sha_of_checkout(source: Path) -> str | None:
                         value = ref.read_text(encoding="utf-8").strip()
                     except OSError:
                         value = ""
-                    if _GIT_HEAD_RE.fullmatch(value):
+                    if _GIT_HEAD_RE.fullmatch(value) or _GIT_SHA256_HEAD_RE.fullmatch(value):
                         return value.lower()
     except (OSError, UnicodeDecodeError):
         pass
@@ -713,8 +720,18 @@ def _head_sha_of_checkout(source: Path) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     value = (done.stdout or "").strip()
-    if done.returncode == 0 and _GIT_HEAD_RE.fullmatch(value):
+    if done.returncode == 0 and (
+        _GIT_HEAD_RE.fullmatch(value) or _GIT_SHA256_HEAD_RE.fullmatch(value)
+    ):
         return value.lower()
+    return None
+
+
+def _head_sha_of_checkout(source: Path) -> str | None:
+    """Resolve *source*'s HEAD to a 40-hex sha, or ``None`` when it has none."""
+    revision = _head_revision_of_checkout(source)
+    if revision is not None and _GIT_HEAD_RE.fullmatch(revision):
+        return revision
     return None
 
 
@@ -1062,17 +1079,21 @@ def run_in_sandbox(
     """
     cache = _resolve_tiktoken_cache(tiktoken_cache, backend=backend)
     weak_ok = weak_override_enabled(allow_weak)
-    source = Path(workdir)
+    source = Path(workdir).expanduser()
+    try:
+        source = source.resolve()
+    except OSError:
+        pass
     root = Path(tempfile.mkdtemp(prefix="bundlebees-verify-"))
     copy_dir = root / "work"
     home = root / "home"
     tmp = root / "tmp"
     try:
-        shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
         # The copy leaves out .git, but a checkout must still name its revision in-jail
         # (trial_harness.code_rev_of reads git HEAD). A plain worktree gets no .git.
-        # Classify once here so a broken checkout is refused and a resolvable one is
-        # staged, rather than both silently producing no .git.
+        # Classify the resolved source once, before copying, so a broken checkout is
+        # refused without paying for a full recursive copy. The same resolved path is
+        # passed to staging, so classification and staging always agree.
         kind, detail = _git_source_kind(source)
         if kind == "broken":
             raise SandboxUnavailable(
@@ -1083,6 +1104,7 @@ def run_in_sandbox(
                 "without it.",
                 code="sandbox_git_broken",
             )
+        shutil.copytree(source, copy_dir, symlinks=True, ignore=_ignore_copy)
         try:
             sha = stage_git_head(copy_dir, source, kind=kind)
         except OSError as exc:
@@ -1092,6 +1114,15 @@ def run_in_sandbox(
                 code="sandbox_git_head_unwritable",
             ) from exc
         if kind == "checkout" and sha is None:
+            revision = _head_revision_of_checkout(source)
+            if revision is not None and _GIT_SHA256_HEAD_RE.fullmatch(revision):
+                raise SandboxUnavailable(
+                    f"the git checkout at {source} has a 64-hex SHA-256 HEAD "
+                    f"({revision}) that the sandbox cannot stage; only a 40-hex "
+                    "SHA-1 revision is representable in the jail's .git/HEAD",
+                    _FIX_GIT_HEAD_SHA256,
+                    code="sandbox_git_head_unresolved",
+                )
             raise SandboxUnavailable(
                 f"the git checkout at {source} has a HEAD that does not resolve to a "
                 "commit (unborn branch or missing ref)",
