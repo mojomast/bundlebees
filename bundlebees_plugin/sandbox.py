@@ -608,6 +608,114 @@ def stage_tiktoken_cache(copy_dir: Path, cache: Path) -> str:
 #: Directory names a served lease payload leaves out (git history, caches, virtualenvs).
 PAYLOAD_IGNORED_NAMES: frozenset[str] = _IGNORED_COPY_NAMES
 
+_FIX_PAYLOAD_GIT = (
+    "A git payload source must be a non-bare checkout with a resolvable HEAD; "
+    "repair the checkout (or point the variable at the worktree the pin names) "
+    "and re-dispatch. A payload source is never silently served as a plain copy "
+    "when it claims to be a git checkout."
+)
+
+
+def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in *cwd* without the coordinator's git configuration."""
+    env = dict(os.environ)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+
+
+def _git_source_kind(source: Path) -> tuple[str, str]:
+    """Classify *source* as ``checkout``, ``bare``, ``broken`` or ``plain``.
+
+    Only the repository root counts: a directory inside a parent repository is
+    a plain payload directory, not a checkout of its own. A ``.git`` entry we
+    cannot resolve is ``broken`` rather than plain, so a damaged checkout is
+    refused instead of silently served without its pin.
+    """
+    try:
+        bare = _run_git(source, "rev-parse", "--is-bare-repository")
+    except (OSError, subprocess.SubprocessError) as exc:
+        has_git = (source / ".git").exists() or (source / ".git").is_symlink()
+        return ("broken", str(exc)) if has_git else ("plain", "")
+    if bare.returncode == 0:
+        if bare.stdout.strip() == "true":
+            return "bare", ""
+        try:
+            top = _run_git(source, "rev-parse", "--show-toplevel")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "broken", str(exc)
+        if top.returncode == 0:
+            if Path(top.stdout.strip()).resolve() == source:
+                return "checkout", ""
+            if not ((source / ".git").exists() or (source / ".git").is_symlink()):
+                return "plain", ""
+        return "broken", top.stderr.strip() or bare.stderr.strip()
+    if (source / ".git").exists() or (source / ".git").is_symlink():
+        return "broken", bare.stderr.strip()
+    return "plain", ""
+
+
+def _remove_staged_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _stage_git_checkout(name: str, source: Path, destination: Path) -> None:
+    """Serve *source* as a single-commit checkout at the same HEAD.
+
+    Only the HEAD commit and its tree are fetched (``--depth=1``); the parent
+    is absent. Tags are not fetched and no remote is configured. The source's
+    working tree is then copied over the checkout so uncommitted and untracked
+    files survive. Metadata that could name the coordinator path (``FETCH_HEAD``,
+    reflogs) is removed, so the served ``.git`` carries neither history nor a
+    host location.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    steps = (
+        ("init", ("init", "--quiet")),
+        (
+            "fetch",
+            (
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                source.as_uri(),
+                "HEAD",
+            ),
+        ),
+        ("checkout", ("checkout", "--quiet", "--force", "--detach", "FETCH_HEAD")),
+    )
+    for label, args in steps:
+        done = _run_git(destination, *args)
+        if done.returncode != 0:
+            raise SandboxUnavailable(
+                f"payload source {name} ({source.name}) at {source} cannot be staged "
+                f"as a single-commit checkout: git {label} failed: "
+                f"{done.stderr.strip()[:300]}",
+                _FIX_PAYLOAD_GIT,
+                code="payload_unservable",
+            )
+    for child in destination.iterdir():
+        if child.name != ".git":
+            _remove_staged_entry(child)
+    shutil.copytree(source, destination, symlinks=True, ignore=_ignore_copy, dirs_exist_ok=True)
+    for metadata in ("FETCH_HEAD", "ORIG_HEAD"):
+        leftover = destination / ".git" / metadata
+        if leftover.is_symlink() or leftover.is_file():
+            leftover.unlink()
+    logs = destination / ".git" / "logs"
+    if logs.is_dir():
+        shutil.rmtree(logs)
+
 
 def stage_payload(copy_dir: Path, payload: Mapping[str, Path | str]) -> dict[str, str]:
     """Copy the lease payload's sources into the sandbox copy; return the relative paths.
@@ -621,13 +729,19 @@ def stage_payload(copy_dir: Path, payload: Mapping[str, Path | str]) -> dict[str
     so the served path never names a host location and the host checkout stays hidden.
 
     Each entry name must be an environment-variable-shaped identifier (it becomes one in the
-    child env) and each source must be an existing directory. ``.git``, caches and virtualenvs
-    are left out, so the payload serves the checkout's files, not its history. Symlinks are
-    copied, never followed. The staging is disposable and deleted with the rest of the sandbox.
+    child env) and each source must be an existing directory. A source that is itself a
+    non-bare git checkout is served as a single-commit checkout at the **same** HEAD, so tests
+    that load the pin as a git checkout run in-jail. The served checkout carries no history
+    beyond that commit, no tags, no remotes and no coordinator path. A source that is not a git
+    checkout is served as a plain copy (no ``.git`` is created); a git source that cannot be
+    staged as a checkout is refused rather than silently degraded to a plain copy. ``.git``,
+    caches and virtualenvs are otherwise left out, and symlinks are copied, never followed. The
+    staging is disposable and deleted with the rest of the sandbox.
     """
     if not payload:
         raise ValueError("an empty payload serves nothing; omit it instead")
     names = list(payload)
+    kinds: dict[str, str] = {}
     for name in names:
         if not PAYLOAD_NAME_RE.fullmatch(str(name)):
             raise ValueError(f"invalid payload name: {name!r}")
@@ -645,16 +759,48 @@ def stage_payload(copy_dir: Path, payload: Mapping[str, Path | str]) -> dict[str
                 _FIX_PAYLOAD,
                 code="payload_unservable",
             )
+        kind, detail = _git_source_kind(resolved)
+        if kind == "bare":
+            raise SandboxUnavailable(
+                f"payload source {name} ({resolved.name}) is a bare git repository: "
+                f"{resolved}; a payload must be a non-bare checkout",
+                _FIX_PAYLOAD_GIT,
+                code="payload_unservable",
+            )
+        if kind == "broken":
+            raise SandboxUnavailable(
+                f"payload source {name} ({resolved.name}) looks like a git checkout "
+                f"but cannot be resolved at HEAD: {resolved}: {detail}",
+                _FIX_PAYLOAD_GIT,
+                code="payload_unservable",
+            )
+        kinds[name] = kind
     served: dict[str, str] = {}
     root = Path(copy_dir) / _SANDBOX_PAYLOAD_DIR
     for name in names:
         source = Path(payload[name]).expanduser().resolve()
         destination = root / str(name)
-        if destination.is_symlink() or destination.is_file():
-            destination.unlink()
-        elif destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(source, destination, symlinks=True, ignore=_ignore_copy)
+        _remove_staged_entry(destination)
+        if kinds[name] == "checkout":
+            try:
+                _stage_git_checkout(name, source, destination)
+            except SandboxUnavailable:
+                _remove_staged_entry(destination)
+                raise
+            except Exception as exc:
+                _remove_staged_entry(destination)
+                raise SandboxUnavailable(
+                    f"payload source {name} ({source.name}) looks like a git checkout "
+                    f"but cannot be staged as a single-commit checkout: {source}: {exc}",
+                    _FIX_PAYLOAD_GIT,
+                    code="payload_unservable",
+                ) from exc
+        else:
+            try:
+                shutil.copytree(source, destination, symlinks=True, ignore=_ignore_copy)
+            except Exception:
+                _remove_staged_entry(destination)
+                raise
         served[str(name)] = f"./{_SANDBOX_PAYLOAD_DIR}/{name}"
     return served
 
