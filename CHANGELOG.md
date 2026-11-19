@@ -186,6 +186,7 @@ one pull request.
   never creates, moves, approves or dispatches work. See `docs/board-stock.md`.
 ### Fixed
 
+- **`verify --commit-local` and `--dry-run` are mutually exclusive.** The parser now puts both flags in one mutually exclusive group, and dispatch independently refuses a hand-built namespace that sets both with `invalid_argument` before any client fetch or verify-results write. Each flag alone keeps its existing behavior; the pair is refused rather than interpreted.
 - **Dry runs no longer replace an attempt's official verify record.** `verify --dry-run` (green or refused) now writes only `verify-results/dry-run/<attempt_id>.json` with `dry_run: true`, leaving the canonical `verify-results/<attempt_id>.json` untouched. A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it passes or refuses; a refusal records `ok: false` with a `code` and `error` and replaces any earlier canonical record for that attempt, while a dry run never writes or replaces the canonical record.
 - **A stale legacy wave record no longer blocks another job's wave 1.**
   `wave_reconciliation_required` fired whenever `waves/w1.json` existed,

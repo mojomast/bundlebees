@@ -8,6 +8,7 @@ evidence goes to ``verify-results/dry-run/<attempt>.json``.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -314,3 +315,113 @@ class TestVerifyRecordDocs:
             text,
             re.IGNORECASE,
         ), f"{path.name} does not say a dry run never writes or replaces the canonical record"
+
+
+def _verify_parser():
+    parser = argparse.ArgumentParser()
+    _ctx(FakeClient()).cli_commands["bundlebees"]["setup_fn"](parser)
+    return parser
+
+
+def test_parser_refuses_commit_local_with_dry_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _verify_parser().parse_args(
+            ["verify", ATTEMPT_ID, "--commit-local", "--dry-run"]
+        )
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--commit-local" in err
+    assert "--dry-run" in err
+
+    with pytest.raises(SystemExit) as help_exit:
+        _verify_parser().parse_args(["verify", ATTEMPT_ID, "--help"])
+    assert help_exit.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--commit-local | --dry-run" in help_text
+
+
+def test_commit_local_flag_still_parses_alone() -> None:
+    args = _verify_parser().parse_args(["verify", ATTEMPT_ID, "--commit-local"])
+
+    assert args.command == "verify"
+    assert args.commit_local is True
+    assert args.dry_run is False
+
+
+def test_dry_run_flag_still_parses_alone() -> None:
+    args = _verify_parser().parse_args(["verify", ATTEMPT_ID, "--dry-run"])
+
+    assert args.command == "verify"
+    assert args.commit_local is False
+    assert args.dry_run is True
+
+
+def test_dispatch_refuses_a_namespace_with_both_flags_before_any_client_call(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    client = FakeClient()
+    args = argparse.Namespace(
+        command="verify",
+        attempt_id=ATTEMPT_ID,
+        workdir=str(tmp_path),
+        branch=BRANCH,
+        tests=["tests/test_sample.py"],
+        state_dir=str(state),
+        kanban_comment=False,
+        commit_local=True,
+        dry_run=True,
+    )
+
+    rc = cli._dispatch(_ctx(client), args)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "invalid_argument" in out
+    assert "--commit-local" in out
+    assert "--dry-run" in out
+    assert client.calls == []
+    assert not (state / "verify-results").exists()
+
+
+def test_flags_alone_keep_their_existing_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin dispatch routing; existing tests own the record-shape guarantees.
+
+    ``test_dry_run_green_leaves_the_official_record_byte_identical`` and
+    ``test_dry_run_does_not_create_a_canonical_record`` already prove that a
+    dry run alone never writes or replaces the canonical record, so this test
+    only pins that the two flags alone still take their former paths.
+    """
+
+    parser = _verify_parser()
+    calls: list[str] = []
+
+    def fake_commit_local(ctx, args):
+        calls.append("commit_local")
+        return 0
+
+    def fake_verify(ctx, args):
+        calls.append("dry_run" if args.dry_run else "commit")
+        return 0
+
+    monkeypatch.setattr(cli, "_cmd_verify_commit_local", fake_commit_local)
+    monkeypatch.setattr(cli, "_cmd_verify", fake_verify)
+    ctx = _ctx(FakeClient())
+    state_dir = str(tmp_path / "state")
+
+    commit_args = parser.parse_args(
+        ["verify", ATTEMPT_ID, "--commit-local", "--state-dir", state_dir]
+    )
+    assert cli._dispatch(ctx, commit_args) == 0
+    assert calls == ["commit_local"]
+
+    dry_args = parser.parse_args(
+        ["verify", ATTEMPT_ID, "--dry-run", "--state-dir", state_dir]
+    )
+    assert cli._dispatch(ctx, dry_args) == 0
+    assert calls == ["commit_local", "dry_run"]
