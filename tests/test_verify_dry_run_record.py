@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -317,6 +318,8 @@ OVERBROAD_DRY_RUN_FORMS = (
     "now writes only `verify-results/dry-run/<attempt_id>.json`",
     "writes only `verify-results/dry-run/<attempt_id>.json`",
     "writes only verify-results/dry-run/<attempt_id>.json",
+    "Dry runs write only `verify-results/dry-run/<attempt_id>.json`",
+    "Dry run writes only `verify-results/dry-run/<attempt_id>.json`",
 )
 CHANGELOG_CRASH_SPLIT = (
     "A failed replace in `cli._write_verify_result` leaves the previous record "
@@ -400,6 +403,19 @@ def _doc_paragraphs(path: Path) -> list[str]:
     return [" ".join(block.split()) for block in re.split(r"\n\s*\n", raw) if block.strip()]
 
 
+def _skill_reference_dry_run_row(document: str) -> str:
+    rows = [
+        line
+        for line in document.splitlines()
+        if re.match(r"^\|\s*`--dry-run`\s*\|", line)
+    ]
+    assert rows, "the skill reference is missing its --dry-run flag row"
+    assert len(rows) == 1, (
+        "the skill reference has more than one --dry-run flag row (duplicate)"
+    )
+    return rows[0]
+
+
 class TestVerifyRecordDocs:
     def test_no_document_claims_only_a_committing_verify(self) -> None:
         for path in REFERENCE_DOCS:
@@ -475,21 +491,19 @@ class TestVerifyRecordDocs:
             )
 
     def test_skill_reference_dry_run_flag_row_scopes_the_side_record(self) -> None:
-        rows = [
-            line
-            for line in SKILL_REFERENCE_DOC.read_text(encoding="utf-8").splitlines()
-            if line.startswith("| `--dry-run` |")
-        ]
-        assert len(rows) == 1, (
-            "the skill reference must have exactly one --dry-run flag row"
+        row = _skill_reference_dry_run_row(
+            SKILL_REFERENCE_DOC.read_text(encoding="utf-8")
         )
-        row = rows[0]
         assert EXPECTED_SIDE_RECORD_CLAUSES["verify-and-deploy.md"] in row, (
             "the --dry-run flag row does not state the exact scoped dry-run clause"
         )
         assert "Dry-run evidence goes to" not in row, (
             "the --dry-run flag row still carries the overbroad dry-run form"
         )
+        for form in OVERBROAD_DRY_RUN_FORMS:
+            assert form not in row, (
+                f"the --dry-run flag row still carries the overbroad dry-run form: {form}"
+            )
 
     def test_changelog_splits_the_crash_and_failed_replace_sentence(self) -> None:
         text = _doc_text(CHANGELOG_DOC)
@@ -821,4 +835,73 @@ def test_successful_verify_records_leave_no_temp_artifacts(
     assert canonical.exists()
     assert sorted(p.name for p in side_dir.iterdir()) == [f"{ATTEMPT_ID}.json"]
     assert not list(state.rglob("*.tmp"))
+
+
+_GOOD_DRY_RUN_ROW = (
+    "| `--dry-run` | Apply the patch and run tests, then stop before any push. "
+    "A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` "
+    "only and never writes or replaces the canonical record. "
+    "Cannot be combined with `--commit-local`; the pair is refused rather than interpreted. |"
+)
+
+
+def _run_skill_reference_row_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, document: str
+) -> None:
+    path = tmp_path / "verify-and-deploy.md"
+    path.write_text(document, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "SKILL_REFERENCE_DOC", path)
+    TestVerifyRecordDocs().test_skill_reference_dry_run_flag_row_scopes_the_side_record()
+
+
+def _row_with_suffix(suffix: str) -> str:
+    return _GOOD_DRY_RUN_ROW[: -len(" |")] + f" {suffix} |"
+
+
+def test_skill_reference_row_pin_accepts_a_reformatted_flag_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _GOOD_DRY_RUN_ROW.replace("| `--dry-run` |", "|  `--dry-run` |", 1)
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_plural_write_only_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_suffix(
+        "Dry runs write only `verify-results/dry-run/<attempt_id>.json`."
+    )
+    with pytest.raises(AssertionError, match="overbroad"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_the_evidence_goes_to_form(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_suffix(
+        "Dry-run evidence goes to `verify-results/dry-run/<attempt_id>.json`."
+    )
+    with pytest.raises(AssertionError, match="overbroad"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_rejects_a_missing_flag_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    document = (
+        "# Verify\n\n"
+        "| Flag | Meaning |\n"
+        "|---|---|\n"
+        "| `--commit-local` | Verify in an isolated worktree. |\n"
+    )
+    with pytest.raises(AssertionError, match="missing"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, document)
+
+
+def test_skill_reference_row_pin_rejects_duplicate_flag_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    document = f"# Verify\n\n{_GOOD_DRY_RUN_ROW}\n{_GOOD_DRY_RUN_ROW}\n"
+    with pytest.raises(AssertionError, match="duplicate"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, document)
 
