@@ -718,3 +718,143 @@ def test_stage_git_head_leaves_an_empty_or_unborn_repository_without_git(tmp_pat
     for source in (empty, broken, unborn):
         assert sandbox.stage_git_head(copy_dir, source) is None
         assert not (copy_dir / ".git").exists()
+
+
+class _Done:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _fake_jail(monkeypatch: pytest.MonkeyPatch, observe):
+    """Let real git run and hand every jail invocation to *observe*."""
+    real_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        command = [str(part) for part in command]
+        if command and command[0] == "git":
+            return real_run(command, **kwargs)
+        return observe(command, kwargs)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+
+
+def _run_through_fake_jail(work: Path):
+    return sandbox.run_in_sandbox(
+        work,
+        ["/bin/true"],
+        backend="firejail",
+        which=lambda name: "/usr/bin/" + name,
+        probe=lambda name: True,
+    )
+
+
+def test_run_in_sandbox_stages_the_checkout_head_into_the_jail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "checkout"
+    sha = _make_checkout(source)
+    assert len(sha) == 40 and all(char in "0123456789abcdef" for char in sha)
+    seen: dict[str, object] = {}
+
+    def observe(command, kwargs):
+        copy_dir = Path(kwargs["cwd"])
+        git_dir = copy_dir / ".git"
+        seen["command"] = command
+        seen["copy_dir"] = copy_dir
+        seen["head"] = (git_dir / "HEAD").read_text(encoding="utf-8")
+        seen["config"] = (git_dir / "config").read_text(encoding="utf-8")
+        seen["refs"] = sorted(entry.name for entry in (git_dir / "refs").iterdir())
+        seen["objects"] = sorted(entry.name for entry in (git_dir / "objects").iterdir())
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    result = _run_through_fake_jail(source)
+
+    assert result["exit_code"] == 0
+    assert seen["command"][0] == "firejail"
+    assert seen["head"] == sha + "\n"
+    assert seen["config"] == (
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+    )
+    assert seen["refs"] == []
+    assert seen["objects"] == []
+    # The fake saw the copy while it existed; run_in_sandbox removed it afterwards.
+    assert not seen["copy_dir"].exists()
+
+
+def test_run_in_sandbox_refuses_a_broken_git_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "broken"
+    (work / ".git").mkdir(parents=True)
+    (work / ".git" / "HEAD").write_text("not a ref\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert caught.value.code == "sandbox_git_broken"
+    assert ".git" in caught.value.fix
+    assert calls == []
+
+
+def test_run_in_sandbox_refuses_a_checkout_without_a_resolvable_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work = tmp_path / "unborn"
+    work.mkdir()
+    _git(work, "init", "-q")
+    calls: list[list[str]] = []
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(work)
+
+    assert caught.value.code == "sandbox_git_head_unresolved"
+    assert calls == []
+
+
+@pytest.mark.parametrize("target", ["HEAD", "config", "refs", "objects"])
+def test_run_in_sandbox_refuses_when_git_staging_cannot_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+):
+    source = tmp_path / "checkout"
+    _make_checkout(source)
+    calls: list[list[str]] = []
+    real_write_text = Path.write_text
+    real_mkdir = Path.mkdir
+
+    def write_text(self, *args, **kwargs):
+        if target in ("HEAD", "config") and self.name == target and self.parent.name == ".git":
+            raise OSError(28, "No space left on device", str(self))
+        return real_write_text(self, *args, **kwargs)
+
+    def mkdir(self, *args, **kwargs):
+        if target in ("refs", "objects") and self.name == target and self.parent.name == ".git":
+            raise OSError(13, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    def observe(command, kwargs):
+        calls.append(command)
+        return _Done()
+
+    _fake_jail(monkeypatch, observe)
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    with pytest.raises(sandbox.SandboxUnavailable) as caught:
+        _run_through_fake_jail(source)
+
+    assert caught.value.code == "sandbox_git_head_unwritable"
+    assert ".git" in caught.value.fix
+    assert calls == []
