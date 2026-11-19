@@ -179,6 +179,7 @@ class JsonQueue:
                 return []
             entries: list[tuple[str, Mapping[str, Any]]] = []
             if isinstance(features, Mapping):
+                seen_keys: dict[str, str] = {}
                 for feature_id, body in features.items():
                     if not isinstance(body, Mapping):
                         raise QueueError(
@@ -186,13 +187,23 @@ class JsonQueue:
                             f"queue feature {feature_id!r} is not an object",
                             "Repair the queue file: every feature must be a JSON object.",
                         )
-                    key = str(feature_id).strip()
+                    raw_key = str(feature_id)
+                    key = raw_key.strip()
                     if not key:
                         raise QueueError(
                             "queue_invalid",
                             "a queue feature id is blank",
                             "Repair the queue file: every feature needs a feature_id or id.",
                         )
+                    if key in seen_keys:
+                        first_key = seen_keys[key]
+                        raise QueueError(
+                            "queue_invalid",
+                            f"queue features {first_key!r} and {raw_key!r} both resolve to {key!r}",
+                            f"Repair the queue file: rename or remove one of the keys {first_key!r} "
+                            f"or {raw_key!r} so {key!r} appears once.",
+                        )
+                    seen_keys[key] = raw_key
                     for body_id in cls._declared_body_ids(body):
                         if body_id != key:
                             raise QueueError(
