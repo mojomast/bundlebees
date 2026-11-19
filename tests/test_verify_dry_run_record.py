@@ -243,3 +243,74 @@ def test_official_refusal_keeps_the_canonical_shape(
     assert payload["ok"] is False
     assert payload["code"] == "scope_violation"
     assert not _side_record(state).exists()
+
+
+def test_non_dry_run_refusal_replaces_a_green_canonical_record(tmp_path: Path):
+    repo, _remote, base_sha = _repo(tmp_path)
+    state = tmp_path / "state"
+    _lease(state, base_sha)
+    official = _seed_official(state)
+    seeded = json.loads(official.read_text(encoding="utf-8"))
+    assert seeded["ok"] is True
+    assert seeded["sha"] == OFFICIAL_SHA
+
+    client = FakeClient(_result(OUT_OF_LEASE_PATCH, base_rev=base_sha))
+
+    rc = _invoke(_ctx(client), _verify_argv(repo, state))
+
+    assert rc != 0
+    payload = json.loads(official.read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+    assert payload["code"] == "scope_violation"
+    assert isinstance(payload["error"], str) and payload["error"]
+    assert payload["sha"] is None
+    assert "dry_run" not in payload
+    assert not _side_record(state).exists()
+
+
+DOCS_ROOT = Path(__file__).resolve().parent.parent
+README_DOC = DOCS_ROOT / "README.md"
+CHANGELOG_DOC = DOCS_ROOT / "CHANGELOG.md"
+SKILL_REFERENCE_DOC = (
+    DOCS_ROOT / "skills" / "bundlebees-operator" / "references" / "verify-and-deploy.md"
+)
+REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
+
+
+def _doc_text(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
+
+
+class TestVerifyRecordDocs:
+    def test_no_document_claims_only_a_committing_verify(self) -> None:
+        for path in REFERENCE_DOCS:
+            assert "only a committing verify" not in _doc_text(path).lower(), path
+
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
+    def test_document_states_the_refusal_truth(self, path: Path) -> None:
+        text = _doc_text(path)
+        assert re.search(
+            r"non-dry-run verify writes\s+`?verify-results/<attempt_id>\.json`?",
+            text,
+            re.IGNORECASE,
+        ), f"{path.name} does not say a non-dry-run verify writes the canonical record"
+        assert re.search(
+            r"refus\w*.{0,160}ok:\s*false.{0,160}code.{0,80}error",
+            text,
+            re.IGNORECASE,
+        ), f"{path.name} does not record ok: false with a code and error on refusal"
+        assert re.search(
+            r"refus\w*.{0,240}replaces?.{0,80}canonical record",
+            text,
+            re.IGNORECASE,
+        ), f"{path.name} does not say a refusal replaces the canonical record"
+        assert re.search(
+            r"dry[- ]run.{0,200}verify-results/dry-run/<attempt_id>\.json",
+            text,
+            re.IGNORECASE,
+        ), f"{path.name} does not name the dry-run side record"
+        assert re.search(
+            r"dry[- ]run.{0,240}never writes or replaces.{0,80}canonical record",
+            text,
+            re.IGNORECASE,
+        ), f"{path.name} does not say a dry run never writes or replaces the canonical record"
