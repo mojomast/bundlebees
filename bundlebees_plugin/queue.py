@@ -263,11 +263,13 @@ class JsonQueue:
                     "a queue feature id is blank",
                     "Repair the queue file: every feature needs a feature_id or id.",
                 )
-            differing = [
-                body_id
-                for body_id in cls._raw_declared_body_ids(body)
-                if body_id.strip() != key
-            ]
+            differing = []
+            seen_differing = set()
+            for body_id in cls._raw_declared_body_ids(body):
+                stripped_id = body_id.strip()
+                if stripped_id != key and stripped_id not in seen_differing:
+                    seen_differing.add(stripped_id)
+                    differing.append(body_id)
             if len(differing) == 1:
                 body_id = differing[0]
                 raise QueueError(

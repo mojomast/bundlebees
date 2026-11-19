@@ -437,6 +437,40 @@ class QueueTests(unittest.TestCase):
                 for expected_id in expected_ids:
                     self.assertIn(expected_id, caught.exception.fix)
 
+    def test_a_flat_map_card_with_two_equal_differing_body_ids_uses_the_single_id_message(self):
+        cases = (
+            (
+                {"feature_id": "f2", "id": "f2"},
+                "queue feature 'f1' carries body id 'f2'",
+                "Repair the queue file: the 'f1' card must use 'f1' as its "
+                "feature_id/id, or move the 'f2' card under that key.",
+            ),
+            (
+                {"feature_id": " f2 ", "id": "f2"},
+                "queue feature 'f1' carries body id ' f2 '",
+                "Repair the queue file: the 'f1' card must use 'f1' as its "
+                "feature_id/id, or move the ' f2 ' card under that key.",
+            ),
+            (
+                {"feature_id": "f2", "id": " f2 "},
+                "queue feature 'f1' carries body id 'f2'",
+                "Repair the queue file: the 'f1' card must use 'f1' as its "
+                "feature_id/id, or move the 'f2' card under that key.",
+            ),
+        )
+        for body, expected_message, expected_fix in cases:
+            with self.subTest(body=body):
+                self.path.write_text(
+                    json.dumps({"f1": {**body, "repo": "r", "job_id": "j1"}})
+                )
+
+                with self.assertRaises(Q.QueueError) as caught:
+                    Q.JsonQueue(self.path).list_items()
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertEqual(str(caught.exception), expected_message)
+                self.assertEqual(caught.exception.fix, expected_fix)
+
     def test_flat_map_identity_comparison_stays_stripped_and_ignores_non_strings(self):
         for document in (
             {" f1 ": {"feature_id": "f1", "repo": "r", "job_id": "j1", "status": "queued"}},
@@ -1604,6 +1638,30 @@ class QueueTests(unittest.TestCase):
         self._assert_blocked_by_job_error(
             result, Q.QueueStore(self.tmp), code="job_invalid",
             message="job document could not be read")
+
+
+class QueueIdentityDocsTests(unittest.TestCase):
+    def setUp(self):
+        self.docs = (Path(__file__).resolve().parents[1] / "docs" / "afk-operations.md").read_text(
+            encoding="utf-8"
+        )
+        section = self.docs.split("### Queue identity", 1)[1].split("\n## ", 1)[0]
+        self.section = " ".join(section.split())
+
+    def test_the_identity_rule_is_scoped_to_each_document_shape(self):
+        self.assertIn("One id, one card per shape.", self.section)
+
+    def test_padded_map_keys_are_not_merged_by_trimming(self):
+        self.assertIn(
+            "trimming does not merge two map keys that differ only in surrounding padding",
+            self.section,
+        )
+
+    def test_a_blank_or_non_string_declared_id_is_ignored(self):
+        self.assertIn(
+            "A blank or non-string `feature_id`/`id` is not an identity and is ignored.",
+            self.section,
+        )
 
 
 if __name__ == "__main__":
