@@ -246,7 +246,11 @@ def test_verify_takes_the_patch_from_the_artifact_api_and_records_its_hash(tmp_p
     sha = hashlib.sha256(GOOD_PATCH.encode()).hexdigest()
     assert f"patch_sha256: {sha}" in out
     from tests.test_cli_acdd import ATTEMPT_ID
-    saved = json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
+    saved = json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
+    assert saved["dry_run"] is True
+    assert not (state / "verify-results" / f"{ATTEMPT_ID}.json").exists()
     assert saved["evidence"]["patch_sha256"] == sha
     assert saved["evidence"]["artifact"] == "orbit.worker-artifact/1"
     assert saved["evidence"]["usage"]["totalTokens"] == 120
