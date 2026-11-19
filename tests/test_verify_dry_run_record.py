@@ -277,6 +277,7 @@ CHANGELOG_DOC = DOCS_ROOT / "CHANGELOG.md"
 SKILL_REFERENCE_DOC = (
     DOCS_ROOT / "skills" / "bundlebees-operator" / "references" / "verify-and-deploy.md"
 )
+DECOY_SKILL_REFERENCE_DOC = SKILL_REFERENCE_DOC
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
 DRY_RUN_SUBJECT_SEPARATORS = "- \u00a0\u2010\u2011\u2013\u2014"
@@ -403,17 +404,62 @@ def _doc_paragraphs(path: Path) -> list[str]:
     return [" ".join(block.split()) for block in re.split(r"\n\s*\n", raw) if block.strip()]
 
 
+def _normalized_overbroad_text(text: str) -> str:
+    normalized = text.casefold().replace("`", "").replace("*", "")
+    normalized = re.sub(r"[-\u2010\u2011\u2013\u2014]", " ", normalized)
+    return " ".join(normalized.split())
+
+
+_DRY_RUN_CELL_ALIASES = ("--dry-run", "-n")
+
+
+def _clean_flag_cell(cell: str) -> str:
+    cleaned = cell.replace("`", "").replace("*", "").casefold()
+    return " ".join(cleaned.split())
+
+
+def _cell_declares_dry_run(cell: str) -> bool:
+    return any(
+        part.strip() in _DRY_RUN_CELL_ALIASES
+        for part in _clean_flag_cell(cell).split(",")
+    )
+
+
+def _cell_mentions_dry_run_flag(cell: str) -> bool:
+    return bool(
+        re.search(r"(?<![\w-])--dry-run(?![\w-])", _clean_flag_cell(cell))
+    )
+
+
 def _skill_reference_dry_run_row(document: str) -> str:
-    rows = [
-        line
-        for line in document.splitlines()
-        if re.match(r"^\|\s*`--dry-run`\s*\|", line)
-    ]
-    assert rows, "the skill reference is missing its --dry-run flag row"
-    assert len(rows) == 1, (
+    first_cell_rows: list[str] = []
+    non_first_cell_rows: list[str] = []
+    for line in document.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = stripped.split("|")[1:]
+        if cells and not cells[-1].strip():
+            cells = cells[:-1]
+        if not cells:
+            continue
+        if _cell_declares_dry_run(cells[0]):
+            first_cell_rows.append(line)
+        elif any(_cell_mentions_dry_run_flag(cell) for cell in cells[1:]):
+            non_first_cell_rows.append(line)
+    if not first_cell_rows:
+        if non_first_cell_rows:
+            raise AssertionError(
+                "the skill reference has a --dry-run flag row but the flag is not "
+                "in the first cell; the --dry-run flag must be in the first cell"
+            )
+        raise AssertionError(
+            "the skill reference is missing its --dry-run flag row"
+        )
+    assert len(first_cell_rows) == 1, (
         "the skill reference has more than one --dry-run flag row (duplicate)"
     )
-    return rows[0]
+    return first_cell_rows[0]
 
 
 class TestVerifyRecordDocs:
@@ -484,9 +530,9 @@ class TestVerifyRecordDocs:
 
     @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
     def test_document_rejects_overbroad_dry_run_forms(self, path: Path) -> None:
-        text = _doc_text(path)
+        text = _normalized_overbroad_text(_doc_text(path))
         for form in OVERBROAD_DRY_RUN_FORMS:
-            assert form not in text, (
+            assert _normalized_overbroad_text(form) not in text, (
                 f"{path.name} still uses the overbroad dry-run form: {form}"
             )
 
@@ -500,8 +546,9 @@ class TestVerifyRecordDocs:
         assert "Dry-run evidence goes to" not in row, (
             "the --dry-run flag row still carries the overbroad dry-run form"
         )
+        normalized_row = _normalized_overbroad_text(row)
         for form in OVERBROAD_DRY_RUN_FORMS:
-            assert form not in row, (
+            assert _normalized_overbroad_text(form) not in normalized_row, (
                 f"the --dry-run flag row still carries the overbroad dry-run form: {form}"
             )
 
@@ -851,11 +898,19 @@ def _run_skill_reference_row_pin(
     path = tmp_path / "verify-and-deploy.md"
     path.write_text(document, encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "SKILL_REFERENCE_DOC", path)
+    assert sys.modules[__name__].SKILL_REFERENCE_DOC == path, (
+        "the row pin harness must redirect the SKILL_REFERENCE_DOC global that "
+        "the shipped assertion reads"
+    )
     TestVerifyRecordDocs().test_skill_reference_dry_run_flag_row_scopes_the_side_record()
 
 
 def _row_with_suffix(suffix: str) -> str:
     return _GOOD_DRY_RUN_ROW[: -len(" |")] + f" {suffix} |"
+
+
+def _row_with_first_cell(first_cell: str) -> str:
+    return _GOOD_DRY_RUN_ROW.replace("| `--dry-run` |", f"|{first_cell}|", 1)
 
 
 def test_skill_reference_row_pin_accepts_a_reformatted_flag_row(
@@ -904,4 +959,95 @@ def test_skill_reference_row_pin_rejects_duplicate_flag_rows(
     document = f"# Verify\n\n{_GOOD_DRY_RUN_ROW}\n{_GOOD_DRY_RUN_ROW}\n"
     with pytest.raises(AssertionError, match="duplicate"):
         _run_skill_reference_row_pin(monkeypatch, tmp_path, document)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "Dry runs write only verify-results/dry-run/<attempt_id>.json.",
+        "dry runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry  runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry-runs write only `verify-results/dry-run/<attempt_id>.json`.",
+        "Dry runs write only  `verify-results/dry-run/<attempt_id>.json`.",
+    ],
+    ids=[
+        "plural-unbackticked",
+        "lowercase",
+        "double-space",
+        "hyphenated-plural",
+        "double-space-before-backtick",
+    ],
+)
+def test_skill_reference_row_pin_rejects_residual_write_only_variants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+) -> None:
+    row = _row_with_suffix(suffix)
+    with pytest.raises(AssertionError, match="overbroad"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_accepts_a_bold_flag_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" **`--dry-run`** ")
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+@pytest.mark.parametrize(
+    "first_cell", ["--dry-run", "-n"], ids=["long-alias", "short-alias"]
+)
+def test_skill_reference_row_pin_accepts_an_alias_flag_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_cell: str
+) -> None:
+    row = _row_with_first_cell(f" {first_cell} ")
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_accepts_an_uppercase_flag_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = _row_with_first_cell(" `--Dry-Run` ")
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+@pytest.mark.parametrize(
+    "first_cell",
+    ["  `--dry-run` ", "\t`--dry-run`\t", "`--dry-run`"],
+    ids=["two-spaces", "tab", "zero-spaces"],
+)
+def test_skill_reference_row_pin_accepts_whitespace_run_flag_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_cell: str
+) -> None:
+    row = _row_with_first_cell(first_cell)
+    _run_skill_reference_row_pin(monkeypatch, tmp_path, f"# Verify\n\n{row}\n")
+
+
+def test_skill_reference_row_pin_reports_a_non_first_cell_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    document = (
+        "# Verify\n\n"
+        "| Flag | Meaning |\n"
+        "|---|---|\n"
+        "| Apply and run tests | `--dry-run` stops before any push. |\n"
+    )
+    with pytest.raises(AssertionError, match="first cell"):
+        _run_skill_reference_row_pin(monkeypatch, tmp_path, document)
+
+
+def test_skill_reference_row_pin_negative_control_decoy_global(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "verify-and-deploy.md"
+    row = _row_with_suffix(
+        "Dry runs write only `verify-results/dry-run/<attempt_id>.json`."
+    )
+    path.write_text(f"# Verify\n\n{row}\n", encoding="utf-8")
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "DECOY_SKILL_REFERENCE_DOC", path)
+    assert module.DECOY_SKILL_REFERENCE_DOC == path
+    assert module.SKILL_REFERENCE_DOC != path
+    with pytest.raises(pytest.fail.Exception, match="DID NOT RAISE"):
+        with pytest.raises(AssertionError, match="overbroad"):
+            TestVerifyRecordDocs().test_skill_reference_dry_run_flag_row_scopes_the_side_record()
 
