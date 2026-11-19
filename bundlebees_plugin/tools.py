@@ -68,8 +68,11 @@ _RUNNING_STATES = {"running", "working", "active", "started"}
 # _tool_write_back to avoid a module-import cycle).
 _TOOL_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted"}
 # The contract gate's provenance/acceptance checks run in the live dispatch path
-# for visibility only; enforcement is off until the owner enables it.
+# for visibility only. This constant is the switch: there is no setting, so
+# turning enforcement on is a deliberate code change, reviewed like any other.
 CONTRACT_GATE_MODE = "report_only"
+#: report-only.jsonl rotates to report-only.jsonl.1 past this size (one backup).
+REPORT_ONLY_MAX_BYTES = 1_048_576
 
 _FIX_PROJECT = (
     "The owner must add this project to the launcher config and restart the "
@@ -489,6 +492,11 @@ def _record_gate_findings(
     path = directory / "report-only.jsonl"
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            if path.stat().st_size >= REPORT_ONLY_MAX_BYTES:
+                os.replace(path, directory / "report-only.jsonl.1")
+        except FileNotFoundError:
+            pass
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             for finding in findings:
@@ -505,7 +513,7 @@ def _record_gate_findings(
                     "field": finding.get("field"),
                 }
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
-    except OSError:
+    except Exception:  # noqa: BLE001 - recording must never abort a dispatch
         return
 
 

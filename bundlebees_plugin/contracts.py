@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Mapping, NoReturn, Sequence
 
@@ -44,7 +45,7 @@ from . import contract as acdd
 from . import packets as _packets
 from . import settings as _settings
 from .pins import WORKFLOW_PIN
-from .security import scrub
+from .security import child_env, scrub
 
 __all__ = [
     "CONTRACT_REQUIRED",
@@ -143,6 +144,18 @@ def require_contract_enabled(
 # ---------------------------------------------------------------------------
 
 
+#: The pinned checkout's HEAD is cached per process for this many seconds, so
+#: dispatch does not run git on every brief. Only a resolved HEAD is cached.
+_WORKFLOW_REF_TTL_S = 30.0
+#: git rev-parse is local and fast; a hung checkout must not stall dispatch.
+_WORKFLOW_REF_TIMEOUT_S = 5
+_workflow_ref_cache: dict[str, tuple[float, str]] = {}
+
+
+def _reset_workflow_ref_cache() -> None:
+    _workflow_ref_cache.clear()
+
+
 def pinned_workflow_ref() -> str:
     """The exact commit of the pinned workflow checkout (the protocol pin)."""
     try:
@@ -154,12 +167,26 @@ def pinned_workflow_ref() -> str:
             "Check out the pinned workflow revision and set WORKFLOW_SRC; "
             "enforcement fails closed rather than guessing.",
         )
-    done = subprocess.run(
-        ["git", "-C", str(source), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    key = str(source)
+    now = time.monotonic()
+    cached = _workflow_ref_cache.get(key)
+    if cached is not None and 0.0 <= now - cached[0] < _WORKFLOW_REF_TTL_S:
+        return cached[1]
+    try:
+        done = subprocess.run(
+            ["git", "-C", key, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_WORKFLOW_REF_TIMEOUT_S,
+            env=child_env({"GIT_TERMINAL_PROMPT": "0"}),
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        _refuse(
+            "provenance_unavailable",
+            "the pinned workflow checkout did not answer git rev-parse in time",
+            "Fix the pinned checkout (WORKFLOW_SRC); do not relax the check.",
+        )
     ref = done.stdout.strip().lower()
     if done.returncode != 0 or _HEX_RE.fullmatch(ref) is None:
         _refuse(
@@ -167,6 +194,7 @@ def pinned_workflow_ref() -> str:
             "cannot resolve the pinned workflow revision in the pinned checkout",
             "Fix the pinned checkout (WORKFLOW_SRC); do not relax the check.",
         )
+    _workflow_ref_cache[key] = (now, ref)
     return ref
 
 
