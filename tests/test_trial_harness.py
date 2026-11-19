@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -157,14 +158,20 @@ def campaign_job_complete(state: Path, job_id: str, campaign_id: str) -> bool:
 
 CHILD_SLEEPER = """
 import os, pathlib, sys, time
-pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+pid_path = pathlib.Path(sys.argv[1])
+tmp_path = pid_path.with_name(pid_path.name + ".tmp")
+tmp_path.write_text(str(os.getpid()))
+os.replace(tmp_path, pid_path)
 time.sleep(60)
 """
 
 CHILD_IGNORES_SIGTERM = """
 import os, pathlib, signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+pid_path = pathlib.Path(sys.argv[1])
+tmp_path = pid_path.with_name(pid_path.name + ".tmp")
+tmp_path.write_text(str(os.getpid()))
+os.replace(tmp_path, pid_path)
 time.sleep(60)
 """
 
@@ -179,7 +186,9 @@ def wait_for_file(path: Path, *, timeout: float = 5.0) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
-            return path.read_text(encoding="utf-8").strip()
+            content = path.read_text(encoding="utf-8").strip()
+            if content:
+                return content
         time.sleep(0.005)
     raise AssertionError(f"{path} was not written")
 
@@ -390,6 +399,25 @@ class ProcessControl:
             except (ProcessLookupError, subprocess.TimeoutExpired):  # pragma: no cover
                 pass
             record.close_log()
+
+    def test_wait_for_file_ignores_an_empty_file_until_the_pid_lands(self, tmp_path):
+        pid_file = tmp_path / "pid"
+        pid_file.write_text("", encoding="utf-8")
+        pid = str(os.getpid())
+
+        def publish_pid_after_the_truncating_create() -> None:
+            time.sleep(0.1)
+            pid_file.write_text(pid, encoding="utf-8")
+
+        writer = threading.Thread(target=publish_pid_after_the_truncating_create, daemon=True)
+        writer.start()
+        try:
+            observed = wait_for_file(pid_file)
+            assert int(observed) == os.getpid()
+            assert observed == pid
+        finally:
+            writer.join(timeout=1.0)
+            assert not writer.is_alive(), "the delayed pid writer did not finish"
 
 
 # ---------------------------------------------------------------------------
