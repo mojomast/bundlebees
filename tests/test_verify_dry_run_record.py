@@ -466,13 +466,30 @@ class TestVerifyRecordDocs:
                 and "event to metrics/<run_id>.jsonl" in raw
             ), "README.md still carries the unqualified metrics sentence in the bash block"
 
-    @pytest.mark.parametrize("path", (README_DOC, CHANGELOG_DOC), ids=lambda path: path.name)
+    @pytest.mark.parametrize("path", REFERENCE_DOCS, ids=lambda path: path.name)
     def test_document_rejects_overbroad_dry_run_forms(self, path: Path) -> None:
         text = _doc_text(path)
         for form in OVERBROAD_DRY_RUN_FORMS:
             assert form not in text, (
                 f"{path.name} still uses the overbroad dry-run form: {form}"
             )
+
+    def test_skill_reference_dry_run_flag_row_scopes_the_side_record(self) -> None:
+        rows = [
+            line
+            for line in SKILL_REFERENCE_DOC.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| `--dry-run` |")
+        ]
+        assert len(rows) == 1, (
+            "the skill reference must have exactly one --dry-run flag row"
+        )
+        row = rows[0]
+        assert EXPECTED_SIDE_RECORD_CLAUSES["verify-and-deploy.md"] in row, (
+            "the --dry-run flag row does not state the exact scoped dry-run clause"
+        )
+        assert "Dry-run evidence goes to" not in row, (
+            "the --dry-run flag row still carries the overbroad dry-run form"
+        )
 
     def test_changelog_splits_the_crash_and_failed_replace_sentence(self) -> None:
         text = _doc_text(CHANGELOG_DOC)
