@@ -25,6 +25,7 @@ import inspect
 import json
 import os
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ try:  # POSIX advisory locks; Linux is the target platform
 except ImportError:  # pragma: no cover - a platform without flock has no claim protocol
     fcntl = None  # type: ignore[assignment]
 
+from . import beat
 from . import bee_events
 from . import board_stock
 from . import campaign as campaign_mod
@@ -49,8 +51,10 @@ from . import landing_bridge
 from . import leases
 from . import queue as queue_mod
 from . import work_scheduler
+from .security import scrub
 
 __all__ = [
+    "DEFAULT_SWEEP_INTERVAL_S",
     "FactoryDriver",
     "FactoryError",
     "FactoryService",
@@ -90,6 +94,9 @@ MAX_WORK_ATTEMPTS = 2
 DEFAULT_SERVICE_INTERVAL_S = 30.0
 #: Polling fallback used only when inotify is unavailable in this sandbox.
 DEFAULT_SERVICE_POLL_S = 0.25
+#: The backstop reconciliation sweep runs at most this often (30 minutes).
+DEFAULT_SWEEP_INTERVAL_S = 1800
+SWEEP_LAST_FILENAME = "sweep-last.json"
 _TERMINAL_TASK_STATES = frozenset({"accepted", "rejected", "failed", "superseded"})
 
 
@@ -186,6 +193,25 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
     os.replace(tmp, path)
     _fsync_dir(path.parent)
+
+
+def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -351,6 +377,35 @@ def _clock(now: Any = None) -> float:
         except ValueError:
             return time.time()
     return time.time()
+
+
+def _origin_branch_view(repo: Path, timeout_s: float = 30.0) -> set[str]:
+    """Return the branch names on origin, raising so the sweep reports the failure."""
+
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git ls-remote timed out after {timeout_s:.0f}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"git could not be started: {type(exc).__name__}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip()[:200]
+        raise RuntimeError(f"git ls-remote failed ({proc.returncode}): {detail}")
+    branches: set[str] = set()
+    for line in proc.stdout.splitlines():
+        _, _, ref = line.partition("\t")
+        name = ref.strip()
+        if name.startswith("refs/heads/"):
+            branch = name[len("refs/heads/"):]
+            if branch:
+                branches.add(branch)
+    return branches
 
 
 @contextmanager
@@ -1276,6 +1331,8 @@ class FactoryDriver:
         startup: bool = True,
         max_work_attempts: int = MAX_WORK_ATTEMPTS,
         campaign_id: str | None = None,
+        sweep_views: Mapping[str, Any] | None = None,
+        sweep_interval_s: float = DEFAULT_SWEEP_INTERVAL_S,
     ) -> None:
         self.state = _state_path(state_dir)
         self.state.mkdir(parents=True, exist_ok=True)
@@ -1294,6 +1351,8 @@ class FactoryDriver:
         self.now = now
         self.wake = WakeCoalescer(self.state, ttl_s=wake_ttl_s)
         self.max_work_attempts = max(1, int(max_work_attempts))
+        self.sweep_views = sweep_views if isinstance(sweep_views, Mapping) else None
+        self.sweep_interval_s = max(0.0, float(sweep_interval_s))
         self._startup_done = not startup
         self.startup_report: dict[str, Any] | None = None
         self._driven_this_pass: set[str] = set()
@@ -1980,6 +2039,49 @@ class FactoryDriver:
                 failures.append(outcome["failure"])
         return failures
 
+    def _sweep_marker_path(self) -> Path:
+        return self.state / "factory" / SWEEP_LAST_FILENAME
+
+    def _sweep_result(self) -> dict[str, Any]:
+        """Run the backstop reconciliation sweep, classify-only, at most once per interval."""
+
+        views = self.sweep_views
+        if views is None:
+            return {"status": "not_configured"}
+        clock = _clock(self.now)
+        try:
+            marker_path = self._sweep_marker_path()
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError):
+                marker = None
+            last = marker.get("at") if isinstance(marker, Mapping) else None
+            if isinstance(last, (int, float)) and clock - float(last) < self.sweep_interval_s:
+                remaining = self.sweep_interval_s - (clock - float(last))
+                return {
+                    "status": "skipped",
+                    "reason": "interval",
+                    "next_in_s": int(max(0.0, remaining)),
+                }
+            report = beat.beat(
+                self.state,
+                launcher=views.get("launcher"),
+                origin_branches=views.get("origin_branches"),
+                open_prs=views.get("open_prs"),
+                merge_stream=None,
+                processor=None,
+                branch_of=views.get("branch_of"),
+                now=clock,
+            )
+            _write_private_json(marker_path, {"at": clock})
+            return report
+        except Exception as exc:  # noqa: BLE001 - the sweep never breaks the pass
+            return {
+                "status": "error",
+                "code": type(exc).__name__,
+                "error": str(scrub(str(exc)))[:300],
+            }
+
     def run_pass(self, *, advance_work: bool = True) -> dict[str, Any]:
         self._driven_this_pass = set()
         startup = self._ensure_startup()
@@ -2134,6 +2236,7 @@ class FactoryDriver:
         }
         if startup is not None:
             result["startup"] = startup
+        result["sweep"] = self._sweep_result()
         return result
 
     def run_once(self) -> dict[str, Any]:
@@ -2722,6 +2825,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-interval", type=float, default=DEFAULT_SERVICE_INTERVAL_S,
                         metavar="SECONDS",
                         help="maximum wait before an idle service pass (default: 30)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="run the classify-only reconciliation sweep on every pass (rate-limited)")
+    parser.add_argument("--sweep-interval-s", type=float, default=DEFAULT_SWEEP_INTERVAL_S,
+                        metavar="SECONDS",
+                        help="minimum seconds between reconciliation sweeps (default: 1800)")
     parser.add_argument("--max-passes", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
@@ -2809,6 +2917,16 @@ def main(argv: list[str] | None = None) -> int:
     }
     if client is not None:
         driver_options["landing_client"] = client
+    if args.sweep and client is not None:
+        if not repo_arg:
+            raise SystemExit("--sweep requires --repo or BUNDLEBEES_REPO for the origin view")
+        repo_path = Path(repo_arg)
+        driver_options["sweep_views"] = {
+            "launcher": client,
+            "origin_branches": lambda: sorted(_origin_branch_view(repo_path, 30.0)),
+            "open_prs": {},
+        }
+        driver_options["sweep_interval_s"] = float(args.sweep_interval_s)
     driver = FactoryDriver(
         state,
         queue_mod.JsonQueue(queue_path),
