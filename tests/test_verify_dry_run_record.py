@@ -278,10 +278,11 @@ SKILL_REFERENCE_DOC = (
 )
 REFERENCE_DOCS = (README_DOC, CHANGELOG_DOC, SKILL_REFERENCE_DOC)
 
-STANDALONE_DRY_RUN = r"(?<!non-)dry[- ]run"
+DRY_RUN_SUBJECT_SEPARATORS = "- \u00a0\u2010\u2011\u2013\u2014"
 DRY_RUN_NEVER_CANONICAL_PIN = re.compile(
-    rf"{STANDALONE_DRY_RUN}\b.{{0,240}}?never writes or replaces"
-    rf".{{0,80}}?canonical record",
+    rf"(?<!non[{DRY_RUN_SUBJECT_SEPARATORS}])(?<!non  )"
+    rf"dry[{DRY_RUN_SUBJECT_SEPARATORS}\s]+runs?\b.{{0,240}}?"
+    rf"never write[s]? or replace[s]?\b.{{0,80}}?canonical record",
     re.IGNORECASE,
 )
 EXPECTED_SIDE_RECORD_CLAUSES = {
@@ -305,6 +306,10 @@ METRICS_DISCLOSURE = (
 UNQUALIFIED_METRICS_DISCLOSURES = (
     "It also appends a `verify` event to `metrics/<run_id>.jsonl`.",
     "It also appends a `verify` event to metrics/<run_id>.jsonl:",
+)
+UNQUALIFIED_METRICS_DISCLOSURE_PIN = re.compile(
+    r"It also appends a `?verify`?\s+event to\s+`?metrics/<run_id>\.jsonl",
+    re.IGNORECASE,
 )
 OVERBROAD_DRY_RUN_FORMS = (
     "Dry-run evidence is written to",
@@ -330,23 +335,29 @@ CHANGELOG_ATOMIC_WRITE = (
 )
 DRY_RUN_NEVER_CANONICAL_SUBJECTS = (
     "A dry run never writes or replaces the canonical record.",
+    "Dry runs never write or replace the canonical record.",
+    "A dry\u00a0run never writes or replaces the canonical record.",
     "A dry-run never writes or replaces the canonical record.",
-    "Dry run never writes or replaces the canonical record.",
-    "Dry-run never writes or replaces the canonical record.",
-    "A dry run (green or refused) never writes or replaces the canonical record.",
-    "A dry run never writes or replaces the earlier canonical record.",
-    "A dry run writes its preview only and never writes or replaces the canonical record.",
-    "`verify --dry-run` never writes or replaces the canonical record.",
-    "A dry run, green or refused, never writes or replaces any canonical record.",
+    "A dry\u2010run never writes or replaces the canonical record.",
+    "A dry\u2011run never writes or replaces the canonical record.",
+    "A dry\u2013run never writes or replaces the canonical record.",
+    "A dry\u2014run never writes or replaces the canonical record.",
+    "A dry  run never writes or replaces the canonical record.",
 )
 DRY_RUN_NEVER_CANONICAL_DECOYS = (
-    "A non-dry-run verify never writes or replaces the canonical record.",
-    "Non-dry-run verify never writes or replaces the canonical record.",
-    "A non-dry-run run never writes or replaces the canonical record.",
-    "The non-dry-run mode never writes or replaces the canonical record.",
-    "This non-dry-run never writes or replaces the canonical record.",
-    "Any non-dry-run never writes or replaces the canonical record.",
-    "non-dry-run: never writes or replaces the canonical record.",
+    "A non-dry-run never writes or replaces the canonical record.",
+    "A non dry run never writes or replaces the canonical record.",
+    "A non\u00a0dry run never writes or replaces the canonical record.",
+    "A non\u2010dry run never writes or replaces the canonical record.",
+    "A non\u2011dry run never writes or replaces the canonical record.",
+    "A non\u2013dry run never writes or replaces the canonical record.",
+    "A non\u2014dry run never writes or replaces the canonical record.",
+)
+DECOY_CORPUS = (
+    "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
+    "passes or refuses; it never writes or replaces the dry-run canonical record at "
+    "`verify-results/dry-run/<attempt_id>.json`.",
+    *DRY_RUN_NEVER_CANONICAL_DECOYS,
 )
 COMMIT_LOCAL_EXCEPTION_PINS = (
     re.compile(r"`?verify --commit-local`? is the exception", re.IGNORECASE),
@@ -376,6 +387,12 @@ GREEN_RECORD_KEYS = (
 
 def _doc_text(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").split())
+
+
+def _doc_text_without_comment_markers(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8")
+    stripped = "\n".join(re.sub(r"^\s*#\s?", "", line) for line in raw.splitlines())
+    return " ".join(stripped.split())
 
 
 def _doc_paragraphs(path: Path) -> list[str]:
@@ -437,6 +454,11 @@ class TestVerifyRecordDocs:
             assert unqualified not in text, (
                 f"{path.name} still carries the unqualified metrics disclosure"
             )
+        normalized = _doc_text_without_comment_markers(path)
+        assert not UNQUALIFIED_METRICS_DISCLOSURE_PIN.search(normalized), (
+            f"{path.name} still carries the unqualified metrics disclosure "
+            "across comment markers or line wrapping"
+        )
         if path == README_DOC:
             raw = path.read_text(encoding="utf-8")
             assert not (
@@ -512,6 +534,14 @@ def test_never_canonical_pin_accepts_the_subject_table(subject: str) -> None:
 )
 def test_never_canonical_pin_rejects_the_negation_decoys(subject: str) -> None:
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+def test_dry_run_decoy_corpus_is_rejected_and_the_changelog_clause_matches() -> None:
+    for decoy in DECOY_CORPUS:
+        assert not DRY_RUN_NEVER_CANONICAL_PIN.search(decoy), decoy
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(
+        EXPECTED_SIDE_RECORD_CLAUSES["CHANGELOG.md"]
+    ), "the new CHANGELOG clause must still match the canonical-record pin"
 
 
 def _verify_parser():
