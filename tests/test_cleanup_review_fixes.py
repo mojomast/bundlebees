@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import board_stock, contracts, factory_driver, leases, tools
+from bundlebees_plugin import beat_reconciliation, board_stock, contracts, factory_driver, leases, tools
 from bundlebees_plugin.client import LauncherClient
 
 T0 = 1_800_000_000.0
@@ -174,6 +174,12 @@ class TestPrViewUnavailable:
         views = factory_driver.sweep_views_for(client, repo)
         assert "open_prs" not in views or views["open_prs"] is None
         _lease_gap(tmp_path / "state")
+        # A pushed branch with no ledger record is already skipped as branch_on_origin;
+        # the PR view only matters for a ledger record that says "pushed, no PR yet".
+        ledger = beat_reconciliation.ledger_path(tmp_path / "state", "att-gap")
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({"attempt_id": "att-gap", "branch": "bee/gap", "pushed": True,
+                                      "status": "failed", "stage": "pr"}), encoding="utf-8")
         result = _driver(tmp_path / "state", tmp_path, {"t": T0}, sweep_views=views).run_pass()
         sweep = _sweep(result["sweep"])
         assert sweep["pr_view"] == "unavailable"
