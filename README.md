@@ -106,8 +106,9 @@ hermes bundlebees verify <attempt_id>
 # replaces any earlier canonical record for that attempt. `verify --commit-local`
 # is the exception: it writes the canonical record only when it commits; a
 # commit-local refusal writes no record and leaves any earlier one in place. A
-# dry run writes only verify-results/dry-run/<attempt_id>.json and never writes
-# or replaces the canonical record:
+# dry run writes its preview to verify-results/dry-run/<attempt_id>.json only
+# and never writes or replaces the canonical record. It also appends a `verify`
+# event to metrics/<run_id>.jsonl:
 hermes bundlebees verify <attempt_id> --dry-run
 ```
 
@@ -390,7 +391,7 @@ These commands are registered as `hermes bundlebees …`. They are **not** model
 |---|---|
 | `hermes bundlebees verify <attempt_id>` | Load the signed lease, check the declared base and exact-commit apply against `source_rev`, apply the in-lease patch on a clean feature-branch worktree, secret-scan, run the named tests in the sandbox, then commit and push that feature branch. `main` and `master` are refused. With a contract in the lease, the patch may not touch approved test files (`tests_tampered`) or prohibited paths, a valid RED must exist (`red_missing`), the approved tests are what runs, and a signed GREEN is recorded. Without one it prints `no ACDD contract; TDD evidence not required`. |
 | `hermes bundlebees verify <attempt_id> --commit-local` | Verify in an isolated worktree and create a local commit on `bb-verify/<attempt_id>`; never pushes. `--commit-local` and `--dry-run` cannot be combined: the pair is refused rather than interpreted. |
-| `hermes bundlebees verify <attempt_id> --dry-run` | Apply and test without committing or pushing. Dry-run evidence is written to `verify-results/dry-run/<attempt_id>.json` and never replaces the attempt record. A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it passes or refuses; a refusal records `ok: false` with a `code` and `error` and replaces any earlier canonical record for that attempt. `verify --commit-local` is the exception: it writes the canonical record only when it commits; a commit-local refusal writes no record and leaves any earlier one in place. A dry run writes only `verify-results/dry-run/<attempt_id>.json` and never writes or replaces the canonical record. `--commit-local` and `--dry-run` cannot be combined: the pair is refused rather than interpreted. |
+| `hermes bundlebees verify <attempt_id> --dry-run` | Apply and test without committing or pushing. Dry-run evidence is written to `verify-results/dry-run/<attempt_id>.json` and never replaces the attempt record. A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it passes or refuses; a refusal records `ok: false` with a `code` and `error` and replaces any earlier canonical record for that attempt. `verify --commit-local` is the exception: it writes the canonical record only when it commits; a commit-local refusal writes no record and leaves any earlier one in place. A dry run writes its preview to `verify-results/dry-run/<attempt_id>.json` only and never writes or replaces the canonical record. It also appends a `verify` event to `metrics/<run_id>.jsonl`. `--commit-local` and `--dry-run` cannot be combined: the pair is refused rather than interpreted. |
 | `hermes bundlebees verify <attempt_id> --workdir <path> --branch <feat> --tests …` | Override worktree, branch, or test targets. Defaults come from plugin settings and the brief. |
 | `hermes bundlebees verify <attempt_id> --kanban-comment` | Also post a comment through the public `hermes` kanban CLI. |
 | `hermes bundlebees integrate --wave <id> --attempts <id> …` | Require an `ok` verify record (ancestor of HEAD) for every attempt, and a valid signed GREEN for every attempt whose lease has a contract, then run the full suite on the combined branch in the sandbox and record a signed `integration` record per contract. Writes `waves/<id>.json`; only `accepted: true` counts. |
