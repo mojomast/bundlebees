@@ -285,12 +285,20 @@ DRY_RUN_SUBJECT_SEPARATORS = (
     "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 )
 _DRY_RUN_GUARD_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf"})
-_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS = ".!?;/"
+_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS = "./"
+_DRY_RUN_GUARD_BOUNDARY_MARKER = "\ue000"
 _DRY_RUN_GUARD_SEPARATOR_RUN = re.compile(
     rf"[{re.escape(DRY_RUN_SUBJECT_SEPARATORS)}]+"
 )
 _DRY_RUN_GUARD_NON_WORD_RUN = re.compile(
-    rf"(?:[^\w{re.escape(_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS)}]|_)+"
+    rf"(?:[^\w{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}]|_)+"
+)
+_DRY_RUN_GUARD_DOT_BOUNDARY = re.compile(r"(?<=\w)\.(?=\s)")
+_DRY_RUN_GUARD_SLASH_BOUNDARY = re.compile(r"(?<=\w)/(?=\w)")
+_DRY_RUN_GUARD_SPLIT_NON = re.compile(
+    rf"\b(?:n[{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}\s]*on"
+    rf"|no[{re.escape(_DRY_RUN_GUARD_BOUNDARY_MARKER)}\s]*n)\b",
+    re.IGNORECASE,
 )
 
 
@@ -305,9 +313,16 @@ def _normalize_dry_run_guard_text(text: str) -> str:
             continue
         guarded.append(character)
     normalized = "".join(guarded)
+    normalized = _DRY_RUN_GUARD_DOT_BOUNDARY.sub(
+        _DRY_RUN_GUARD_BOUNDARY_MARKER, normalized
+    )
+    normalized = _DRY_RUN_GUARD_SLASH_BOUNDARY.sub(
+        _DRY_RUN_GUARD_BOUNDARY_MARKER, normalized
+    )
     normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
     normalized = _DRY_RUN_GUARD_NON_WORD_RUN.sub(" ", normalized)
-    return " ".join(normalized.split())
+    normalized = " ".join(normalized.split())
+    return _DRY_RUN_GUARD_SPLIT_NON.sub("non", normalized)
 
 
 class _NormalizedPin:
@@ -445,6 +460,52 @@ DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non- dry run never writes or replaces the canonical record.",
     "A non--dry run never writes or replaces the canonical record.",
     "A non\u2013\u00a0dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_BOUNDARY_DECOYS = (
+    "A non!dry run never writes or replaces the canonical record.",
+    "A non! dry run never writes or replaces the canonical record.",
+    "A non !dry run never writes or replaces the canonical record.",
+    "A non?dry run never writes or replaces the canonical record.",
+    "A non? dry run never writes or replaces the canonical record.",
+    "A non;dry run never writes or replaces the canonical record.",
+    "A non; dry run never writes or replaces the canonical record.",
+    "A non / dry run never writes or replaces the canonical record.",
+    "A non/ dry run never writes or replaces the canonical record.",
+    "A non..dry run never writes or replaces the canonical record.",
+    "A non./dry run never writes or replaces the canonical record.",
+    "A non/.dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_BOUNDARY_DECOY_IDS = (
+    "bang-tight",
+    "bang-space",
+    "space-bang",
+    "question-tight",
+    "question-space",
+    "semicolon-tight",
+    "semicolon-space",
+    "spaced-slash",
+    "slash-space",
+    "double-dot",
+    "dot-slash",
+    "slash-dot",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_DECOYS = (
+    "A no\tn dry run never writes or replaces the canonical record.",
+    "A n\ton dry run never writes or replaces the canonical record.",
+    "A no\nn dry run never writes or replaces the canonical record.",
+    "A no\rn dry run never writes or replaces the canonical record.",
+    "A no\vn dry run never writes or replaces the canonical record.",
+    "A no\fn dry run never writes or replaces the canonical record.",
+    "A n\non dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_SPLIT_DECOY_IDS = (
+    "no-tab-n",
+    "n-tab-on",
+    "no-line-feed-n",
+    "no-carriage-return-n",
+    "no-vertical-tab-n",
+    "no-form-feed-n",
+    "n-line-feed-on",
 )
 DECOY_CORPUS = (
     "A non-dry-run verify writes `verify-results/<attempt_id>.json` whether it "
@@ -746,6 +807,28 @@ def test_never_canonical_pin_accepts_subjects_after_sentence_boundaries(
     "subject", DRY_RUN_NEVER_CANONICAL_DECOYS, ids=range(len(DRY_RUN_NEVER_CANONICAL_DECOYS))
 )
 def test_never_canonical_pin_rejects_the_negation_decoys(subject: str) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_BOUNDARY_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_BOUNDARY_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_the_boundary_overreach_decoys(
+    subject: str,
+) -> None:
+    assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_SPLIT_DECOYS,
+    ids=DRY_RUN_NEVER_CANONICAL_SPLIT_DECOY_IDS,
+)
+def test_never_canonical_pin_rejects_the_split_negation_decoys(
+    subject: str,
+) -> None:
     assert not DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
 
 
