@@ -285,20 +285,26 @@ DRY_RUN_SUBJECT_SEPARATORS = (
     "- \u00a0\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 )
 _DRY_RUN_GUARD_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf"})
+_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS = ".!?;/"
 _DRY_RUN_GUARD_SEPARATOR_RUN = re.compile(
     rf"[{re.escape(DRY_RUN_SUBJECT_SEPARATORS)}]+"
 )
-_DRY_RUN_GUARD_NON_WORD_RUN = re.compile(r"[\W_]+")
+_DRY_RUN_GUARD_NON_WORD_RUN = re.compile(
+    rf"(?:[^\w{re.escape(_DRY_RUN_GUARD_SENTENCE_BOUNDARY_CHARACTERS)}]|_)+"
+)
 
 
 def _normalize_dry_run_guard_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    normalized = "".join(
-        character
-        for character in normalized
-        if unicodedata.category(character)
-        not in _DRY_RUN_GUARD_STRIPPED_CATEGORIES
-    )
+    guarded: list[str] = []
+    for character in normalized:
+        category = unicodedata.category(character)
+        if category in _DRY_RUN_GUARD_STRIPPED_CATEGORIES:
+            if category == "Cc" and character.isspace():
+                guarded.append(" ")
+            continue
+        guarded.append(character)
+    normalized = "".join(guarded)
     normalized = _DRY_RUN_GUARD_SEPARATOR_RUN.sub(" ", normalized)
     normalized = _DRY_RUN_GUARD_NON_WORD_RUN.sub(" ", normalized)
     return " ".join(normalized.split())
@@ -387,6 +393,30 @@ DRY_RUN_NEVER_CANONICAL_EXTENDED_SUBJECTS = (
     "A dry\u2015run never writes or replaces the canonical record.",
     "A dry\u2212run never writes or replaces the canonical record.",
     "A dry\uff0drun never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_CC_SUBJECTS = (
+    "A dry\trun never writes or replaces the canonical record.",
+    "A dry\nrun never writes or replaces the canonical record.",
+    "A dry\rrun never writes or replaces the canonical record.",
+    "A dry\vrun never writes or replaces the canonical record.",
+    "A dry\frun never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_CC_SUBJECT_IDS = (
+    "tab-u0009",
+    "line-feed-u000a",
+    "carriage-return-u000d",
+    "vertical-tab-u000b",
+    "form-feed-u000c",
+)
+DRY_RUN_NEVER_CANONICAL_SENTENCE_BOUNDARY_SUBJECTS = (
+    "The canon. Dry run never writes or replaces the canonical record.",
+    "Their value is non. Dry run never writes or replaces the canonical record.",
+    "Their value is non/dry run never writes or replaces the canonical record.",
+)
+DRY_RUN_NEVER_CANONICAL_SENTENCE_BOUNDARY_IDS = (
+    "after-canon-terminator",
+    "after-non-terminator",
+    "after-non-slash",
 )
 DRY_RUN_NEVER_CANONICAL_DECOYS = (
     "A non-dry-run never writes or replaces the canonical record.",
@@ -687,6 +717,26 @@ def test_never_canonical_pin_accepts_the_subject_table(subject: str) -> None:
     ids=["figure-dash", "horizontal-bar", "minus-sign", "fullwidth-hyphen"],
 )
 def test_never_canonical_pin_accepts_the_extended_separator_subjects(
+    subject: str,
+) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_CC_SUBJECTS,
+    ids=DRY_RUN_NEVER_CANONICAL_CC_SUBJECT_IDS,
+)
+def test_never_canonical_pin_accepts_cc_separated_subjects(subject: str) -> None:
+    assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), repr(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    DRY_RUN_NEVER_CANONICAL_SENTENCE_BOUNDARY_SUBJECTS,
+    ids=DRY_RUN_NEVER_CANONICAL_SENTENCE_BOUNDARY_IDS,
+)
+def test_never_canonical_pin_accepts_subjects_after_sentence_boundaries(
     subject: str,
 ) -> None:
     assert DRY_RUN_NEVER_CANONICAL_PIN.search(subject), subject
