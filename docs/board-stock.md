@@ -104,8 +104,9 @@ never guesses a number.
 ## Where it runs
 
 - `beat.beat()` — duty `stock_ready_column`, after the reconciliation sweep and
-  the merge stream. The heartbeat is the reconcile safety net; this duty is an
-  observation, not a trigger to dispatch.
+  the merge stream. `beat.beat()` runs from the factory driver's opt-in
+  `--sweep` backstop, not a heartbeat; this duty is an observation, not a
+  trigger to dispatch.
 - `FactoryService.run_pass()` — after the dispatch gate, when `--service` is
   running. The pass result gains a `stock` key only when the flag is on.
 - Manually:

@@ -110,6 +110,13 @@ git -C "$WORKFLOW_SRC" rev-parse HEAD
 git -C "$HYVV_SRC" rev-parse HEAD
 ```
 
+**Deploy rule:** on the host, `WORKFLOW_SRC` must be exactly at `pins.WORKFLOW_PIN`
+(`bundlebees_plugin/pins.py`). Scaffolds seal that pin into feature packets and the
+contract gate compares a packet's `workflow_ref` with `WORKFLOW_SRC`'s HEAD, so a
+checkout at any other commit makes every packet dispatch log `provenance_mismatch`
+(report-only today) and the doctor report the pin stale. Move the checkout only
+together with a deliberate pin bump that passes CI.
+
 ## Changing a pin
 
 A pin moves only through review. Update the SHAs in `.github/workflows/ci.yml`,

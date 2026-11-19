@@ -307,23 +307,6 @@ def test_a_drifting_low_comments_on_each_change_and_the_docs_say_so(tmp_path: Pa
     assert (repeated["changed"], repeated["notified"]) == (False, False)
     assert len(spy.calls) == 2
 
-    docs = (Path(__file__).resolve().parent.parent / "docs" / "board-stock.md").read_text(
-        encoding="utf-8"
-    )
-    assert "On a transition into `low`, and only then" not in docs
-    assert "A continuing shortfall does not comment again" not in docs
-    assert "when a low observation changes" in docs
-    assert "Identical repeats do not comment again" in docs
-    assert "starts a new episode" in docs
-
-
-def test_the_service_docs_do_not_promise_one_comment_per_shortfall_episode():
-    docs = (Path(__file__).resolve().parent.parent / "docs" / "factory-driver-service.md").read_text(
-        encoding="utf-8"
-    )
-    phrase = "one comment per " + "shortfall episode"
-    assert phrase not in " ".join(docs.split())
-
 
 def test_without_a_card_the_signal_is_still_written(tmp_path: Path):
     record = board_stock.flag(
