@@ -40,6 +40,8 @@ except ImportError:  # pragma: no cover - a platform without flock has no claim 
     fcntl = None  # type: ignore[assignment]
 
 from . import beat
+from . import beat_reconciliation
+from . import launcher_adapter
 from . import bee_events
 from . import board_stock
 from . import campaign as campaign_mod
@@ -51,7 +53,7 @@ from . import landing_bridge
 from . import leases
 from . import queue as queue_mod
 from . import work_scheduler
-from .security import scrub
+from .security import child_env, scrub
 
 __all__ = [
     "DEFAULT_SWEEP_INTERVAL_S",
@@ -389,6 +391,10 @@ def _origin_branch_view(repo: Path, timeout_s: float = 30.0) -> set[str]:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            # Never hand the driver's environment (launcher token, provider
+            # keys) to git, ssh or credential helpers, and never wait on a prompt.
+            env=child_env({"GIT_TERMINAL_PROMPT": "0"}),
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"git ls-remote timed out after {timeout_s:.0f}s") from exc
@@ -1312,6 +1318,42 @@ def _discover_subscribers(state: Path) -> list[str]:
     return sorted(found)
 
 
+def sweep_views_for(client: Any, repo: Path, *, timeout_s: float = 30.0) -> dict[str, Any]:
+    """The production sweep views: the launcher through the reconcile adapter.
+
+    ``LauncherClient`` has no ``list_attempts()``; the sweep reads it through
+    :class:`launcher_adapter.LauncherAdapter`. No PR view is wired (none is
+    cheaply available to the driver), so ``open_prs`` is omitted and the sweep
+    reports ``pr_view: "unavailable"`` instead of flagging PR gaps it cannot see.
+    """
+
+    repo_path = Path(repo)
+    return {
+        "launcher": launcher_adapter.LauncherAdapter(client),
+        "origin_branches": lambda: sorted(_origin_branch_view(repo_path, timeout_s)),
+    }
+
+
+def _without_pr_view(report: dict[str, Any]) -> dict[str, Any]:
+    """Move pushed-without-PR detections aside when there is no PR view."""
+
+    report["pr_view"] = "unavailable"
+    kept: list[Any] = []
+    unverified: list[Any] = []
+    for item in report.get("detected") or []:
+        if isinstance(item, Mapping) and item.get("reason") == beat_reconciliation.REASON_RESUME_PR:
+            unverified.append(dict(item, note="pr_view_unavailable"))
+        else:
+            kept.append(item)
+    report["detected"] = kept
+    report["unverified"] = unverified
+    counts = report.get("counts")
+    if isinstance(counts, dict):
+        counts["detected"] = len(kept)
+        counts["unverified"] = len(unverified)
+    return report
+
+
 class FactoryDriver:
     """One coordinator loop over durable queue, landing and scheduler state."""
 
@@ -2056,25 +2098,43 @@ class FactoryDriver:
             except (FileNotFoundError, OSError, ValueError):
                 marker = None
             last = marker.get("at") if isinstance(marker, Mapping) else None
-            if isinstance(last, (int, float)) and clock - float(last) < self.sweep_interval_s:
+            # A future-dated marker (clock skew) is ignored rather than
+            # suppressing the sweep until the clock catches up.
+            if (
+                isinstance(last, (int, float))
+                and 0.0 <= clock - float(last) < self.sweep_interval_s
+            ):
                 remaining = self.sweep_interval_s - (clock - float(last))
                 return {
                     "status": "skipped",
                     "reason": "interval",
                     "next_in_s": int(max(0.0, remaining)),
                 }
-            report = beat.beat(
+            # Classify-only end to end: no processor, no sweep record, no
+            # claim files, and no board-stock duty (that one can post comments).
+            pr_view = views.get("open_prs")
+            sweep = beat_reconciliation.sweep(
                 self.state,
                 launcher=views.get("launcher"),
                 origin_branches=views.get("origin_branches"),
-                open_prs=views.get("open_prs"),
-                merge_stream=None,
+                open_prs=pr_view if pr_view is not None else {},
                 processor=None,
                 branch_of=views.get("branch_of"),
                 now=clock,
+                record=False,
+                claim=False,
             )
+            if pr_view is None and sweep.get("status") != "error":
+                sweep = _without_pr_view(sweep)
             _write_private_json(marker_path, {"at": clock})
-            return report
+            status = str(sweep.get("status") or "ok")
+            return {
+                "schema": beat.SCHEMA,
+                "at": beat_reconciliation.stamp(clock),
+                "mode": "classify_only",
+                "status": "partial" if status == "error" else status,
+                "duties": {beat.DUTY_SWEEP: sweep},
+            }
         except Exception as exc:  # noqa: BLE001 - the sweep never breaks the pass
             return {
                 "status": "error",
@@ -2920,12 +2980,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.sweep and client is not None:
         if not repo_arg:
             raise SystemExit("--sweep requires --repo or BUNDLEBEES_REPO for the origin view")
-        repo_path = Path(repo_arg)
-        driver_options["sweep_views"] = {
-            "launcher": client,
-            "origin_branches": lambda: sorted(_origin_branch_view(repo_path, 30.0)),
-            "open_prs": {},
-        }
+        driver_options["sweep_views"] = sweep_views_for(client, Path(repo_arg))
         driver_options["sweep_interval_s"] = float(args.sweep_interval_s)
     driver = FactoryDriver(
         state,
