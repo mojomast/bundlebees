@@ -1733,5 +1733,70 @@ class QueueIdentityDocsTests(unittest.TestCase):
         )
 
 
+class QueueIdentityListScopeDocsTests(unittest.TestCase):
+    def setUp(self):
+        self.docs = (Path(__file__).resolve().parents[1] / "docs" / "afk-operations.md").read_text(
+            encoding="utf-8"
+        )
+        section = self.docs.split("### Queue identity", 1)[1].split("\n## ", 1)[0]
+        self.section = " ".join(section.split())
+
+    def test_omission_and_restatement_are_scoped_to_the_map_shapes(self):
+        self.assertIn(
+            "In a map shape a card body may omit `feature_id`/`id` or restate the entry's id; "
+            "a features-list card must declare its own.",
+            self.section,
+        )
+
+
+class QueueIdentityListCardTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "queue.json"
+
+    def _write_live_envelope(self, features):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "schema": "bundlebees.queue/1",
+                    "generated_at": "2026-11-18T04:27:23Z",
+                    "features": features,
+                    "note": "live-shaped queue",
+                }
+            )
+        )
+
+    def test_a_features_list_card_without_an_id_is_refused_by_every_read(self):
+        self._write_live_envelope([{"job_id": "j1"}])
+        queue = Q.JsonQueue(self.path)
+
+        for action in ("list", "get"):
+            with self.subTest(action=action):
+                with self.assertRaises(Q.QueueError) as caught:
+                    if action == "list":
+                        queue.list_items()
+                    else:
+                        queue.get("anything")
+
+                self.assertEqual(caught.exception.code, "queue_invalid")
+                self.assertIn("has no feature_id", caught.exception.message)
+                self.assertTrue(caught.exception.fix, "a refusal must carry a repair hint")
+
+    def test_a_features_list_card_that_restates_its_id_is_still_accepted(self):
+        self._write_live_envelope(
+            [
+                {"feature_id": "f1", "id": " f1 ", "job_id": "j1"},
+                {"id": "f2", "job_id": "j2"},
+            ]
+        )
+        queue = Q.JsonQueue(self.path)
+
+        items = queue.list_items()
+
+        self.assertEqual([item.feature_id for item in items], ["f1", "f2"])
+        self.assertEqual(queue.get("f1").job_id, "j1")
+
+
 if __name__ == "__main__":
     unittest.main()

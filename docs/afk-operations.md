@@ -72,7 +72,7 @@ queue.
 
 One id, one card per shape. The authoritative id is the features-map key, the
 features-list card's `feature_id` (falling back to `id`), or the flat-map map key
-exactly as written. A card body may omit `feature_id`/`id` or restate that id.
+exactly as written. In a map shape a card body may omit `feature_id`/`id` or restate the entry's id; a features-list card must declare its own.
 Any differing declared `feature_id`/`id` refuses the whole document with
 `queue_invalid`; a refused document is never partially read. A blank map key is
 refused. Ids are compared after trimming surrounding whitespace, but trimming
