@@ -35,7 +35,9 @@ def _no_payload_pins(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _record(state: Path) -> dict:
-    return json.loads((state / "verify-results" / f"{ATTEMPT_ID}.json").read_text())
+    return json.loads(
+        (state / "verify-results" / "dry-run" / f"{ATTEMPT_ID}.json").read_text()
+    )
 
 
 def _commit_targets(repo: Path, files: dict[str, str]) -> None:
