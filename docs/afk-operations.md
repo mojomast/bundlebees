@@ -70,12 +70,13 @@ queue.
 
 ### Queue identity
 
-One id, one card. The authoritative id is the features-map key, the
+One id, one card per shape. The authoritative id is the features-map key, the
 features-list card's `feature_id` (falling back to `id`), or the flat-map map key
 exactly as written. A card body may omit `feature_id`/`id` or restate that id.
 Any differing declared `feature_id`/`id` refuses the whole document with
 `queue_invalid`; a refused document is never partially read. A blank map key is
-refused. Ids are compared after trimming surrounding whitespace, and a
+refused. Ids are compared after trimming surrounding whitespace, but trimming
+does not merge two map keys that differ only in surrounding padding. A blank or
 non-string `feature_id`/`id` is not an identity and is ignored. Keep keys
 unpadded: the flat-map entry id is the key as written.
 
