@@ -1,9 +1,13 @@
-"""The beat flow: the heartbeat's duties, with the reconciliation sweep first.
+"""The beat flow: the sweep backstop's duties, with the reconciliation sweep first.
 
-The beat is the coordinator's recurring heartbeat turn (the catch-up cron) and
-now the **reconcile safety net only**: landings are dispatched by the
-event-driven factory service (seconds) or the 2-minute scout hook, and the beat
-repairs whatever those push triggers missed. Its duties used to be implicit and
+:func:`beat` runs from the factory driver's opt-in ``--sweep`` backstop — at
+most once per ``--sweep-interval-s`` (default 1800 s) — not from the Hermes
+30-minute heartbeat, which is an LLM prompt job that works the campaign plan's
+slices and the merge stream. The beat is the **reconcile safety net only**:
+landings are dispatched by the event-driven factory service (seconds) or the
+2-minute scout hook, and the beat classifies whatever those push triggers
+missed.
+Its duties used to be implicit and
 sequenced by whatever the turn happened to be busy with — which is how the gap
 happened: while the beats were working the merge wave, completed bees whose
 branches were never pushed sat unprocessed for 30+ minutes because nothing
@@ -18,7 +22,7 @@ is a third, observation-only duty; with its flag unset it does not exist.
 
 The scout's origin-delta detection is unchanged: :func:`scout_tick` performs
 exactly the same read-only classification the sweep uses, writes nothing, and
-still leaves the acting to the beat.
+leaves any acting to its caller.
 """
 
 from __future__ import annotations
