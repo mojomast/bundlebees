@@ -1447,10 +1447,26 @@ def recover_integration(state_dir: Path, job: dict[str, Any], *, repo: Path | No
     if not any(os.path.lexists(p) for p in (selection, state / "waves" / f"{wave_id}.json",
                                             state / "job-wave-proofs" / f"{wave_id}.json",
                                             ij._wave_identity_path(state, wave_id))):
+        job_attempts = [
+            str(attempt)
+            for task in (job.get("tasks") or [])
+            if isinstance(task, Mapping)
+            for attempt in (task.get("attempts") or [])
+        ]
         for legacy in ij._legacy_names(job):
-            if legacy != wave_id and os.path.lexists(state / "waves" / f"{legacy}.json"):
-                raise JobError("wave_reconciliation_required", f"Legacy wave {legacy} requires reconciliation.",
-                               "Inspect the saved job and evidence; a legacy record cannot prove a handoff.")
+            if legacy == wave_id or not os.path.lexists(state / "waves" / f"{legacy}.json"):
+                continue
+            try:
+                foreign = ij.legacy_wave_is_foreign(state, legacy, job_id=job_id,
+                                                    attempts=job_attempts)
+            except (ij.IntegrateError, OSError, ValueError):
+                foreign = False  # unreadable evidence is never provably foreign
+            if foreign:
+                # Another job's record under a shared legacy name is not this
+                # job's evidence; it can neither be adopted nor block it.
+                continue
+            raise JobError("wave_reconciliation_required", f"Legacy wave {legacy} requires reconciliation.",
+                           "Inspect the saved job and evidence; a legacy record cannot prove a handoff.")
         return False
     try:
         with test_receipts.claim_key(state, "integrate-wave:" + wave_id):

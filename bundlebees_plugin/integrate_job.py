@@ -123,13 +123,54 @@ def _reconcile(wave: str, why: str) -> IntegrateError:
                           "Reconcile the integration evidence and ref explicitly; preserve the original records.")
 
 
-def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str]) -> None:
-    """A differently named receipt cannot attest today's wave-bound identity."""
+def legacy_wave_is_foreign(state_dir: Path, legacy: str, *, job_id: str = "",
+                           attempts: Sequence[str] = ()) -> bool:
+    """Whether legacy waves/<legacy>.json provably belongs to another job.
+
+    Every job's wave 1 has the bare ``w1`` legacy alias, so a record left by an
+    unrelated job or a standalone integration must not refuse this job.  Only
+    evidence that can belong here may block: a sealed identity naming another
+    job proves it is foreign, and so do recorded attempts that do not overlap
+    this job's attempts.  Unreadable, empty or shape-less evidence is never
+    called foreign - that still fails closed in the caller.
+    """
+
+    state = Path(state_dir)
+    stored = _read_evidence(_wave_identity_path(state, legacy), legacy) or {}
+    identity = stored.get("identity")
+    if not isinstance(identity, Mapping):
+        identity = {}
+    owner = str(identity.get("job_id") or "").strip()
+    if job_id and owner and owner != job_id:
+        return True
+    record = _read_evidence(state / "waves" / f"{legacy}.json", legacy)
+    if not isinstance(record, Mapping):
+        return False
+    claimed = record.get("attempts")
+    if not isinstance(claimed, list):
+        return False
+    claimed_ids = {str(entry) for entry in claimed if str(entry or "").strip()}
+    if not claimed_ids:
+        return False
+    return not (claimed_ids & {str(entry) for entry in attempts if str(entry or "").strip()})
+
+
+def adopt_legacy_wave(state_dir: Path, *, wave: str, legacy: str, attempts: Sequence[str],
+                      job_id: str = "") -> None:
+    """A differently named receipt cannot attest today's wave-bound identity.
+
+    A record that provably belongs to another job is ignored: it is not this
+    job's evidence, so it can neither be adopted nor refuse this integration.
+    """
     if wave == legacy:
         return None
     target = Path(state_dir) / "waves" / f"{wave}.json"
     source = Path(state_dir) / "waves" / f"{legacy}.json"
-    if not target.exists() and (os.path.lexists(source) or os.path.lexists(_wave_identity_path(state_dir, legacy))):
+    if target.exists():
+        return None
+    if os.path.lexists(source) or os.path.lexists(_wave_identity_path(state_dir, legacy)):
+        if legacy_wave_is_foreign(state_dir, legacy, job_id=job_id, attempts=attempts):
+            return None
         raise _reconcile(wave, f"legacy evidence at {legacy} cannot be adopted by attempt name")
 
 
@@ -826,7 +867,8 @@ def _integrate_locked(
     pair = _wave_pair(state_dir, repo, wave, identity)
     if pair is None:
         for legacy in _legacy_names(job):
-            adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts)
+            adopt_legacy_wave(state_dir, wave=wave, legacy=legacy, attempts=attempts,
+                              job_id=str(job.get("job_id") or ""))
     elif pair[1]["identity_digest"] != identity_digest:
         original = pair[0]
         wave = _derived_wave_id(wave, identity_digest)

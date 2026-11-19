@@ -68,6 +68,20 @@ Both shapes are read and updated in place; any other JSON shape is a typed
 `queue_invalid` refusal, never an `AttributeError`. A missing file is an empty
 queue.
 
+### Queue identity
+
+One id, one card per shape. The authoritative id is the features-map key, the
+features-list card's `feature_id` (falling back to `id`), or the flat-map map key
+exactly as written. In a map shape a card body may omit `feature_id`/`id` or restate the entry's id; a features-list card must declare its own.
+Any differing declared `feature_id`/`id` refuses the whole document with
+`queue_invalid`; a refused document is never partially read. A blank map key is
+refused. Ids are compared after trimming surrounding whitespace, but trimming
+does not merge two map keys that differ only in surrounding padding. In the
+features-map shape the trimmed key is the id, so two keys that differ only in
+padding resolve to one id and are refused as ambiguous. A blank or
+non-string `feature_id`/`id` is not an identity and is ignored. Keep keys
+unpadded: the flat-map entry id is the key as written.
+
 ## Run
 
 One pass, then exit:
