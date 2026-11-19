@@ -43,6 +43,7 @@ from typing import Any, Mapping, NoReturn, Sequence
 from . import contract as acdd
 from . import packets as _packets
 from . import settings as _settings
+from .pins import WORKFLOW_PIN
 from .security import scrub
 
 __all__ = [
@@ -65,9 +66,8 @@ CONTRACT_REQUIRED = "contract_required"
 #: The label a contract-free dispatch carries when the flag is off.
 LEGACY_NOTE = "no ACDD contract; TDD evidence not required"
 
-#: Placeholder a scaffolded packet skeleton carries until the operator seals
-#: the pinned workflow revision into it.
-PIN_WORKFLOW_REVISION = "PIN-THE-WORKFLOW-REV"
+#: The pinned workflow commit a scaffolded packet seals as its ``workflow_ref``.
+PIN_WORKFLOW_REVISION = WORKFLOW_PIN
 
 _PACKET_VERSION = "rizzstack.feature-packet/1"
 _KNOWN_CONTRACT_VERSIONS = frozenset({"acdd/1"})

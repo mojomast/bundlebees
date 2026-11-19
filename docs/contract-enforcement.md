@@ -141,8 +141,10 @@ machine-readable envelope, never a traceback. The contract is **valid as
 generated** — it passes
 `contract validate` and can be frozen after review. The packet is a
 **skeleton** for the pinned `rizzstack.feature-packet/1` protocol: its
-`workflow_ref` (`PIN-THE-WORKFLOW-REV`), authorization and budget blocks are
-placeholders. Before admission, the operator must freeze the contract, seal
+`workflow_ref` seals the pinned workflow commit from
+`bundlebees_plugin/pins.py`, the same pin the doctor's `pinned_workflow` check
+uses; the authorization and budget blocks are placeholders. Before admission,
+the operator must freeze the contract, seal
 `review.contract_sha256` into the packet, and set `workflow_ref` to the pinned
 checkout's `HEAD`. One acceptance criterion (`AC-001`, `AC-002`, ...) is
 generated per `--test`; `--statement` overrides the derived statements in the
