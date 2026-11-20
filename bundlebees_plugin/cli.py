@@ -38,6 +38,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -838,17 +839,34 @@ def _tool_completion(state_dir: Path, attempt_id: str) -> Mapping[str, Any] | No
     ``attempt_id``, an attempt id that is not a safe single path component, an
     unknown terminal state, or a ``recorded_at`` that is not exactly
     whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are rejected)
-    makes the record absent. Nothing here writes to the store.
+    makes the record absent. A final-component symlink is refused where the
+    platform supports ``O_NOFOLLOW``, and a non-regular file (FIFO, device or
+    directory) is refused too. Nothing here writes to the store.
     """
     from . import agent_consumer
 
     if not _ATTEMPT_ID_RE.fullmatch(attempt_id) or ".." in attempt_id:
         return None
     path = Path(state_dir) / "tool-completions" / f"{attempt_id}.json"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        raw = path.read_bytes()
+        fd = os.open(path, flags)
     except OSError:
         return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_size > _MAX_TOOL_COMPLETION_BYTES:
+            return None
+        raw = os.read(fd, _MAX_TOOL_COMPLETION_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     if len(raw) > _MAX_TOOL_COMPLETION_BYTES:
         return None
     try:
