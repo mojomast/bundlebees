@@ -181,7 +181,11 @@ def _state(tmp_path: Path, *, record_lease: bool = True) -> tuple[Path, dict | N
 
 
 def _outbox_dir(tmp_path: Path) -> Path:
-    return tmp_path / "hyvv-outbox"
+    # The canonical hyvv layout (landing_export.landed_outbox(data_dir)): <data>/events/outbox.
+    # From hyvv 0.1.17 the writer also keeps its export index at <data>/events/export-index.json,
+    # i.e. beside the outbox. A bare "hyvv-outbox" directory would make hyvv treat the outbox itself
+    # as the data dir and put that index INSIDE it, which the bridge rightly refuses as a non-file.
+    return tmp_path / "hyvv-data" / "events" / "outbox"
 
 
 def _events_outbox(state: Path) -> Path:

@@ -9,9 +9,9 @@ derived from `pyproject.toml`.
 |---|---|---|
 | workflow | `9c69d3a987ea9544a77cdd9b5a259904eb36f006` | canonical packets, landing events, recovery and RETURN validators |
 | bundlebees | `HEAD` | current checkout; build identity is generated below, never self-pinned |
-| hyvv | `8ffaf73000974e0ba273c72fca42e07b79c38106` | governed provisioning contract and launcher outbox |
+| hyvv | `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd` | governed provisioning contract and launcher outbox |
 | Hermes | `>=0.23.0` | plugin host API floor (`requires_hermes`) |
-| launcher | `0.1.16` | local worker launcher result envelope |
+| launcher | `0.1.17` | local worker launcher result envelope |
 | python | `3.12` | tested interpreter (project floor: `>=3.11`) |
 | bundlebees package | `0.1.1` | `pyproject.toml` build identity |
 
