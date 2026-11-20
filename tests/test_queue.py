@@ -1699,20 +1699,26 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(record_path.read_text(), record_before)
 
     def test_a_non_feature_id_queue_error_from_claim_propagates(self):
-        store = Q.QueueStore(self.tmp)
-        queue_before = self.path.read_text()
+        for code in ("queue_state_corrupt", "queue_unreadable"):
+            with self.subTest(code=code), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({"f1": card("f1")}))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                queue_before = path.read_text()
 
-        with mock.patch.object(Q.QueueStore, "claim",
-                               side_effect=Q.QueueError(
-                                   "queue_state_corrupt", "claim state is unreadable")):
-            with self.assertRaises(Q.QueueError) as caught:
-                Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+                with mock.patch.object(Q.QueueStore, "claim",
+                                       side_effect=Q.QueueError(
+                                           code, "claim state is unreadable")):
+                    with self.assertRaises(Q.QueueError) as caught:
+                        Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
 
-        self.assertEqual(caught.exception.code, "queue_state_corrupt")
-        self.assertEqual(self.queue.get("f1").status, "queued")
-        self.assertEqual(self.path.read_text(), queue_before)
-        self.assertEqual(list(store.root.glob("*.json")), [],
-                         "a refused claim must not write a record")
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(queue.get("f1").status, "queued")
+                self.assertEqual(path.read_text(), queue_before)
+                self.assertEqual(list(store.root.glob("*.json")), [],
+                                 "a refused claim must not write a record")
 
     def test_a_normal_active_record_is_not_refused(self):
         self.path.write_text(json.dumps({
@@ -1903,6 +1909,124 @@ class QueueTests(unittest.TestCase):
         self.assertLessEqual(len(result["refused"][1]["detail"]), 400)
         self.assertEqual(result["orphaned"], [])
         self.assertEqual(result["orphaned_live"], [])
+
+    def test_admit_and_observation_refuse_the_same_unreachable_ids_exactly(self):
+        scenarios = {
+            "claimed card and running record": (
+                {"bad name": card("bad name", job_id="job_bad", status="claimed")},
+                {"feature_id": "bad name", "state": "running", "job_id": "job_bad",
+                 "pid": DEAD_PID},
+                "running",
+            ),
+            "claimed card without a record": (
+                {"bad name": card("bad name", job_id="job_bad", status="claimed")},
+                None,
+                "claimed",
+            ),
+            "running card without a record": (
+                {"bad name": card("bad name", job_id="job_bad", status="running")},
+                None,
+                "running",
+            ),
+            "queued card and running record are deduped": (
+                {"bad name": card("bad name", job_id="job_bad", status="queued")},
+                {"feature_id": "bad name", "state": "running", "job_id": "job_bad",
+                 "pid": DEAD_PID},
+                "running",
+            ),
+            "clean": (
+                {"f1": card("f1", status="ready_for_review")},
+                None,
+                None,
+            ),
+        }
+
+        def build(root, document, record):
+            path = Path(root) / "queue.json"
+            path.write_text(json.dumps(document))
+            if record is not None:
+                record_dir = Path(root) / "queue"
+                record_dir.mkdir(parents=True, exist_ok=True)
+                (record_dir / f"{record['feature_id']}.json").write_text(
+                    json.dumps(record, indent=2, sort_keys=True))
+            return Q.JsonQueue(path)
+
+        for name, (document, record, expected_state) in scenarios.items():
+            with self.subTest(name=name):
+                with TemporaryDirectory() as admitted_tmp, \
+                        TemporaryDirectory() as observed_tmp:
+                    admitted_queue = build(admitted_tmp, document, record)
+                    observed_queue = build(observed_tmp, document, record)
+                    admitted = Q.run_once(
+                        Path(admitted_tmp), admitted_queue,
+                        tick=lambda job_id: {"status": "ok"})
+                    observed = Q.run_once(
+                        Path(observed_tmp), observed_queue,
+                        tick=lambda job_id: {"status": "ok"}, admit=False)
+
+                self.assertEqual(admitted["refused"], observed["refused"])
+                if expected_state is None:
+                    self.assertEqual(admitted["refused"], [])
+                    continue
+                self.assertEqual(len(admitted["refused"]), 1)
+                self.assertEqual(self._refused_entry_shape(admitted["refused"][0]), {
+                    "feature": "bad name",
+                    "job": "job_bad",
+                    "state": expected_state,
+                    "code": "feature_id_invalid",
+                })
+
+    def test_observation_scope_defers_a_queued_unaddressable_card_to_admission(self):
+        document = {"bad name": card("bad name", job_id="job_bad")}
+        with TemporaryDirectory() as observed_tmp:
+            path = Path(observed_tmp) / "queue.json"
+            path.write_text(json.dumps(document))
+            queue = Q.JsonQueue(path)
+            observed = Q.run_once(Path(observed_tmp), queue,
+                                  tick=lambda job_id: {"status": "ok"}, admit=False)
+
+        self.assertEqual(observed["action"], "observation_only")
+        self.assertEqual(observed["refused"], [])
+        self.assertEqual(observed["queued"], ["bad name"])
+
+        with TemporaryDirectory() as admitted_tmp:
+            path = Path(admitted_tmp) / "queue.json"
+            path.write_text(json.dumps(document))
+            queue = Q.JsonQueue(path)
+            admitted = Q.run_once(Path(admitted_tmp), queue,
+                                  tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(admitted["action"], "refused")
+        self.assertEqual(len(admitted["refused"]), 1)
+        self.assertEqual(self._refused_entry_shape(admitted["refused"][0]), {
+            "feature": "bad name",
+            "job": "job_bad",
+            "state": "queued",
+            "code": "feature_id_invalid",
+        })
+
+    def test_observation_only_reports_an_unaddressable_record_without_a_card_as_orphaned(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = tmp / "queue.json"
+            path.write_text(json.dumps({"f1": card("f1", status="ready_for_review")}))
+            queue = Q.JsonQueue(path)
+            record_dir = tmp / "queue"
+            record_dir.mkdir(parents=True, exist_ok=True)
+            (record_dir / "bad name.json").write_text(json.dumps({
+                "feature_id": "bad name",
+                "state": "running",
+                "job_id": "job_bad",
+                "pid": DEAD_PID,
+            }, indent=2, sort_keys=True))
+
+            result = Q.run_once(tmp, queue,
+                                tick=lambda job_id: {"status": "ok"}, admit=False)
+
+        self.assertEqual(result["action"], "observation_only")
+        self.assertEqual(result["refused"], [],
+                         "a record with no card is an orphan, not an unreachable claim")
+        self.assertEqual([entry["feature"] for entry in result["orphaned"]], ["bad name"])
 
     def test_observation_only_idle_payload_has_an_empty_refused_list(self):
         self.path.write_text(json.dumps({"f1": card("f1", status="ready_for_review")}))
