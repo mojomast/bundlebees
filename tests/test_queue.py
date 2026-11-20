@@ -1910,6 +1910,41 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["orphaned"], [])
         self.assertEqual(result["orphaned_live"], [])
 
+    def test_refused_entries_pin_the_exact_canonical_details(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+            "other name": card("other name", job_id="job_other", status="claimed"),
+        }))
+        store, _ = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        paths = [self.path, *sorted(store.root.glob("*.json"))]
+        before = {path: path.read_bytes() for path in paths}
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"},
+                            admit=False)
+
+        self.assertEqual(result["action"], "observation_only")
+        self.assertEqual(len(result["refused"]), 2)
+        self.assertEqual([entry["feature"] for entry in result["refused"]],
+                         ["bad name", "other name"])
+        self.assertEqual(
+            result["refused"][0]["detail"],
+            "active claim skipped: its feature id cannot name a store path, "
+            "so it can be neither ticked nor rewritten; the card and record "
+            "were left untouched")
+        self.assertEqual(
+            result["refused"][1]["detail"],
+            "card not advanced: its feature id cannot name a store path, "
+            "so it can be neither read nor written; the card was left untouched")
+        self.assertEqual(
+            {path: path.read_bytes() for path in [self.path, *sorted(store.root.glob("*.json"))]},
+            before,
+            "the observation pass must leave queue.json and every queue/*.json byte-unchanged")
+
     def test_admit_and_observation_refuse_the_same_unreachable_ids_exactly(self):
         scenarios = {
             "claimed card and running record": (
