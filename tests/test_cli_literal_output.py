@@ -297,3 +297,54 @@ def test_key_shape_guard_keeps_literal_controls(branch, capsys):
 
     cli._print_branch(branch)
     assert capsys.readouterr().out == f"branch: {branch}\n"
+
+
+@pytest.mark.parametrize(
+    ("value", "collapse", "expected"),
+    [
+        pytest.param(None, False, None, id="null"),
+        pytest.param(None, True, None, id="null-collapse"),
+        pytest.param("", False, "", id="empty"),
+        pytest.param("", True, "", id="empty-collapse"),
+        pytest.param("   ", False, "   ", id="whitespace"),
+        pytest.param("   ", True, "   ", id="whitespace-collapse"),
+    ],
+)
+def test_display_branch_preserves_null_and_empty(value, collapse, expected):
+    result = cli._display_branch(value, collapse=collapse)
+
+    if expected is None:
+        assert result is None
+    else:
+        assert result == expected
+    assert result != "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        pytest.param(None, None, id="null"),
+        pytest.param("", "", id="empty"),
+    ],
+)
+def test_verify_record_preserves_null_and_empty_branch(tmp_path, branch, expected):
+    state = tmp_path / "state"
+
+    target = cli._write_verify_result(
+        state,
+        "att-null",
+        ok=False,
+        sha=None,
+        branch=branch,
+        files=[],
+        tests=[],
+        code="sandbox_env_missing",
+        error="x",
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    if expected is None:
+        assert record["branch"] is None
+    else:
+        assert record["branch"] == expected
+    assert record["branch"] != "[redacted]"
