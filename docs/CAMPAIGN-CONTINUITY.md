@@ -155,17 +155,22 @@ pass in that mode is `observation_only` when there is queued or active work: it
 reports the queued and active cards, the unreachable ids it refuses to touch
 (`refused`) and claims with no card (`orphaned` when the recorded pid is not
 alive, `orphaned_live` when it is still alive), and moves nothing. A claim is
-`orphaned` when its recorded pid is not alive; not alive covers a
-missing/malformed/non-positive/bool pid as well as a process that is gone
-(`liveness.pid_alive` returns False unless the pid is a positive int and
-`os.kill(pid, 0)` succeeds). `orphaned_live` remains the live-pid case. A queued
-card whose id cannot name a claim record is refused only when admission is
-attempted, so an observation pass lists it under `queued`, not `refused`. An
-empty observation pass (no queued or active work) returns the queue action
-`idle`, not `observation_only`; the `idle` payload still carries `refused`,
-`orphaned` and `orphaned_live`, while `queued`, `active` and `detail` are
-omitted. The pass JSON carries `observation_only: true` either way and a
-one-line warning goes to stderr. Observation is useful for watching state;
+`orphaned` when its recorded pid is not alive: `liveness.pid_alive` returns
+False for a bool, a non-int or a non-positive pid; on POSIX it calls
+`os.kill(pid, 0)`, where `ProcessLookupError` means False, `PermissionError`
+(a live pid owned by another user) means True, and `OverflowError`/`OSError`
+mean False, while on Windows it uses `OpenProcess(0x1000)`/
+`GetExitCodeProcess` and treats exit code 259 as alive. `orphaned_live` remains
+the live-pid case. A queued card whose id cannot name a claim record is refused
+only when admission is attempted, so an observation pass lists it under
+`queued`, not `refused`. An empty observation pass returns the queue action
+`idle`, not `observation_only`; `idle` means there are no queued ids and no
+active claim records (a card-less record alone would force `observation_only`),
+so on an idle pass `orphaned` and `orphaned_live` are necessarily empty while
+only `refused` can be non-empty; the `idle` payload still carries all three
+keys, while `queued`, `active` and `detail` are omitted. The pass JSON carries
+`observation_only: true` either way and a one-line warning goes to stderr.
+Observation is useful for watching state;
 it is not a work-conserving scheduler, and no card is marked `running` by it.
 
 A production pass never treats a tick's own status as acceptance. A tick
