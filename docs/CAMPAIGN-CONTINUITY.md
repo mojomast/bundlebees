@@ -164,12 +164,16 @@ mean False, while on Windows it uses `OpenProcess(0x1000)`/
 the live-pid case. A queued card whose id cannot name a claim record is refused
 only when admission is attempted, so an observation pass lists it under
 `queued`, not `refused`. An empty observation pass returns the queue action
-`idle`, not `observation_only`; `idle` means there are no queued ids and no
-active claim records (a card-less record alone would force `observation_only`),
-so on an idle pass `orphaned` and `orphaned_live` are necessarily empty while
-only `refused` can be non-empty; the `idle` payload still carries all three
-keys, while `queued`, `active` and `detail` are omitted. The pass JSON carries
-`observation_only: true` either way and a one-line warning goes to stderr.
+`idle`, not `observation_only`: for the observation pass, `idle` means there
+are no queued ids and no active claim records (an active card-less record alone
+would force `observation_only`; a terminal card-less record is skipped and does
+not), so on an idle observation pass `orphaned` and `orphaned_live` are
+necessarily empty while only `refused` can be non-empty; the `idle` payload
+still carries all three keys, while `queued`, `active` and `detail` are
+omitted. The pass JSON carries `observation_only: true` either way and a
+one-line warning goes to stderr. The production `idle` action is not so
+constrained: it can return with queued ids still present and with non-empty
+`orphaned`/`orphaned_live` after it settles dead claims or reports live ones.
 Observation is useful for watching state;
 it is not a work-conserving scheduler, and no card is marked `running` by it.
 

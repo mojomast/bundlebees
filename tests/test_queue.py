@@ -1475,6 +1475,30 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(record["detail"]), 400)
         self.assertEqual(record["detail"], expected_full[:400])
 
+    def test_settle_orphan_detail_cap_includes_the_declared_id_suffix(self):
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+        declared = "x" * 450
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": declared,
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+        })
+        expected_full = (
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {DEAD_PID!r} is not alive; "
+            f"the record declared feature_id {declared!r}"
+        )
+
+        Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = store.read("orig")
+        self.assertEqual(record["state"], "blocked")
+        self.assertGreater(len(expected_full), 400)
+        self.assertEqual(len(record["detail"]), 400)
+        self.assertEqual(record["detail"], expected_full[:400])
+        self.assertIn("the record declared feature_id '", record["detail"])
+
     def test_a_normal_active_card_still_advances_when_an_orphan_is_present(self):
         self.path.write_text(json.dumps({
             "f1": card("f1", status="claimed"),
