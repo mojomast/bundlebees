@@ -302,13 +302,19 @@ one pull request.
   into a generic conflict — pinned end to end: a host 409
   `{"error": "quota_exhausted"}` travels the real HTTP path and the provisioner
   refuses with that exact code before a journal entry is written.
-- **`attempts`/`status` count only live work as in-flight.** A dispatched
-  attempt with no recorded outcome is now `expired` once the 12-hour idle
-  window passes, and a `verified` result is no longer in flight because the bee
-  has already finished and the result awaits acceptance. On a real 414-lease
-  store this took the reported `in_flight` count from 297 (with zero bees
-  running) to 6, so the fleet view no longer reports finished and abandoned
-  dispatches as active bees.
+- **`attempts`/`status` count only live work as in-flight and report terminal
+  tool completions.** A validated `rizzstack.tool-completion/1` record now
+  makes an attempt `failed` when its state is `failed`, `cancelled` or
+  `interrupted`, and `unverified` when it is `succeeded`; a verify record
+  still outranks a completion. The terminal-completion branch precedes the
+  expiry check, so a terminal completion is never called `expired`, and
+  `updated_at` reports the completion's `recorded_at` when it is the latest
+  stamp. A dispatched attempt with no recorded outcome is `expired` once the
+  12-hour idle window passes, and a `verified` result is no longer in flight
+  because the bee has already finished and the result awaits acceptance. On a
+  real 414-lease store this took the reported `in_flight` count from 297 (with
+  zero bees running) to 6, so the fleet view no longer reports finished and
+  abandoned dispatches as active bees.
 - **Verify records its durable delivery intent before the push.** `verify` now
   defines the lease's `source_rev` as the base revision before it writes the
   delivery outbox row, so the intent carries the verified base and the PR
