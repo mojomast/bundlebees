@@ -728,6 +728,61 @@ def _reconcile_diverged_cards(
     return reconciled
 
 
+def _pid_alive(pid: Any) -> bool:
+    """Whether ``pid`` names a live process; a malformed pid is not alive."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _orphaned_claims(
+    store: "QueueStore",
+    items: Mapping[str, Item],
+    records: list[dict[str, Any]],
+    *,
+    settle: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Report active claims whose feature has no card in the queue document.
+
+    Such a claim can never be advanced or admitted again. When its recorded
+    process is gone it is settled as blocked so it stops counting as in flight;
+    a live pid is left alone because another consumer may still own it. With
+    ``settle=False`` nothing is written and dead records are only reported.
+    """
+    orphaned: list[dict[str, Any]] = []
+    orphaned_live: list[dict[str, Any]] = []
+    for record in records:
+        feature_id = str(record.get("feature_id"))
+        if feature_id in items:
+            continue
+        pid = record.get("pid")
+        entry = {
+            "feature": feature_id,
+            "job": str(record.get("job_id") or ""),
+            "pid": pid,
+            "state": str(record.get("state") or ""),
+        }
+        if _pid_alive(pid):
+            orphaned_live.append(entry)
+            continue
+        if settle:
+            detail = (
+                "orphaned claim: the queue document has no card for this feature; "
+                f"the recorded pid {pid!r} is not alive"
+            )[:400]
+            store.write(feature_id, dict(record, state="blocked", detail=detail, pid=os.getpid()))
+        orphaned.append(entry)
+    return orphaned, orphaned_live
+
+
 def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any = None,
              handoff_context: Mapping[str, Any] | None = None,
              admit: bool = True) -> dict[str, Any]:
@@ -735,23 +790,35 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
 
     A feature that is claimed or running is never dropped from scheduling because
     of its displayed status, and completion is derived from the job document.
-    ``admit=False`` is the observation-only pass: a tick that cannot dispatch or
-    verify must not claim a feature, because the claim would only mark a card
-    running with nothing able to advance it.
+    An active claim whose feature is absent from the queue document is settled
+    as blocked when its recorded pid is dead, and is reported (never mutated)
+    when that pid is still alive. ``admit=False`` is the observation-only pass:
+    a tick that cannot dispatch or verify must not claim a feature, because the
+    claim would only mark a card running with nothing able to advance it, and
+    it never writes an orphan repair.
     """
 
     store = QueueStore(state_dir)
     items = {item.feature_id: item for item in queue.list_items()}
     if not admit:
+        active_records = store.active()
+        orphaned, orphaned_live = _orphaned_claims(store, items, active_records, settle=False)
         queued = sorted(feature_id for feature_id, item in items.items() if item.status == "queued")
-        active = sorted(str(record.get("feature_id")) for record in store.active())
+        active = sorted(str(record.get("feature_id")) for record in active_records)
         if not queued and not active:
-            return {"action": "idle", "feature": None}
+            return {
+                "action": "idle",
+                "feature": None,
+                "orphaned": orphaned,
+                "orphaned_live": orphaned_live,
+            }
         return {
             "action": "observation_only",
             "feature": None,
             "queued": queued[:50],
             "active": active[:50],
+            "orphaned": orphaned,
+            "orphaned_live": orphaned_live,
             "detail": (
                 "this pass has no dispatch-capable tick (no launcher/repo/suite); it cannot "
                 "claim, dispatch, verify or integrate, so no card was moved"
@@ -763,7 +830,15 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     # work is admitted, then continue the normal pass.
     reconciled = _reconcile_diverged_cards(state_dir, queue, store, items)
 
+    # An active claim with no card can never be advanced again. Settle the
+    # provably dead ones before the normal pass so a live claim elsewhere still
+    # advances and admission is still attempted.
+    active_records = store.active()
+    orphaned, orphaned_live = _orphaned_claims(store, items, active_records, settle=True)
+
     def finish(payload: dict[str, Any]) -> dict[str, Any]:
+        payload.setdefault("orphaned", orphaned)
+        payload.setdefault("orphaned_live", orphaned_live)
         if reconciled:
             payload["reconciled"] = reconciled
         return payload
@@ -775,7 +850,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             return finish({"action": "handoff", "feature": created[0], "created": created})
 
     # 1. Advance existing work before admitting anything new.
-    for record in store.active():
+    for record in active_records:
         feature_id = str(record.get("feature_id"))
         item = items.get(feature_id)
         if item is None:
@@ -851,7 +926,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
                 "status": first["state"],
                 "detail": first["detail"],
             })
-        return {"action": "idle", "feature": None}
+        return finish({"action": "idle", "feature": None})
 
     try:
         record = store.claim(item.feature_id, job_id=item.job_id)
