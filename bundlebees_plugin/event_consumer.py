@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover - a platform without flock cannot prove 
     fcntl = None  # type: ignore[assignment]
 
 from . import coordinator_actions
+from . import liveness
 
 SCHEMA = "rizzstack.landing-event/1"
 DELIVERY_SCHEMA = "rizzstack.event-delivery/1"
@@ -308,18 +309,7 @@ def _locked(path: Path) -> Iterator[None]:
             pass
 
 
-def _holder_alive(pid: Any) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+_holder_alive = liveness.pid_alive
 
 
 def _claim_expired(claim: Mapping[str, Any], clock: float) -> bool:

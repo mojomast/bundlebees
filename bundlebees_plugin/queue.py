@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from . import job as jobs
+from . import liveness
 from . import provision_bind
 from . import provisioning
 from . import verify_local
@@ -728,19 +729,7 @@ def _reconcile_diverged_cards(
     return reconciled
 
 
-def _pid_alive(pid: Any) -> bool:
-    """Whether ``pid`` names a live process; a malformed pid is not alive."""
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OverflowError, OSError):
-        return False
-    return True
+_pid_alive = liveness.pid_alive
 
 
 def _orphaned_claims(
