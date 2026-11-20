@@ -1258,6 +1258,9 @@ class QueueTests(unittest.TestCase):
             "pid": DEAD_PID,
             "state": "running",
         }])
+        self.assertEqual(result["refused"], [],
+                         "a record with no card is an orphan, not an unreachable active claim")
+        self.assertEqual(result["cards_without_records"], [])
 
     def test_public_write_and_claim_still_reject_invalid_ids(self):
         store = Q.QueueStore(self.tmp)
@@ -1479,6 +1482,212 @@ class QueueTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "idle")
         self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [])
+
+    # -- unreachable active claims and cards without durable records --------
+
+    def _refused_entry_shape(self, entry):
+        return {key: entry[key] for key in ("feature", "job", "state", "code")}
+
+    def test_an_unreachable_active_claim_is_refused_without_raising_or_mutating(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+        }))
+        store, record_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+            "claimed_at": "2026-11-15T00:14:00Z",
+        })
+        card_before = self.path.read_text()
+        record_before = record_path.read_text()
+        calls = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: calls.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertIsNone(result["feature"])
+        self.assertEqual(calls, [], "an id that cannot name a store path must never be ticked")
+        self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [])
+        self.assertEqual(result["cards_without_records"], [])
+        self.assertEqual(len(result["refused"]), 1)
+        entry = result["refused"][0]
+        self.assertEqual(self._refused_entry_shape(entry), {
+            "feature": "bad name",
+            "job": "job_bad",
+            "state": "running",
+            "code": "feature_id_invalid",
+        })
+        self.assertIn("active claim", entry["detail"])
+        self.assertLessEqual(len(entry["detail"]), 400)
+        self.assertEqual(self.path.read_text(), card_before)
+        self.assertEqual(record_path.read_text(), record_before)
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["bad name.json"])
+
+    def test_an_unreachable_active_claim_does_not_stop_another_active_claim(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+            "f1": card("f1", job_id="job_1", status="claimed"),
+        }))
+        store, record_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        bad_card_before = json.loads(self.path.read_text())["bad name"]
+        record_before = record_path.read_text()
+        calls = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}), \
+             mock.patch.object(Q, "_job_accepted", lambda state_dir, job_id: True):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: calls.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(calls, ["job_1"], "the reachable active claim must still advance")
+        self.assertEqual(result["action"], "ready_for_review")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual([entry["feature"] for entry in result["refused"]], ["bad name"])
+        self.assertEqual(json.loads(self.path.read_text())["bad name"], bad_card_before)
+        self.assertEqual(record_path.read_text(), record_before)
+        self.assertEqual(store.read("f1")["state"], "ready_for_review")
+        self.assertEqual(self.queue.get("f1").status, "ready_for_review")
+
+    def test_a_card_without_a_record_is_reported_and_left_claimed(self):
+        for status in ("claimed", "running"):
+            with self.subTest(status=status), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({
+                    "different": card("different", job_id="job_orig", status=status),
+                }))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                (store.root / "orig.json").write_text(json.dumps({
+                    "feature_id": "different",
+                    "state": "running",
+                    "job_id": "job_orig",
+                    "pid": DEAD_PID,
+                }, indent=2, sort_keys=True))
+                queue_before = path.read_text()
+                orig_before = (store.root / "orig.json").read_text()
+
+                result = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "halted"})
+
+                self.assertEqual(result["action"], "idle")
+                self.assertIsNone(result["feature"])
+                self.assertEqual(result["cards_without_records"], [{
+                    "feature": "different",
+                    "job": "job_orig",
+                    "state": status,
+                }])
+                self.assertEqual(result["refused"], [])
+                self.assertEqual(result["orphaned"][0]["feature"], "orig")
+                self.assertEqual(path.read_text(), queue_before,
+                                 "a recordless card must never be rewritten or given a record")
+                self.assertEqual(queue.get("different").status, status)
+                self.assertFalse((store.root / "different.json").exists())
+                self.assertNotEqual((store.root / "orig.json").read_text(), orig_before,
+                                    "the invalid-stem orphan still settles in place")
+                self.assertEqual(store.read("orig")["state"], "blocked")
+
+    def test_report_keys_stay_empty_for_active_and_terminal_records(self):
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        self.queue.set_status("f1", "claimed", {"job_id": "job_1"})
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            active = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(active["action"], "running")
+        self.assertEqual(active["refused"], [])
+        self.assertEqual(active["cards_without_records"], [])
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = tmp / "queue.json"
+            path.write_text(json.dumps({"f1": card("f1", status="claimed")}))
+            queue = Q.JsonQueue(path)
+            Q.QueueStore(tmp).write("f1", {"state": "blocked", "job_id": "job_1",
+                                           "detail": "stopped by contract"})
+
+            terminal = Q.run_once(tmp, queue, tick=lambda job_id: {"status": "ok"})
+
+            self.assertEqual(terminal["action"], "reconciled")
+            self.assertEqual(terminal["reconciled"][0]["feature"], "f1")
+            self.assertEqual(terminal["refused"], [])
+            self.assertEqual(terminal["cards_without_records"], [])
+
+    def test_every_admit_payload_carries_the_new_report_keys(self):
+        cases = (
+            ("idle", {"f1": card("f1", status="ready_for_review")}, "ok", False, None, None),
+            ("blocked", {"f1": card("f1")}, "blocked", False, None, None),
+            ("running", {"f1": card("f1")}, "running", False, None, None),
+            ("ready_for_review", {"f1": card("f1", status="claimed")}, "ok", True, None, "running"),
+            ("handoff", {"f1": card("f1")}, "ok", False, {"worktree": "unused"}, None),
+        )
+        for action, document, tick_status, accepted, context, record_state in cases:
+            with self.subTest(action=action), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps(document))
+                queue = Q.JsonQueue(path)
+                if record_state is not None:
+                    Q.QueueStore(tmp).write("f1", {"state": record_state, "job_id": "job_1"})
+                with mock.patch.object(Q, "_load_job_or_none",
+                                       lambda state_dir, job_id: {"job_id": job_id}), \
+                     mock.patch.object(Q, "_job_accepted",
+                                       lambda state_dir, job_id, accepted=accepted: accepted), \
+                     mock.patch.object(Q, "_handoff_dependents",
+                                       lambda *args, **kwargs: ["f9"]):
+                    result = Q.run_once(tmp, queue,
+                                        tick=lambda job_id: {"status": tick_status},
+                                        handoff_context=context)
+
+                self.assertEqual(result["action"], action)
+                self.assertIn("refused", result)
+                self.assertIn("cards_without_records", result)
+                self.assertEqual(result["refused"], [])
+                self.assertEqual(result["cards_without_records"], [])
+
+    def test_observation_only_pass_is_clean_for_unreachable_and_recordless_cards(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+            "different": card("different", job_id="job_orig", status="claimed"),
+        }))
+        store, bad_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        orig_path = store.root / "orig.json"
+        orig_path.write_text(json.dumps({
+            "feature_id": "different",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+        }, indent=2, sort_keys=True))
+        queue_before = self.path.read_text()
+        bad_before = bad_path.read_text()
+        orig_before = orig_path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"},
+                            admit=False)
+
+        self.assertEqual(result["action"], "observation_only")
+        self.assertEqual(self.path.read_text(), queue_before)
+        self.assertEqual(bad_path.read_text(), bad_before)
+        self.assertEqual(orig_path.read_text(), orig_before)
+        self.assertEqual(result["orphaned"][0]["feature"], "orig")
         self.assertEqual(result["orphaned_live"], [])
 
     def test_dependencies_unlock_on_job_evidence_not_card_status(self):

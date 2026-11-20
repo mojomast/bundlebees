@@ -679,17 +679,23 @@ def _reconcile_diverged_cards(
     queue: QueueAdapter,
     store: "QueueStore",
     items: Mapping[str, Item],
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Repair cards whose displayed status contradicts their durable record.
 
     A claimed/running card whose record is genuinely active is normal work and
     is left to the active pass. A card whose record is non-active is invisible
     to both the active pass and admission, so it is rewritten to the record's
     state here, before any new work is admitted. A missing record keeps the
-    existing behaviour; an unreadable record is not repaired and raises the
-    same typed :class:`QueueError` the active pass raises.
+    existing behaviour and is only reported, because there is nothing to
+    repair; an unreadable record is not repaired and raises the same typed
+    :class:`QueueError` the active pass raises.
+
+    Returns the repairs plus a report-only list of claimed/running cards whose
+    own record is genuinely absent. Like every other unreachable state, such a
+    card cannot be advanced or admitted, so a silent ``idle`` would hide it.
     """
     reconciled: list[dict[str, str]] = []
+    without_records: list[dict[str, str]] = []
     for feature_id in sorted(items):
         item = items[feature_id]
         if item.status not in ("claimed", "running"):
@@ -709,6 +715,11 @@ def _reconcile_diverged_cards(
                 "Inspect it by hand; an unreadable record may be an active claim.",
             ) from exc
         if record is None:
+            without_records.append({
+                "feature": feature_id,
+                "job": item.job_id,
+                "state": item.status,
+            })
             continue
         if not isinstance(record, Mapping):
             raise QueueError(
@@ -752,7 +763,7 @@ def _reconcile_diverged_cards(
             "record_state": record_state,
             "detail": detail,
         })
-    return reconciled
+    return reconciled, without_records
 
 
 _pid_alive = liveness.pid_alive
@@ -851,17 +862,22 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     # A claimed/running card whose record is already terminal is invisible to
     # both the active pass and admission. Repair every such card before any new
     # work is admitted, then continue the normal pass.
-    reconciled = _reconcile_diverged_cards(state_dir, queue, store, items)
+    reconciled, cards_without_records = _reconcile_diverged_cards(
+        state_dir, queue, store, items
+    )
 
     # An active claim with no card can never be advanced again. Settle the
     # provably dead ones before the normal pass so a live claim elsewhere still
     # advances and admission is still attempted.
     active_records = store.active()
     orphaned, orphaned_live = _orphaned_claims(store, items, active_records, settle=True)
+    refused: list[dict[str, Any]] = []
 
     def finish(payload: dict[str, Any]) -> dict[str, Any]:
         payload.setdefault("orphaned", orphaned)
         payload.setdefault("orphaned_live", orphaned_live)
+        payload.setdefault("refused", refused)
+        payload.setdefault("cards_without_records", cards_without_records)
         if reconciled:
             payload["reconciled"] = reconciled
         return payload
@@ -877,6 +893,26 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         feature_id = str(record.get("feature_id"))
         item = items.get(feature_id)
         if item is None:
+            continue
+        try:
+            store.path(feature_id)
+        except QueueError as exc:
+            if exc.code != "feature_id_invalid":
+                raise
+            # Nothing can read, tick or rewrite this claim: its id cannot name
+            # a store path. Report it and leave both card and record untouched
+            # so one corrupt id cannot abort the whole queue pass.
+            refused.append({
+                "feature": feature_id,
+                "job": str(record.get("job_id") or item.job_id or ""),
+                "state": str(record.get("state") or ""),
+                "code": exc.code,
+                "detail": (
+                    "active claim skipped: its feature id cannot name a store path, "
+                    "so it can be neither ticked nor rewritten; the card and record "
+                    "were left untouched"
+                )[:400],
+            })
             continue
         claimed_job = str(record.get("job_id") or "")
         if claimed_job and claimed_job != item.job_id:
