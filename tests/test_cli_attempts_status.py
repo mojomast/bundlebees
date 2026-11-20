@@ -605,6 +605,19 @@ def test_a_completion_naming_a_different_attempt_is_ignored(tmp_path: Path, caps
     assert status["in_flight_attempts"] == ["att-own"]
 
 
+def test_tool_completion_rejects_a_traversal_attempt_id(tmp_path: Path):
+    state = tmp_path / "state"
+    (state / "tool-completions").mkdir(parents=True)
+    outside = _completion_payload("../outside", recorded_at=COMPLETION_AT)
+    (state / "outside.json").write_text(json.dumps(outside), encoding="utf-8")
+
+    assert cli._tool_completion(state, "../outside") is None
+
+    inside = _completion_payload("att-inside", recorded_at=COMPLETION_AT)
+    _write_completion(state, "att-inside", inside)
+    assert cli._tool_completion(state, "att-inside") == inside
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -615,7 +628,13 @@ def test_a_completion_naming_a_different_attempt_is_ignored(tmp_path: Path, caps
         ),
         pytest.param(b"[]", id="non-mapping"),
         pytest.param(b"\xff\xfe{}\xff", id="invalid-utf8"),
-        pytest.param(("[" * 100000 + "]" * 100000).encode(), id="deeply-nested-json"),
+        pytest.param(
+            ("[" * 10000 + "]" * 10000).encode(), id="deeply-nested-json"
+        ),
+        pytest.param(
+            ("[" * 100000 + "]" * 100000).encode(),
+            id="deeply-nested-oversized-json",
+        ),
         pytest.param(
             json.dumps(
                 _completion_payload(
@@ -700,6 +719,25 @@ def test_a_terminal_completion_keeps_an_ancient_lease_out_of_expired(
     assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
     row = json.loads(capsys.readouterr().out)["attempts"][0]
     assert row["state"] != "expired"
+    assert row["state"] == "unverified"
+    assert row["updated_at"] == completion_at
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 0
+
+
+def test_a_completion_older_than_the_ttl_outranks_expiry(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-old", now=ANCIENT)
+    completion_at = _stamp(2880)
+    _write_completion(
+        state,
+        "att-old",
+        _completion_payload("att-old", recorded_at=completion_at),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
     assert row["state"] == "unverified"
     assert row["updated_at"] == completion_at
 

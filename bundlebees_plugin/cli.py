@@ -835,12 +835,15 @@ def _tool_completion(state_dir: Path, attempt_id: str) -> Mapping[str, Any] | No
     unreadable file, invalid UTF-8, a document larger than 65536 bytes, invalid
     JSON (including recursion-depth failure), a non-mapping document, a schema
     other than ``agent_consumer.TOOL_COMPLETION_SCHEMA``, a different
-    ``attempt_id``, an unknown terminal state, or a ``recorded_at`` that is not
-    exactly whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are
-    rejected) makes the record absent. Nothing here writes to the store.
+    ``attempt_id``, an attempt id that is not a safe single path component, an
+    unknown terminal state, or a ``recorded_at`` that is not exactly
+    whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are rejected)
+    makes the record absent. Nothing here writes to the store.
     """
     from . import agent_consumer
 
+    if not _ATTEMPT_ID_RE.fullmatch(attempt_id) or ".." in attempt_id:
+        return None
     path = Path(state_dir) / "tool-completions" / f"{attempt_id}.json"
     try:
         raw = path.read_bytes()
