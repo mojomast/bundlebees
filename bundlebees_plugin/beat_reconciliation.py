@@ -83,6 +83,14 @@ BACKOFF = "backoff"
 CLAIM_BUSY = "claim_busy"
 MALFORMED_ATTEMPT = "malformed_attempt"
 LEDGER_CORRUPT = "ledger_corrupt"
+#: Skip reasons for work that already landed under another name: a merged PR or
+#: commit on main names the attempt id (coordinator applies, squash bodies), a
+#: merged PR came from the attempt's own branch (squash or merge commit, branch
+#: since deleted), or from its retry branch (``<branch>-2``...).
+LANDED_ATTEMPT_ID = "landed_attempt_id"
+LANDED_MERGED_BRANCH = "landed_merged_branch"
+LANDED_RETRY_BRANCH = "landed_retry_branch"
+LANDED_REASONS = frozenset({LANDED_ATTEMPT_ID, LANDED_MERGED_BRANCH, LANDED_RETRY_BRANCH})
 
 #: Detection reasons for attempts the sweep will process.
 REASON_UNPUSHED = "succeeded_unpushed_no_pr"
@@ -98,6 +106,12 @@ _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _PR_URL_RE = re.compile(r"/pull/([0-9]+)\s*$")
+#: An attempt id named in text. Short forms (``att_55bbab04``) are common in
+#: PR bodies; at least 8 hex digits are required to count as a reference.
+_ATT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])att_([0-9a-f]{8,32})(?![0-9a-f])")
+_MERGE_FROM_RE = re.compile(r"^Merge pull request #([0-9]+) from [A-Za-z0-9._-]+/(\S+)", re.M)
+_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_RETRY_SUFFIX_RE = re.compile(r"^-([2-9]|[1-9][0-9])$")
 
 _GIT_TIMEOUT_S = 120
 _GH_TIMEOUT_S = 120
@@ -620,6 +634,140 @@ def classify_attempt(
     return {"attempt_id": attempt, "branch": branch, "decision": "process", "reason": REASON_UNPUSHED, "stage": STAGE_FULL}
 
 
+def _texts_tokens(text: str) -> set[str]:
+    return {"att_" + m.group(1) for m in _ATT_TOKEN_RE.finditer(text or "")}
+
+
+def landed_index(prs: Any = (), commits: Any = ()) -> dict[str, Any]:
+    """Index landed work for one repository: attempt-id references and merged branches.
+
+    ``prs`` are **merged** pull requests as mappings (``number``,
+    ``headRefName``, ``title``, ``body``); ``commits`` are commits on main as
+    mappings (``sha``, ``message``) or message strings. Only references that
+    are actually present are indexed; nothing is inferred from timing or files.
+    """
+
+    attempts: dict[str, str] = {}
+    branches: dict[str, str] = {}
+    for pr in prs if isinstance(prs, (list, tuple)) else []:
+        if not isinstance(pr, Mapping):
+            continue
+        numbers = _pr_numbers(pr.get("number"))
+        if not numbers:
+            continue
+        where = f"PR #{numbers[0]}"
+        for token in _texts_tokens(f"{pr.get('title') or ''}\n{pr.get('body') or ''}"):
+            attempts.setdefault(token, where)
+        head = _clean_branch(pr.get("headRefName") or pr.get("head_branch") or "")
+        if head:
+            branches.setdefault(head, where)
+    for commit in commits if isinstance(commits, (list, tuple)) else []:
+        if isinstance(commit, Mapping):
+            message = commit.get("message")
+            sha = str(commit.get("sha") or "")
+        else:
+            message, sha = commit, ""
+        if not isinstance(message, str):
+            continue
+        where = f"commit {sha[:12]}" if _SHA_RE.match(sha or "") else "commit on main"
+        for token in _texts_tokens(message):
+            attempts.setdefault(token, where)
+        for match in _MERGE_FROM_RE.finditer(message):
+            head = _clean_branch(match.group(2))
+            if head:
+                branches.setdefault(head, f"PR #{match.group(1)}")
+    return {"attempts": attempts, "branches": branches}
+
+
+def landed_match(attempt_id: str, branch: str, index: Mapping[str, Any] | None,
+                 *, branch_rules: bool = True) -> dict[str, str] | None:
+    """``{"reason", "evidence"}`` when ``index`` shows this attempt's work landed.
+
+    An attempt-id reference matches the full id or an 8+ hex digit prefix of
+    it. Branch rules need the attempt's own repository: a merged PR whose head
+    is the attempt's branch, or exactly ``<branch>-N`` (a retry branch).
+    """
+
+    if not isinstance(index, Mapping):
+        return None
+    attempts = index.get("attempts") if isinstance(index.get("attempts"), Mapping) else {}
+    for token, where in attempts.items():
+        if isinstance(token, str) and len(token) >= 12 and attempt_id.startswith(token):
+            return {"reason": LANDED_ATTEMPT_ID, "evidence": f"{where} names {token}"}
+    if not branch_rules or not branch:
+        return None
+    branches = index.get("branches") if isinstance(index.get("branches"), Mapping) else {}
+    if branch in branches:
+        return {"reason": LANDED_MERGED_BRANCH, "evidence": f"{branches[branch]} merged from {branch}"}
+    for head, where in branches.items():
+        if isinstance(head, str) and head.startswith(branch) and _RETRY_SUFFIX_RE.match(head[len(branch):]):
+            return {"reason": LANDED_RETRY_BRANCH, "evidence": f"{where} merged from retry branch {head}"}
+    return None
+
+
+def _project_of(entry: Mapping[str, Any], attempt: str, state_dir: Path) -> str:
+    brief = entry.get("brief")
+    project = brief.get("project") if isinstance(brief, Mapping) else None
+    if not isinstance(project, str) or not project.strip():
+        try:
+            lease_brief = leases.load_lease(state_dir, attempt).get("brief")
+        except leases.LeaseError:
+            lease_brief = None
+        project = lease_brief.get("project") if isinstance(lease_brief, Mapping) else None
+    project = project.strip() if isinstance(project, str) else ""
+    return project if _PROJECT_RE.match(project) else ""
+
+
+class _LandedView:
+    """Lazy, per-run, per-repository view of landed work. Never raises.
+
+    ``source`` is a mapping ``project -> index`` or a callable ``project ->
+    index``. A repository whose view cannot be read is reported and its
+    attempts are classified exactly as before (still flagged): a missing view
+    never hides a gap.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.cache: dict[str, dict[str, Any] | None] = {}
+        self.errors: dict[str, str] = {}
+
+    def get(self, project: str) -> dict[str, Any] | None:
+        if project in self.cache:
+            return self.cache[project]
+        value: Any = None
+        try:
+            value = self.source.get(project) if isinstance(self.source, Mapping) else self.source(project)
+        except Exception as exc:  # noqa: BLE001 - an unreadable repo is reported, not guessed
+            self.errors[project] = _clip(scrub(f"{type(exc).__name__}: {exc}"))
+            value = None
+        if value is not None and not isinstance(value, Mapping):
+            self.errors[project] = "the landed view is not a mapping"
+            value = None
+        self.cache[project] = dict(value) if isinstance(value, Mapping) else None
+        return self.cache[project]
+
+    def match(self, attempt: str, branch: str, project: str) -> dict[str, str] | None:
+        if project:
+            found = landed_match(attempt, branch, self.get(project))
+            if found:
+                found = dict(found, project=project)
+            return found
+        # No project: attempt ids are globally unique, branch names are not.
+        for name, index in list(self.cache.items()):
+            found = landed_match(attempt, branch, index, branch_rules=False)
+            if found:
+                return dict(found, project=name)
+        return None
+
+    def status(self) -> str:
+        if not self.cache:
+            return "ok"
+        if self.errors and len(self.errors) == len(self.cache):
+            return "unavailable"
+        return "partial" if self.errors else "ok"
+
+
 def attempt_claim_key(attempt_id: str) -> str:
     """The durable claim-file key for one attempt's processing."""
 
@@ -732,6 +880,7 @@ def sweep(
     wait_s: float = 0.0,
     record: bool = True,
     claim: bool = True,
+    landed: Any = None,
 ) -> dict[str, Any]:
     """Run one completed-attempt reconciliation sweep and return its report.
 
@@ -743,11 +892,17 @@ def sweep(
     classifies only (the scout's read-only mode). ``record=False`` and
     ``claim=False`` keep a run read-only end to end.
 
+    ``landed`` (optional) is the landed-work view (see :class:`_LandedView`):
+    a succeeded, never-recorded attempt whose work a merged PR or a commit on
+    main already carries is skipped with a ``landed_*`` reason and listed in
+    ``report["landed"]`` with its evidence, instead of being detected.
+
     The report never raises for an unobservable world: it reports
     ``status: "error"`` with a stable code, so a beat cannot die on the sweep.
     """
 
     state = Path(state_dir)
+    landed_view = _LandedView(landed) if landed is not None else None
     clock = _clock(now)
     report = _empty_report(_iso(clock))
 
@@ -799,6 +954,22 @@ def sweep(
             if decision["decision"] != "process":
                 _skip(report, decision["attempt_id"], decision["branch"], decision["reason"])
                 continue
+            if (
+                landed_view is not None
+                and decision["reason"] == REASON_UNPUSHED
+                and records.get(attempt) is None
+            ):
+                found = landed_view.match(attempt, branch, _project_of(entry, attempt, state))
+                if found:
+                    _skip(report, attempt, branch, found["reason"])
+                    report.setdefault("landed", []).append({
+                        "attempt_id": attempt,
+                        "branch": branch,
+                        "project": found.get("project", ""),
+                        "reason": found["reason"],
+                        "evidence": found["evidence"],
+                    })
+                    continue
             detected = {
                 "attempt_id": attempt,
                 "branch": branch,
@@ -910,6 +1081,12 @@ def sweep(
         if claim_handle is not None:
             claim_handle.release()
 
+    if landed_view is not None:
+        report["landed_view"] = landed_view.status()
+        report.setdefault("landed", [])
+        report["counts"]["landed"] = len(report["landed"])
+        if landed_view.errors:
+            report["landed_errors"] = dict(sorted(landed_view.errors.items()))
     if record:
         _bump_skips(state, [item["reason"] for item in report["skipped"]], report["at"])
         _write_json(sweep_dir(state) / LAST_SWEEP_FILENAME, report)

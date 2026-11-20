@@ -24,7 +24,9 @@ import importlib
 import inspect
 import json
 import os
+import re
 import select
+import shutil
 import subprocess
 import sys
 import threading
@@ -1318,6 +1320,79 @@ def _discover_subscribers(state: Path) -> list[str]:
     return sorted(found)
 
 
+#: How much landed history the sweep reads per repository (merged PRs, commits on main).
+LANDED_PR_LIMIT = 400
+LANDED_COMMIT_PAGES = 3
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+?(?:\.git)?/?$")
+
+
+def _origin_owner(repo: Path, timeout_s: float) -> str:
+    """The GitHub owner of the driver's checkout (``git remote get-url origin``)."""
+
+    proc = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=str(repo), capture_output=True, text=True,
+        timeout=timeout_s, env=child_env({"GIT_TERMINAL_PROMPT": "0"}), stdin=subprocess.DEVNULL,
+    )
+    match = _GITHUB_REMOTE_RE.search((proc.stdout or "").strip()) if proc.returncode == 0 else None
+    if not match:
+        raise RuntimeError("the checkout's origin is not a GitHub remote")
+    return match.group(1)
+
+
+def _gh_path() -> str:
+    found = shutil.which("gh")
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / "gh"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    raise RuntimeError("the gh CLI is not installed")
+
+
+def _gh_json(argv: Sequence[str], timeout_s: float) -> Any:
+    proc = subprocess.run(
+        [_gh_path(), *argv], capture_output=True, text=True, timeout=timeout_s,
+        env=child_env({"GIT_TERMINAL_PROMPT": "0"}), stdin=subprocess.DEVNULL,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh failed ({proc.returncode}): {(proc.stderr or '').strip()[:160]}")
+    return json.loads(proc.stdout or "null")
+
+
+def landed_view_for(repo: Path, *, timeout_s: float = 60.0, gh_json: Any = None) -> Any:
+    """Read-only landed-work view: merged PRs and recent commits on main, per project.
+
+    ``project`` is an attempt's ``brief.project`` (a repository name under the
+    driver checkout's GitHub owner). Any read failure raises, so the sweep
+    reports that repository's view as unavailable and keeps flagging its
+    attempts; nothing is written anywhere.
+    """
+
+    reader = gh_json if gh_json is not None else (lambda argv: _gh_json(argv, timeout_s))
+    owner: list[str] = []
+
+    def view(project: str) -> dict[str, Any]:
+        if not owner:
+            owner.append(_origin_owner(Path(repo), timeout_s))
+        slug = f"{owner[0]}/{project}"
+        prs = reader(["pr", "list", "--repo", slug, "--state", "merged", "--limit", str(LANDED_PR_LIMIT),
+                      "--json", "number,headRefName,title,body"])
+        if not isinstance(prs, list):
+            raise RuntimeError("gh pr list returned no list")
+        commits: list[Any] = []
+        for page in range(1, LANDED_COMMIT_PAGES + 1):
+            batch = reader(["api", f"repos/{slug}/commits?sha=main&per_page=100&page={page}",
+                            "--jq", "[.[] | {sha: .sha, message: .commit.message}]"])
+            if not isinstance(batch, list):
+                raise RuntimeError("gh api commits returned no list")
+            commits.extend(batch)
+            if len(batch) < 100:
+                break
+        return beat_reconciliation.landed_index(prs, commits)
+
+    return view
+
+
 def sweep_views_for(client: Any, repo: Path, *, timeout_s: float = 30.0) -> dict[str, Any]:
     """The production sweep views: the launcher through the reconcile adapter.
 
@@ -1331,6 +1406,7 @@ def sweep_views_for(client: Any, repo: Path, *, timeout_s: float = 30.0) -> dict
     return {
         "launcher": launcher_adapter.LauncherAdapter(client),
         "origin_branches": lambda: sorted(_origin_branch_view(repo_path, timeout_s)),
+        "landed": landed_view_for(repo_path),
     }
 
 
@@ -2123,6 +2199,7 @@ class FactoryDriver:
                 now=clock,
                 record=False,
                 claim=False,
+                landed=views.get("landed"),
             )
             if pr_view is None and sweep.get("status") != "error":
                 sweep = _without_pr_view(sweep)
