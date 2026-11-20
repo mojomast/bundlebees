@@ -1190,7 +1190,12 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(record["state"], "blocked")
         self.assertEqual(record["feature_id"], "orig")
         self.assertEqual(record["feature_id_declared"], "different")
-        self.assertIn("'different'", record["detail"])
+        self.assertEqual(
+            record["detail"],
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {DEAD_PID!r} is not alive; "
+            f"the record declared feature_id {'different'!r}",
+        )
         self.assertLessEqual(len(record["detail"]), 400)
         self.assertEqual(record["claimed_at"], "2026-11-15T00:14:00Z")
         self.assertFalse(any(str(key).startswith("_") for key in record))
@@ -1229,7 +1234,12 @@ class QueueTests(unittest.TestCase):
                     self.assertEqual(record["feature_id"], stem)
                     self.assertIn("feature_id_declared", record)
                     self.assertIsNone(record["feature_id_declared"])
-                    self.assertIn("None", record["detail"])
+                    self.assertEqual(
+                        record["detail"],
+                        "orphaned claim: the queue document has no card for this feature; "
+                        f"the recorded pid {DEAD_PID!r} is not alive; "
+                        f"the record declared feature_id {None!r}",
+                    )
                     self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), [f"{stem}.json"])
                     self.assertEqual(result["orphaned"][0]["feature"], stem)
 
@@ -1334,7 +1344,12 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(record["state"], "blocked")
         self.assertEqual(record["feature_id"], "orig")
         self.assertEqual(record["feature_id_declared"], "../evil")
-        self.assertIn("'../evil'", record["detail"])
+        self.assertEqual(
+            record["detail"],
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {DEAD_PID!r} is not alive; "
+            f"the record declared feature_id {'../evil'!r}",
+        )
         self.assertFalse((store.root / "different.json").exists())
         self.assertFalse((store.root / "None.json").exists())
         self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["f1.json", "orig.json"])
@@ -1359,7 +1374,12 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(record["state"], "blocked")
         self.assertEqual(record["feature_id"], "orig")
         self.assertEqual(record["feature_id_declared"], "different")
-        self.assertIn("'different'", record["detail"])
+        self.assertEqual(
+            record["detail"],
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {DEAD_PID!r} is not alive; "
+            f"the record declared feature_id {'different'!r}",
+        )
         self.assertFalse((store.root / "different.json").exists())
         self.assertFalse((store.root / "None.json").exists())
         self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["f1.json", "orig.json"])
@@ -1430,6 +1450,30 @@ class QueueTests(unittest.TestCase):
             "pid": os.getpid(),
             "state": "running",
         }])
+
+    def test_settle_orphan_detail_is_truncated_at_the_400_character_cap(self):
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+        declared = "x" * 450
+        pid = "p" * 400
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": declared,
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": pid,
+        })
+        expected_full = (
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {pid!r} is not alive; "
+            f"the record declared feature_id {declared!r}"
+        )
+
+        Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = store.read("orig")
+        self.assertEqual(record["state"], "blocked")
+        self.assertGreater(len(expected_full), 400)
+        self.assertEqual(len(record["detail"]), 400)
+        self.assertEqual(record["detail"], expected_full[:400])
 
     def test_a_normal_active_card_still_advances_when_an_orphan_is_present(self):
         self.path.write_text(json.dumps({
