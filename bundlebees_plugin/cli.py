@@ -757,6 +757,10 @@ _ATTEMPT_DISPATCHED = "dispatched"
 _ATTEMPT_VERIFIED = "verified"
 _ATTEMPT_FAILED = "failed"
 _ATTEMPT_ACCEPTED = "accepted"
+#: A terminal tool-path completion that says ``succeeded`` but has no verify
+#: record: the bee finished the work, but nobody has verified it. It is neither
+#: in flight nor failed, so it gets its own truthful word.
+_ATTEMPT_UNVERIFIED = "unverified"
 #: Dispatched, no outcome ever recorded, and past the window in which an
 #: outcome could plausibly still arrive. This is not a success/failure claim:
 #: it says the store has no verified outcome for the attempt, so counting it
@@ -803,6 +807,47 @@ def _latest_stamp(*values: Any) -> str:
         if len(text) >= 20 and text > best:
             best = text
     return best
+
+
+def _tool_completion(state_dir: Path, attempt_id: str) -> dict[str, str] | None:
+    """This attempt's validated terminal tool-completion record, or None.
+
+    The dispatch tool writes ``tool-completions/<attempt_id>.json`` when a
+    bee finishes; it is local evidence, so the view reads it instead of the
+    launcher. Only a JSON object that names this exact attempt, carries a
+    member of ``agent_consumer.TOOL_TERMINAL_STATES`` and a parseable ISO-8601
+    Zulu ``recorded_at`` is accepted. Anything missing, unreadable, malformed,
+    mismatched or non-terminal is ignored (fail-open) and leaves the existing
+    lease/verify/acceptance behaviour untouched.
+    """
+    from . import agent_consumer
+
+    if not _ATTEMPT_ID_RE.fullmatch(attempt_id) or ".." in attempt_id:
+        return None
+    path = Path(state_dir) / "tool-completions" / f"{attempt_id}.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        record = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, Mapping):
+        return None
+    if str(record.get("attempt_id") or "") != attempt_id:
+        return None
+    state = str(record.get("state") or "")
+    if state not in agent_consumer.TOOL_TERMINAL_STATES:
+        return None
+    stamp = str(record.get("recorded_at") or "").strip()
+    if len(stamp) < 20 or not stamp.endswith("Z"):
+        return None
+    try:
+        _dt.datetime.strptime(stamp[:20], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return {"state": state, "recorded_at": stamp}
 
 
 def _accepted_waves(state_dir: Path) -> dict[str, str]:
@@ -900,13 +945,22 @@ def _attribution_route(state_dir: Path, attempt_id: str) -> tuple[str | None, st
 def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
     """One row per recorded attempt, derived from local evidence only.
 
-    The state comes from the coordinator's own records -- an accepted wave
-    record first, then the verify result -- so the view never asks the launcher
-    and never widens what the lease recorded. Every value passes through
-    ``scrub`` before it can reach the output. A validated attempt id survives
-    the scrub as evidence, not a credential -- unless it is itself
-    secret-shaped: then the scrubbed form always wins and the raw id is never
-    re-inserted into the row.
+    The state comes from the coordinator's own records, in this precedence:
+    an accepted wave record, then the verify result, then the terminal
+    tool-completion record the dispatch tool wrote. A verify result always
+    outranks a completion, so a failed completion later verified ok reads
+    ``verified``. A terminal completion whose state is failed, cancelled or
+    interrupted reads ``failed``; one whose state is succeeded and has no
+    verify record reads ``unverified`` -- the bee finished the work but nobody
+    verified it, so it is neither in flight nor failed. (The shipped vocabulary
+    has no cancelled/interrupted word, so those completion states remain
+    ``failed``.) Without a terminal completion, a fresh lease reads
+    ``dispatched`` and a lease older than ``ATTEMPT_TTL_S`` reads ``expired``.
+    The view never asks the launcher and never widens what the lease recorded.
+    Every value passes through ``scrub`` before it can reach the output. A
+    validated attempt id survives the scrub as evidence, not a credential --
+    unless it is itself secret-shaped: then the scrubbed form always wins and
+    the raw id is never re-inserted into the row.
     """
     from . import verify_local
 
@@ -920,8 +974,12 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
         brief = lease.get("brief") if isinstance(lease.get("brief"), Mapping) else {}
         result = verify_local.read_record(state_dir, attempt_id) or {}
         evidence = result.get("evidence") if isinstance(result.get("evidence"), Mapping) else {}
+        completion = _tool_completion(state_dir, attempt_id)
         updated_at = _latest_stamp(
-            record.get("created_at"), result.get("at"), accepted.get(attempt_id)
+            record.get("created_at"),
+            result.get("at"),
+            accepted.get(attempt_id),
+            completion.get("recorded_at") if completion else None,
         )
         if attempt_id in accepted:
             state = _ATTEMPT_ACCEPTED
@@ -929,6 +987,12 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             state = _ATTEMPT_VERIFIED
         elif result.get("ok") is False:
             state = _ATTEMPT_FAILED
+        elif completion is not None:
+            state = (
+                _ATTEMPT_UNVERIFIED
+                if completion["state"] == "succeeded"
+                else _ATTEMPT_FAILED
+            )
         elif (age := _age_s(updated_at, _dt.datetime.now(_dt.timezone.utc))) is not None and (
             age > ATTEMPT_TTL_S
         ):

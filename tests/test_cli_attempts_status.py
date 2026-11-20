@@ -172,6 +172,32 @@ def _accepted_wave(state: Path, wave_id: str, attempt_id: str, *, at: str) -> No
     )
 
 
+def _completion(
+    state: Path,
+    attempt_id: str,
+    *,
+    state_name: str = "succeeded",
+    at: str | None = None,
+    recorded_attempt_id: str | None = None,
+) -> None:
+    path = state / "tool-completions" / f"{attempt_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "rizzstack.tool-completion/1",
+                "attempt_id": recorded_attempt_id or attempt_id,
+                "state": state_name,
+                "branch": f"feat/{attempt_id}",
+                "feature_id": "feature-a",
+                "event_id": "event-a",
+                "recorded_at": at or _stamp(20),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _snapshot(root: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -509,6 +535,105 @@ def test_a_failed_outcome_past_the_ttl_stays_failed(tmp_path: Path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# A terminal tool-completion is local evidence, not in-flight work
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_completion_is_failed_and_not_in_flight(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-done", now=_now_stamp(), project="proj-a")
+    _completion(state, "att-done", state_name="failed", at=_now_stamp())
+    _lease(state, "att-live", now=_now_stamp(), project="proj-b")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    rows = {row["attempt_id"]: row for row in json.loads(capsys.readouterr().out)["attempts"]}
+    assert rows["att-done"]["state"] == "failed"
+    assert rows["att-live"]["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att-live"]
+
+
+def test_a_succeeded_completion_is_unverified_and_not_in_flight(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-succeeded", now=_now_stamp(), project="proj-a")
+    _completion(state, "att-succeeded", state_name="succeeded", at=_now_stamp())
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "unverified"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 0
+    assert status["in_flight_attempts"] == []
+
+
+def test_a_completion_for_a_different_attempt_is_ignored(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-mismatch", now=_now_stamp(), project="proj-a")
+    _completion(
+        state,
+        "att-mismatch",
+        state_name="failed",
+        at=_now_stamp(),
+        recorded_attempt_id="att-other",
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 1
+
+
+def test_a_malformed_completion_is_ignored_and_the_view_succeeds(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    names = ("att-bad-json", "att-unknown-state", "att-not-mapping")
+    for name in names:
+        _lease(state, name, now=_now_stamp(), project="proj-a")
+    root = state / "tool-completions"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "att-bad-json.json").write_text("{not json", encoding="utf-8")
+    _completion(state, "att-unknown-state", state_name="running", at=_now_stamp())
+    (root / "att-not-mapping.json").write_text(json.dumps([1, 2]), encoding="utf-8")
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    rows = {row["attempt_id"]: row for row in json.loads(capsys.readouterr().out)["attempts"]}
+    assert set(rows) == set(names)
+    assert {row["state"] for row in rows.values()} == {"dispatched"}
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == len(names)
+
+
+def test_a_verify_result_outranks_a_failed_completion(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-relater", now=_now_stamp(), project="proj-a")
+    _completion(state, "att-relater", state_name="failed", at=_stamp(30))
+    _verify_result(state, "att-relater", ok=True, at=_stamp(10))
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "verified"
+
+
+def test_an_ancient_lease_with_a_fresh_completion_is_not_expired(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    fresh = _now_stamp()
+    _lease(state, "att-ancient", now=ANCIENT, project="proj-a")
+    _completion(state, "att-ancient", state_name="succeeded", at=fresh)
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "unverified"
+    assert row["updated_at"] == fresh
+
+
+# ---------------------------------------------------------------------------
 # Dispatch route comes only from a verified attribution intent
 # ---------------------------------------------------------------------------
 
@@ -591,6 +716,7 @@ def test_the_views_leave_the_store_byte_for_byte_unchanged(tmp_path: Path, capsy
     _verify_result(state, "att-a", ok=True, at=VERIFIED_AT)
     _accepted_wave(state, "w1", "att-a", at=ACCEPTED_AT)
     _attribution_intent(state, "att-a")
+    _completion(state, "att-a", state_name="failed", at=VERIFIED_AT)
     before = _snapshot(state)
 
     assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
