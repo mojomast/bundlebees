@@ -618,6 +618,23 @@ def test_tool_completion_rejects_a_traversal_attempt_id(tmp_path: Path):
     assert cli._tool_completion(state, "att-inside") == inside
 
 
+def test_tool_completion_rejects_a_regex_valid_dotdot_attempt_id(tmp_path: Path):
+    state = tmp_path / "state"
+    payload = _completion_payload("a..b", recorded_at=COMPLETION_AT)
+    _write_completion(state, "a..b", payload)
+
+    assert cli._tool_completion(state, "a..b") is None
+
+
+def test_tool_completion_rejects_an_absolute_attempt_id(tmp_path: Path):
+    state = tmp_path / "state"
+    abs_id = str(tmp_path / "abs-outside")
+    payload = _completion_payload(abs_id, recorded_at=COMPLETION_AT)
+    (tmp_path / "abs-outside.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cli._tool_completion(state, abs_id) is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
