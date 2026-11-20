@@ -59,6 +59,12 @@ BRANCH_BUDGET_NOTE = "no merge, tag, force-push, or hook skip"
 _MAIN_BRANCHES = {"main", "master"}
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_BRANCH_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_BRANCH_IPV6_RE = re.compile(
+    r"(?<![:.\w])(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?![:.\w])"
+    r"|\[[0-9A-Fa-f:]{2,}\]"
+)
+_BRANCH_LONG_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _MAX_SCAN_BYTES = 2_000_000
 _MAX_TEST_OUTPUT = 4000
@@ -115,6 +121,12 @@ def _literal_branch(value: Any) -> str | None:
         return None
     if looks_like_secret(value):
         return None
+    if _BRANCH_IPV4_RE.search(value) or _BRANCH_IPV6_RE.search(value):
+        return None
+    for run in _BRANCH_LONG_RUN_RE.finditer(value):
+        text = run.group()
+        if any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text):
+            return None
     return value
 
 
