@@ -679,7 +679,7 @@ def _reconcile_diverged_cards(
     queue: QueueAdapter,
     store: "QueueStore",
     items: Mapping[str, Item],
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
     """Repair cards whose displayed status contradicts their durable record.
 
     A claimed/running card whose record is genuinely active is normal work and
@@ -690,12 +690,15 @@ def _reconcile_diverged_cards(
     repair; an unreadable record is not repaired and raises the same typed
     :class:`QueueError` the active pass raises.
 
-    Returns the repairs plus a report-only list of claimed/running cards whose
-    own record is genuinely absent. Like every other unreachable state, such a
-    card cannot be advanced or admitted, so a silent ``idle`` would hide it.
+    Returns the repairs, a report-only list of claimed/running cards whose own
+    record is genuinely absent, and a report-only list of claimed/running cards
+    whose feature id cannot name a store path. Like every other unreachable
+    state, such a card cannot be advanced or admitted, so a silent ``idle``
+    would hide it.
     """
     reconciled: list[dict[str, str]] = []
     without_records: list[dict[str, str]] = []
+    unaddressable: list[dict[str, str]] = []
     for feature_id in sorted(items):
         item = items[feature_id]
         if item.status not in ("claimed", "running"):
@@ -705,7 +708,17 @@ def _reconcile_diverged_cards(
         except QueueError as exc:
             if exc.code == "feature_id_invalid":
                 # No store path can exist for this id, so there is no record to
-                # reconcile; this keeps the card's pre-existing outcome.
+                # reconcile. Report the unreachable card and leave it untouched.
+                unaddressable.append({
+                    "feature": feature_id,
+                    "job": item.job_id,
+                    "state": item.status,
+                    "code": exc.code,
+                    "detail": (
+                        "card not advanced: its feature id cannot name a store path, "
+                        "so it can be neither read nor written; the card was left untouched"
+                    )[:400],
+                })
                 continue
             raise
         except OSError as exc:
@@ -763,7 +776,7 @@ def _reconcile_diverged_cards(
             "record_state": record_state,
             "detail": detail,
         })
-    return reconciled, without_records
+    return reconciled, without_records, unaddressable
 
 
 _pid_alive = liveness.pid_alive
@@ -862,7 +875,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     # A claimed/running card whose record is already terminal is invisible to
     # both the active pass and admission. Repair every such card before any new
     # work is admitted, then continue the normal pass.
-    reconciled, cards_without_records = _reconcile_diverged_cards(
+    reconciled, cards_without_records, unaddressable = _reconcile_diverged_cards(
         state_dir, queue, store, items
     )
 
@@ -872,6 +885,43 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     active_records = store.active()
     orphaned, orphaned_live = _orphaned_claims(store, items, active_records, settle=True)
     refused: list[dict[str, Any]] = []
+    refused_features: set[str] = set()
+
+    # Build the unreachable-active report before the handoff branch so a
+    # handoff pass cannot hide a record it will not advance. A record whose
+    # card is absent is an orphan, not an unreachable active claim.
+    for record in active_records:
+        feature_id = str(record.get("feature_id"))
+        item = items.get(feature_id)
+        if item is None:
+            continue
+        try:
+            store.path(feature_id)
+        except QueueError as exc:
+            if exc.code != "feature_id_invalid":
+                raise
+            refused.append({
+                "feature": feature_id,
+                "job": str(record.get("job_id") or item.job_id or ""),
+                "state": str(record.get("state") or ""),
+                "code": exc.code,
+                "detail": (
+                    "active claim skipped: its feature id cannot name a store path, "
+                    "so it can be neither ticked nor rewritten; the card and record "
+                    "were left untouched"
+                )[:400],
+            })
+            refused_features.add(feature_id)
+
+    # A claimed/running card whose own id cannot name a store path is equally
+    # unreachable. Report it once; an active record for the same id already
+    # owns the report above.
+    for entry in unaddressable:
+        feature_id = entry["feature"]
+        if feature_id in refused_features:
+            continue
+        refused.append(entry)
+        refused_features.add(feature_id)
 
     def finish(payload: dict[str, Any]) -> dict[str, Any]:
         payload.setdefault("orphaned", orphaned)
@@ -891,6 +941,9 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     # 1. Advance existing work before admitting anything new.
     for record in active_records:
         feature_id = str(record.get("feature_id"))
+        if feature_id in refused_features:
+            # Already reported before handoff; never append the same id twice.
+            continue
         item = items.get(feature_id)
         if item is None:
             continue
@@ -913,6 +966,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
                     "were left untouched"
                 )[:400],
             })
+            refused_features.add(feature_id)
             continue
         claimed_job = str(record.get("job_id") or "")
         if claimed_job and claimed_job != item.job_id:
@@ -990,6 +1044,24 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     try:
         record = store.claim(item.feature_id, job_id=item.job_id)
     except QueueError as exc:
+        if exc.code == "feature_id_invalid":
+            detail = (
+                "the card was not admitted: its feature id cannot name a claim record; "
+                "repair the feature id and a later pass retries it"
+            )[:400]
+            refused.append({
+                "feature": item.feature_id,
+                "job": item.job_id,
+                "state": item.status,
+                "code": exc.code,
+                "detail": detail,
+            })
+            return finish({
+                "action": "refused",
+                "feature": item.feature_id,
+                "code": exc.code,
+                "detail": detail,
+            })
         if exc.code != "already_claimed":
             raise
         existing = store.read(item.feature_id) or {}

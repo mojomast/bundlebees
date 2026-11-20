@@ -1560,6 +1560,125 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(store.read("f1")["state"], "ready_for_review")
         self.assertEqual(self.queue.get("f1").status, "ready_for_review")
 
+    def test_a_handoff_pass_reports_an_unreachable_active_claim(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+        }))
+        store, record_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        card_before = self.path.read_text()
+        record_before = record_path.read_text()
+
+        with mock.patch.object(Q, "_handoff_dependents",
+                               lambda *args, **kwargs: ["f9"]):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: {"status": "ok"},
+                                handoff_context={"worktree": "unused"})
+
+        self.assertEqual(result["action"], "handoff")
+        self.assertEqual(result["created"], ["f9"])
+        self.assertEqual(len(result["refused"]), 1,
+                         "one card/record pair must yield exactly one refused entry")
+        self.assertEqual(self._refused_entry_shape(result["refused"][0]), {
+            "feature": "bad name",
+            "job": "job_bad",
+            "state": "running",
+            "code": "feature_id_invalid",
+        })
+        self.assertLessEqual(len(result["refused"][0]["detail"]), 400)
+        self.assertEqual(self.path.read_text(), card_before)
+        self.assertEqual(record_path.read_text(), record_before)
+
+    def test_a_handoff_pass_without_bad_ids_has_no_refusals(self):
+        self.path.write_text(json.dumps({"f1": card("f1")}))
+
+        with mock.patch.object(Q, "_handoff_dependents",
+                               lambda *args, **kwargs: ["f9"]):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: {"status": "ok"},
+                                handoff_context={"worktree": "unused"})
+
+        self.assertEqual(result["action"], "handoff")
+        self.assertEqual(result["refused"], [])
+        self.assertEqual(result["cards_without_records"], [])
+
+    def test_a_claimed_or_running_card_with_an_unaddressable_id_and_no_record_is_refused(self):
+        for status in ("claimed", "running"):
+            with self.subTest(status=status), TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                path = tmp / "queue.json"
+                path.write_text(json.dumps({
+                    "bad name": card("bad name", job_id="job_bad", status=status),
+                }))
+                queue = Q.JsonQueue(path)
+                store = Q.QueueStore(tmp)
+                queue_before = path.read_text()
+
+                result = Q.run_once(tmp, queue,
+                                    tick=lambda job_id: {"status": "ok"})
+
+                self.assertEqual(result["action"], "idle")
+                self.assertIsNone(result["feature"])
+                self.assertEqual(result["cards_without_records"], [])
+                self.assertEqual(len(result["refused"]), 1)
+                entry = result["refused"][0]
+                self.assertEqual(self._refused_entry_shape(entry), {
+                    "feature": "bad name",
+                    "job": "job_bad",
+                    "state": status,
+                    "code": "feature_id_invalid",
+                })
+                self.assertIn("feature id", entry["detail"])
+                self.assertLessEqual(len(entry["detail"]), 400)
+                self.assertEqual(path.read_text(), queue_before)
+                self.assertEqual(list(store.root.glob("*.json")), [])
+
+    def test_a_queued_card_with_an_unaddressable_id_is_refused_not_raised(self):
+        self.path.write_text(json.dumps({"bad name": card("bad name", job_id="job_bad")}))
+        store = Q.QueueStore(self.tmp)
+        queue_before = self.path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue,
+                            tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "refused")
+        self.assertEqual(result["feature"], "bad name")
+        self.assertEqual(result["code"], "feature_id_invalid")
+        self.assertLessEqual(len(result["detail"]), 400)
+        self.assertIn("not admitted", result["detail"])
+        self.assertIn("later pass", result["detail"])
+        self.assertEqual(len(result["refused"]), 1)
+        entry = result["refused"][0]
+        self.assertEqual(self._refused_entry_shape(entry), {
+            "feature": "bad name",
+            "job": "job_bad",
+            "state": "queued",
+            "code": "feature_id_invalid",
+        })
+        self.assertEqual(entry["detail"], result["detail"])
+        self.assertEqual(self.path.read_text(), queue_before)
+        self.assertEqual(list(store.root.glob("*.json")), [])
+
+    def test_a_normal_active_record_is_not_refused(self):
+        self.path.write_text(json.dumps({
+            "f1": card("f1", job_id="job_1", status="claimed"),
+        }))
+        store = Q.QueueStore(self.tmp)
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue,
+                                tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(result["refused"], [])
+        self.assertEqual(result["cards_without_records"], [])
+
     def test_a_card_without_a_record_is_reported_and_left_claimed(self):
         for status in ("claimed", "running"):
             with self.subTest(status=status), TemporaryDirectory() as tmp:
