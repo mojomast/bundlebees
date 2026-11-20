@@ -779,6 +779,68 @@ def _reconcile_diverged_cards(
     return reconciled, without_records, unaddressable
 
 
+def _observation_refusals(
+    store: "QueueStore",
+    items: Mapping[str, Item],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read-only refused report for the observation-only pass.
+
+    The admit pass reports an active claim or a claimed/running card whose id
+    cannot name a store path; the observation pass must surface the same
+    unreachable work without reconciling, settling or rewriting anything. The
+    entries are the admit pass's own shapes, deduped by feature, so one
+    card/record pair is reported once.
+    """
+    refused: list[dict[str, Any]] = []
+    refused_features: set[str] = set()
+    for record in records:
+        feature_id = str(record.get("feature_id"))
+        item = items.get(feature_id)
+        if item is None:
+            continue
+        try:
+            store.path(feature_id)
+        except QueueError as exc:
+            if exc.code != "feature_id_invalid":
+                raise
+            refused.append({
+                "feature": feature_id,
+                "job": str(record.get("job_id") or item.job_id or ""),
+                "state": str(record.get("state") or ""),
+                "code": exc.code,
+                "detail": (
+                    "active claim skipped: its feature id cannot name a store path, "
+                    "so it can be neither ticked nor rewritten; the card and record "
+                    "were left untouched"
+                )[:400],
+            })
+            refused_features.add(feature_id)
+    for feature_id in sorted(items):
+        item = items[feature_id]
+        if item.status not in ("claimed", "running"):
+            continue
+        if feature_id in refused_features:
+            continue
+        try:
+            store.path(feature_id)
+        except QueueError as exc:
+            if exc.code != "feature_id_invalid":
+                raise
+            refused.append({
+                "feature": feature_id,
+                "job": item.job_id,
+                "state": item.status,
+                "code": exc.code,
+                "detail": (
+                    "card not advanced: its feature id cannot name a store path, "
+                    "so it can be neither read nor written; the card was left untouched"
+                )[:400],
+            })
+            refused_features.add(feature_id)
+    return refused
+
+
 _pid_alive = liveness.pid_alive
 
 
@@ -849,6 +911,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
     items = {item.feature_id: item for item in queue.list_items()}
     if not admit:
         active_records = store.active()
+        refused = _observation_refusals(store, items, active_records)
         orphaned, orphaned_live = _orphaned_claims(store, items, active_records, settle=False)
         queued = sorted(feature_id for feature_id, item in items.items() if item.status == "queued")
         active = sorted(str(record.get("feature_id")) for record in active_records)
@@ -856,6 +919,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             return {
                 "action": "idle",
                 "feature": None,
+                "refused": refused,
                 "orphaned": orphaned,
                 "orphaned_live": orphaned_live,
             }
@@ -864,6 +928,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             "feature": None,
             "queued": queued[:50],
             "active": active[:50],
+            "refused": refused,
             "orphaned": orphaned,
             "orphaned_live": orphaned_live,
             "detail": (
@@ -1049,13 +1114,18 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
                 "the card was not admitted: its feature id cannot name a claim record; "
                 "repair the feature id and a later pass retries it"
             )[:400]
-            refused.append({
-                "feature": item.feature_id,
-                "job": item.job_id,
-                "state": item.status,
-                "code": exc.code,
-                "detail": detail,
-            })
+            # The active scan may already have reported this same id from its
+            # claim record. Keep that one entry (it names the running state) and
+            # report only the admission refusal in the payload.
+            if item.feature_id not in refused_features:
+                refused.append({
+                    "feature": item.feature_id,
+                    "job": item.job_id,
+                    "state": item.status,
+                    "code": exc.code,
+                    "detail": detail,
+                })
+                refused_features.add(item.feature_id)
             return finish({
                 "action": "refused",
                 "feature": item.feature_id,

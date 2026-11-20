@@ -1663,6 +1663,57 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(), queue_before)
         self.assertEqual(list(store.root.glob("*.json")), [])
 
+    def test_a_queued_card_with_a_live_claim_record_is_refused_once(self):
+        # A queued card whose id also has a hand-written active record is
+        # reported twice at base: once by the active scan and once by admission.
+        # It is one card/record pair, so it must yield one refused entry.
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_b", status="queued"),
+        }))
+        store, record_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_b",
+            "pid": DEAD_PID,
+        })
+        card_before = self.path.read_text()
+        record_before = record_path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "refused")
+        self.assertEqual(result["feature"], "bad name")
+        self.assertEqual(result["code"], "feature_id_invalid")
+        self.assertLessEqual(len(result["detail"]), 400)
+        self.assertIn("not admitted", result["detail"])
+        self.assertEqual(len(result["refused"]), 1,
+                         "one card/record pair must yield exactly one refused entry")
+        entry = result["refused"][0]
+        self.assertEqual(self._refused_entry_shape(entry), {
+            "feature": "bad name",
+            "job": "job_b",
+            "state": "running",
+            "code": "feature_id_invalid",
+        })
+        self.assertEqual(self.path.read_text(), card_before)
+        self.assertEqual(record_path.read_text(), record_before)
+
+    def test_a_non_feature_id_queue_error_from_claim_propagates(self):
+        store = Q.QueueStore(self.tmp)
+        queue_before = self.path.read_text()
+
+        with mock.patch.object(Q.QueueStore, "claim",
+                               side_effect=Q.QueueError(
+                                   "queue_state_corrupt", "claim state is unreadable")):
+            with self.assertRaises(Q.QueueError) as caught:
+                Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(caught.exception.code, "queue_state_corrupt")
+        self.assertEqual(self.queue.get("f1").status, "queued")
+        self.assertEqual(self.path.read_text(), queue_before)
+        self.assertEqual(list(store.root.glob("*.json")), [],
+                         "a refused claim must not write a record")
+
     def test_a_normal_active_record_is_not_refused(self):
         self.path.write_text(json.dumps({
             "f1": card("f1", job_id="job_1", status="claimed"),
@@ -1808,6 +1859,79 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(orig_path.read_text(), orig_before)
         self.assertEqual(result["orphaned"][0]["feature"], "orig")
         self.assertEqual(result["orphaned_live"], [])
+
+    def test_observation_only_reports_unreachable_active_and_card_ids_read_only(self):
+        self.path.write_text(json.dumps({
+            "bad name": card("bad name", job_id="job_bad", status="claimed"),
+            "other name": card("other name", job_id="job_other", status="claimed"),
+        }))
+        store, bad_path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        queue_before = self.path.read_text()
+        bad_before = bad_path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"},
+                            admit=False)
+
+        self.assertEqual(result["action"], "observation_only")
+        self.assertEqual(self.path.read_text(), queue_before)
+        self.assertEqual(bad_path.read_text(), bad_before)
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")),
+                         ["bad name.json"])
+        self.assertEqual([entry["feature"] for entry in result["refused"]],
+                         ["bad name", "other name"],
+                         "the active record owns its own report; the claimed card is deduped")
+        self.assertEqual(self._refused_entry_shape(result["refused"][0]), {
+            "feature": "bad name",
+            "job": "job_bad",
+            "state": "running",
+            "code": "feature_id_invalid",
+        })
+        self.assertIn("active claim", result["refused"][0]["detail"])
+        self.assertLessEqual(len(result["refused"][0]["detail"]), 400)
+        self.assertEqual(self._refused_entry_shape(result["refused"][1]), {
+            "feature": "other name",
+            "job": "job_other",
+            "state": "claimed",
+            "code": "feature_id_invalid",
+        })
+        self.assertIn("feature id", result["refused"][1]["detail"])
+        self.assertLessEqual(len(result["refused"][1]["detail"]), 400)
+        self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [])
+
+    def test_observation_only_idle_payload_has_an_empty_refused_list(self):
+        self.path.write_text(json.dumps({"f1": card("f1", status="ready_for_review")}))
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"},
+                            admit=False)
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(result["refused"], [])
+
+    def test_observation_only_never_repairs_a_diverged_card_or_writes(self):
+        self.path.write_text(json.dumps({
+            "f_div": card("f_div", job_id="job_div", status="claimed"),
+        }))
+        store = Q.QueueStore(self.tmp)
+        store.write("f_div", {"state": "blocked", "job_id": "job_div",
+                              "detail": "stopped by contract"})
+        queue_before = self.path.read_text()
+        record_before = store.path("f_div").read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"},
+                            admit=False)
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(self.path.read_text(), queue_before,
+                         "the observation pass must not reconcile the diverged card")
+        self.assertEqual(store.path("f_div").read_text(), record_before)
+        self.assertEqual(self.queue.get("f_div").status, "claimed")
+        self.assertEqual(result["refused"], [])
 
     def test_dependencies_unlock_on_job_evidence_not_card_status(self):
         self.queue.set_status("f1", "ready_for_review")   # card says done
