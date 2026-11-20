@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from bundlebees_plugin import cli, verify_local
 from tests.test_cli import (
     IN_LEASE_PATCH,
@@ -27,6 +29,21 @@ from tests.test_cli import (
 BRANCH = "fix/verify-node-targets-" + "2026-11-18"
 ATTEMPT_ID = "att_" + "0123456789abcdef" * 2
 COMMIT = "a1" * 20
+
+ADDRESS_DECOYS = ("10.0.0.1", "feat/10.0.0.1")
+HIGH_ENTROPY_DECOYS = (
+    "feat/" + "a1" * 20,
+    "feat/" + "0123456789abcdef" * 2,
+    "feat/" + "A1" * 16,
+)
+DECOY_BRANCHES = ADDRESS_DECOYS + HIGH_ENTROPY_DECOYS
+LITERAL_CONTROLS = (
+    "fix/verify-node-targets-2026-11-18",
+    "feat/snapshot-decisions-section",
+    "fix/verify-literal-redaction-parity",
+    "release/2026-11-20",
+    "v1.2.3",
+)
 
 
 def _verify_argv(repo, state) -> list[str]:
@@ -144,3 +161,48 @@ def test_untrusted_text_and_outside_paths_stay_redacted(tmp_path, capsys):
     assert "[redacted]" in out
 
     assert lookalike not in cli._tail(f"test output: {lookalike}")
+
+
+@pytest.mark.parametrize("branch", DECOY_BRANCHES)
+def test_literal_branch_rejects_address_and_long_run_shapes(branch):
+    assert cli._literal_branch(branch) is None
+
+
+@pytest.mark.parametrize("branch", DECOY_BRANCHES)
+def test_print_branch_redacts_address_and_long_run_shapes(branch, capsys):
+    cli._print_branch(branch)
+    out = capsys.readouterr().out
+
+    raw_suffix = branch.rsplit("/", 1)[-1]
+    assert branch not in out
+    assert raw_suffix not in out
+    marker = "[redacted-ip]" if branch in ADDRESS_DECOYS else "[redacted]"
+    assert marker in out
+
+
+@pytest.mark.parametrize("branch", LITERAL_CONTROLS)
+def test_literal_branch_keeps_ordinary_branch_names(branch, capsys):
+    assert cli._literal_branch(branch) == branch
+
+    cli._print_branch(branch)
+    assert capsys.readouterr().out == f"branch: {branch}\n"
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        ("10.0.0.1", "[redacted-ip]"),
+        ("fix/verify-node-targets-2026-11-18", "fix/verify-node-targets-2026-11-18"),
+    ],
+)
+def test_attempts_row_applies_branch_shape_gate(tmp_path, capsys, branch, expected):
+    state = tmp_path / "state"
+    _lease(state, "b" * 40, attempt_id="att-shape", branch=branch)
+
+    rc = _invoke(_ctx(FakeClient()), ["attempts", "--state-dir", str(state)])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    rows = json.loads(out)["attempts"]
+    row = next(item for item in rows if item["attempt_id"] == "att-shape")
+    assert row["branch"] == expected
