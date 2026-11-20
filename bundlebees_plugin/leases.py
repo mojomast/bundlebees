@@ -99,7 +99,7 @@ class LeaseError(Exception):
 
 def _validate_attempt_id(attempt_id: Any) -> str:
     text = attempt_id if isinstance(attempt_id, str) else ""
-    if not text or ".." in text or not _ATTEMPT_ID_RE.match(text):
+    if not text or ".." in text or not _ATTEMPT_ID_RE.fullmatch(text):
         raise LeaseError(
             "lease_invalid",
             "attempt id is not a safe lease file name",
