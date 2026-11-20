@@ -63,6 +63,10 @@ KEY_SHAPE_DECOYS = (
     "feat/0123456789abcdef_0123456789abcdef",
     "fix/DEADBEEFDEADBEEF-deadbeefdeadbeef",
 )
+KEY_SHAPE_LEAK_BRANCHES = (
+    "feat/550e8400-e29b-41d4-a716-446655440000",
+    "fix/DEADBEEFDEADBEEF-deadbeefdeadbeef",
+)
 
 
 def _verify_argv(repo, state) -> list[str]:
@@ -123,6 +127,19 @@ def test_verify_record_never_reinserts_an_invalid_branch(tmp_path, capsys):
     row = next(item for item in rows if item["attempt_id"] == "att-bad")
     assert row["branch"] != bad_branch
     assert "[redacted]" in row["branch"]
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_LEAK_BRANCHES)
+def test_verify_record_redacts_key_shaped_branch(tmp_path, branch):
+    state = tmp_path / "state"
+    target = cli._write_verify_result(
+        state, "att-key", ok=True, sha=None, branch=branch, files=[], tests=[]
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert record["branch"] == "[redacted]"
+    assert "DEADBEEFDEADBEEF" not in record["branch"]
+    assert "deadbeefdeadbeef" not in record["branch"]
 
 
 def test_commit_local_prints_validated_commit_digest(tmp_path, capsys, monkeypatch):
@@ -225,6 +242,20 @@ def test_attempts_row_applies_branch_shape_gate(tmp_path, capsys, branch, expect
     rows = json.loads(out)["attempts"]
     row = next(item for item in rows if item["attempt_id"] == "att-shape")
     assert row["branch"] == expected
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_LEAK_BRANCHES)
+def test_attempts_row_redacts_key_shaped_branch(tmp_path, capsys, branch):
+    state = tmp_path / "state"
+    _lease(state, "b" * 40, attempt_id="att-key", branch=branch)
+
+    rc = _invoke(_ctx(FakeClient()), ["attempts", "--state-dir", str(state)])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    rows = json.loads(out)["attempts"]
+    row = next(item for item in rows if item["attempt_id"] == "att-key")
+    assert row["branch"] == "[redacted]"
 
 
 @pytest.mark.parametrize("branch", KEY_SHAPE_BRANCHES)
