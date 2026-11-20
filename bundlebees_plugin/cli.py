@@ -757,6 +757,9 @@ _ATTEMPT_DISPATCHED = "dispatched"
 _ATTEMPT_VERIFIED = "verified"
 _ATTEMPT_FAILED = "failed"
 _ATTEMPT_ACCEPTED = "accepted"
+#: A terminal tool-path completion says the bee succeeded, but no verifier has
+#: checked the result: the work is finished, yet its outcome is not established.
+_ATTEMPT_UNVERIFIED = "unverified"
 #: Dispatched, no outcome ever recorded, and past the window in which an
 #: outcome could plausibly still arrive. This is not a success/failure claim:
 #: it says the store has no verified outcome for the attempt, so counting it
@@ -775,6 +778,14 @@ ATTEMPT_TTL_S = 12 * 60 * 60
 #: acceptance, so counting it inflates the fleet view with work that is over.
 #: (104 such rows sat in this store, all of them reported as active bees.)
 _IN_FLIGHT_STATES = frozenset({_ATTEMPT_DISPATCHED})
+
+#: A tool completion is local evidence, not a document to load: anything larger
+#: than this is ignored unread rather than parsed.
+_MAX_TOOL_COMPLETION_BYTES = 65536
+
+#: Completion stamps are whole seconds: fractional seconds are not the format
+#: the writer records, so such a record is not admitted.
+_WHOLE_SECOND_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def _age_s(stamp: Any, now: _dt.datetime) -> float | None:
@@ -803,6 +814,60 @@ def _latest_stamp(*values: Any) -> str:
         if len(text) >= 20 and text > best:
             best = text
     return best
+
+
+def _whole_second_stamp(value: Any) -> str | None:
+    """*value* when it is exactly ``YYYY-MM-DDTHH:MM:SSZ``, else None."""
+    if not isinstance(value, str) or _WHOLE_SECOND_STAMP_RE.fullmatch(value) is None:
+        return None
+    try:
+        _dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return value
+
+
+def _tool_completion(state_dir: Path, attempt_id: str) -> Mapping[str, Any] | None:
+    """The validated terminal tool-completion record for ``attempt_id``, or None.
+
+    Completion evidence is read from
+    ``state_dir/tool-completions/<attempt_id>.json``. The view is fail-open: an
+    unreadable file, invalid UTF-8, a document larger than 65536 bytes, invalid
+    JSON (including recursion-depth failure), a non-mapping document, a schema
+    other than ``agent_consumer.TOOL_COMPLETION_SCHEMA``, a different
+    ``attempt_id``, an unknown terminal state, or a ``recorded_at`` that is not
+    exactly whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are
+    rejected) makes the record absent. Nothing here writes to the store.
+    """
+    from . import agent_consumer
+
+    path = Path(state_dir) / "tool-completions" / f"{attempt_id}.json"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if len(raw) > _MAX_TOOL_COMPLETION_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    try:
+        record = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(record, Mapping):
+        return None
+    if record.get("schema") != agent_consumer.TOOL_COMPLETION_SCHEMA:
+        return None
+    if record.get("attempt_id") != attempt_id:
+        return None
+    state_name = record.get("state")
+    if not isinstance(state_name, str) or state_name not in agent_consumer.TOOL_TERMINAL_STATES:
+        return None
+    if _whole_second_stamp(record.get("recorded_at")) is None:
+        return None
+    return record
 
 
 def _accepted_waves(state_dir: Path) -> dict[str, str]:
@@ -900,13 +965,21 @@ def _attribution_route(state_dir: Path, attempt_id: str) -> tuple[str | None, st
 def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
     """One row per recorded attempt, derived from local evidence only.
 
-    The state comes from the coordinator's own records -- an accepted wave
-    record first, then the verify result -- so the view never asks the launcher
-    and never widens what the lease recorded. Every value passes through
-    ``scrub`` before it can reach the output. A validated attempt id survives
-    the scrub as evidence, not a credential -- unless it is itself
-    secret-shaped: then the scrubbed form always wins and the raw id is never
-    re-inserted into the row.
+    State precedence is fixed: an accepted wave record, then a verify result
+    (ok true is ``verified`` and ok false is ``failed``), then a validated
+    terminal tool completion (``succeeded`` is ``unverified``; ``failed``,
+    ``cancelled`` and ``interrupted`` are ``failed``), then the lease-derived
+    state (``dispatched``, or ``expired`` once its latest stamp is past
+    ``ATTEMPT_TTL_S``). A verify record always outranks a completion, and the
+    completion branch precedes the expiry check, so a terminal completion is
+    never reported as expired. ``updated_at`` is the latest of the lease's
+    ``created_at``, the verify stamp, the accepted-wave stamp and the
+    completion's ``recorded_at``. The view never asks the launcher, never
+    writes to the store, and ignores malformed completion evidence without
+    raising. Every value passes through ``scrub`` before it can reach the
+    output. A validated attempt id survives the scrub as evidence, not a
+    credential -- unless it is itself secret-shaped: then the scrubbed form
+    always wins and the raw id is never re-inserted into the row.
     """
     from . import verify_local
 
@@ -920,8 +993,13 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
         brief = lease.get("brief") if isinstance(lease.get("brief"), Mapping) else {}
         result = verify_local.read_record(state_dir, attempt_id) or {}
         evidence = result.get("evidence") if isinstance(result.get("evidence"), Mapping) else {}
+        completion = _tool_completion(state_dir, attempt_id)
+        completion_at = completion.get("recorded_at") if completion is not None else None
         updated_at = _latest_stamp(
-            record.get("created_at"), result.get("at"), accepted.get(attempt_id)
+            record.get("created_at"),
+            result.get("at"),
+            accepted.get(attempt_id),
+            completion_at,
         )
         if attempt_id in accepted:
             state = _ATTEMPT_ACCEPTED
@@ -929,6 +1007,13 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             state = _ATTEMPT_VERIFIED
         elif result.get("ok") is False:
             state = _ATTEMPT_FAILED
+        elif completion is not None:
+            # Terminal completion evidence outranks the idle window: the bee
+            # finished, so the lease age cannot make this look abandoned.
+            if completion.get("state") == "succeeded":
+                state = _ATTEMPT_UNVERIFIED
+            else:
+                state = _ATTEMPT_FAILED
         elif (age := _age_s(updated_at, _dt.datetime.now(_dt.timezone.utc))) is not None and (
             age > ATTEMPT_TTL_S
         ):

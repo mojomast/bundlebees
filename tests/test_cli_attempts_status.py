@@ -20,7 +20,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from bundlebees_plugin import attribution, cli, grants, leases
+import pytest
+
+from bundlebees_plugin import agent_consumer, attribution, cli, grants, leases
 from bundlebees_plugin.brief import validate_brief
 from tests.fakes import FakeCtx, load_plugin, secret_scope
 
@@ -150,6 +152,32 @@ def _verify_result(state: Path, attempt_id: str, *, ok: bool, at: str) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _completion_payload(
+    attempt_id: str,
+    *,
+    recorded_at: str,
+    state_name: str = "succeeded",
+    **overrides,
+) -> dict:
+    record = {
+        "schema": agent_consumer.TOOL_COMPLETION_SCHEMA,
+        "attempt_id": attempt_id,
+        "state": state_name,
+        "recorded_at": recorded_at,
+    }
+    record.update(overrides)
+    return record
+
+
+def _write_completion(state: Path, attempt_id: str, payload) -> None:
+    path = state / "tool-completions" / f"{attempt_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, (bytes, bytearray)):
+        path.write_bytes(payload)
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _accepted_wave(state: Path, wave_id: str, attempt_id: str, *, at: str) -> None:
@@ -509,6 +537,199 @@ def test_a_failed_outcome_past_the_ttl_stays_failed(tmp_path: Path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Terminal tool completions are local evidence, not an outcome claim
+# ---------------------------------------------------------------------------
+
+COMPLETION_AT = _stamp(20)
+
+
+def test_a_failed_completion_is_failed_and_not_in_flight(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-live", now=CREATED_B)
+    _lease(state, "att-done", now=CREATED_A)
+    _write_completion(
+        state,
+        "att-done",
+        _completion_payload("att-done", recorded_at=COMPLETION_AT, state_name="failed"),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    rows = {row["attempt_id"]: row for row in json.loads(capsys.readouterr().out)["attempts"]}
+    assert rows["att-done"]["state"] == "failed"
+    assert rows["att-done"]["updated_at"] == COMPLETION_AT
+    assert rows["att-live"]["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att-live"]
+
+
+def test_a_succeeded_completion_is_unverified_and_not_in_flight(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-unverified", now=CREATED_A)
+    _write_completion(
+        state,
+        "att-unverified",
+        _completion_payload("att-unverified", recorded_at=COMPLETION_AT),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "unverified"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 0
+    assert status["in_flight_attempts"] == []
+
+
+def test_a_completion_naming_a_different_attempt_is_ignored(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-own", now=CREATED_A)
+    _write_completion(
+        state,
+        "att-own",
+        _completion_payload(
+            "att-other", recorded_at=COMPLETION_AT, state_name="failed"
+        ),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att-own"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"{not json", id="bad-json"),
+        pytest.param(
+            _completion_payload("att-bad", recorded_at=COMPLETION_AT, state_name="running"),
+            id="unknown-state",
+        ),
+        pytest.param(b"[]", id="non-mapping"),
+        pytest.param(b"\xff\xfe{}\xff", id="invalid-utf8"),
+        pytest.param(("[" * 100000 + "]" * 100000).encode(), id="deeply-nested-json"),
+        pytest.param(
+            json.dumps(
+                _completion_payload(
+                    "att-bad", recorded_at=COMPLETION_AT, padding="x" * 70000
+                )
+            ).encode(),
+            id="oversized-file",
+        ),
+        pytest.param(
+            {
+                "attempt_id": "att-bad",
+                "state": "succeeded",
+                "recorded_at": COMPLETION_AT,
+            },
+            id="missing-schema",
+        ),
+        pytest.param(
+            _completion_payload(
+                "att-bad",
+                recorded_at=COMPLETION_AT,
+                schema="rizzstack.tool-completion/2",
+            ),
+            id="mismatched-schema",
+        ),
+        pytest.param(
+            _completion_payload(
+                "att-bad", recorded_at=COMPLETION_AT[:-1] + ".500Z"
+            ),
+            id="fractional-stamp",
+        ),
+    ],
+)
+def test_a_malformed_completion_is_ignored_and_the_row_stays_dispatched(
+    tmp_path: Path, capsys, payload
+):
+    state = tmp_path / "state"
+    _lease(state, "att-bad", now=CREATED_A)
+    _write_completion(state, "att-bad", payload)
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "dispatched"
+    assert row["updated_at"] == CREATED_A
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att-bad"]
+
+
+def test_a_verify_record_outranks_a_failed_completion(tmp_path: Path, capsys):
+    state = tmp_path / "state"
+    _lease(state, "att-verified", now=CREATED_A)
+    _write_completion(
+        state,
+        "att-verified",
+        _completion_payload("att-verified", recorded_at=_stamp(50), state_name="failed"),
+    )
+    _verify_result(state, "att-verified", ok=True, at=VERIFIED_AT)
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "verified"
+    assert row["updated_at"] == VERIFIED_AT
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 0
+
+
+def test_a_terminal_completion_keeps_an_ancient_lease_out_of_expired(
+    tmp_path: Path, capsys
+):
+    state = tmp_path / "state"
+    _lease(state, "att-old", now=ANCIENT)
+    completion_at = _stamp(1)
+    _write_completion(
+        state,
+        "att-old",
+        _completion_payload("att-old", recorded_at=completion_at),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] != "expired"
+    assert row["state"] == "unverified"
+    assert row["updated_at"] == completion_at
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 0
+
+
+@pytest.mark.parametrize("completion_state", ["cancelled", "interrupted"])
+def test_cancelled_and_interrupted_completions_are_failed(
+    tmp_path: Path, capsys, completion_state: str
+):
+    state = tmp_path / "state"
+    _lease(state, "att-terminal", now=CREATED_A)
+    _write_completion(
+        state,
+        "att-terminal",
+        _completion_payload(
+            "att-terminal", recorded_at=COMPLETION_AT, state_name=completion_state
+        ),
+    )
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "failed"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["in_flight"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Dispatch route comes only from a verified attribution intent
 # ---------------------------------------------------------------------------
 
@@ -591,6 +812,11 @@ def test_the_views_leave_the_store_byte_for_byte_unchanged(tmp_path: Path, capsy
     _verify_result(state, "att-a", ok=True, at=VERIFIED_AT)
     _accepted_wave(state, "w1", "att-a", at=ACCEPTED_AT)
     _attribution_intent(state, "att-a")
+    _write_completion(
+        state,
+        "att-a",
+        _completion_payload("att-a", recorded_at=COMPLETION_AT),
+    )
     before = _snapshot(state)
 
     assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
