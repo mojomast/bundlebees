@@ -18,6 +18,8 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -633,6 +635,73 @@ def test_tool_completion_rejects_an_absolute_attempt_id(tmp_path: Path):
     (tmp_path / "abs-outside.json").write_text(json.dumps(payload), encoding="utf-8")
 
     assert cli._tool_completion(state, abs_id) is None
+
+
+def test_tool_completion_refuses_a_symlinked_record(tmp_path: Path):
+    state = tmp_path / "state"
+    completions = state / "tool-completions"
+    completions.mkdir(parents=True)
+    payload = _completion_payload("att_symlink", recorded_at=COMPLETION_AT)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(payload), encoding="utf-8")
+
+    target = json.loads(outside.read_text(encoding="utf-8"))
+    assert target["schema"] == agent_consumer.TOOL_COMPLETION_SCHEMA
+    assert target["attempt_id"] == "att_symlink"
+
+    (completions / "att_symlink.json").symlink_to(outside)
+    assert cli._tool_completion(state, "att_symlink") is None
+
+    control = _completion_payload("att_symlink_ok", recorded_at=COMPLETION_AT)
+    _write_completion(state, "att_symlink_ok", control)
+    assert cli._tool_completion(state, "att_symlink_ok") == control
+
+
+def test_tool_completion_refuses_a_fifo_without_blocking(tmp_path: Path):
+    state = tmp_path / "state"
+    completions = state / "tool-completions"
+    completions.mkdir(parents=True)
+    path = completions / "att_fifo.json"
+    os.mkfifo(path)
+    payload = _completion_payload("att_fifo", recorded_at=COMPLETION_AT)
+    encoded = json.dumps(payload).encode()
+
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    keeper = None
+    try:
+        os.write(fd, encoded)
+        assert json.loads(os.read(fd, len(encoded)).decode("utf-8")) == payload
+        os.write(fd, encoded)
+
+        # Keep the buffered evidence alive while the writer is closed, so the
+        # read path cannot fall back on a writer to avoid opening the FIFO.
+        keeper = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        os.close(fd)
+        fd = None
+
+        result: dict[str, object] = {}
+
+        def call() -> None:
+            result["value"] = cli._tool_completion(state, "att_fifo")
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        thread.join(2.0)
+
+        assert not thread.is_alive()
+        assert result["value"] is None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if keeper is not None:
+            os.close(keeper)
+
+
+def test_tool_completion_refuses_a_directory(tmp_path: Path):
+    state = tmp_path / "state"
+    (state / "tool-completions" / "att_dir.json").mkdir(parents=True)
+
+    assert cli._tool_completion(state, "att_dir") is None
 
 
 @pytest.mark.parametrize(
