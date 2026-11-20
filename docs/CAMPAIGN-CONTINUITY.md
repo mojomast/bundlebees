@@ -151,10 +151,13 @@ authenticated export events; it has no dispatch-capable tick and runs
 
 With no launcher URL at all the driver runs the **mechanical observation tick**.
 That tick cannot dispatch, verify, integrate or adopt a worker result, so a queue
-pass in that mode is `observation_only`: it reports the queued and active cards
-and moves nothing. The pass JSON carries `observation_only: true` and a
-one-line warning goes to stderr. Observation is useful for watching state; it is
-not a work-conserving scheduler, and no card is marked `running` by it.
+pass in that mode is `observation_only`: it reports the queued and active cards,
+the unreachable ids it refuses to touch (`refused`) and claims with no card
+(`orphaned`), and moves nothing. A queued card whose id cannot name a claim
+record is refused only when admission is attempted, so an observation pass lists
+it under `queued`, not `refused`. The pass JSON carries `observation_only: true`
+and a one-line warning goes to stderr. Observation is useful for watching state;
+it is not a work-conserving scheduler, and no card is marked `running` by it.
 
 A production pass never treats a tick's own status as acceptance. A tick
 that escalates (a terminal integration stop) or awaits a recovery decision

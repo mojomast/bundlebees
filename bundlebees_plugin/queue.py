@@ -674,6 +674,35 @@ def _record_detail(record: Mapping[str, Any], record_state: str) -> str:
     return summary[:400]
 
 
+def _unreachable_claim_entry(record: Mapping[str, Any], item: Item, code: str) -> dict[str, Any]:
+    """The refused entry for an active claim whose id cannot name a store path."""
+    return {
+        "feature": str(record.get("feature_id")),
+        "job": str(record.get("job_id") or item.job_id or ""),
+        "state": str(record.get("state") or ""),
+        "code": code,
+        "detail": (
+            "active claim skipped: its feature id cannot name a store path, "
+            "so it can be neither ticked nor rewritten; the card and record "
+            "were left untouched"
+        )[:400],
+    }
+
+
+def _unreachable_card_entry(item: Item, code: str) -> dict[str, Any]:
+    """The refused entry for a claimed/running card whose id cannot name a store path."""
+    return {
+        "feature": item.feature_id,
+        "job": item.job_id,
+        "state": item.status,
+        "code": code,
+        "detail": (
+            "card not advanced: its feature id cannot name a store path, "
+            "so it can be neither read nor written; the card was left untouched"
+        )[:400],
+    }
+
+
 def _reconcile_diverged_cards(
     state_dir: Path,
     queue: QueueAdapter,
@@ -709,16 +738,7 @@ def _reconcile_diverged_cards(
             if exc.code == "feature_id_invalid":
                 # No store path can exist for this id, so there is no record to
                 # reconcile. Report the unreachable card and leave it untouched.
-                unaddressable.append({
-                    "feature": feature_id,
-                    "job": item.job_id,
-                    "state": item.status,
-                    "code": exc.code,
-                    "detail": (
-                        "card not advanced: its feature id cannot name a store path, "
-                        "so it can be neither read nor written; the card was left untouched"
-                    )[:400],
-                })
+                unaddressable.append(_unreachable_card_entry(item, exc.code))
                 continue
             raise
         except OSError as exc:
@@ -804,17 +824,7 @@ def _observation_refusals(
         except QueueError as exc:
             if exc.code != "feature_id_invalid":
                 raise
-            refused.append({
-                "feature": feature_id,
-                "job": str(record.get("job_id") or item.job_id or ""),
-                "state": str(record.get("state") or ""),
-                "code": exc.code,
-                "detail": (
-                    "active claim skipped: its feature id cannot name a store path, "
-                    "so it can be neither ticked nor rewritten; the card and record "
-                    "were left untouched"
-                )[:400],
-            })
+            refused.append(_unreachable_claim_entry(record, item, exc.code))
             refused_features.add(feature_id)
     for feature_id in sorted(items):
         item = items[feature_id]
@@ -827,16 +837,7 @@ def _observation_refusals(
         except QueueError as exc:
             if exc.code != "feature_id_invalid":
                 raise
-            refused.append({
-                "feature": feature_id,
-                "job": item.job_id,
-                "state": item.status,
-                "code": exc.code,
-                "detail": (
-                    "card not advanced: its feature id cannot name a store path, "
-                    "so it can be neither read nor written; the card was left untouched"
-                )[:400],
-            })
+            refused.append(_unreachable_card_entry(item, exc.code))
             refused_features.add(feature_id)
     return refused
 
@@ -965,17 +966,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
         except QueueError as exc:
             if exc.code != "feature_id_invalid":
                 raise
-            refused.append({
-                "feature": feature_id,
-                "job": str(record.get("job_id") or item.job_id or ""),
-                "state": str(record.get("state") or ""),
-                "code": exc.code,
-                "detail": (
-                    "active claim skipped: its feature id cannot name a store path, "
-                    "so it can be neither ticked nor rewritten; the card and record "
-                    "were left untouched"
-                )[:400],
-            })
+            refused.append(_unreachable_claim_entry(record, item, exc.code))
             refused_features.add(feature_id)
 
     # A claimed/running card whose own id cannot name a store path is equally
@@ -1020,17 +1011,7 @@ def run_once(state_dir: Path, queue: QueueAdapter, *, tick: Any, on_status: Any 
             # Nothing can read, tick or rewrite this claim: its id cannot name
             # a store path. Report it and leave both card and record untouched
             # so one corrupt id cannot abort the whole queue pass.
-            refused.append({
-                "feature": feature_id,
-                "job": str(record.get("job_id") or item.job_id or ""),
-                "state": str(record.get("state") or ""),
-                "code": exc.code,
-                "detail": (
-                    "active claim skipped: its feature id cannot name a store path, "
-                    "so it can be neither ticked nor rewritten; the card and record "
-                    "were left untouched"
-                )[:400],
-            })
+            refused.append(_unreachable_claim_entry(record, item, exc.code))
             refused_features.add(feature_id)
             continue
         claimed_job = str(record.get("job_id") or "")
