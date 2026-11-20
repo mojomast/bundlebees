@@ -376,6 +376,84 @@ def _default_metadata_version(name: str) -> str | None:
         return None
 
 
+_GATEWAY_PATH_KEYS = ("path", "directory", "location", "root", "plugin_path")
+
+
+def _hermes_home() -> Path:
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _proc_start_epoch(pid: int, start_ticks: int, proc: Path = Path("/proc")) -> float | None:
+    """Wall-clock start of ``pid`` when its kernel start time equals ``start_ticks``.
+
+    The recorded tick count is only trusted when it matches the live process, so a
+    reused pid or a non-Linux host yields None rather than a guessed time.
+    """
+    try:
+        stat = (proc / str(int(pid)) / "stat").read_text(encoding="utf-8", errors="replace")
+        fields = stat[stat.rindex(")") + 2:].split()
+        ticks = int(fields[19])
+        if ticks != int(start_ticks):
+            return None
+        btime = next(
+            int(line.split()[1])
+            for line in (proc / "stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError):
+        return None
+
+
+def _gateway_started_at(home: Path, proc: Path = Path("/proc")) -> float | None:
+    """When the running gateway started, from ``gateway_state.json`` cross-checked against /proc."""
+    try:
+        state = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, Mapping) or state.get("gateway_state") != "running":
+        return None
+    pid, ticks = state.get("pid"), state.get("start_time")
+    if not isinstance(pid, int) or not isinstance(ticks, int) or isinstance(ticks, bool):
+        return None
+    return _proc_start_epoch(pid, ticks, proc)
+
+
+def _gateway_entry(config: Any, home: Path, proc: Path = Path("/proc")) -> tuple[str, Any]:
+    """The bundlebees gateway entry, with the load path Hermes actually uses.
+
+    Hermes keeps only ``settings`` under ``plugins.entries.<name>`` and loads an
+    enabled plugin from ``<HERMES_HOME>/plugins/<name>``. An explicit path key still
+    wins; the conventional directory is used only for an enabled, not-disabled plugin
+    whose directory has a manifest. ``gateway_started_at`` lets the check refuse to
+    vouch for a checkout that moved after the gateway loaded it.
+    """
+    plugins = config.get("plugins") if isinstance(config, Mapping) else None
+    entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+    entry = entries.get("bundlebees") if isinstance(entries, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return "ok", None
+    resolved = dict(entry)
+    if not any(isinstance(resolved.get(key), str) and resolved[key].strip() for key in _GATEWAY_PATH_KEYS):
+        enabled = plugins.get("enabled") if isinstance(plugins, Mapping) else None
+        disabled = plugins.get("disabled") if isinstance(plugins, Mapping) else None
+        candidate = home / "plugins" / "bundlebees"
+        if (isinstance(enabled, list) and "bundlebees" in enabled
+                and not (isinstance(disabled, list) and "bundlebees" in disabled)
+                and (candidate / "plugin.yaml").is_file()):
+            resolved["path"] = str(candidate)
+            resolved["path_source"] = "hermes plugin directory"
+    started = _gateway_started_at(home, proc)
+    if started is not None:
+        resolved["gateway_started_at"] = started
+    return "ok", resolved
+
+
 def _default_gateway_config() -> tuple[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
@@ -385,10 +463,17 @@ def _default_gateway_config() -> tuple[str, Any]:
         config = load_config_readonly() or {}
     except Exception:
         return "unreadable", None
-    plugins = config.get("plugins") if isinstance(config, Mapping) else None
-    entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
-    entry = entries.get("bundlebees") if isinstance(entries, Mapping) else None
-    return "ok", entry if isinstance(entry, Mapping) else None
+    return _gateway_entry(config, _hermes_home())
+
+
+def _checkout_changed_at(path: Path) -> float | None:
+    """Last time the plugin checkout moved: its git HEAD, else its manifest."""
+    for marker in (path / ".git" / "HEAD", path / "plugin.yaml"):
+        try:
+            return marker.stat().st_mtime
+        except OSError:
+            continue
+    return None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -403,6 +488,25 @@ def _default_observatory_get(url: str) -> int:
         return int(getattr(response, "status", 0) or 0)
 
 
+def _version_info_hermes_version(get_info: Callable[[], Any] | None = None) -> str | None:
+    """Hermes's own in-process identity (``hermes_cli.version_info``), no subprocess.
+
+    A git install has no ``hermes`` distribution and ``hermes --version`` can take
+    longer than the subprocess timeout, so the doctor (which runs inside Hermes)
+    asks the version module directly. Placeholders ("unknown", "0.0.0") are not
+    a version.
+    """
+    try:
+        if get_info is None:
+            from hermes_cli.version_info import get_version_info as get_info
+        base = str(getattr(get_info(), "base_version", "") or "").strip()
+    except Exception:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+){1,3}", base) and base != "0.0.0":
+        return base
+    return None
+
+
 def _default_hermes_version() -> str | None:
     try:
         value = importlib.metadata.version("hermes")
@@ -411,6 +515,9 @@ def _default_hermes_version() -> str | None:
     match = re.search(r"\d+(?:\.\d+){0,3}", str(value or ""))
     if match:
         return match.group(0)
+    in_process = _version_info_hermes_version()
+    if in_process:
+        return in_process
     try:
         proc = subprocess.run(
             ["hermes", "--version"],
@@ -602,13 +709,22 @@ def _bundlebees_gateway_check(context: Context) -> Finding:
     if not isinstance(entry, Mapping):
         return Finding("unknown", "no bundlebees plugin entry is present in the gateway configuration")
     path: Path | None = None
-    for key in ("path", "directory", "location", "root", "plugin_path"):
+    for key in _GATEWAY_PATH_KEYS:
         value = entry.get(key)
         if isinstance(value, str) and value.strip():
             path = Path(value.strip()).expanduser()
             break
     if path is None:
         return Finding("unknown", "the gateway plugin entry does not name a load path")
+    started = entry.get("gateway_started_at")
+    changed = _checkout_changed_at(path)
+    if isinstance(started, (int, float)) and changed is not None and changed > started:
+        return Finding(
+            "unknown",
+            "the plugin checkout at the gateway's load path changed after the gateway started; "
+            "the loaded revision is not determinable until the gateway restarts",
+            fix=_GATEWAY_FIX,
+        )
     version = _manifest_version(path)
     if version is None:
         return Finding("unknown", "the gateway-loaded plugin manifest has no readable version")
