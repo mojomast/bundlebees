@@ -27,6 +27,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from . import liveness
+
 SCHEMA = "rizzstack.standing-grant/1"
 GLOBAL_MAX_BEES = 12
 DEFAULT_REPO_MAX_BEES = 3
@@ -188,30 +190,7 @@ class Grant:
 _JOB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
-def pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":  # pragma: no cover - Windows host
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return False
-        try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == 259
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+pid_alive = liveness.pid_alive
 
 
 @contextlib.contextmanager

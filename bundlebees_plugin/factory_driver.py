@@ -53,6 +53,7 @@ from . import event_consumer
 from . import job as jobs
 from . import landing_bridge
 from . import leases
+from . import liveness
 from . import queue as queue_mod
 from . import work_scheduler
 from .security import child_env, scrub
@@ -336,22 +337,7 @@ def _scope_allows(scope: Sequence[str], lease_files: Sequence[str]) -> bool:
     )
 
 
-def _pid_alive(pid: Any) -> bool:
-    try:
-        number = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if number <= 0:
-        return False
-    try:
-        os.kill(number, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+_pid_alive = liveness.pid_alive
 
 
 def _iso(now: Any = None) -> str:

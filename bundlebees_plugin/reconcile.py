@@ -39,6 +39,7 @@ from . import agent_work as work_queue
 from . import campaign as campaign_state
 from . import git_observer
 from . import job as jobs
+from . import liveness
 from . import queue as queue_mod
 from . import recovery as recoveries
 from . import work_scheduler
@@ -298,18 +299,7 @@ class _Lock:
             self.held = False
 
 
-def _holder_alive(pid: Any) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+_holder_alive = liveness.pid_alive
 
 
 def _acquire_lock(
