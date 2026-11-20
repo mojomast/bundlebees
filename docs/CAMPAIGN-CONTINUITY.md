@@ -153,7 +153,8 @@ With no launcher URL at all the driver runs the **mechanical observation tick**.
 That tick cannot dispatch, verify, integrate or adopt a worker result, so a queue
 pass in that mode is `observation_only`: it reports the queued and active cards,
 the unreachable ids it refuses to touch (`refused`) and claims with no card
-(`orphaned`), and moves nothing. A queued card whose id cannot name a claim
+(`orphaned` when the recorded pid is dead, `orphaned_live` when it is still
+alive), and moves nothing. A queued card whose id cannot name a claim
 record is refused only when admission is attempted, so an observation pass lists
 it under `queued`, not `refused`. The pass JSON carries `observation_only: true`
 and a one-line warning goes to stderr. Observation is useful for watching state;
