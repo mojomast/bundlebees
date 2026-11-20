@@ -48,7 +48,7 @@ emit a safe export line).
 What the script does and does not do:
 
 - It clones at the revisions CI pins (`workflow` `9c69d3a987ea9544a77cdd9b5a259904eb36f006`
-  on `feat/bee-landed`, `hyvv` `8ffaf73000974e0ba273c72fca42e07b79c38106` on
+  on `feat/bee-landed`, `hyvv` `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd` on
   `feat/bee-landed-events`) and verifies each checkout's HEAD against that pin
   and the marker files. A checkout already at the pin is left untouched and no
   network round trip is made.
@@ -98,7 +98,7 @@ runner:
    `git rev-parse HEAD` equals the pin, then sets `WORKFLOW_SRC` and
    `REQUIRE_WORKFLOW=1`.
 3. **hyvv** — the same for `mojomast/hyvv` (`feat/bee-landed-events`,
-   `8ffaf73000974e0ba273c72fca42e07b79c38106`), setting `HYVV_SRC` and
+   `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd`), setting `HYVV_SRC` and
    `REQUIRE_HYVV=1`.
 
 The script mirrors those exact steps so a local run and CI exercise the same

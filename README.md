@@ -66,8 +66,9 @@ split.
 - hyvv PR #5 (`feat/bee-landed-events`, merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) supplies
   provisioning, the canonical outbox and authenticated integer-position export. PR #4 was closed as
   superseded by #5;
-- the running worker launcher is still the older released `0.1.16` build; provisioning and the export
-  endpoint are not deployed there and the real-bee factory canary remains **NOT RUN**;
+- the running worker launcher is the released `0.1.17` build (hyvv `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd`,
+  applied Nov 17, 2026); its provisioning capabilities read reports `rizzstack.provisioning/1`, and the
+  real-bee factory canary remains **NOT RUN**;
 - merges, pushes to protected branches, releases, deploys, policy enrollment and real-TTY authorization
   are human acts. This campaign's merges were explicitly approved; no deployment was performed.
 
@@ -321,7 +322,7 @@ The runtime runs a fixed protocol revision, not whatever is on a branch tip:
 | `HYVV_SRC` | checkout of `hyvv` containing the provisioning contract; `REQUIRE_HYVV=1` makes it mandatory |
 
 CI pins workflow `9c69d3a987ea9544a77cdd9b5a259904eb36f006` and hyvv
-`8ffaf73000974e0ba273c72fca42e07b79c38106` (reviewed protocol revisions), verifies each checkout's HEAD, and fails closed
+`1fcf1039e67ec5fd07e2111cba1808f793c7b5bd` (reviewed protocol revisions), verifies each checkout's HEAD, and fails closed
 when either is absent. At runtime, a missing workflow checkout refuses packet admission and every recovery
 operation (`recovery_protocol_unavailable`); there is no local fallback validator.
 
@@ -552,9 +553,9 @@ eval "$(sh scripts/setup-pinned-sources.sh)"
 
 # Deterministic suite. CI pins both protocol checkouts by commit and makes them mandatory:
 #   workflow 9c69d3a987ea9544a77cdd9b5a259904eb36f006  (reviewed protocol revision)
-#   hyvv     8ffaf73000974e0ba273c72fca42e07b79c38106  (reviewed provisioning revision)
+#   hyvv     1fcf1039e67ec5fd07e2111cba1808f793c7b5bd  (reviewed provisioning revision)
 WORKFLOW_SRC=<checkout-of-9c69d3a> REQUIRE_WORKFLOW=1 \
-HYVV_SRC=<checkout-of-8ffaf73> REQUIRE_HYVV=1 \
+HYVV_SRC=<checkout-of-1fcf103> REQUIRE_HYVV=1 \
 GITLEAKS="$(command -v gitleaks)" \
 python -m pytest -rs
 
