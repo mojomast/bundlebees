@@ -65,6 +65,11 @@ _BRANCH_IPV6_RE = re.compile(
     r"|\[[0-9A-Fa-f:]{2,}\]"
 )
 _BRANCH_LONG_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
+_BRANCH_KEY_SHAPE_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|[0-9a-f]{16}[-_][0-9a-f]{16}",
+    re.IGNORECASE,
+)
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _MAX_SCAN_BYTES = 2_000_000
 _MAX_TEST_OUTPUT = 4000
@@ -123,6 +128,8 @@ def _literal_branch(value: Any) -> str | None:
         return None
     if _BRANCH_IPV4_RE.search(value) or _BRANCH_IPV6_RE.search(value):
         return None
+    if _BRANCH_KEY_SHAPE_RE.search(value):
+        return None
     for run in _BRANCH_LONG_RUN_RE.finditer(value):
         text = run.group()
         if any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text):
@@ -154,7 +161,8 @@ def _print_branch(value: Any, suffix: str = "") -> None:
     if branch is not None:
         print(f"branch: {branch}{suffix}")
     else:
-        _print(f"branch: {value}{suffix}")
+        text = _BRANCH_KEY_SHAPE_RE.sub("[redacted]", str(scrub(str(value))))
+        _print(f"branch: {text}{suffix}")
 
 
 def _print_state_path(label: str, value: Any, state_dir: Path) -> None:

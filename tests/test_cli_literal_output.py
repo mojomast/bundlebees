@@ -44,6 +44,25 @@ LITERAL_CONTROLS = (
     "release/2026-11-20",
     "v1.2.3",
 )
+KEY_SHAPE_BRANCHES = (
+    "feat/0123456789abcdef0123456789abcdef-0123456789abcdef",
+    "feat/0123456789abcdef0123456789abcdef-DEADBEEFDEADBEEF",
+    "feat/0123456789abcdef0123456789abcdef-e29b-41d4-a716-446655440000",
+    "feat/0123456789abcdef0123456789abcdef_0123456789abcdef",
+)
+KEY_SHAPE_FRAGMENTS = (
+    "0123456789abcdef0123456789abcdef",
+    "0123456789abcdef",
+    "0123456789abcdef01234567",
+    "DEADBEEFDEADBEEF",
+)
+KEY_SHAPE_DECOYS = (
+    "550e8400-e29b-41d4-a716-446655440000",
+    "feat/550e8400-e29b-41d4-a716-446655440000",
+    "feat/0123456789abcdef-0123456789abcdef",
+    "feat/0123456789abcdef_0123456789abcdef",
+    "fix/DEADBEEFDEADBEEF-deadbeefdeadbeef",
+)
 
 
 def _verify_argv(repo, state) -> list[str]:
@@ -206,3 +225,44 @@ def test_attempts_row_applies_branch_shape_gate(tmp_path, capsys, branch, expect
     rows = json.loads(out)["attempts"]
     row = next(item for item in rows if item["attempt_id"] == "att-shape")
     assert row["branch"] == expected
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_BRANCHES)
+def test_print_branch_scrubs_before_key_shape_substitution(branch, capsys):
+    cli._print_branch(branch)
+    out = capsys.readouterr().out
+
+    assert branch not in out
+    assert out == "branch: [redacted]\n"
+    for fragment in KEY_SHAPE_FRAGMENTS:
+        assert fragment not in out
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_BRANCHES)
+def test_literal_branch_rejects_whole_key_shape_runs(branch):
+    assert cli._literal_branch(branch) is None
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_DECOYS)
+def test_literal_branch_rejects_key_shapes(branch):
+    assert cli._literal_branch(branch) is None
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_DECOYS)
+def test_print_branch_redacts_key_shapes(branch, capsys):
+    cli._print_branch(branch)
+    out = capsys.readouterr().out
+
+    assert branch not in out
+    assert branch.rsplit("/", 1)[-1] not in out
+    assert "[redacted]" in out
+    if branch.startswith("fix/"):
+        assert out == "branch: fix/[redacted]\n"
+
+
+@pytest.mark.parametrize("branch", LITERAL_CONTROLS + ("feat/issue-1234",))
+def test_key_shape_guard_keeps_literal_controls(branch, capsys):
+    assert cli._literal_branch(branch) == branch
+
+    cli._print_branch(branch)
+    assert capsys.readouterr().out == f"branch: {branch}\n"
