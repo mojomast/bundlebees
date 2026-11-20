@@ -188,7 +188,10 @@ def test_missing_record_is_reported_with_a_fix(tmp_path: Path):
     assert "bundlebees_dispatch" in text or "bundlebees lease" in text
 
 
-@pytest.mark.parametrize("attempt_id", ["../x", "", "a/b", "..", "a..b"])
+@pytest.mark.parametrize(
+    "attempt_id",
+    ["../x", "", "a/b", "..", "a..b", "att\n", "att_0123456789abcdef\n"],
+)
 def test_bad_attempt_ids_are_invalid(tmp_path: Path, attempt_id: str):
     with pytest.raises(LeaseError) as excinfo:
         record_lease(tmp_path, attempt_id, _brief())
@@ -197,6 +200,31 @@ def test_bad_attempt_ids_are_invalid(tmp_path: Path, attempt_id: str):
     with pytest.raises(LeaseError) as excinfo:
         load_lease(tmp_path, attempt_id)
     assert excinfo.value.code == "lease_invalid"
+
+
+def test_trailing_newline_attempt_id_is_refused_without_side_effects(tmp_path: Path):
+    with pytest.raises(LeaseError) as excinfo:
+        record_lease(tmp_path, "att\n", _brief())
+    assert excinfo.value.code == "lease_invalid"
+    assert not (tmp_path / "leases").exists()
+    assert not (tmp_path / "lease.key").exists()
+
+    record = record_lease(tmp_path, "att", _brief())
+    assert record["attempt_id"] == "att"
+    assert load_lease(tmp_path, "att") == record
+
+
+def test_valid_attempt_id_with_allowed_punctuation_round_trips(tmp_path: Path):
+    attempt_id = "att_0123456789abcdef-Gh.i_J"
+    record = record_lease(tmp_path, attempt_id, _brief())
+
+    assert record["attempt_id"] == attempt_id
+    loaded = load_lease(tmp_path, attempt_id)
+    assert loaded == record
+    assert loaded["attempt_id"] == attempt_id
+    assert [path.name for path in (tmp_path / "leases").iterdir()] == [
+        f"{attempt_id}.json"
+    ]
 
 
 @pytest.mark.parametrize(
