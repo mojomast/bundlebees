@@ -382,6 +382,12 @@ class KanbanQueue:
         self._json(args)
 
 
+class _ActiveRecord(dict):
+    """A parsed claim record with its source path kept out of the JSON body."""
+
+    __slots__ = ("source_path",)
+
+
 class QueueStore:
     """Durable claim + link records, one file per feature."""
 
@@ -403,9 +409,14 @@ class QueueStore:
         except ValueError as exc:
             raise QueueError("queue_state_corrupt", f"{feature_id} state is unreadable: {exc}", "Inspect it by hand.") from exc
 
-    def write(self, feature_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
-        body = dict(record, feature_id=feature_id, updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        path = self.path(feature_id)
+    def _write_at(self, path: Path, feature_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
+        """Write a record to one exact path, never persisting an internal key."""
+        body = {
+            key: value
+            for key, value in record.items()
+            if not str(key).startswith("_")
+        }
+        body = dict(body, feature_id=feature_id, updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(body, handle, indent=2, sort_keys=True)
@@ -415,6 +426,10 @@ class QueueStore:
         _sync_dir(path.parent)
         return body
 
+    def write(self, feature_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
+        path = self.path(feature_id)
+        return self._write_at(path, feature_id, record)
+
     def active(self) -> list[dict[str, Any]]:
         """Every claim that is still in flight, refusing records it cannot read.
 
@@ -423,6 +438,12 @@ class QueueStore:
         scheduler forget work that is genuinely running, and let a second
         consumer claim the same feature. A record that is genuinely absent
         (never written, or removed between listing and reading) is normal.
+
+        A claim file's name is its identity. When the body agrees, the record
+        is returned exactly as written. When it declares a different (or no)
+        ``feature_id``, the declared value is preserved verbatim as
+        ``feature_id_declared`` and the file stem becomes ``feature_id``. The
+        source path rides on a dict subclass attribute, never in the body.
         """
         records = []
         for path in sorted(self.root.glob("*.json")):
@@ -450,9 +471,14 @@ class QueueStore:
                     f"{path.stem} queue state is not a JSON object",
                     "Inspect it by hand; a corrupt record may be an active claim.",
                 )
-            record.setdefault("feature_id", path.stem)
+            declared = record.get("feature_id")
+            if not (isinstance(declared, str) and declared == path.stem):
+                record["feature_id_declared"] = declared
+            record["feature_id"] = path.stem
             if record.get("state") in ("claimed", "running"):
-                records.append(record)
+                active = _ActiveRecord(record)
+                active.source_path = path
+                records.append(active)
         return records
 
     def claim(self, feature_id: str, *, job_id: str) -> dict[str, Any]:
@@ -766,8 +792,16 @@ def _orphaned_claims(
             detail = (
                 "orphaned claim: the queue document has no card for this feature; "
                 f"the recorded pid {pid!r} is not alive"
-            )[:400]
-            store.write(feature_id, dict(record, state="blocked", detail=detail, pid=os.getpid()))
+            )
+            if "feature_id_declared" in record:
+                detail += f"; the record declared feature_id {record['feature_id_declared']!r}"
+            detail = detail[:400]
+            settled = dict(record, state="blocked", detail=detail, pid=os.getpid())
+            source_path = getattr(record, "source_path", None)
+            if source_path is not None:
+                store._write_at(source_path, feature_id, settled)
+            else:
+                store.write(feature_id, settled)
         orphaned.append(entry)
     return orphaned, orphaned_live
 

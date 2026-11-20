@@ -1108,6 +1108,259 @@ class QueueTests(unittest.TestCase):
         store.path(feature_id).write_text(json.dumps(record, indent=2, sort_keys=True))
         return store, record
 
+    def _write_raw_record(self, stem, body):
+        store = Q.QueueStore(self.tmp)
+        path = store.root / f"{stem}.json"
+        path.write_text(json.dumps(body, indent=2, sort_keys=True))
+        return store, path
+
+    def test_active_uses_the_file_stem_and_preserves_a_disagreeing_declared_id(self):
+        cases = {
+            "string": "different",
+            "none": None,
+            "non_string": 7,
+            "missing": "__missing__",
+        }
+        for name, declared in cases.items():
+            with self.subTest(name=name):
+                stem = f"orig_{name}"
+                body = {"state": "running", "job_id": f"job_{name}", "pid": DEAD_PID}
+                if declared != "__missing__":
+                    body["feature_id"] = declared
+                with TemporaryDirectory() as tmp:
+                    store = Q.QueueStore(Path(tmp))
+                    (store.root / f"{stem}.json").write_text(
+                        json.dumps(body, indent=2, sort_keys=True)
+                    )
+
+                    records = store.active()
+
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(record["feature_id"], stem)
+                if declared != "__missing__":
+                    self.assertEqual(record["feature_id_declared"], declared)
+                else:
+                    self.assertIn("feature_id_declared", record)
+                    self.assertIsNone(record["feature_id_declared"])
+                self.assertFalse(any(str(key).startswith("_") for key in record))
+                self.assertNotIn("_path", json.dumps(record))
+                self.assertNotIn("source_path", json.dumps(record))
+
+    def test_active_returns_an_agreeing_record_exactly_as_written(self):
+        body = {"feature_id": "orig", "state": "running", "job_id": "job_orig", "pid": DEAD_PID}
+        store, _ = self._write_raw_record("orig", body)
+
+        records = store.active()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(dict(records[0]), body)
+        self.assertEqual(json.dumps(records[0], sort_keys=True), json.dumps(body, sort_keys=True))
+        self.assertNotIn("feature_id_declared", records[0])
+
+    def test_active_still_refuses_corrupt_json_and_a_non_object_body(self):
+        store = Q.QueueStore(self.tmp)
+        corrupt = store.root / "corrupt.json"
+        corrupt.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(Q.QueueError) as caught:
+            store.active()
+        self.assertEqual(caught.exception.code, "queue_state_corrupt")
+
+        corrupt.unlink()
+        not_an_object = store.root / "not_object.json"
+        not_an_object.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        with self.assertRaises(Q.QueueError) as caught:
+            store.active()
+        self.assertEqual(caught.exception.code, "queue_state_corrupt")
+
+    def test_a_mismatched_body_id_settles_its_own_file_and_names_the_declared_id(self):
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": "different",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+            "claimed_at": "2026-11-15T00:14:00Z",
+        })
+        before = store.path("orig").read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = store.read("orig")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["feature_id"], "orig")
+        self.assertEqual(record["feature_id_declared"], "different")
+        self.assertIn("'different'", record["detail"])
+        self.assertLessEqual(len(record["detail"]), 400)
+        self.assertEqual(record["claimed_at"], "2026-11-15T00:14:00Z")
+        self.assertFalse(any(str(key).startswith("_") for key in record))
+        self.assertNotEqual(store.path("orig").read_text(), before)
+        self.assertEqual(sorted(path.name for path in store.root.glob("*.json")), ["orig.json"])
+        self.assertEqual(result["orphaned"], [{
+            "feature": "orig",
+            "job": "job_orig",
+            "pid": DEAD_PID,
+            "state": "running",
+        }])
+
+    def test_null_or_missing_body_ids_also_settle_under_the_file_stem(self):
+        for name, body in (
+            ("null", {"feature_id": None}),
+            ("missing", {}),
+        ):
+            with self.subTest(name=name):
+                with TemporaryDirectory() as tmp:
+                    tmp = Path(tmp)
+                    path = tmp / "queue.json"
+                    path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+                    store = Q.QueueStore(tmp)
+                    stem = f"orig_{name}"
+                    (store.root / f"{stem}.json").write_text(json.dumps({
+                        **body,
+                        "state": "running",
+                        "job_id": f"job_{name}",
+                        "pid": DEAD_PID,
+                    }, indent=2, sort_keys=True))
+
+                    result = Q.run_once(tmp, Q.JsonQueue(path), tick=lambda job_id: {"status": "halted"})
+
+                    record = store.read(stem)
+                    self.assertEqual(record["state"], "blocked")
+                    self.assertEqual(record["feature_id"], stem)
+                    self.assertIn("feature_id_declared", record)
+                    self.assertIsNone(record["feature_id_declared"])
+                    self.assertIn("None", record["detail"])
+                    self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), [f"{stem}.json"])
+                    self.assertEqual(result["orphaned"][0]["feature"], stem)
+
+    def test_an_orphan_whose_stem_the_store_rejects_is_settled_in_place(self):
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+        store, path = self._write_raw_record("bad name", {
+            "feature_id": "bad name",
+            "state": "running",
+            "job_id": "job_bad",
+            "pid": DEAD_PID,
+        })
+        with self.assertRaises(Q.QueueError) as caught:
+            store.path("bad name")
+        self.assertEqual(caught.exception.code, "feature_id_invalid")
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = json.loads(path.read_text())
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["feature_id"], "bad name")
+        self.assertEqual(record["job_id"], "job_bad")
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["bad name.json"])
+        self.assertEqual(result["orphaned"], [{
+            "feature": "bad name",
+            "job": "job_bad",
+            "pid": DEAD_PID,
+            "state": "running",
+        }])
+
+    def test_public_write_and_claim_still_reject_invalid_ids(self):
+        store = Q.QueueStore(self.tmp)
+        for feature_id in ("bad name", "../evil"):
+            with self.subTest(feature_id=feature_id):
+                with self.assertRaises(Q.QueueError) as caught:
+                    store.write(feature_id, {"state": "running"})
+                self.assertEqual(caught.exception.code, "feature_id_invalid")
+                with self.assertRaises(Q.QueueError) as caught:
+                    store.claim(feature_id, job_id="job_1")
+                self.assertEqual(caught.exception.code, "feature_id_invalid")
+
+    def test_a_live_pid_with_a_mismatched_body_id_is_reported_under_the_stem(self):
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+        store, path = self._write_raw_record("orig", {
+            "feature_id": "different",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": os.getpid(),
+        })
+        before = path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(store.read("orig")["state"], "running")
+        self.assertEqual(store.read("orig")["feature_id"], "different")
+        self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [{
+            "feature": "orig",
+            "job": "job_orig",
+            "pid": os.getpid(),
+            "state": "running",
+        }])
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["orig.json"])
+
+    def test_a_second_pass_after_settling_a_mismatched_orphan_is_idempotent(self):
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": "different",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+        })
+        self.path.write_text(json.dumps({"other": card("other", status="ready_for_review")}))
+
+        first = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+        second = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        self.assertEqual(first["orphaned"][0]["feature"], "orig")
+        self.assertEqual(second["orphaned"], [])
+        self.assertEqual(store.read("orig")["state"], "blocked")
+        self.assertEqual([record["feature_id"] for record in store.active()], [])
+
+    def test_a_mismatched_evil_body_id_does_not_abort_and_the_queued_card_is_admitted(self):
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": "../evil",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+        })
+        self.path.write_text(json.dumps({"f1": card("f1")}))
+
+        with mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(self.queue.get("f1").status, "running")
+        self.assertIsNotNone(store.read("f1"))
+        record = store.read("orig")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["feature_id"], "orig")
+        self.assertEqual(record["feature_id_declared"], "../evil")
+        self.assertIn("'../evil'", record["detail"])
+        self.assertFalse((store.root / "different.json").exists())
+        self.assertFalse((store.root / "None.json").exists())
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["f1.json", "orig.json"])
+
+    def test_a_mismatched_different_body_id_does_not_mint_a_record_and_the_card_is_admitted(self):
+        store, _ = self._write_raw_record("orig", {
+            "feature_id": "different",
+            "state": "running",
+            "job_id": "job_orig",
+            "pid": DEAD_PID,
+        })
+        self.path.write_text(json.dumps({"f1": card("f1")}))
+
+        with mock.patch.object(Q, "_load_job_or_none", lambda state_dir, job_id: {"job_id": job_id}):
+            result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["action"], "running")
+        self.assertEqual(self.queue.get("f1").status, "running")
+        self.assertIsNotNone(store.read("f1"))
+        record = store.read("orig")
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["feature_id"], "orig")
+        self.assertEqual(record["feature_id_declared"], "different")
+        self.assertIn("'different'", record["detail"])
+        self.assertFalse((store.root / "different.json").exists())
+        self.assertFalse((store.root / "None.json").exists())
+        self.assertEqual(sorted(p.name for p in store.root.glob("*.json")), ["f1.json", "orig.json"])
+
     def test_an_orphaned_active_claim_with_a_dead_pid_is_settled_as_blocked(self):
         self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
         store, original = self._write_record("smoke-20261114", pid=DEAD_PID)
