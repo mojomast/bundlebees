@@ -93,13 +93,19 @@ python -m bundlebees_plugin.factory_driver --state "$STATE" --once
 With no launcher URL this is the **observation-only** pass: the mechanical tick
 cannot dispatch, verify, integrate or adopt a worker result, so the pass reports
 the queued and active cards, the unreachable ids it refuses to touch (`refused`)
-and claims with no card (`orphaned` when the recorded pid is dead,
-`orphaned_live` when it is still alive), and moves none of them. A queued card
-whose id cannot name a claim record is refused only when admission is attempted,
-so an observation pass lists it under `queued`, not `refused`. Its JSON carries
-`observation_only: true` and the queue action is `observation_only` when there is
-queued or active work, or `idle` when there is none; a one-line warning goes to
-stderr.
+and claims with no card (`orphaned` when the recorded pid is not alive,
+`orphaned_live` when it is still alive), and moves none of them. A claim is
+`orphaned` when its recorded pid is not alive; not alive covers a
+missing/malformed/non-positive/bool pid as well as a process that is gone
+(`liveness.pid_alive` returns False unless the pid is a positive int and
+`os.kill(pid, 0)` succeeds). `orphaned_live` remains the live-pid case. A queued
+card whose id cannot name a claim record is refused only when admission is
+attempted, so an observation pass lists it under `queued`, not `refused`. Its
+JSON carries `observation_only: true` either way, and the queue action is
+`observation_only` when there is queued or active work, or `idle` (not
+`observation_only`) when there is none. The empty-pass `idle` payload still
+carries `refused`, `orphaned` and `orphaned_live`, while `queued`, `active` and
+`detail` are omitted. A one-line warning goes to stderr.
 
 A real job tick also needs the repository, scanner and launcher URL:
 

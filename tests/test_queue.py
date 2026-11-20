@@ -1372,9 +1372,11 @@ class QueueTests(unittest.TestCase):
 
         record = store.read("smoke-20261114")
         self.assertEqual(record["state"], "blocked")
-        self.assertTrue(record["detail"].startswith(
-            "orphaned claim: the queue document has no card for this feature"))
-        self.assertIn(str(DEAD_PID), record["detail"])
+        self.assertEqual(
+            record["detail"],
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {DEAD_PID!r} is not alive",
+        )
         self.assertLessEqual(len(record["detail"]), 400)
         self.assertEqual(record["feature_id"], original["feature_id"])
         self.assertEqual(record["job_id"], original["job_id"])
@@ -1397,9 +1399,11 @@ class QueueTests(unittest.TestCase):
 
         record = store.read("smoke-true-pid")
         self.assertEqual(record["state"], "blocked")
-        self.assertTrue(record["detail"].startswith(
-            "orphaned claim: the queue document has no card for this feature"))
-        self.assertIn("True", record["detail"])
+        self.assertEqual(
+            record["detail"],
+            "orphaned claim: the queue document has no card for this feature; "
+            f"the recorded pid {True!r} is not alive",
+        )
         self.assertEqual(record["feature_id"], original["feature_id"])
         self.assertEqual(record["job_id"], original["job_id"])
         self.assertEqual(result["orphaned"], [{
