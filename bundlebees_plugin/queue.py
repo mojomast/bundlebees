@@ -738,7 +738,7 @@ def _pid_alive(pid: Any) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OverflowError, OSError):
         return False
     return True
 

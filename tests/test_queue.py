@@ -21,6 +21,11 @@ from bundlebees_plugin import queue as Q
 def card(feature_id, job_id="job_1", deps=(), status="queued", repo="mojomast/smoke-real"):
     return {"repo": repo, "job_id": job_id, "depends_on": list(deps), "status": status}
 
+
+# Linux can never allocate this pid: PID_MAX_LIMIT is 4194304, below 2**31 - 1.
+DEAD_PID = 2147483647
+
+
 class QueueTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -1080,6 +1085,15 @@ class QueueTests(unittest.TestCase):
 
     # -- active claims whose feature has no queue card ----------------------
 
+    def test_pid_alive_returns_false_for_a_pid_too_large_for_os_kill(self):
+        self.assertIs(Q._pid_alive(2147483648), False)
+        self.assertIs(Q._pid_alive(2147483647), False)
+
+    def test_pid_alive_returns_false_for_bool_and_malformed_pids(self):
+        self.assertIs(Q._pid_alive(True), False)
+        self.assertIs(Q._pid_alive(False), False)
+        self.assertIs(Q._pid_alive("123"), False)
+
     def _write_record(self, feature_id, *, pid, state="running", job_id=None,
                       claimed_at="2026-11-15T00:14:00Z"):
         store = Q.QueueStore(self.tmp)
@@ -1096,7 +1110,7 @@ class QueueTests(unittest.TestCase):
 
     def test_an_orphaned_active_claim_with_a_dead_pid_is_settled_as_blocked(self):
         self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
-        store, original = self._write_record("smoke-20261114", pid=999999)
+        store, original = self._write_record("smoke-20261114", pid=DEAD_PID)
 
         result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
 
@@ -1104,7 +1118,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(record["state"], "blocked")
         self.assertTrue(record["detail"].startswith(
             "orphaned claim: the queue document has no card for this feature"))
-        self.assertIn("999999", record["detail"])
+        self.assertIn(str(DEAD_PID), record["detail"])
         self.assertLessEqual(len(record["detail"]), 400)
         self.assertEqual(record["feature_id"], original["feature_id"])
         self.assertEqual(record["job_id"], original["job_id"])
@@ -1114,14 +1128,35 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["orphaned"], [{
             "feature": "smoke-20261114",
             "job": "smoke-20261114",
-            "pid": 999999,
+            "pid": DEAD_PID,
+            "state": "running",
+        }])
+        self.assertEqual(result["orphaned_live"], [])
+
+    def test_an_orphaned_claim_with_a_true_pid_is_settled_as_blocked(self):
+        self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
+        store, original = self._write_record("smoke-true-pid", pid=True)
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = store.read("smoke-true-pid")
+        self.assertEqual(record["state"], "blocked")
+        self.assertTrue(record["detail"].startswith(
+            "orphaned claim: the queue document has no card for this feature"))
+        self.assertIn("True", record["detail"])
+        self.assertEqual(record["feature_id"], original["feature_id"])
+        self.assertEqual(record["job_id"], original["job_id"])
+        self.assertEqual(result["orphaned"], [{
+            "feature": "smoke-true-pid",
+            "job": "smoke-true-pid",
+            "pid": True,
             "state": "running",
         }])
         self.assertEqual(result["orphaned_live"], [])
 
     def test_an_orphaned_claim_with_a_live_pid_is_reported_and_left_untouched(self):
         self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
-        store, original = self._write_record("orphan_live", pid=os.getpid(), job_id="job_live")
+        store, _ = self._write_record("orphan_live", pid=os.getpid(), job_id="job_live")
         before = store.path("orphan_live").read_text()
 
         result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
@@ -1141,7 +1176,7 @@ class QueueTests(unittest.TestCase):
             "f1": card("f1", status="claimed"),
             "t_a7d7725d": card("t_a7d7725d", status="ready_for_review"),
         }))
-        store, _ = self._write_record("a_orphan", pid=999999, job_id="job_orphan")
+        store, _ = self._write_record("a_orphan", pid=DEAD_PID, job_id="job_orphan")
         store.write("f1", {"state": "running", "job_id": "job_1"})
         called = []
 
@@ -1158,7 +1193,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["orphaned"], [{
             "feature": "a_orphan",
             "job": "job_orphan",
-            "pid": 999999,
+            "pid": DEAD_PID,
             "state": "running",
         }])
         self.assertEqual(store.read("a_orphan")["state"], "blocked")
@@ -1166,7 +1201,7 @@ class QueueTests(unittest.TestCase):
 
     def test_observation_only_reports_but_never_settles_an_orphan(self):
         self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
-        store, _ = self._write_record("a_orphan", pid=999999, job_id="job_orphan")
+        store, _ = self._write_record("a_orphan", pid=DEAD_PID, job_id="job_orphan")
         before = store.path("a_orphan").read_text()
         queue_before = self.path.read_text()
 
@@ -1178,7 +1213,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["orphaned"], [{
             "feature": "a_orphan",
             "job": "job_orphan",
-            "pid": 999999,
+            "pid": DEAD_PID,
             "state": "running",
         }])
         self.assertEqual(result["orphaned_live"], [])
