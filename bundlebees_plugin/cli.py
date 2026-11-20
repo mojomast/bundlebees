@@ -155,14 +155,32 @@ def _literal_state_path(value: Any, state_dir: Path) -> str | None:
     return str(resolved)
 
 
+def _display_branch(value: Any, *, collapse: bool = False) -> Any:
+    """Return a branch for display: validated names literally, others scrubbed.
+
+    A refused value is scrubbed first, then any digit-free key shape is
+    substituted. The JSON record surfaces pass ``collapse`` so a key-shaped
+    value becomes only the marker; the human-readable print keeps its ordinary
+    prefix. Non-string values keep whatever ``scrub`` produced, including None.
+    """
+    branch = _literal_branch(value)
+    if branch is not None:
+        return branch
+    if not isinstance(value, str):
+        return scrub(value)
+    text = str(scrub(value))
+    if collapse and _BRANCH_KEY_SHAPE_RE.search(text):
+        return "[redacted]"
+    return _BRANCH_KEY_SHAPE_RE.sub("[redacted]", text)
+
+
 def _print_branch(value: Any, suffix: str = "") -> None:
     """Print a validated branch literally; anything else keeps full scrubbing."""
     branch = _literal_branch(value)
     if branch is not None:
         print(f"branch: {branch}{suffix}")
     else:
-        text = _BRANCH_KEY_SHAPE_RE.sub("[redacted]", str(scrub(str(value))))
-        _print(f"branch: {text}{suffix}")
+        _print(f"branch: {_display_branch(value)}{suffix}")
 
 
 def _print_state_path(label: str, value: Any, state_dir: Path) -> None:
@@ -944,9 +962,7 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             and not looks_like_secret(attempt_id)
         ):
             clean["attempt_id"] = attempt_id
-        validated_branch = _literal_branch(row.get("branch"))
-        if validated_branch is not None:
-            clean["branch"] = validated_branch
+        clean["branch"] = _display_branch(row.get("branch"), collapse=True)
         rows.append(clean)
     return rows
 
@@ -2514,9 +2530,7 @@ def _write_verify_result(
         payload["dry_run"] = True
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
-    validated_branch = _literal_branch(branch)
-    if validated_branch is not None:
-        clean["branch"] = validated_branch
+    clean["branch"] = _display_branch(branch, collapse=True)
     if isinstance(source_rev, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", source_rev):
         clean["evidence"]["source_rev"] = source_rev
     for key in ("patch_sha256", "result_sha256"):
