@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import unittest
 from unittest import mock
@@ -1076,6 +1077,121 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(called, ["job_1"])
         self.assertEqual(result["action"], "ready_for_review")
         self.assertEqual(self.queue.get("f1").status, "ready_for_review")
+
+    # -- active claims whose feature has no queue card ----------------------
+
+    def _write_record(self, feature_id, *, pid, state="running", job_id=None,
+                      claimed_at="2026-11-15T00:14:00Z"):
+        store = Q.QueueStore(self.tmp)
+        record = {
+            "feature_id": feature_id,
+            "state": state,
+            "job_id": job_id or feature_id,
+            "pid": pid,
+            "claimed_at": claimed_at,
+            "updated_at": claimed_at,
+        }
+        store.path(feature_id).write_text(json.dumps(record, indent=2, sort_keys=True))
+        return store, record
+
+    def test_an_orphaned_active_claim_with_a_dead_pid_is_settled_as_blocked(self):
+        self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
+        store, original = self._write_record("smoke-20261114", pid=999999)
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        record = store.read("smoke-20261114")
+        self.assertEqual(record["state"], "blocked")
+        self.assertTrue(record["detail"].startswith(
+            "orphaned claim: the queue document has no card for this feature"))
+        self.assertIn("999999", record["detail"])
+        self.assertLessEqual(len(record["detail"]), 400)
+        self.assertEqual(record["feature_id"], original["feature_id"])
+        self.assertEqual(record["job_id"], original["job_id"])
+        self.assertEqual(record["claimed_at"], original["claimed_at"])
+        self.assertNotEqual(record["updated_at"], original["updated_at"])
+        self.assertTrue(store.path("smoke-20261114").exists())
+        self.assertEqual(result["orphaned"], [{
+            "feature": "smoke-20261114",
+            "job": "smoke-20261114",
+            "pid": 999999,
+            "state": "running",
+        }])
+        self.assertEqual(result["orphaned_live"], [])
+
+    def test_an_orphaned_claim_with_a_live_pid_is_reported_and_left_untouched(self):
+        self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
+        store, original = self._write_record("orphan_live", pid=os.getpid(), job_id="job_live")
+        before = store.path("orphan_live").read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "halted"})
+
+        self.assertEqual(store.path("orphan_live").read_text(), before)
+        self.assertEqual(store.read("orphan_live")["state"], "running")
+        self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [{
+            "feature": "orphan_live",
+            "job": "job_live",
+            "pid": os.getpid(),
+            "state": "running",
+        }])
+
+    def test_a_normal_active_card_still_advances_when_an_orphan_is_present(self):
+        self.path.write_text(json.dumps({
+            "f1": card("f1", status="claimed"),
+            "t_a7d7725d": card("t_a7d7725d", status="ready_for_review"),
+        }))
+        store, _ = self._write_record("a_orphan", pid=999999, job_id="job_orphan")
+        store.write("f1", {"state": "running", "job_id": "job_1"})
+        called = []
+
+        with mock.patch.object(Q, "_load_job_or_none",
+                               lambda state_dir, job_id: {"job_id": job_id}), \
+             mock.patch.object(Q, "_job_accepted", lambda state_dir, job_id: True):
+            result = Q.run_once(
+                self.tmp, self.queue,
+                tick=lambda job_id: called.append(job_id) or {"status": "ok"})
+
+        self.assertEqual(called, ["job_1"])
+        self.assertEqual(result["action"], "ready_for_review")
+        self.assertEqual(result["feature"], "f1")
+        self.assertEqual(result["orphaned"], [{
+            "feature": "a_orphan",
+            "job": "job_orphan",
+            "pid": 999999,
+            "state": "running",
+        }])
+        self.assertEqual(store.read("a_orphan")["state"], "blocked")
+        self.assertEqual(store.read("f1")["state"], "ready_for_review")
+
+    def test_observation_only_reports_but_never_settles_an_orphan(self):
+        self.path.write_text(json.dumps({"t_a7d7725d": card("t_a7d7725d", status="ready_for_review")}))
+        store, _ = self._write_record("a_orphan", pid=999999, job_id="job_orphan")
+        before = store.path("a_orphan").read_text()
+        queue_before = self.path.read_text()
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"}, admit=False)
+
+        self.assertEqual(result["action"], "observation_only")
+        self.assertEqual(store.path("a_orphan").read_text(), before)
+        self.assertEqual(self.path.read_text(), queue_before)
+        self.assertEqual(result["orphaned"], [{
+            "feature": "a_orphan",
+            "job": "job_orphan",
+            "pid": 999999,
+            "state": "running",
+        }])
+        self.assertEqual(result["orphaned_live"], [])
+
+    def test_orphan_payload_keys_are_empty_without_orphans(self):
+        self.queue.set_status("f1", "ready_for_review")
+        self.queue.set_status("f2", "ready_for_review")
+
+        result = Q.run_once(self.tmp, self.queue, tick=lambda job_id: {"status": "ok"})
+
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(result["orphaned"], [])
+        self.assertEqual(result["orphaned_live"], [])
 
     def test_dependencies_unlock_on_job_evidence_not_card_status(self):
         self.queue.set_status("f1", "ready_for_review")   # card says done
