@@ -37,6 +37,13 @@ HIGH_ENTROPY_DECOYS = (
     "feat/" + "A1" * 16,
 )
 DECOY_BRANCHES = ADDRESS_DECOYS + HIGH_ENTROPY_DECOYS
+KEY_SHAPE_DECOYS = (
+    "feat/550e8400-e29b-41d4-a716-446655440000",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "feat/0123456789abcdef-0123456789abcdef",
+    "feat/0123456789abcdef_0123456789abcdef",
+    "fix/DEADBEEFDEADBEEF-deadbeefdeadbeef",
+)
 LITERAL_CONTROLS = (
     "fix/verify-node-targets-2026-11-18",
     "feat/snapshot-decisions-section",
@@ -180,8 +187,32 @@ def test_print_branch_redacts_address_and_long_run_shapes(branch, capsys):
     assert marker in out
 
 
+@pytest.mark.parametrize("branch", KEY_SHAPE_DECOYS)
+def test_literal_branch_rejects_key_shapes(branch):
+    assert cli._literal_branch(branch) is None
+
+
+@pytest.mark.parametrize("branch", KEY_SHAPE_DECOYS)
+def test_print_branch_redacts_key_shapes(branch, capsys):
+    cli._print_branch(branch)
+    out = capsys.readouterr().out
+
+    raw_suffix = branch.rsplit("/", 1)[-1]
+    assert branch not in out
+    assert raw_suffix not in out
+    assert "[redacted]" in out
+
+
 @pytest.mark.parametrize("branch", LITERAL_CONTROLS)
 def test_literal_branch_keeps_ordinary_branch_names(branch, capsys):
+    assert cli._literal_branch(branch) == branch
+
+    cli._print_branch(branch)
+    assert capsys.readouterr().out == f"branch: {branch}\n"
+
+
+def test_literal_branch_keeps_issue_number_branch(capsys):
+    branch = "feat/issue-1234"
     assert cli._literal_branch(branch) == branch
 
     cli._print_branch(branch)
@@ -205,4 +236,27 @@ def test_attempts_row_applies_branch_shape_gate(tmp_path, capsys, branch, expect
     assert rc == 0, out
     rows = json.loads(out)["attempts"]
     row = next(item for item in rows if item["attempt_id"] == "att-shape")
+    assert row["branch"] == expected
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        (
+            "feat/550e8400-e29b-41d4-a716-446655440000",
+            "[redacted]",
+        ),
+        ("fix/verify-node-targets-2026-11-18", "fix/verify-node-targets-2026-11-18"),
+    ],
+)
+def test_attempts_row_redacts_key_shaped_branch(tmp_path, capsys, branch, expected):
+    state = tmp_path / "state"
+    _lease(state, "b" * 40, attempt_id="att-key", branch=branch)
+
+    rc = _invoke(_ctx(FakeClient()), ["attempts", "--state-dir", str(state)])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    rows = json.loads(out)["attempts"]
+    row = next(item for item in rows if item["attempt_id"] == "att-key")
     assert row["branch"] == expected
