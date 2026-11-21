@@ -664,6 +664,55 @@ def test_non_regular_move_destination_is_bounded_and_self_heals(tmp_path, kind):
     assert ack_path.read_bytes() == ack_before
 
 
+def test_regular_file_destination_conflict_is_refused_and_preserves_bytes(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+
+    first = _consume_bounded(state, source)
+
+    assert first["processed"] == 1
+    assert first["failed"] == 0
+    acked = source / landing_bridge.ACK_DIR / "attempt.json"
+    original = acked.read_bytes()
+    planted = b'{"planted": "different bytes"}\n'
+    assert planted != original
+    acked.write_bytes(planted)
+    (source / "attempt.json").write_bytes(original)
+    ack_path = _ack_path(source)
+    ack_before = ack_path.read_bytes()
+
+    second = _consume_bounded(state, source)
+
+    assert second["processed"] == 0
+    assert second["duplicates"] == 0
+    assert second["failed"] == 1
+    assert second["failures"][0]["source"] == "attempt.json"
+    assert second["failures"][0]["error"] == "source_conflict"
+    assert second["failures"][0]["message"] == (
+        "source attempt.json conflicts with an already-acked file"
+    )
+    assert second["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert (source / "attempt.json").read_bytes() == original
+    assert acked.read_bytes() == planted
+    assert ack_path.read_bytes() == ack_before
+
+    third = _consume_bounded(state, source)
+
+    assert third["processed"] == 0
+    assert third["duplicates"] == 0
+    assert third["failed"] == 1
+    assert third["failures"][0]["source"] == "attempt.json"
+    assert third["failures"][0]["error"] == "source_conflict"
+    assert third["failures"][0]["message"] == (
+        "source attempt.json conflicts with an already-acked file"
+    )
+    assert third["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert (source / "attempt.json").read_bytes() == original
+    assert acked.read_bytes() == planted
+    assert ack_path.read_bytes() == ack_before
+
+
 def test_control_happy_path_and_replay_stay_unchanged(tmp_path):
     state, source, event = _acking_setup(tmp_path)
 
