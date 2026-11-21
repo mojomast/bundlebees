@@ -1055,20 +1055,36 @@ def test_t10_each_delivery_stores_its_own_distinct_exact_pr_url(tmp_path):
     assert stored_a["pr_url"] != stored_b["pr_url"]
 
 
-def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "view", "--repo", "mojomast/bundlebees", "--json", "url"],
+        ["pr", "merge", "--repo", "mojomast/bundlebees", "123", "--squash"],
+        ["run", "list", "--repo", "mojomast/bundlebees", "--limit", "5"],
+        ["api", "graphql", "-f", "query=query{viewer{login}}"],
+        ["repo", "view", "mojomast/bundlebees", "--json", "name"],
+        ["status"],
+    ],
+    ids=["pr-view", "pr-merge", "run-list", "api-graphql", "repo-view", "single-token"],
+)
+def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch, argv):
     def timing_out_run(*args, **kwargs):
-        raise subprocess.TimeoutExpired(["gh", "pr", "view"], 120)
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
 
     monkeypatch.setattr(delivery.subprocess, "run", timing_out_run)
 
     with pytest.raises(delivery.DeliveryError) as caught:
-        delivery._run_gh(["pr", "view", "--repo", "mojomast/bundlebees", "--json", "url"])
+        delivery._run_gh(argv)
 
     payload = caught.value.to_dict()
+    expected_prefix = "gh " + " ".join(argv[:2])
     assert payload["error"] == "gh_timeout"
-    assert "gh pr view" in payload["message"]
+    assert expected_prefix in payload["message"]
     assert "gh pr create" not in payload["message"]
     assert "gh pr list" not in payload["message"]
+    for token in argv[2:]:
+        if len(token) >= 3:
+            assert token not in payload["message"]
 
 
 if __name__ == "__main__":
