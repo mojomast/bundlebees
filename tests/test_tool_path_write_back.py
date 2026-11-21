@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -762,3 +764,117 @@ def test_a_symlinked_completion_record_is_still_ignored(tmp_path):
     assert events[0]["id"] == result["event_id"]
     assert all(event["id"] != planted_id for event in events)
     assert planted_path.read_bytes() == planted
+
+
+# ---------------------------------------------------------------------------
+# Write-side completion evidence: guarded dir fd, non-regular records
+# ---------------------------------------------------------------------------
+
+
+def test_a_symlinked_completions_directory_is_refused_before_any_write(tmp_path):
+    attempt = "att-write-symdir"
+    dispatch(tmp_path, attempt)
+    outside = planted_outside(tmp_path, "write-symdir")
+    os.chmod(outside, 0o755)
+    planted_path = outside / f"{attempt}.json"
+    planted = b'{"planted":true}'
+    planted_path.write_bytes(planted)
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert [path.name for path in outside.iterdir()] == [f"{attempt}.json"]
+    assert planted_path.read_bytes() == planted
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_fifo_completion_record_never_blocks_the_write_back(tmp_path):
+    attempt = "att-write-fifo"
+    dispatch(tmp_path, attempt)
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    fifo = completions / f"{attempt}.json"
+    os.mkfifo(fifo)
+
+    outcome: dict = {}
+
+    def run():
+        outcome["result"] = complete(tmp_path, attempt)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    result = outcome["result"]
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert len(outbox_events(tmp_path)) == 1
+    assert stat.S_ISFIFO(fifo.stat().st_mode)
+
+
+def test_a_plain_completion_directory_records_once_and_replays_idempotently(tmp_path):
+    attempt = "att-write-plain"
+    dispatch(tmp_path, attempt)
+
+    first = complete(tmp_path, attempt)
+
+    completions = tmp_path / "tool-completions"
+    record_path = completions / f"{attempt}.json"
+    assert first["emitted"] is True
+    assert first["created"] is True
+    assert first["completion_record"] == f"tool-completions/{attempt}.json"
+    assert stat.S_ISREG(record_path.stat().st_mode)
+    assert record_path.stat().st_nlink == 1
+    assert stat.S_IMODE(completions.stat().st_mode) == 0o700
+    raw = record_path.read_bytes()
+
+    second = complete(tmp_path, attempt)
+
+    assert second["emitted"] is True
+    assert second["created"] is False
+    assert second["event_id"] == first["event_id"]
+    assert record_path.read_bytes() == raw
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_preexisting_identical_completion_record_is_not_rewritten(tmp_path):
+    attempt = "att-write-same"
+    dispatch(tmp_path, attempt)
+    complete(tmp_path, attempt)
+    record_path = tmp_path / "tool-completions" / f"{attempt}.json"
+    raw = record_path.read_bytes()
+
+    created = agent_consumer._write_completion_record(
+        tmp_path, attempt, json.loads(raw.decode("utf-8"))
+    )
+
+    assert created is False
+    assert record_path.read_bytes() == raw
+    assert record_path.stat().st_nlink == 1
+
+
+def test_a_preexisting_different_completion_record_is_refused_unrewritten(tmp_path):
+    attempt = "att-write-diff"
+    dispatch(tmp_path, attempt)
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    record_path = completions / f"{attempt}.json"
+    planted_record = planted_completion(
+        attempt, bee_events.EVENT_ID_PREFIX + "9" * 32
+    )
+    planted_record["state"] = "failed"
+    planted = write_planted(record_path, planted_record)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert record_path.read_bytes() == planted
+    assert len(outbox_events(tmp_path)) == 1

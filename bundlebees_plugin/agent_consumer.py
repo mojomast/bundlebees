@@ -36,6 +36,7 @@ import os
 import re
 import stat
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -206,30 +207,19 @@ def _data_replay_matches(stored_data: Any, event_data: Any) -> bool:
     return all(stored_result.get(key) == value for key, value in event_result.items())
 
 
-def _read_completion_record(state_path: Path, attempt: str) -> bytes | None:
-    """Read ``<attempt>.json`` under the tool-completions directory, safely.
+def _read_completion_record_fd(dir_fd: int, attempt: str) -> bytes | None:
+    """Read ``<attempt>.json`` relative to an open completion directory.
 
-    The directory itself is opened with a no-symlink guard and the record is
-    opened relative to that directory descriptor, so a ``tool-completions``
-    entry that is a symlink (or not a directory) is refused and nothing
-    outside the state directory is read.  The record must be a regular,
-    single-link file of at most 65536 bytes: a hardlink is not evidence this
-    writer produced the record.  Any refusal is ``None``.
+    The record must be a regular, single-link file of at most 65536 bytes: a
+    hardlink is not evidence this writer produced the record.  ``O_NONBLOCK``
+    makes a FIFO at the record path openable-but-refused instead of blocking,
+    so no completion read can ever hang.  Any refusal is ``None``.
     """
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
     nonblock = getattr(os, "O_NONBLOCK", 0)
-    dir_fd: int | None = None
     fd: int | None = None
     try:
-        try:
-            dir_fd = os.open(
-                state_path / _TOOL_COMPLETIONS_DIR,
-                os.O_RDONLY | directory | nofollow,
-            )
-        except (OSError, TypeError, NotImplementedError):
-            return None
         try:
             fd = os.open(
                 f"{attempt}.json",
@@ -260,6 +250,137 @@ def _read_completion_record(state_path: Path, attempt: str) -> bytes | None:
             try:
                 os.close(fd)
             except OSError:
+                pass
+
+
+def _read_completion_record(state_path: Path, attempt: str) -> bytes | None:
+    """Read ``<attempt>.json`` under the tool-completions directory, safely.
+
+    The directory itself is opened with a no-symlink guard and the record is
+    opened relative to that directory descriptor, so a ``tool-completions``
+    entry that is a symlink (or not a directory) is refused and nothing
+    outside the state directory is read.  The record must be a regular,
+    single-link file of at most 65536 bytes: a hardlink is not evidence this
+    writer produced the record.  Any refusal is ``None``.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    dir_fd: int | None = None
+    try:
+        try:
+            dir_fd = os.open(
+                state_path / _TOOL_COMPLETIONS_DIR,
+                os.O_RDONLY | directory | nofollow,
+            )
+        except (OSError, TypeError, NotImplementedError):
+            return None
+        return _read_completion_record_fd(dir_fd, attempt)
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+
+
+def _write_completion_record(
+    state_path: Path, attempt: str, record: Mapping[str, Any]
+) -> bool:
+    """Publish a completion record create-only, through a guarded dir fd.
+
+    The ``tool-completions`` directory is opened itself with
+    ``O_NOFOLLOW|O_DIRECTORY``; a symlinked or non-directory entry is refused
+    before anything is read or written.  The existing-record read, the
+    temporary file and the final link are all relative to that descriptor, so
+    no component can redirect completion evidence outside the state
+    directory.  Returns whether this call created a new record.  An identical
+    existing record is left untouched (``False``); a different one is refused;
+    a directory refusal is ``False``.  No temporary file is ever left behind.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | directory | nofollow
+    path = state_path / _TOOL_COMPLETIONS_DIR
+    payload = bee_events._canonical(record)
+    dir_fd: int | None = None
+    tmp_name: str | None = None
+    try:
+        try:
+            dir_fd = os.open(path, flags)
+        except FileNotFoundError:
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                pass
+            except (OSError, TypeError, NotImplementedError):
+                return False
+            try:
+                dir_fd = os.open(path, flags)
+            except (OSError, TypeError, NotImplementedError):
+                return False
+        except (OSError, TypeError, NotImplementedError):
+            return False
+
+        try:
+            os.fchmod(dir_fd, 0o700)
+        except OSError:
+            pass
+
+        existing = _read_completion_record_fd(dir_fd, attempt)
+        if existing is not None:
+            if existing == payload:
+                return False
+            raise ValueError("completion record already holds different bytes")
+
+        tmp_name = f".{attempt}.json.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("completion record write made no progress")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        try:
+            os.link(
+                tmp_name,
+                f"{attempt}.json",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            existing = _read_completion_record_fd(dir_fd, attempt)
+            if existing is not None and existing == payload:
+                return False
+            raise ValueError("completion record already holds different bytes")
+        except (OSError, TypeError, NotImplementedError):
+            return False
+
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        return True
+    finally:
+        if tmp_name is not None and dir_fd is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except (OSError, TypeError, NotImplementedError):
                 pass
         if dir_fd is not None:
             try:
@@ -461,12 +582,13 @@ def record_tool_completion(
     if clean_usage:
         record["usage"] = clean_usage
     try:
-        bee_events._create_only_json(
-            state_path / _TOOL_COMPLETIONS_DIR / f"{attempt}.json", record
-        )
+        written = _write_completion_record(state_path, attempt, record)
+    except Exception:  # noqa: BLE001 - completion evidence is best-effort too
+        written = False
+    if written:
         usage_recorded = bool(clean_usage)
         completion_record = f"{_TOOL_COMPLETIONS_DIR}/{attempt}.json"
-    except Exception:  # noqa: BLE001 - completion evidence is best-effort too
+    else:
         usage_recorded = False
         completion_record = None
 

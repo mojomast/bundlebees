@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -807,3 +808,35 @@ def test_http_retry_after_an_ambiguous_acceptance_gets_a_receipt(tmp_path, monke
     assert state["attempt"] == 2
     assert len(effects) == 1
     assert len(list(_verified_dir(tmp_path).glob("*.json"))) == 1
+
+
+def test_a_fifo_at_the_outbox_path_cannot_block_record_landing(tmp_path):
+    state = tmp_path / "state"
+    event = _event()
+    outbox = _outbox(state)
+    outbox.mkdir(parents=True)
+    path = events._outbox_path(state, event["id"])
+    os.mkfifo(path)
+    before = path.stat()
+
+    outcome: dict = {}
+
+    def run():
+        try:
+            events.record_landing(state, event)
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion
+            outcome["error"] = exc
+        else:
+            outcome["error"] = None
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    exc = outcome["error"]
+    assert isinstance(exc, events.EventError)
+    assert exc.code == "event_invalid"
+    after = path.stat()
+    assert stat.S_ISFIFO(after.st_mode)
+    assert after.st_ino == before.st_ino

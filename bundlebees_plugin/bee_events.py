@@ -1224,7 +1224,7 @@ def _read_regular(path: Path, *, limit: int = _MAX_READ_BYTES) -> bytes | None:
     """Read a regular non-symlink file, or return None when it does not exist."""
 
     try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None
     except OSError as exc:
