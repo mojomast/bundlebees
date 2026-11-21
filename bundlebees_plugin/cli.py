@@ -842,39 +842,61 @@ def _tool_completion(state_dir: Path, attempt_id: str) -> Mapping[str, Any] | No
     """The validated terminal tool-completion record for ``attempt_id``, or None.
 
     Completion evidence is read from
-    ``state_dir/tool-completions/<attempt_id>.json``. The view is fail-open: an
-    unreadable file, invalid UTF-8, a document larger than 65536 bytes, invalid
-    JSON (including recursion-depth failure), a non-mapping document, a schema
-    other than ``agent_consumer.TOOL_COMPLETION_SCHEMA``, a different
-    ``attempt_id``, an attempt id that is not a safe single path component, an
-    unknown terminal state, or a ``recorded_at`` that is not exactly
-    whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are rejected)
-    makes the record absent. A final-component symlink is refused where the
-    platform supports ``O_NOFOLLOW``, and a non-regular file (FIFO, device or
-    directory) is refused too. Nothing here writes to the store.
+    ``state_dir/tool-completions/<attempt_id>.json``. The directory itself is
+    opened with a no-symlink directory guard, and the record is opened relative
+    to that descriptor, so a ``tool-completions`` entry that is a symlink (or
+    not a directory) is refused and its target is never read. The view is
+    fail-open: an unreadable file, invalid UTF-8, a document larger than 65536
+    bytes, invalid JSON (including recursion-depth failure), a non-mapping
+    document, a schema other than ``agent_consumer.TOOL_COMPLETION_SCHEMA``, a
+    different ``attempt_id``, an attempt id that is not a safe single path
+    component, an unknown terminal state, or a ``recorded_at`` that is not
+    exactly whole-second ``YYYY-MM-DDTHH:MM:SSZ`` (fractional seconds are
+    rejected) makes the record absent. A final-component symlink is refused
+    where the platform supports ``O_NOFOLLOW``, a non-regular file (FIFO,
+    device or directory) is refused, and a file with more than one hard link
+    (``st_nlink != 1``) is refused as well. Failure of either link guard makes
+    the record absent, so such an attempt reports as ``dispatched``. Nothing
+    here writes to the store.
     """
     from . import agent_consumer
 
     if not _ATTEMPT_ID_RE.fullmatch(attempt_id) or ".." in attempt_id:
         return None
-    path = Path(state_dir) / "tool-completions" / f"{attempt_id}.json"
+    completions_dir = Path(state_dir) / "tool-completions"
+    name = f"{attempt_id}.json"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    dir_flags = (
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    )
     try:
-        fd = os.open(path, flags)
+        dir_fd = os.open(completions_dir, dir_flags)
     except OSError:
         return None
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except OSError:
             return None
-        if info.st_size > _MAX_TOOL_COMPLETION_BYTES:
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            if info.st_nlink != 1:
+                return None
+            if info.st_size > _MAX_TOOL_COMPLETION_BYTES:
+                return None
+            raw = os.read(fd, _MAX_TOOL_COMPLETION_BYTES + 1)
+        except OSError:
             return None
-        raw = os.read(fd, _MAX_TOOL_COMPLETION_BYTES + 1)
-    except OSError:
-        return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     finally:
         try:
-            os.close(fd)
+            os.close(dir_fd)
         except OSError:
             pass
     if len(raw) > _MAX_TOOL_COMPLETION_BYTES:

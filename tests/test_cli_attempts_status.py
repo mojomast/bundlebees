@@ -704,6 +704,99 @@ def test_tool_completion_refuses_a_directory(tmp_path: Path):
     assert cli._tool_completion(state, "att_dir") is None
 
 
+def test_tool_completion_refuses_a_symlinked_completions_directory(
+    tmp_path: Path, capsys
+):
+    state = tmp_path / "state"
+    _lease(state, "att_symdir", now=CREATED_A)
+    outside = tmp_path / "outside-completions"
+    outside.mkdir()
+    payload = _completion_payload("att_symdir", recorded_at=COMPLETION_AT)
+    (outside / "att_symdir.json").write_text(json.dumps(payload), encoding="utf-8")
+    (state / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    assert cli._tool_completion(state, "att_symdir") is None
+
+    assert _invoke(_ctx(), ["attempts", "--state-dir", str(state)]) == 0
+    row = json.loads(capsys.readouterr().out)["attempts"][0]
+    assert row["state"] == "dispatched"
+
+    assert _invoke(_ctx(), ["status", "--state-dir", str(state)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["in_flight"] == 1
+    assert status["in_flight_attempts"] == ["att_symdir"]
+
+    (state / "tool-completions").unlink()
+    (state / "tool-completions").mkdir()
+    control = _completion_payload("att_symdir_ok", recorded_at=COMPLETION_AT)
+    _write_completion(state, "att_symdir_ok", control)
+    assert cli._tool_completion(state, "att_symdir_ok") == control
+
+
+def test_tool_completion_refuses_a_hardlinked_record(tmp_path: Path):
+    state = tmp_path / "state"
+    completions = state / "tool-completions"
+    completions.mkdir(parents=True)
+    payload = _completion_payload("att_hardlink", recorded_at=COMPLETION_AT)
+    source = tmp_path / "hardlink-source.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    os.link(source, completions / "att_hardlink.json")
+
+    assert cli._tool_completion(state, "att_hardlink") is None
+
+    control = _completion_payload("att_hardlink_ok", recorded_at=COMPLETION_AT)
+    _write_completion(state, "att_hardlink_ok", control)
+    assert cli._tool_completion(state, "att_hardlink_ok") == control
+
+
+def _padded_completion(payload: dict, size: int) -> bytes:
+    encoded = json.dumps(payload).encode()
+    assert len(encoded) <= size
+    return encoded + b" " * (size - len(encoded))
+
+
+def test_tool_completion_accepts_exactly_65536_bytes_and_refuses_65537(
+    tmp_path: Path,
+):
+    state = tmp_path / "state"
+    payload = _completion_payload("att_bound", recorded_at=COMPLETION_AT)
+    raw = _padded_completion(payload, 65536)
+    assert len(raw) == 65536
+    _write_completion(state, "att_bound", raw)
+    assert cli._tool_completion(state, "att_bound") == payload
+
+    _write_completion(state, "att_bound", raw + b" ")
+    assert cli._tool_completion(state, "att_bound") is None
+
+
+def test_tool_completion_post_read_bound_is_pinned(tmp_path: Path, monkeypatch):
+    state = tmp_path / "state"
+    payload = _completion_payload("att_post_bound", recorded_at=COMPLETION_AT)
+    _write_completion(state, "att_post_bound", payload)
+    oversized = _padded_completion(payload, 70000)
+
+    def fake_read(fd: int, size: int) -> bytes:
+        return oversized
+
+    monkeypatch.setattr(cli.os, "read", fake_read)
+    assert cli._tool_completion(state, "att_post_bound") is None
+
+
+def test_tool_completion_pre_read_bound_is_pinned(tmp_path: Path, monkeypatch):
+    state = tmp_path / "state"
+    payload = _completion_payload("att_pre_bound", recorded_at=COMPLETION_AT)
+    encoded = json.dumps(payload).encode()
+    raw = encoded + b" " * (65537 - len(encoded))
+    assert len(raw) == 65537
+    _write_completion(state, "att_pre_bound", raw)
+
+    def fake_read(fd: int, size: int) -> bytes:
+        return encoded
+
+    monkeypatch.setattr(cli.os, "read", fake_read)
+    assert cli._tool_completion(state, "att_pre_bound") is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
