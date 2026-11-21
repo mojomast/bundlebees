@@ -870,5 +870,91 @@ def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
     assert calls and calls[0][1]["timeout"] == 120
 
 
+def _assert_no_deliveries_written(state_dir):
+    deliveries = Path(state_dir) / "deliveries"
+    assert not deliveries.exists() or list(deliveries.iterdir()) == []
+
+
+def test_t1_record_intent_rejects_slash_attempt_id_without_writing(tmp_path):
+    with pytest.raises(delivery.DeliveryError) as caught:
+        _intent(tmp_path, attempt="att/a")
+
+    payload = caught.value.to_dict()
+    assert payload["error"] == "unsafe_attempt_id"
+    assert "empty or contains characters outside [A-Za-z0-9_.-]" in payload["message"]
+    assert "att_<hex>" in payload["fix"]
+    _assert_no_deliveries_written(tmp_path)
+
+
+def test_t2_record_intent_rejects_question_mark_attempt_id_without_writing(tmp_path):
+    with pytest.raises(delivery.DeliveryError) as caught:
+        _intent(tmp_path, attempt="att?a")
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    _assert_no_deliveries_written(tmp_path)
+
+
+def test_t3_record_intent_rejects_empty_attempt_id_without_writing(tmp_path):
+    with pytest.raises(delivery.DeliveryError) as caught:
+        _intent(tmp_path, attempt="")
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    _assert_no_deliveries_written(tmp_path)
+
+
+@pytest.mark.parametrize("attempt_id", ["att ", "att\n"], ids=["space", "newline"])
+def test_t4_record_intent_rejects_whitespace_attempt_id_without_writing(tmp_path, attempt_id):
+    with pytest.raises(delivery.DeliveryError) as caught:
+        _intent(tmp_path, attempt=attempt_id)
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    _assert_no_deliveries_written(tmp_path)
+
+
+def test_t5_safe_attempt_id_round_trips(tmp_path):
+    _intent(tmp_path, attempt="att_ok-1.x", branch="rails/ok")
+    record_path = tmp_path / "deliveries" / "att_ok-1.x.json"
+    assert record_path.exists()
+    assert [row["attempt_id"] for row in delivery.pending(tmp_path)] == ["att_ok-1.x"]
+
+    pushed = delivery.record_pushed(tmp_path, "att_ok-1.x", "a" * 40)
+    assert pushed["state"] == delivery.STATE_PUSHED
+
+    gh = FakeGh()
+    result = delivery.sweep(tmp_path, gh)
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_ok-1.x"]
+    assert set(gh.prs) == {"rails/ok"}
+    assert delivery.pending(tmp_path) == []
+
+
+def test_t6_distinct_safe_ids_do_not_alias(tmp_path):
+    _intent(tmp_path, attempt="att_one", branch="rails/one")
+    _intent(tmp_path, attempt="att_two", branch="rails/two")
+
+    files = sorted(path.name for path in (tmp_path / "deliveries").glob("*.json"))
+    assert files == ["att_one.json", "att_two.json"]
+    assert sorted(row["attempt_id"] for row in delivery.pending(tmp_path)) == [
+        "att_one", "att_two"]
+
+
+def test_t7_record_pushed_rejects_unsafe_id_instead_of_reading_alias(tmp_path):
+    _intent(tmp_path, attempt="att_a", branch="rails/a")
+    alias = tmp_path / "deliveries" / "att_a.json"
+    before = alias.read_text(encoding="utf-8")
+
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery.record_pushed(tmp_path, "att/a", "b" * 40)
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    assert alias.read_text(encoding="utf-8") == before
+
+    with pytest.raises(delivery.DeliveryError) as caught_pr:
+        delivery.record_pr(tmp_path, "att/a", "https://github.com/mojomast/bundlebees/pull/1")
+
+    assert caught_pr.value.to_dict()["error"] == "unsafe_attempt_id"
+    assert alias.read_text(encoding="utf-8") == before
+    assert [row["state"] for row in delivery.pending(tmp_path)] == [delivery.STATE_INTENT]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -62,9 +62,23 @@ def _deliveries_dir(state_dir: str | os.PathLike) -> Path:
     return directory
 
 
+def _record_name(attempt_id: str) -> str:
+    return f"{re.sub(r'[^A-Za-z0-9_.-]', '_', attempt_id)}.json"
+
+
+def _is_safe_attempt_id(attempt_id: object) -> bool:
+    return (isinstance(attempt_id, str) and bool(attempt_id)
+            and re.sub(r"[^A-Za-z0-9_.-]", "_", attempt_id) == attempt_id)
+
+
 def _record_path(state_dir: str | os.PathLike, attempt_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", attempt_id)
-    return _deliveries_dir(state_dir) / f"{safe}.json"
+    if not _is_safe_attempt_id(attempt_id):
+        raise DeliveryError(
+            "unsafe_attempt_id",
+            f"unsafe attempt_id {attempt_id!r}: the id is empty or contains characters outside [A-Za-z0-9_.-]",
+            "Use the launcher attempt id (att_<hex>); do not pass paths or arbitrary text.",
+        )
+    return _deliveries_dir(state_dir) / f"{attempt_id}.json"
 
 
 def _write(record: dict) -> None:
@@ -178,7 +192,7 @@ def scan(state_dir: str | os.PathLike) -> dict:
         if record.get("schema") != SCHEMA:
             damaged_rows.append(_damaged(path, "schema_mismatch"))
             continue
-        if _record_path(state_dir, attempt_id).name != path.name:
+        if _record_name(attempt_id) != path.name:
             damaged_rows.append(_damaged(path, "identity_mismatch"))
             continue
         state = record.get("state")
