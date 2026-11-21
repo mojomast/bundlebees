@@ -8,6 +8,7 @@ outbox/delivery durability checks run for real.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -502,6 +503,25 @@ def _consume_bounded(state: Path, source: Path, timeout: float = 2.0):
     return result["value"]
 
 
+def _read_regular_bounded(path: Path, timeout: float = 2.0):
+    result: dict = {}
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result["value"] = landing_bridge._read_regular(path)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "_read_regular blocked on a non-regular file"
+    if errors:
+        raise errors[0]
+    return result["value"]
+
+
 def _acking_setup(tmp_path: Path) -> tuple[Path, Path, dict]:
     state = tmp_path / "state"
     source = tmp_path / "hyvv-outbox"
@@ -582,6 +602,68 @@ def test_directory_ack_is_contained_as_pending(tmp_path):
     assert (source / "attempt.json").exists()
 
 
+@pytest.mark.parametrize("kind", ["fifo", "directory"])
+def test_non_regular_move_destination_is_bounded_and_self_heals(tmp_path, kind):
+    state, source, event = _acking_setup(tmp_path)
+    acked = source / landing_bridge.ACK_DIR
+    acked.mkdir(parents=True, exist_ok=True)
+    destination = acked / "attempt.json"
+    if kind == "fifo":
+        os.mkfifo(destination)
+    else:
+        destination.mkdir()
+    original = (source / "attempt.json").read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    ack_path = _ack_path(source)
+
+    first = _consume_bounded(state, source)
+
+    assert first["processed"] == 0
+    assert first["duplicates"] == 0
+    assert first["failed"] == 1
+    assert first["failures"][0]["source"] == "attempt.json"
+    assert first["failures"][0]["error"] == "source_invalid"
+    assert first["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert ack_path.exists()
+    ack = json.loads(ack_path.read_text())
+    assert ack["source"] == "attempt.json"
+    assert ack["source_sha256"] == original_sha256
+    assert (source / "attempt.json").exists()
+    if kind == "fifo":
+        assert stat.S_ISFIFO(destination.stat().st_mode)
+    else:
+        assert destination.is_dir()
+
+    second = _consume_bounded(state, source)
+
+    assert second["processed"] == 0
+    assert second["duplicates"] == 0
+    assert second["failed"] == 1
+    assert second["failures"][0]["source"] == "attempt.json"
+    assert second["failures"][0]["error"] == "source_invalid"
+    assert second["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert (source / "attempt.json").exists()
+
+    ack_before = ack_path.read_bytes()
+    if kind == "fifo":
+        destination.unlink()
+    else:
+        destination.rmdir()
+
+    third = _consume_bounded(state, source)
+
+    assert third["processed"] == 0
+    assert third["duplicates"] == 1
+    assert third["failed"] == 0
+    assert third["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert not (source / "attempt.json").exists()
+    assert destination.read_bytes() == original
+    assert ack_path.read_bytes() == ack_before
+
+
 def test_control_happy_path_and_replay_stay_unchanged(tmp_path):
     state, source, event = _acking_setup(tmp_path)
 
@@ -622,16 +704,33 @@ def test_control_corrupt_ack_fails_closed_and_is_never_overwritten(tmp_path):
     assert ack.read_bytes() == before
 
 
+def test_regular_file_outbox_is_refused_not_treated_as_empty(tmp_path):
+    state = tmp_path / "state"
+    bogus = tmp_path / "not-a-directory.json"
+    bogus.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(landing_bridge.BridgeError) as scan_error:
+        landing_bridge.scan_pending(state, bogus)
+    assert scan_error.value.code == "source_invalid"
+    assert "launcher outbox is not a directory" in scan_error.value.error
+
+    with pytest.raises(landing_bridge.BridgeError) as consume_error:
+        landing_bridge.consume_once(state, bogus)
+    assert consume_error.value.code == "source_invalid"
+    assert "launcher outbox is not a directory" in consume_error.value.error
+
+
 def test_fifo_reads_do_not_leak_file_descriptors(tmp_path):
     fifo = tmp_path / "probe-fifo.json"
     _make_fifo(fifo)
     fd_dir = Path("/proc/self/fd")
-    if fd_dir.is_dir():
-        with pytest.raises(landing_bridge.BridgeError):
-            landing_bridge._read_regular(fifo)
-        before = len(os.listdir(fd_dir))
+    before = len(os.listdir(fd_dir)) if fd_dir.is_dir() else None
+    with pytest.raises(landing_bridge.BridgeError):
+        _read_regular_bounded(fifo)
+    if before is not None:
+        assert len(os.listdir(fd_dir)) == before
     for _ in range(200):
         with pytest.raises(landing_bridge.BridgeError):
-            landing_bridge._read_regular(fifo)
-    if fd_dir.is_dir():
+            _read_regular_bounded(fifo)
+    if before is not None:
         assert len(os.listdir(fd_dir)) == before

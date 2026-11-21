@@ -24,6 +24,7 @@ one pull request.
 - **Reconciliation sweep backstop:** the factory driver runs the sweep classify-only through `LauncherAdapter`, at most every 1800 s, when started with `--sweep` (the shipped systemd unit passes it). Without a PR view it reports `pr_view: "unavailable"` and lists pushed-without-PR ledger records as `unverified` instead of gaps. git runs with `child_env()` and `GIT_TERMINAL_PROMPT=0`.
 - **Removed:** `graceful_recovery` (never wired), the changelog-coverage and changelog-entry tests, and doc-text assertions in tests. `verify_workers` is marked NOT WIRED. The bundled TDD evidence schema is synced with workflow's (optional `sequence`, `prev_sha256`); bundlebees does not emit the hash chain (declined).
 - **Landing-bridge non-blocking reads:** the landing bridge opens ack, source and cursor files non-blocking, so a FIFO or other non-regular file is refused with `source_invalid` instead of wedging the ingest pass, and an unusable acknowledgement is reported as pending rather than aborting the pass.
+- **Landing-bridge residual hardening (tests and docs only):** the tests now pin a non-regular path at the move destination (`acked/<name>`, FIFO and directory) as bounded with no duplicate event and self-healing once removed, take the file-descriptor baseline before the first read, bound the fd test so a regression fails instead of hanging, and cover a non-directory outbox; the docs now say `pending` means not provably acknowledged and `failures` is authoritative (review-bb-pr223 R1/R2/R3/R5/R7; tests and docs only).
 
 ### Added
 
