@@ -628,3 +628,80 @@ def test_trusted_argv_rejects_an_exact_interpreter_with_a_leading_token(
 
     assert argv_text != text
     assert "[redacted]" in argv_text
+
+
+RESIDUAL_ARGV_SHAPES = (
+    pytest.param(
+        ["tests/a.test.mjs"],
+        "/home/clanker01/.ssh/" + _NEAR_MISS_RUN + "/node --test tests/a.test.mjs",
+        id="node-arm-path-basename",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs"],
+        "/home/clanker01/.ssh/" + _NEAR_MISS_RUN + " node --test tests/a.test.mjs",
+        id="node-arm-path-leading-token",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        " ".join(
+            [
+                INTERPRETER,
+                *PYTEST_FLAGS,
+                "/home/clanker01/.ssh/" + _NEAR_MISS_RUN,
+                "tests/test_sample.py",
+            ]
+        ),
+        id="pytest-arm-middle-token",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        " ".join(
+            [
+                INTERPRETER,
+                *PYTEST_FLAGS[:6],
+                "--junitxml=/home/clanker01/.ssh/" + _NEAR_MISS_RUN + "/junit.xml",
+                "tests/test_sample.py",
+            ]
+        ),
+        id="pytest-arm-foreign-junitxml",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        " ".join(
+            [
+                INTERPRETER,
+                *PYTEST_FLAGS,
+                "/home/clanker01/.ssh/" + _NEAR_MISS_RUN + "/test_sample.py",
+            ]
+        ),
+        id="pytest-arm-target-directory",
+    ),
+)
+
+
+@pytest.mark.parametrize("tests, text", RESIDUAL_ARGV_SHAPES)
+def test_trusted_argv_rejects_residual_widened_shapes(
+    tmp_path, monkeypatch, tests, text
+):
+    """Pin review-bb-pr231 F1 measured survivors, one row per widening.
+
+    R1r: node arm matches tokens[0] by basename plus an exact tail.
+    R2r: node arm matches a tail slice with a leading token.
+    R3: pytest arm matches the fixed flags as a prefix and the targets as a
+    suffix with a foreign token in the middle.
+    R5r: pytest arm accepts any --junitxml= value.
+    R6r: pytest arm compares the target-directory basename only.
+
+    A relaxed match for any row must keep the argv out of the trusted literal
+    path, so no widened shape may be restored verbatim.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
