@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -517,6 +518,32 @@ def test_record_landing_refuses_conflicting_bytes_under_the_same_id(tmp_path):
     assert _code(exc) == "event_conflict"
     stored = _read(_outbox(state) / f"{event['id']}.json")
     assert stored["data"]["result"]["reference"] == "refs/heads/feat/bee-events"
+
+
+def test_a_fifo_at_the_outbox_path_never_blocks_and_is_refused(tmp_path):
+    state = tmp_path / "state"
+    event = _event()
+    path = events._outbox_path(state, event["id"])
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    outcome: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            events.record_landing(state, event)
+        except BaseException as exc:  # noqa: BLE001 - the thread reports the refusal
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive(), "the outbox reader blocked on a FIFO"
+
+    error = outcome.get("error")
+    assert isinstance(error, events.EventError)
+    assert error.code == "event_invalid"
+    assert stat.S_ISFIFO(path.stat().st_mode)
 
 
 def test_a_failed_outbox_publish_leaves_no_partial_file(tmp_path, monkeypatch):

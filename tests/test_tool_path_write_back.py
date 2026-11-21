@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -737,6 +739,144 @@ def test_a_completion_record_over_65536_bytes_is_not_a_prior_record(tmp_path):
     assert events[0]["id"] == over_bound["event_id"]
     assert events[0]["data"]["attempt_id"] == "att-bound-big"
     assert all(event["id"] != big_id for event in events)
+
+
+# ---------------------------------------------------------------------------
+# WRITE side: a symlinked parent, a FIFO, and unrewritten prior bytes
+# ---------------------------------------------------------------------------
+
+
+def test_a_symlinked_completions_directory_is_never_written_or_chmodded(tmp_path):
+    attempt = "att-symwrite"
+    dispatch(tmp_path, attempt)
+    outside = planted_outside(tmp_path, "symwrite-empty")
+    os.chmod(outside, 0o755)
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = agent_consumer.record_tool_completion(
+        tmp_path, attempt, state="succeeded", now=T0, usage=USAGE
+    )
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert list(outside.iterdir()) == []
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_symlinked_completions_directory_never_rewrites_a_planted_record(tmp_path):
+    attempt = "att-symwrite-planted"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "9" * 32
+    outside = planted_outside(tmp_path, "symwrite-planted")
+    planted_path = outside / f"{attempt}.json"
+    planted = write_planted(planted_path, planted_completion(attempt, planted_id))
+    os.chmod(outside, 0o755)
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = agent_consumer.record_tool_completion(
+        tmp_path, attempt, state="succeeded", now=T0, usage=USAGE
+    )
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert planted_path.read_bytes() == planted
+    assert sorted(path.name for path in outside.iterdir()) == [f"{attempt}.json"]
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_fifo_completion_record_never_wedges_the_write_back(tmp_path):
+    attempt = "att-fifo"
+    dispatch(tmp_path, attempt)
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    fifo = completions / f"{attempt}.json"
+    os.mkfifo(fifo)
+
+    result: dict[str, dict] = {}
+
+    def run() -> None:
+        result["value"] = agent_consumer.record_tool_completion(
+            tmp_path, attempt, state="succeeded", now=T0, usage=USAGE
+        )
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive(), "the completion writer blocked on a FIFO"
+
+    value = result["value"]
+    assert value["emitted"] is True
+    assert value["completion_record"] is None
+    assert value["usage_recorded"] is False
+    assert len(outbox_events(tmp_path)) == 1
+    assert stat.S_ISFIFO(fifo.stat().st_mode)
+    assert [path.name for path in completions.iterdir()] == [f"{attempt}.json"]
+
+
+def test_a_plain_completion_directory_records_once_and_replays_idempotently(tmp_path):
+    attempt = "att-plain"
+    dispatch(tmp_path, attempt)
+
+    first = complete(tmp_path, attempt_id=attempt)
+    completions = tmp_path / "tool-completions"
+    record_path = completions / f"{attempt}.json"
+
+    assert first["emitted"] is True
+    assert first["created"] is True
+    assert first["completion_record"] == f"tool-completions/{attempt}.json"
+    info = record_path.stat()
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_nlink == 1
+    assert stat.S_IMODE(completions.stat().st_mode) == 0o700
+    assert len(outbox_events(tmp_path)) == 1
+
+    second = complete(tmp_path, attempt_id=attempt)
+
+    assert second["emitted"] is True
+    assert second["created"] is False
+    assert second["event_id"] == first["event_id"]
+    assert second["completion_record"] == f"tool-completions/{attempt}.json"
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_an_identical_prior_record_is_not_rewritten(tmp_path):
+    attempt = "att-identical"
+    dispatch(tmp_path, attempt)
+    complete(tmp_path, attempt_id=attempt)
+    record_path = tmp_path / "tool-completions" / f"{attempt}.json"
+    before = record_path.read_bytes()
+
+    created = agent_consumer._write_completion_record(
+        tmp_path, attempt, json.loads(before)
+    )
+
+    assert created is False
+    assert record_path.read_bytes() == before
+
+
+def test_a_different_prior_record_is_never_rewritten(tmp_path):
+    attempt = "att-different"
+    dispatch(tmp_path, attempt)
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    planted_id = bee_events.EVENT_ID_PREFIX + "8" * 32
+    planted_path = completions / f"{attempt}.json"
+    planted = write_planted(
+        planted_path,
+        {**planted_completion(attempt, planted_id), "state": "failed"},
+    )
+
+    result = complete(tmp_path, attempt_id=attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert planted_path.read_bytes() == planted
+    assert len(outbox_events(tmp_path)) == 1
 
 
 def test_a_symlinked_completion_record_is_still_ignored(tmp_path):
