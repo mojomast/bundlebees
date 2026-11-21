@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -762,3 +764,146 @@ def test_a_symlinked_completion_record_is_still_ignored(tmp_path):
     assert events[0]["id"] == result["event_id"]
     assert all(event["id"] != planted_id for event in events)
     assert planted_path.read_bytes() == planted
+
+
+# ---------------------------------------------------------------------------
+# RED: the completion-record writer never leaves the state directory
+# ---------------------------------------------------------------------------
+
+
+def test_a_symlinked_completions_directory_is_refused_before_any_write(tmp_path):
+    attempt = "att-write-symdir"
+    dispatch(tmp_path, attempt)
+    outside = tmp_path.parent / f"{tmp_path.name}-write-symdir"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert list(outside.iterdir()) == []
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_symlinked_completions_directory_conflict_is_refused_without_a_write(tmp_path):
+    attempt = "att-write-symdir-conflict"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "2" * 32
+    outside = tmp_path.parent / f"{tmp_path.name}-write-symdir-conflict"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    planted_path = outside / f"{attempt}.json"
+    planted = write_planted(planted_path, planted_completion(attempt, planted_id))
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert planted_path.read_bytes() == planted
+    assert [path.name for path in outside.iterdir()] == [f"{attempt}.json"]
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_a_fifo_completion_record_never_blocks_the_write_back(tmp_path):
+    attempt = "att-write-fifo"
+    dispatch(tmp_path, attempt)
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    fifo = completions / f"{attempt}.json"
+    os.mkfifo(fifo)
+
+    holder: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            holder["result"] = complete(tmp_path, attempt)
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion
+            holder["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    assert "error" not in holder
+    result = holder["result"]
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert len(outbox_events(tmp_path)) == 1
+    assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+    assert [path.name for path in completions.iterdir()] == [f"{attempt}.json"]
+
+
+def test_a_plain_completions_directory_records_and_replays_idempotently(tmp_path):
+    attempt = "att-write-control"
+    dispatch(tmp_path, attempt)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["created"] is True
+    assert result["completion_record"] == f"tool-completions/{attempt}.json"
+    path = tmp_path / "tool-completions" / f"{attempt}.json"
+    info = os.stat(path)
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_nlink == 1
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert len(outbox_events(tmp_path)) == 1
+
+    replay = complete(tmp_path, attempt)
+
+    assert replay["emitted"] is True
+    assert replay["created"] is False
+    assert replay["event_id"] == result["event_id"]
+    assert len(outbox_events(tmp_path)) == 1
+
+
+def test_an_identical_existing_record_is_not_rewritten(tmp_path):
+    attempt = "att-write-identical"
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    record = {
+        "schema": agent_consumer.TOOL_COMPLETION_SCHEMA,
+        "attempt_id": attempt,
+        "state": "succeeded",
+        "branch": "bee/tool-write-back",
+        "feature_id": "bundlebees",
+        "event_id": bee_events.EVENT_ID_PREFIX + "3" * 32,
+        "recorded_at": "2027-01-15T08:00:00Z",
+    }
+    payload = bee_events._canonical(record)
+    path = completions / f"{attempt}.json"
+    path.write_bytes(payload)
+
+    created = agent_consumer._write_completion_record(tmp_path, attempt, record)
+
+    assert created is False
+    assert path.read_bytes() == payload
+
+
+def test_a_different_existing_record_is_refused_untouched(tmp_path):
+    attempt = "att-write-different"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "4" * 32
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    planted_record = planted_completion(attempt, planted_id)
+    planted_record["state"] = "failed"
+    path = completions / f"{attempt}.json"
+    planted = write_planted(path, planted_record)
+
+    result = complete(tmp_path, attempt)
+
+    assert result["emitted"] is True
+    assert result["completion_record"] is None
+    assert result["usage_recorded"] is False
+    assert path.read_bytes() == planted
+    assert len(outbox_events(tmp_path)) == 1
