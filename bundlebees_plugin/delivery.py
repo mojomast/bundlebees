@@ -152,7 +152,7 @@ def scan(state_dir: str | os.PathLike) -> dict:
     for path in sorted(_deliveries_dir(state_dir).glob("*.json")):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             damaged_rows.append(_damaged(path, "unreadable_record"))
             continue
         if not isinstance(record, dict):
@@ -187,7 +187,7 @@ def scan(state_dir: str | os.PathLike) -> dict:
 
 
 def pending(state_dir: str | os.PathLike) -> list[dict]:
-    """Every delivery record that is not yet ``pr_open``, oldest first."""
+    """Every valid record that is not yet ``pr_open``, oldest first."""
     return scan(state_dir)["pending"]
 
 

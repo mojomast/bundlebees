@@ -215,6 +215,110 @@ class DeliveryDamagedRecords(unittest.TestCase):
                 delivery.STATE_PR_OPEN,
             )
 
+    def test_non_utf8_record_is_damaged_and_valid_delivery_still_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_bin.json").write_bytes(b'{"schema": "\xff\xfe"}')
+            self.assertEqual([row["attempt_id"] for row in delivery.pending(d)], ["att_del000000001"])
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [{"attempt_id": "att_bin",
+                                                  "file": "att_bin.json",
+                                                  "reason": "unreadable_record"}])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(gh.prs["rails/r99-x"], result["opened"][0]["pr_url"])
+            self.assertEqual(delivery.pending(d), [])
+            record = json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
+
+    def test_not_an_object_is_damaged_and_valid_delivery_converges(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_array.json").write_text("[]", encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [{"attempt_id": "att_array",
+                                                  "file": "att_array.json",
+                                                  "reason": "not_an_object"}])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(gh.prs["rails/r99-x"], result["opened"][0]["pr_url"])
+            self.assertEqual(delivery.pending(d), [])
+            record = json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
+
+    def test_schema_mismatch_is_damaged_and_valid_delivery_converges(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_schema.json").write_text(json.dumps({
+                "schema": "rizzstack.delivery/2",
+                "attempt_id": "att_schema",
+                "repo": "mojomast/bundlebees",
+                "branch": "rails/schema",
+                "state": delivery.STATE_PUSHED,
+                "pushed_sha": "e" * 40,
+                "created_at": 0.5,
+            }), encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [{"attempt_id": "att_schema",
+                                                  "file": "att_schema.json",
+                                                  "reason": "schema_mismatch"}])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(gh.prs["rails/r99-x"], result["opened"][0]["pr_url"])
+            self.assertEqual(set(gh.prs), {"rails/r99-x"})
+            self.assertEqual(delivery.pending(d), [])
+            record = json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
+
+    def test_missing_attempt_id_is_damaged_and_valid_delivery_converges(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_absent.json").write_text(json.dumps({
+                "schema": delivery.SCHEMA,
+                "repo": "mojomast/bundlebees",
+                "branch": "rails/absent",
+                "state": delivery.STATE_PUSHED,
+                "pushed_sha": "f" * 40,
+                "created_at": 0.5,
+            }), encoding="utf-8")
+            (deliveries / "att_nonstring.json").write_text(json.dumps({
+                "schema": delivery.SCHEMA,
+                "attempt_id": 123,
+                "repo": "mojomast/bundlebees",
+                "branch": "rails/nonstring",
+                "state": delivery.STATE_PUSHED,
+                "pushed_sha": "1" * 40,
+                "created_at": 0.6,
+            }), encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [
+                {"attempt_id": "att_absent",
+                 "file": "att_absent.json",
+                 "reason": "missing_attempt_id"},
+                {"attempt_id": "att_nonstring",
+                 "file": "att_nonstring.json",
+                 "reason": "missing_attempt_id"},
+            ])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(gh.prs["rails/r99-x"], result["opened"][0]["pr_url"])
+            self.assertEqual(set(gh.prs), {"rails/r99-x"})
+            self.assertEqual(delivery.pending(d), [])
+            record = json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
+
 
 def test_cli_only_damaged_record_is_not_an_all_clear(tmp_path, capsys, monkeypatch):
     state = tmp_path / "state"
@@ -231,6 +335,24 @@ def test_cli_only_damaged_record_is_not_an_all_clear(tmp_path, capsys, monkeypat
 
     assert rc == 2
     assert "damaged: att_damaged.json - unreadable_record" in out
+    assert "nothing pending" not in out
+
+
+def test_cli_non_utf8_record_is_not_an_all_clear(tmp_path, capsys, monkeypatch):
+    state = tmp_path / "state"
+    deliveries = state / "deliveries"
+    deliveries.mkdir(parents=True)
+    (deliveries / "att_bin.json").write_bytes(b'{"schema": "\xff\xfe"}')
+
+    def forbidden_sweep(*args, **kwargs):
+        raise AssertionError("sweep must not be called when only damaged records exist")
+
+    monkeypatch.setattr(delivery, "sweep", forbidden_sweep)
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(state), dry_run=False))
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "damaged: att_bin.json - unreadable_record" in out
     assert "nothing pending" not in out
 
 
