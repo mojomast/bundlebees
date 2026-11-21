@@ -9,6 +9,9 @@ outbox/delivery durability checks run for real.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -468,3 +471,167 @@ def test_crash_after_ack_before_move_finishes_on_restart(tmp_path, monkeypatch):
     assert not (source / "crash-before-move.json").exists()
     assert len(_json_files(_outbox(state))) == 1
     assert len(_json_files(_inbox(state))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking reads and per-source ack containment
+# ---------------------------------------------------------------------------
+
+
+def _make_fifo(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(path)
+
+
+def _consume_bounded(state: Path, source: Path, timeout: float = 2.0):
+    result: dict = {}
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result["value"] = landing_bridge.consume_once(state, source)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "consume_once blocked on a non-regular file"
+    if errors:
+        raise errors[0]
+    return result["value"]
+
+
+def _acking_setup(tmp_path: Path) -> tuple[Path, Path, dict]:
+    state = tmp_path / "state"
+    source = tmp_path / "hyvv-outbox"
+    lease = _record_lease(state)
+    event = _event(lease_record=lease)
+    _write_source(source, "attempt.json", event)
+    _subscribe(state)
+    return state, source, event
+
+
+def _ack_path(source: Path, name: str = "attempt.json") -> Path:
+    return source / landing_bridge.ACK_DIR / ".acks" / f"{name}.ack.json"
+
+
+def test_fifo_source_is_refused_without_wedging_the_pass(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+    fifo = source / "zz-fifo.json"
+    _make_fifo(fifo)
+
+    result = _consume_bounded(state, source)
+
+    assert result["processed"] == 1
+    assert result["failed"] == 1
+    assert result["failures"][0]["source"] == "zz-fifo.json"
+    assert result["failures"][0]["error"] == "source_invalid"
+    assert result["pending"] == 1
+    assert len(_json_files(_outbox(state))) == 1
+    assert (source / landing_bridge.ACK_DIR / "attempt.json").exists()
+    assert not (source / "attempt.json").exists()
+    assert stat.S_ISFIFO(fifo.stat().st_mode)
+
+
+def test_fifo_ack_is_refused_without_wedging_or_ingesting(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+    fifo = _ack_path(source)
+    _make_fifo(fifo)
+
+    result = _consume_bounded(state, source)
+
+    assert result["processed"] == 0
+    assert result["failed"] == 1
+    assert result["failures"][0]["source"] == "attempt.json"
+    assert result["failures"][0]["error"] == "source_invalid"
+    assert result["pending"] == 1
+    assert len(_json_files(_outbox(state))) == 0
+    assert (source / "attempt.json").exists()
+    assert stat.S_ISFIFO(fifo.stat().st_mode)
+
+
+def test_symlink_ack_is_contained_as_pending(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+    outside = tmp_path / "outside-ack.json"
+    outside.write_bytes(b"{}")
+    ack = _ack_path(source)
+    ack.parent.mkdir(parents=True, exist_ok=True)
+    ack.symlink_to(outside)
+
+    result = _consume_bounded(state, source)
+
+    assert result["failed"] == 1
+    assert result["failures"][0]["error"] == "source_invalid"
+    assert result["pending"] == 1
+    assert landing_bridge.scan_pending(state, source) == ["attempt.json"]
+    assert (source / "attempt.json").exists()
+
+
+def test_directory_ack_is_contained_as_pending(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+    ack = _ack_path(source)
+    ack.mkdir(parents=True)
+
+    result = _consume_bounded(state, source)
+
+    assert result["failed"] == 1
+    assert result["failures"][0]["error"] == "source_invalid"
+    assert result["pending"] == 1
+    assert landing_bridge.scan_pending(state, source) == ["attempt.json"]
+    assert (source / "attempt.json").exists()
+
+
+def test_control_happy_path_and_replay_stay_unchanged(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+
+    first = landing_bridge.consume_once(state, source)
+
+    assert first["processed"] == 1
+    assert first["failed"] == 0
+    assert first["pending"] == 0
+    assert len(_json_files(_outbox(state))) == 1
+    assert len(_json_files(_inbox(state))) == 1
+    assert not (source / "attempt.json").exists()
+    assert (source / landing_bridge.ACK_DIR / "attempt.json").exists()
+
+    _write_source(source, "attempt.json", event)
+    replay = landing_bridge.consume_once(state, source)
+
+    assert replay["processed"] == 0
+    assert replay["failed"] == 0
+    assert replay["duplicates"] == 1
+    assert replay["sources"][0]["event_ids"] == [event["id"]]
+    assert len(_json_files(_outbox(state))) == 1
+
+
+def test_control_corrupt_ack_fails_closed_and_is_never_overwritten(tmp_path):
+    state, source, event = _acking_setup(tmp_path)
+    ack = _ack_path(source)
+    ack.parent.mkdir(parents=True, exist_ok=True)
+    ack.write_bytes(b"not json")
+    before = ack.read_bytes()
+
+    result = landing_bridge.consume_once(state, source)
+
+    assert result["processed"] == 0
+    assert result["failed"] == 1
+    assert result["failures"][0]["error"] == "source_invalid"
+    assert result["pending"] == 1
+    assert (source / "attempt.json").exists()
+    assert ack.read_bytes() == before
+
+
+def test_fifo_reads_do_not_leak_file_descriptors(tmp_path):
+    fifo = tmp_path / "probe-fifo.json"
+    _make_fifo(fifo)
+    fd_dir = Path("/proc/self/fd")
+    if fd_dir.is_dir():
+        with pytest.raises(landing_bridge.BridgeError):
+            landing_bridge._read_regular(fifo)
+        before = len(os.listdir(fd_dir))
+    for _ in range(200):
+        with pytest.raises(landing_bridge.BridgeError):
+            landing_bridge._read_regular(fifo)
+    if fd_dir.is_dir():
+        assert len(os.listdir(fd_dir)) == before

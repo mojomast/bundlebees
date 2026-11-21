@@ -71,6 +71,7 @@ _ACK_META_DIR = ".acks"
 _ACK_SUFFIX = ".ack.json"
 _MAX_SOURCE_BYTES = bee_events.MAX_EVENT_BYTES * 8
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 _ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _JOB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -118,7 +119,7 @@ def _fsync_dir(path: Path) -> None:
 
 def _read_regular(path: Path, *, limit: int = _MAX_SOURCE_BYTES) -> bytes | None:
     try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -767,7 +768,11 @@ def scan_pending(state_dir: Any, launcher_outbox: Any) -> list[str]:
     source = Path(launcher_outbox)
     pending: list[str] = []
     for path in _iter_source_files(source):
-        if _ack_for(source, path.name) is None:
+        try:
+            ack = _ack_for(source, path.name)
+        except (BridgeError, bee_events.EventError):
+            ack = None
+        if ack is None:
             pending.append(path.name)
     return pending
 
