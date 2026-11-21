@@ -290,6 +290,15 @@ delivery, after delivery and before the ack, or after the ack and before the
 move replays cleanly because the outbox, delivery and ack records are
 create-only/fsynced.
 
+In the `consume_once` reply, `pending` counts sources that are not provably
+acknowledged, including a source whose acknowledgement cannot be read;
+`failures` is the authoritative per-source signal and carries the refusal code.
+A source that ingested but could not be moved because `acked/<name>` is
+occupied by a non-regular path (a FIFO or a directory) is reported under
+`failures` with `source_invalid` while `pending` stays `0`, and the event is
+recorded exactly once; remove the offending path and the next pass takes the
+duplicate branch, completes the move and does not re-deliver the event.
+
 ## Refusal codes
 
 | Code | Meaning |
