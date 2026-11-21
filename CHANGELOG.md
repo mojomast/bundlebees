@@ -337,6 +337,7 @@ one pull request.
   worker-supplied values, stays scrubbed.
 
 ### Security
+- **Attempts/status completion evidence reader hardening:** the reader now opens `tool-completions` itself with a directory-level no-symlink guard and opens each record relative to that descriptor, so a symlinked or non-directory `tool-completions` entry is refused without reading its target. A record with more than one hard link is also refused. The 65536-byte bound is pinned at the exact boundary, with both the pre-read size and post-read length race clauses tested; any refusal leaves the attempt reporting as `dispatched`.
 - **Verify worktree integrity:** every git worktree-add site in `verify`
   (main verify, identity-for-commit, commit-contains-patch) now forces a
   **full checkout** (worktree-scoped `git sparse-checkout disable` with a
