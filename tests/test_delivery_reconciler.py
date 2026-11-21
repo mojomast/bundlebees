@@ -847,6 +847,40 @@ def test_existing_oserror_and_deliveryerror_classifications_are_preserved(tmp_pa
                for row in os_result["errors"] + delivery_result["errors"])
 
 
+def test_record_pr_branch_oserror_stays_record_io_failed(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_record_pr_os", repo="mojomast/bundlebees",
+           branch="rails/record-pr-os")
+    delivery.record_pushed(state, "att_record_pr_os", "a" * 40)
+
+    record_path = state / "deliveries" / "att_record_pr_os.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    original_pr_url = "https://github.com/mojomast/bundlebees/pull/216"
+    record["pr_url"] = original_pr_url
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    assert delivery.next_step(record) == "record_pr"
+
+    def disk_failure(state_dir, attempt_id, pr_url):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(delivery, "record_pr", disk_failure)
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+
+    assert result["existing"] == []
+    assert result["errors"] == [{
+        "attempt_id": "att_record_pr_os",
+        "branch": "rails/record-pr-os",
+        "error": {"error": "record_io_failed", "message": "simulated disk failure",
+                  "fix": "Inspect the deliveries directory; the sweep can be rerun safely."},
+    }]
+    assert result["errors"][0]["error"]["error"] != "gh_run_failed"
+    unchanged = json.loads(record_path.read_text(encoding="utf-8"))
+    assert unchanged["state"] == delivery.STATE_PUSHED
+    assert unchanged["pr_url"] == original_pr_url
+
+
 def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
     calls = []
 
@@ -871,7 +905,8 @@ def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
 
 
 def test_run_gh_missing_binary_is_gh_run_failed_not_record_io_and_not_timeout(tmp_path, monkeypatch):
-    _intent(tmp_path, attempt="att_gh_missing", branch="rails/missing")
+    _intent(tmp_path, attempt="att_gh_missing", repo="Hostile-Org/REPO-CANARY-4f1d",
+           branch="rails/BRANCH-CANARY-9a2c")
     delivery.record_pushed(tmp_path, "att_gh_missing", "a" * 40)
 
     def missing_run(*args, **kwargs):
@@ -885,11 +920,36 @@ def test_run_gh_missing_binary_is_gh_run_failed_not_record_io_and_not_timeout(tm
     error = result["errors"][0]
     assert error["attempt_id"] == "att_gh_missing"
     payload = error["error"]
-    assert payload["error"] == "gh_run_failed"
-    assert "No such file or directory" in payload["message"]
-    assert "Install gh" in payload["fix"]
-    assert "idempotent" in payload["fix"]
+    assert payload == {
+        "error": "gh_run_failed",
+        "message": "gh could not be run (FileNotFoundError): [Errno 2] No such file or directory: 'gh'",
+        "fix": "Install gh or fix PATH so the sweep can reach GitHub, then rerun; it is idempotent.",
+    }
+    assert "Hostile-Org/REPO-CANARY-4f1d" not in payload["message"]
+    assert "Hostile-Org/REPO-CANARY-4f1d" not in payload["fix"]
+    assert "rails/BRANCH-CANARY-9a2c" not in payload["message"]
+    assert "rails/BRANCH-CANARY-9a2c" not in payload["fix"]
     assert payload["error"] not in ("record_io_failed", "gh_timeout")
+
+
+def test_gh_run_failed_message_is_bounded_at_160_chars(tmp_path):
+    _intent(tmp_path, attempt="att_gh_long", branch="rails/long")
+    delivery.record_pushed(tmp_path, "att_gh_long", "a" * 40)
+
+    def overflowing_runner(args):
+        raise OSError("x" * 400)
+
+    result = delivery.sweep(tmp_path, overflowing_runner)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_gh_long"
+    payload = error["error"]
+    assert payload["error"] == "gh_run_failed"
+    assert payload["message"] == "gh could not be run (OSError): " + "x" * 160
+    assert len(payload["message"]) == len("gh could not be run (OSError): ") + 160
+    assert "x" * 161 not in payload["message"]
+    assert "x" * 400 not in payload["message"]
 
 
 def test_run_gh_permission_error_is_gh_run_failed(tmp_path, monkeypatch):
