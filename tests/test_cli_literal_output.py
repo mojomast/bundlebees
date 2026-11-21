@@ -557,3 +557,74 @@ def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_basename(
 
     assert argv_text != text
     assert "[redacted]" in argv_text
+
+
+_NEAR_MISS_RUN = "9f2c7d1e5a3b4c6d8e0f1a2b3c4d5e6f"
+NEAR_MISS_INTERPRETERS = (
+    pytest.param(
+        INTERPRETER + "/" + _NEAR_MISS_RUN + "/python3.14",
+        id="interpreter-with-suffix",
+    ),
+    pytest.param(
+        INTERPRETER.rsplit("/", 1)[0]
+        + "/"
+        + _NEAR_MISS_RUN
+        + "/python3.14",
+        id="sibling-in-same-directory",
+    ),
+    pytest.param(
+        INTERPRETER.rsplit("/", 1)[0] + "/" + _NEAR_MISS_RUN,
+        id="same-directory-different-basename",
+    ),
+    pytest.param(
+        "/opt/evil/" + _NEAR_MISS_RUN + "/bin/python3.14",
+        id="foreign-prefix-short-suffix",
+    ),
+    pytest.param(
+        "/etc/" + _NEAR_MISS_RUN + "/python3.14",
+        id="foreign-directory-same-basename",
+    ),
+)
+
+
+@pytest.mark.parametrize("interpreter", NEAR_MISS_INTERPRETERS)
+def test_trusted_argv_rejects_every_near_miss_interpreter_shape(
+    tmp_path, monkeypatch, interpreter
+):
+    """Pin review-bb-pr230 F1 near-miss interpreter shapes as a class.
+
+    The five rows cover an appended suffix, a sibling basename in the same
+    directory, a same-directory high-entropy basename, a foreign prefix
+    sharing the /bin/python3.14 suffix, and a foreign directory sharing the
+    basename. A relaxation of any shape must not restore the argv literally.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([interpreter, *PYTEST_FLAGS, *tests])
+
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_trusted_argv_rejects_an_exact_interpreter_with_a_leading_token(
+    tmp_path, monkeypatch
+):
+    """Pin review-bb-pr230 F1 C4b: an exact interpreter plus a leading token is not a tail-slice match."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([INTERPRETER, _NEAR_MISS_RUN, *PYTEST_FLAGS, *tests])
+
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
