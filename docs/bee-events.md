@@ -294,10 +294,18 @@ In the `consume_once` reply, `pending` counts sources that are not provably
 acknowledged, including a source whose acknowledgement cannot be read;
 `failures` is the authoritative per-source signal and carries the refusal code.
 A source that ingested but could not be moved because `acked/<name>` is
-occupied by a non-regular path (a FIFO or a directory) is reported under
-`failures` with `source_invalid` while `pending` stays `0`, and the event is
-recorded exactly once; remove the offending path and the next pass takes the
-duplicate branch, completes the move and does not re-deliver the event.
+occupied by a path the destination read refuses — a FIFO, a directory, a unix
+socket, or a symlink whose target resolves — is reported under `failures` with
+`source_invalid` while `pending` stays `0`, and the event is recorded exactly
+once; remove the offending path and the next pass takes the duplicate branch,
+completes the move and does not re-deliver the event. A symlink that cannot be
+resolved (a dangling link or a link loop) is not refused: `destination.exists()`
+is false, so the rename replaces the link with the source file.
+
+An acknowledgement record that is unreadable or not valid JSON cannot prove the
+source was processed: that source is reported under `failures` with
+`source_invalid` and stays in `pending` on every pass, and the ack file is never
+rewritten, so an operator must repair or remove it.
 
 ## Refusal codes
 
