@@ -10,6 +10,7 @@ and any path outside the verify state directory -- keeps full redaction.
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,7 @@ from tests.test_cli import (
 BRANCH = "fix/verify-node-targets-" + "2026-11-18"
 ATTEMPT_ID = "att_" + "0123456789abcdef" * 2
 COMMIT = "a1" * 20
+INTERPRETER = "/opt/toolchains/python-3.14.9+20261021-linux-x64/bin/python3.14"
 
 ADDRESS_DECOYS = ("10.0.0.1", "feat/10.0.0.1")
 HIGH_ENTROPY_DECOYS = (
@@ -348,3 +350,71 @@ def test_verify_record_preserves_null_and_empty_branch(tmp_path, branch, expecte
     else:
         assert record["branch"] == expected
     assert record["branch"] != "[redacted]"
+
+
+PYTEST_FLAGS = (
+    "-B",
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "-q",
+    "--junitxml={evidence}/junit.xml",
+)
+
+
+def _argv_record(tmp_path, attempt_id, text, tests):
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        attempt_id,
+        ok=True,
+        sha="a" * 40,
+        branch=BRANCH,
+        files=[],
+        tests=tests,
+        evidence={"test_argv": text},
+    )
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def test_verify_record_keeps_cli_built_pytest_argv_literal(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", INTERPRETER)
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"])
+    record = _argv_record(tmp_path, "att-argv", text, ["tests/test_sample.py"])
+
+    assert record["evidence"]["test_argv"] == text
+    assert INTERPRETER in record["evidence"]["test_argv"]
+
+
+def test_verify_record_keeps_node_argv_literal(tmp_path):
+    text = "node --test tests/a.test.mjs tests/b.test.mjs"
+    record = _argv_record(
+        tmp_path,
+        "att-node-argv",
+        text,
+        ["tests/a.test.mjs", "tests/b.test.mjs"],
+    )
+
+    assert record["evidence"]["test_argv"] == text
+
+
+def test_verify_record_still_scrubs_a_non_template_argv(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", INTERPRETER)
+    text = INTERPRETER + " -m pytest tests/test_sample.py"
+    record = _argv_record(
+        tmp_path, "att-non-template", text, ["tests/test_sample.py"]
+    )
+
+    assert record["evidence"]["test_argv"] != text
+    assert "[redacted]" in record["evidence"]["test_argv"]
+
+
+def test_verify_record_still_scrubs_a_truncated_template(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", INTERPRETER)
+    template = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"])
+    text = template + " " + ("x" * 2100)
+    record = _argv_record(
+        tmp_path, "att-truncated-template", text, ["tests/test_sample.py"]
+    )
+
+    assert "[redacted]" in record["evidence"]["test_argv"]

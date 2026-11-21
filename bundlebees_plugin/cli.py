@@ -2417,6 +2417,42 @@ def _test_argv_text(argv: list[str]) -> str:
     return " ".join(argv)[:2000]
 
 
+_PYTEST_ARGV_FLAGS = (
+    "-B",
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "-q",
+    "--junitxml={evidence}/junit.xml",
+)
+
+
+def _trusted_test_argv(
+    evidence: Mapping[str, Any] | None, tests: list[str]
+) -> str | None:
+    """Return the recorded argv when it is exactly a template this CLI builds.
+
+    A sandboxed run composes ``test_argv`` only from ``sys.executable`` (or the
+    fixed ``node`` runner), fixed flags, the ``{evidence}`` placeholder and the
+    validated test targets. An exact match to that template is therefore
+    evidence, not untrusted text, so it is safe to keep the interpreter path
+    that the generic long-key scrub would redact. Every other shape stays
+    untrusted and loses the exemption.
+    """
+    value = (evidence or {}).get("test_argv")
+    if not isinstance(value, str) or not value or len(value) > 2000:
+        return None
+    tokens = value.split(" ")
+    if any(not token for token in tokens):
+        return None
+    if tokens == ["node", "--test", *tests]:
+        return value
+    if tokens == [sys.executable, *_PYTEST_ARGV_FLAGS, *tests]:
+        return value
+    return None
+
+
 def _run_sandboxed(
     workdir: Path,
     targets: list[str],
@@ -2682,6 +2718,11 @@ def _write_verify_result(
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    # The argv is CLI-composed evidence: only an exact template match keeps the
+    # interpreter path that the long-key scrub would otherwise redact.
+    argv_text = _trusted_test_argv(evidence, list(tests))
+    if argv_text is not None:
+        clean["evidence"]["test_argv"] = argv_text
     data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
     tmp_path: str | None = None
     handle = None
