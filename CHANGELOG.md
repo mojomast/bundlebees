@@ -23,6 +23,7 @@ one pull request.
 - **Workflow pin:** the `PIN-THE-WORKFLOW-REV` placeholder is gone; scaffolds seal `pins.WORKFLOW_PIN`, which the doctor also checks.
 - **Reconciliation sweep backstop:** the factory driver runs the sweep classify-only through `LauncherAdapter`, at most every 1800 s, when started with `--sweep` (the shipped systemd unit passes it). Without a PR view it reports `pr_view: "unavailable"` and lists pushed-without-PR ledger records as `unverified` instead of gaps. git runs with `child_env()` and `GIT_TERMINAL_PROMPT=0`.
 - **Removed:** `graceful_recovery` (never wired), the changelog-coverage and changelog-entry tests, and doc-text assertions in tests. `verify_workers` is marked NOT WIRED. The bundled TDD evidence schema is synced with workflow's (optional `sequence`, `prev_sha256`); bundlebees does not emit the hash chain (declined).
+- **Landing-bridge non-blocking reads:** the landing bridge opens ack, source and cursor files non-blocking, so a FIFO or other non-regular file is refused with `source_invalid` instead of wedging the ingest pass, and an unusable acknowledgement is reported as pending rather than aborting the pass.
 
 ### Added
 
