@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -707,6 +708,166 @@ def test_row_oserror_is_contained_and_remaining_rows_converge(tmp_path, monkeypa
     assert [row["attempt_id"] for row in second["opened"]] == ["att_first"]
     first_record = json.loads((state / "deliveries" / "att_first.json").read_text(encoding="utf-8"))
     assert first_record["state"] == delivery.STATE_PR_OPEN
+
+
+def test_runner_timeout_expired_is_contained_and_remaining_rows_converge(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_first", branch="rails/first")
+    delivery.record_pushed(state, "att_first", "a" * 40)
+    _intent(state, attempt="att_second", branch="rails/second")
+    delivery.record_pushed(state, "att_second", "b" * 40)
+
+    class TimeoutOnFirstGh(FakeGh):
+        def __call__(self, args):
+            if args[:2] == ["pr", "list"] and args[args.index("--head") + 1] == "rails/first":
+                self.calls.append(list(args))
+                raise subprocess.TimeoutExpired(["gh", *args], 120)
+            return super().__call__(args)
+
+    result = delivery.sweep(state, TimeoutOnFirstGh())
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_first"
+    assert error["branch"] == "rails/first"
+    assert error["error"]["error"] == "unexpected_error"
+    assert error["error"]["message"].startswith("TimeoutExpired:")
+    assert error["error"]["fix"] == "Inspect the row; the sweep can be rerun safely."
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_second"]
+    second_record = json.loads((state / "deliveries" / "att_second.json").read_text(encoding="utf-8"))
+    assert second_record["state"] == delivery.STATE_PR_OPEN
+    assert [row["attempt_id"] for row in delivery.pending(state)] == ["att_first"]
+
+
+def test_record_pr_json_decode_error_is_contained_and_remaining_rows_converge(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_first", branch="rails/first")
+    delivery.record_pushed(state, "att_first", "a" * 40)
+    _intent(state, attempt="att_second", branch="rails/second")
+    delivery.record_pushed(state, "att_second", "b" * 40)
+
+    original = delivery.record_pr
+
+    def corrupted(state_dir, attempt_id, pr_url):
+        if attempt_id == "att_first":
+            raise json.JSONDecodeError("simulated corrupt record", "", 0)
+        return original(state_dir, attempt_id, pr_url)
+
+    monkeypatch.setattr(delivery, "record_pr", corrupted)
+    result = delivery.sweep(state, FakeGh())
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_first"
+    assert error["branch"] == "rails/first"
+    assert error["error"]["error"] == "unexpected_error"
+    assert error["error"]["message"].startswith("JSONDecodeError:")
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_second"]
+    second_record = json.loads((state / "deliveries" / "att_second.json").read_text(encoding="utf-8"))
+    assert second_record["state"] == delivery.STATE_PR_OPEN
+
+
+def test_runner_unicode_decode_error_is_contained_and_remaining_rows_converge(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_first", branch="rails/first")
+    delivery.record_pushed(state, "att_first", "a" * 40)
+    _intent(state, attempt="att_second", branch="rails/second")
+    delivery.record_pushed(state, "att_second", "b" * 40)
+
+    class UndecodableGh(FakeGh):
+        def __call__(self, args):
+            if args[:2] == ["pr", "list"] and args[args.index("--head") + 1] == "rails/first":
+                self.calls.append(list(args))
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return super().__call__(args)
+
+    result = delivery.sweep(state, UndecodableGh())
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_first"
+    assert error["branch"] == "rails/first"
+    assert error["error"]["error"] == "unexpected_error"
+    assert error["error"]["message"].startswith("UnicodeDecodeError:")
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_second"]
+    second_record = json.loads((state / "deliveries" / "att_second.json").read_text(encoding="utf-8"))
+    assert second_record["state"] == delivery.STATE_PR_OPEN
+
+
+def test_base_exception_from_runner_is_not_swallowed(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_first", branch="rails/first")
+    delivery.record_pushed(state, "att_first", "a" * 40)
+
+    class SweepAbort(BaseException):
+        pass
+
+    class AbortingGh(FakeGh):
+        def __call__(self, args):
+            raise SweepAbort("control: BaseException must escape the per-row handler")
+
+    with pytest.raises(SweepAbort):
+        delivery.sweep(state, AbortingGh())
+
+
+def test_existing_oserror_and_deliveryerror_classifications_are_preserved(tmp_path, monkeypatch):
+    os_state = tmp_path / "os_state"
+    _intent(os_state, attempt="att_os", branch="rails/os")
+    delivery.record_pushed(os_state, "att_os", "a" * 40)
+
+    def disk_failure(state_dir, attempt_id, pr_url):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(delivery, "record_pr", disk_failure)
+    os_result = delivery.sweep(os_state, FakeGh())
+
+    assert os_result["errors"] == [{
+        "attempt_id": "att_os",
+        "branch": "rails/os",
+        "error": {"error": "record_io_failed", "message": "simulated disk failure",
+                  "fix": "Inspect the deliveries directory; the sweep can be rerun safely."},
+    }]
+
+    delivery_state = tmp_path / "delivery_state"
+    _intent(delivery_state, attempt="att_delivery", branch="rails/delivery")
+    delivery.record_pushed(delivery_state, "att_delivery", "b" * 40)
+
+    class DeliveryErrorGh(FakeGh):
+        def __call__(self, args):
+            raise delivery.DeliveryError("gh_list_failed", "simulated gh failure", "Check gh.")
+
+    delivery_result = delivery.sweep(delivery_state, DeliveryErrorGh())
+
+    assert delivery_result["errors"] == [{
+        "attempt_id": "att_delivery",
+        "branch": "rails/delivery",
+        "error": {"error": "gh_list_failed", "message": "simulated gh failure", "fix": "Check gh."},
+    }]
+    assert all(row["error"]["error"] != "unexpected_error"
+               for row in os_result["errors"] + delivery_result["errors"])
+
+
+def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
+    calls = []
+
+    def timing_out_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise subprocess.TimeoutExpired(["gh", "pr", "list"], 120)
+
+    monkeypatch.setattr(delivery.subprocess, "run", timing_out_run)
+
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery._run_gh(["pr", "list", "--repo", "mojomast/bundlebees", "--head", "rails/secret"])
+
+    payload = caught.value.to_dict()
+    assert payload["error"] == "gh_timeout"
+    assert "pr list" in payload["message"]
+    assert "idempotent" in payload["message"]
+    assert "mojomast/bundlebees" not in payload["message"]
+    assert "rails/secret" not in payload["message"]
+    assert "network" in payload["fix"]
+    assert "rerun" in payload["fix"]
+    assert calls and calls[0][1]["timeout"] == 120
 
 
 if __name__ == "__main__":
