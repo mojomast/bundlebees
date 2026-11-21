@@ -674,7 +674,7 @@ RESIDUAL_ARGV_SHAPES = (
                 "/home/clanker01/.ssh/" + _NEAR_MISS_RUN + "/test_sample.py",
             ]
         ),
-        id="pytest-arm-target-directory",
+        id="pytest-arm-target-last-component",
     ),
 )
 
@@ -690,7 +690,8 @@ def test_trusted_argv_rejects_residual_widened_shapes(
     R3: pytest arm matches the fixed flags as a prefix and the targets as a
     suffix with a foreign token in the middle.
     R5r: pytest arm accepts any --junitxml= value.
-    R6r: pytest arm compares the target-directory basename only.
+    R6r: pytest arm compares the target's last path component (its basename);
+    parent-directory comparison is a separate shape, pinned by the sweep below.
 
     A relaxed match for any row must keep the argv out of the trusted literal
     path, so no widened shape may be restored verbatim.
@@ -705,3 +706,139 @@ def test_trusted_argv_rejects_residual_widened_shapes(
 
     assert argv_text != text
     assert "[redacted]" in argv_text
+
+
+_NEAR_MISS_DIR = "/home/clanker01/.ssh/" + _NEAR_MISS_RUN
+
+
+def _argv_sweep_cases():
+    templates = (
+        (
+            "pytest",
+            [INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"],
+            ["tests/test_sample.py"],
+        ),
+        (
+            "node",
+            ["node", "--test", "tests/a.test.mjs"],
+            ["tests/a.test.mjs"],
+        ),
+    )
+    cases = []
+    for arm, template, tests in templates:
+        for index, token in enumerate(template):
+            for kind, mutated in (
+                ("foreign-prefix", _NEAR_MISS_DIR + "/" + token.lstrip("/")),
+                ("appended-component", token + "/" + _NEAR_MISS_RUN),
+            ):
+                tokens = list(template)
+                tokens[index] = mutated
+                cases.append(
+                    pytest.param(
+                        tests,
+                        template,
+                        tokens,
+                        id=f"{arm}-{index}-{kind}",
+                    )
+                )
+            if "/" in token:
+                tokens = list(template)
+                tokens[index] = token.rsplit("/", 1)[0] + "/" + _NEAR_MISS_RUN
+                cases.append(
+                    pytest.param(
+                        tests,
+                        template,
+                        tokens,
+                        id=f"{arm}-{index}-same-dir-foreign-base",
+                    )
+                )
+            cases.append(
+                pytest.param(
+                    tests,
+                    template,
+                    [
+                        *template[:index],
+                        _NEAR_MISS_DIR,
+                        *template[index:],
+                    ],
+                    id=f"{arm}-{index}-inserted-before",
+                )
+            )
+            cases.append(
+                pytest.param(
+                    tests,
+                    template,
+                    [
+                        *template[: index + 1],
+                        _NEAR_MISS_DIR,
+                        *template[index + 1 :],
+                    ],
+                    id=f"{arm}-{index}-inserted-after",
+                )
+            )
+    cases.append(
+        pytest.param(
+            ["tests/test_sample.py"],
+            [INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"],
+            [
+                INTERPRETER,
+                "--junitxml=" + _NEAR_MISS_DIR + "/junit.xml",
+                *PYTEST_FLAGS,
+                "tests/test_sample.py",
+            ],
+            id="pytest-1-leading-option",
+        )
+    )
+    return tuple(cases)
+
+
+ARGV_SWEEP_CASES = _argv_sweep_cases()
+
+
+@pytest.mark.parametrize("tests, template, tokens", ARGV_SWEEP_CASES)
+def test_trusted_argv_rejects_a_one_token_mutation_at_every_position(
+    tmp_path, monkeypatch, tests, template, tokens
+):
+    """Sweep one-token mutations across every position of both templates.
+
+    The earlier tables pin named shapes; this sweeps every position of the
+    pytest and node templates so a single-token comparison relaxed anywhere
+    must fail here. A finite sweep bounds only the mutations it enumerates.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+
+    assert tokens != template
+    text = " ".join(tokens)
+
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    assert record["evidence"]["test_argv"] != text
+    assert "[redacted]" in record["evidence"]["test_argv"]
+
+
+ARGV_SWEEP_POSITIVE_CASES = (
+    pytest.param(
+        ["tests/test_sample.py"],
+        [INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"],
+        id="pytest-exact",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs"],
+        ["node", "--test", "tests/a.test.mjs"],
+        id="node-exact",
+    ),
+)
+
+
+@pytest.mark.parametrize("tests, tokens", ARGV_SWEEP_POSITIVE_CASES)
+def test_trusted_argv_sweep_positive_controls_restore_exact_templates(
+    monkeypatch, tests, tokens
+):
+    """An always-None guard must fail: the exact templates still restore."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+
+    text = " ".join(tokens)
+    assert cli._trusted_test_argv({"test_argv": text}, tests) == text
