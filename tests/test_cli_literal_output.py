@@ -940,3 +940,66 @@ def test_trusted_argv_two_target_exact_template_still_restores(monkeypatch):
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
 
     assert cli._trusted_test_argv({"test_argv": text}, tests) == text
+
+RESIDUAL_MULTI_TARGET_CONJUNCTION_SHAPES = (
+    pytest.param(
+        ["tests/test_sample.py", "tests/test_sample_second.py"],
+        [
+            INTERPRETER,
+            *PYTEST_FLAGS,
+            "tests/test_sample.py",
+            "tests/" + _NEAR_MISS_RUN + ".py",
+        ],
+        id="pytest-two-target-same-dir-foreign-basename",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs", "tests/b.test.mjs"],
+        ["node", "--test", "tests/a.test.mjs", "tests/" + _NEAR_MISS_RUN + ".mjs"],
+        id="node-two-target-same-dir-foreign-basename",
+    ),
+    pytest.param(
+        ["tests/a.py", "tests/b.py", "tests/c.py"],
+        [
+            INTERPRETER,
+            *PYTEST_FLAGS,
+            "tests/a.py",
+            _NEAR_MISS_DIR + "/foreign.py",
+            "tests/c.py",
+        ],
+        id="pytest-three-target-foreign-middle",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs", "tests/b.test.mjs", "tests/c.test.mjs"],
+        [
+            "node",
+            "--test",
+            "tests/a.test.mjs",
+            _NEAR_MISS_DIR + "/foreign.mjs",
+            "tests/c.test.mjs",
+        ],
+        id="node-three-target-foreign-middle",
+    ),
+)
+
+@pytest.mark.parametrize("tests, tokens", RESIDUAL_MULTI_TARGET_CONJUNCTION_SHAPES)
+def test_trusted_argv_rejects_multi_target_conjunction_widenings(
+    tmp_path, monkeypatch, tests, tokens
+):
+    """Pin review-bb-pr234 F1/F2's two measured conjunction families.
+
+    F1: a parent-only comparison over several targets sees every dirname as
+    `tests`, so a same-directory foreign basename carrying a 32-char run is
+    restored. F2: a first+last conjunction over three targets ignores the
+    middle token, so a foreign middle path is restored. These rows pass on
+    the base guard; mutant-kill is the discrimination. A finite table bounds
+    only the shapes it enumerates.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+
+    text = " ".join(tokens)
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    assert record["evidence"]["test_argv"] != text
+    assert "[redacted]" in record["evidence"]["test_argv"]
