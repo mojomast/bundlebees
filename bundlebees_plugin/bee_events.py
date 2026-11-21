@@ -126,6 +126,7 @@ _VERIFIED_DELIVERIES: "OrderedDict[tuple[str, str], dict[str, Any]]" = OrderedDi
 _VERIFIED_LOCK = threading.Lock()
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
 _EVENT_ID_RE = re.compile(r"^urn:rizzstack:bee-landed:[0-9a-f]{32}$")
 _SOURCE_REV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
@@ -1224,7 +1225,7 @@ def _read_regular(path: Path, *, limit: int = _MAX_READ_BYTES) -> bytes | None:
     """Read a regular non-symlink file, or return None when it does not exist."""
 
     try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as exc:
