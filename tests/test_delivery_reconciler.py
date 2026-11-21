@@ -568,11 +568,54 @@ def test_pushed_record_without_pushed_sha_is_incomplete_and_not_swept(tmp_path):
     assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
     assert set(gh.prs) == {"rails/valid"}
     assert not [call for call in gh.calls if "rails/nosha" in call]
+    valid_record = json.loads((state / "deliveries" / "att_valid.json").read_text(encoding="utf-8"))
+    assert valid_record["state"] == delivery.STATE_PR_OPEN
+
+
+@pytest.mark.parametrize("fields", [
+    pytest.param({"repo": "mojomast/bundlebees", "branch": "rails/nosha",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": None},
+                 id="pushed-sha-none"),
+    pytest.param({"branch": "rails/norepo",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": "b" * 40},
+                 id="pushed-repo-absent"),
+    pytest.param({"repo": "mojomast/bundlebees",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": "b" * 40},
+                 id="pushed-branch-absent"),
+    pytest.param({"repo": "", "branch": "rails/emptyrepo",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": "b" * 40},
+                 id="pushed-repo-empty"),
+    pytest.param({"repo": "mojomast/bundlebees", "branch": "",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": "b" * 40},
+                 id="pushed-branch-empty"),
+    pytest.param({"repo": "mojomast/bundlebees", "branch": "rails/emptysha",
+                  "state": delivery.STATE_PUSHED, "pushed_sha": ""},
+                 id="pushed-sha-empty"),
+])
+def test_pushed_record_missing_repo_branch_or_sha_is_incomplete_and_not_swept(tmp_path, fields):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_valid", branch="rails/valid")
+    delivery.record_pushed(state, "att_valid", "a" * 40)
+    _write_record(state, "att_bad.json", attempt_id="att_bad", created_at=0.5, **fields)
+
+    scanned = delivery.scan(state)
+    assert scanned["damaged"] == [{"attempt_id": "att_bad", "file": "att_bad.json",
+                                   "reason": "incomplete_record"}]
+    assert [row["attempt_id"] for row in scanned["pending"]] == ["att_valid"]
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
+    assert set(gh.prs) == {"rails/valid"}
+    valid_record = json.loads((state / "deliveries" / "att_valid.json").read_text(encoding="utf-8"))
+    assert valid_record["state"] == delivery.STATE_PR_OPEN
 
 
 @pytest.mark.parametrize("fields", [
     {"branch": "rails/norepo"},
     {"repo": "", "branch": "rails/emptyrepo"},
+    pytest.param({"repo": "mojomast/bundlebees"}, id="intent-branch-absent"),
+    pytest.param({"repo": "mojomast/bundlebees", "branch": ""}, id="intent-branch-empty"),
 ])
 def test_intent_missing_repo_or_branch_is_incomplete_and_not_swept(tmp_path, fields):
     state = tmp_path / "state"
@@ -591,6 +634,8 @@ def test_intent_missing_repo_or_branch_is_incomplete_and_not_swept(tmp_path, fie
     assert result["blocked"] == []
     assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
     assert set(gh.prs) == {"rails/valid"}
+    valid_record = json.loads((state / "deliveries" / "att_valid.json").read_text(encoding="utf-8"))
+    assert valid_record["state"] == delivery.STATE_PR_OPEN
 
 
 def test_empty_attempt_id_is_damaged_and_never_reaches_record_pr(tmp_path, monkeypatch):
