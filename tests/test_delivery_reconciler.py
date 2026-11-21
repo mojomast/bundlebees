@@ -1064,8 +1064,9 @@ def test_t10_each_delivery_stores_its_own_distinct_exact_pr_url(tmp_path):
         ["api", "graphql", "-f", "query=query{viewer{login}}"],
         ["repo", "view", "mojomast/bundlebees", "--json", "name"],
         ["status"],
+        ["auth"],
     ],
-    ids=["pr-view", "pr-merge", "run-list", "api-graphql", "repo-view", "single-token"],
+    ids=["pr-view", "pr-merge", "run-list", "api-graphql", "repo-view", "single-token", "single-token-auth"],
 )
 def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch, argv):
     def timing_out_run(*args, **kwargs):
@@ -1077,14 +1078,12 @@ def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch, argv):
         delivery._run_gh(argv)
 
     payload = caught.value.to_dict()
-    expected_prefix = "gh " + " ".join(argv[:2])
+    expected_shape = " ".join(argv[:2])
     assert payload["error"] == "gh_timeout"
-    assert expected_prefix in payload["message"]
+    assert payload["message"].startswith(f"gh {expected_shape} ")
+    assert not any(token in payload["message"].split() for token in argv[2:])
     assert "gh pr create" not in payload["message"]
     assert "gh pr list" not in payload["message"]
-    for token in argv[2:]:
-        if len(token) >= 3:
-            assert token not in payload["message"]
 
 
 if __name__ == "__main__":
