@@ -984,7 +984,7 @@ def test_t5_safe_attempt_id_round_trips(tmp_path):
     assert delivery.pending(tmp_path) == []
     stored = json.loads(record_path.read_text(encoding="utf-8"))
     assert stored["state"] == delivery.STATE_PR_OPEN
-    assert stored["pr_url"]
+    assert stored["pr_url"] == gh.prs["rails/ok"]
 
 
 def test_t6_distinct_safe_ids_do_not_alias(tmp_path):
@@ -1014,6 +1014,61 @@ def test_t7_record_pushed_rejects_unsafe_id_instead_of_reading_alias(tmp_path):
     assert caught_pr.value.to_dict()["error"] == "unsafe_attempt_id"
     assert alias.read_text(encoding="utf-8") == before
     assert [row["state"] for row in delivery.pending(tmp_path)] == [delivery.STATE_INTENT]
+
+
+def test_t8_record_pushed_rejects_unsafe_id_without_creating_deliveries_dir(tmp_path):
+    assert not (tmp_path / "deliveries").exists()
+
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery.record_pushed(tmp_path, "att/a", "b" * 40)
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    assert not (tmp_path / "deliveries").exists()
+
+
+def test_t9_record_pr_rejects_unsafe_id_without_creating_deliveries_dir(tmp_path):
+    assert not (tmp_path / "deliveries").exists()
+
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery.record_pr(tmp_path, "att/a", "https://github.com/mojomast/bundlebees/pull/1")
+
+    assert caught.value.to_dict()["error"] == "unsafe_attempt_id"
+    assert not (tmp_path / "deliveries").exists()
+
+
+def test_t10_each_delivery_stores_its_own_distinct_exact_pr_url(tmp_path):
+    _intent(tmp_path, attempt="att_url_a", branch="rails/url-a")
+    _intent(tmp_path, attempt="att_url_b", branch="rails/url-b")
+    delivery.record_pushed(tmp_path, "att_url_a", "a" * 40)
+    delivery.record_pushed(tmp_path, "att_url_b", "b" * 40)
+
+    gh = FakeGh()
+    result = delivery.sweep(tmp_path, gh)
+
+    assert sorted(row["attempt_id"] for row in result["opened"]) == ["att_url_a", "att_url_b"]
+    stored_a = json.loads((tmp_path / "deliveries" / "att_url_a.json").read_text(encoding="utf-8"))
+    stored_b = json.loads((tmp_path / "deliveries" / "att_url_b.json").read_text(encoding="utf-8"))
+    assert stored_a["state"] == delivery.STATE_PR_OPEN
+    assert stored_b["state"] == delivery.STATE_PR_OPEN
+    assert stored_a["pr_url"] == gh.prs["rails/url-a"]
+    assert stored_b["pr_url"] == gh.prs["rails/url-b"]
+    assert stored_a["pr_url"] != stored_b["pr_url"]
+
+
+def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch):
+    def timing_out_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["gh", "pr", "view"], 120)
+
+    monkeypatch.setattr(delivery.subprocess, "run", timing_out_run)
+
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery._run_gh(["pr", "view", "--repo", "mojomast/bundlebees", "--json", "url"])
+
+    payload = caught.value.to_dict()
+    assert payload["error"] == "gh_timeout"
+    assert "gh pr view" in payload["message"]
+    assert "gh pr create" not in payload["message"]
+    assert "gh pr list" not in payload["message"]
 
 
 if __name__ == "__main__":
