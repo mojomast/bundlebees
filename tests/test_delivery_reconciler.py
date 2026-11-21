@@ -1082,6 +1082,9 @@ def test_t11_run_gh_timeout_names_unmodelled_subcommand(monkeypatch, argv):
     assert payload["error"] == "gh_timeout"
     assert payload["message"].startswith(f"gh {expected_shape} ")
     assert not any(token in payload["message"].split() for token in argv[2:])
+    for token in argv[2:]:
+        if len(token) >= 3:
+            assert token not in payload["message"]
     assert "gh pr create" not in payload["message"]
     assert "gh pr list" not in payload["message"]
 
