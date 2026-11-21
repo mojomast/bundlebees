@@ -2417,6 +2417,40 @@ def _test_argv_text(argv: list[str]) -> str:
     return " ".join(argv)[:2000]
 
 
+_PYTEST_ARGV_FLAGS = (
+    "-B",
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "-q",
+    "--junitxml={evidence}/junit.xml",
+)
+
+
+def _trusted_test_argv(
+    evidence: Mapping[str, Any] | None, tests: list[str]
+) -> str | None:
+    """Return the exact CLI-built test argv when it matches a known template.
+
+    The argv is composed by this CLI from ``sys.executable``, fixed flags, the
+    ``{evidence}`` placeholder and the validated test targets, so an exact
+    template match is evidence rather than untrusted text. Every other shape
+    returns ``None`` and keeps full scrubbing.
+    """
+    value = (evidence or {}).get("test_argv")
+    if not isinstance(value, str) or not value or len(value) > 2000:
+        return None
+    tokens = value.split(" ")
+    if any(not token for token in tokens):
+        return None
+    if tokens == ["node", "--test", *tests]:
+        return value
+    if tokens == [sys.executable, *_PYTEST_ARGV_FLAGS, *tests]:
+        return value
+    return None
+
+
 def _run_sandboxed(
     workdir: Path,
     targets: list[str],
@@ -2682,6 +2716,9 @@ def _write_verify_result(
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    argv_text = _trusted_test_argv(evidence, list(tests))
+    if argv_text is not None:
+        clean["evidence"]["test_argv"] = argv_text
     data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
     tmp_path: str | None = None
     handle = None

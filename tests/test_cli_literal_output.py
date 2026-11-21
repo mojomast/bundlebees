@@ -29,6 +29,16 @@ from tests.test_cli import (
 BRANCH = "fix/verify-node-targets-" + "2026-11-18"
 ATTEMPT_ID = "att_" + "0123456789abcdef" * 2
 COMMIT = "a1" * 20
+INTERPRETER = "/opt/toolchains/python-3.14.9+20261021-linux-x64/bin/python3.14"
+PYTEST_FLAGS = (
+    "-B",
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "-q",
+    "--junitxml={evidence}/junit.xml",
+)
 
 ADDRESS_DECOYS = ("10.0.0.1", "feat/10.0.0.1")
 HIGH_ENTROPY_DECOYS = (
@@ -348,3 +358,64 @@ def test_verify_record_preserves_null_and_empty_branch(tmp_path, branch, expecte
     else:
         assert record["branch"] == expected
     assert record["branch"] != "[redacted]"
+
+
+def _write_argv_record(tmp_path, tests, text):
+    state = tmp_path / "state"
+    target = cli._write_verify_result(
+        state,
+        "att-argv",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-literal",
+        files=[],
+        tests=tests,
+        evidence={"test_argv": text},
+    )
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def test_verify_record_keeps_cli_built_pytest_argv_literal(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+
+    assert record["evidence"]["test_argv"] == text
+    assert INTERPRETER in record["evidence"]["test_argv"]
+
+
+def test_verify_record_keeps_node_argv_literal(tmp_path):
+    tests = ["tests/" + "a1" * 20 + ".test.mjs", "tests/b.test.mjs"]
+    text = " ".join(["node", "--test", *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+
+    assert record["evidence"]["test_argv"] == text
+    assert tests[0] in record["evidence"]["test_argv"]
+
+
+def test_verify_record_still_scrubs_a_non_template_argv(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = INTERPRETER + " -m pytest tests/test_sample.py"
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_truncated_template(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/" + "a1" * 1050 + ".py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+
+    assert len(text) > 2000
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
