@@ -802,8 +802,8 @@ def test_trusted_argv_rejects_a_one_token_mutation_at_every_position(
     """Sweep one-token mutations across every position of both templates.
 
     The earlier tables pin named shapes; this sweeps every position of the
-    pytest and node templates so a single-token comparison relaxed anywhere
-    must fail here. A finite sweep bounds only the mutations it enumerates.
+    pytest and node templates so the enumerated single-token mutations fail
+    here. A finite sweep bounds only the mutations it enumerates.
     """
 
     monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
@@ -841,4 +841,102 @@ def test_trusted_argv_sweep_positive_controls_restore_exact_templates(
     monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
 
     text = " ".join(tokens)
+    assert cli._trusted_test_argv({"test_argv": text}, tests) == text
+
+
+RESIDUAL_TWO_TARGET_AND_NORMALISED_SHAPES = (
+    pytest.param(
+        ["tests/test_sample.py", "tests/test_sample_second.py"],
+        [
+            INTERPRETER,
+            *PYTEST_FLAGS,
+            "tests/test_sample.py",
+            _NEAR_MISS_DIR + "/test_sample_second.py",
+        ],
+        id="pytest-second-target-foreign-prefix",
+    ),
+    pytest.param(
+        ["tests/test_sample.py", "tests/test_sample_second.py"],
+        [
+            INTERPRETER,
+            *PYTEST_FLAGS,
+            _NEAR_MISS_DIR + "/test_sample.py",
+            "tests/test_sample_second.py",
+        ],
+        id="pytest-first-target-foreign-prefix",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs", "tests/b.test.mjs"],
+        ["node", "--test", "tests/a.test.mjs", _NEAR_MISS_DIR + "/b.test.mjs"],
+        id="node-second-target-foreign-prefix",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs", "tests/b.test.mjs"],
+        ["node", "--test", _NEAR_MISS_DIR + "/a.test.mjs", "tests/b.test.mjs"],
+        id="node-first-target-foreign-prefix",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        [INTERPRETER, *PYTEST_FLAGS, "tests/" + _NEAR_MISS_RUN + "/../test_sample.py"],
+        id="pytest-normpath-parent-segment",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        [INTERPRETER, *PYTEST_FLAGS, "./tests/" + _NEAR_MISS_RUN + "/../test_sample.py"],
+        id="pytest-dot-prefix",
+    ),
+    pytest.param(
+        ["tests/test_sample.py"],
+        [INTERPRETER, *PYTEST_FLAGS, "tests/./" + _NEAR_MISS_RUN + "/../test_sample.py"],
+        id="pytest-dot-middle-segment",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs"],
+        ["node", "--test", "tests/" + _NEAR_MISS_RUN + "/../a.test.mjs"],
+        id="node-normpath-parent-segment",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs"],
+        ["node", "--test", "./tests/" + _NEAR_MISS_RUN + "/../a.test.mjs"],
+        id="node-dot-prefix",
+    ),
+    pytest.param(
+        ["tests/a.test.mjs"],
+        ["node", "--test", "tests/./" + _NEAR_MISS_RUN + "/../a.test.mjs"],
+        id="node-dot-middle-segment",
+    ),
+)
+
+
+@pytest.mark.parametrize("tests, tokens", RESIDUAL_TWO_TARGET_AND_NORMALISED_SHAPES)
+def test_trusted_argv_rejects_two_target_and_normalised_widenings(
+    tmp_path, monkeypatch, tests, tokens
+):
+    """Pin review-bb-pr233 F1's two measured widening families.
+
+    S1/S2 compare only one of several targets (first-only and last-only
+    variants), so a two-target ``tests`` list can restore a foreign target.
+    S3/S4 compare lexical normalisations, so a ``.`` or ``..`` segment that
+    normalises onto the exact target is restored with its foreign component
+    intact. These rows pass on the base guard; mutant-kill is the
+    discrimination. A finite table bounds only the shapes it enumerates.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+
+    text = " ".join(tokens)
+    assert cli._trusted_test_argv({"test_argv": text}, tests) is None
+
+    record = _write_argv_record(tmp_path, tests, text)
+    assert record["evidence"]["test_argv"] != text
+    assert "[redacted]" in record["evidence"]["test_argv"]
+
+
+def test_trusted_argv_two_target_exact_template_still_restores(monkeypatch):
+    """A guard that refuses multi-target templates must fail here."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py", "tests/test_sample_second.py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+
     assert cli._trusted_test_argv({"test_argv": text}, tests) == text
