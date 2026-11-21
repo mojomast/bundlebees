@@ -221,7 +221,12 @@ def next_step(record: dict) -> str:
 
 
 def _run_gh(args: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+    try:
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        shape = " ".join(args[:2]) if len(args) >= 2 else " ".join(args[:1])
+        raise DeliveryError("gh_timeout", f"gh {shape} timed out after 120s; the sweep is idempotent.",
+                            "Check gh/network connectivity, then rerun the sweep.") from None
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -306,4 +311,9 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
             result["errors"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
                                      "error": {"error": "record_io_failed", "message": str(exc)[:200],
                                                "fix": "Inspect the deliveries directory; the sweep can be rerun safely."}})
+        except Exception as exc:
+            result["errors"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
+                                     "error": {"error": "unexpected_error",
+                                               "message": (f"{type(exc).__name__}: {exc}")[:200],
+                                               "fix": "Inspect the row; the sweep can be rerun safely."}})
     return result
