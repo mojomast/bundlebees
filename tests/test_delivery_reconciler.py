@@ -870,9 +870,66 @@ def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
     assert calls and calls[0][1]["timeout"] == 120
 
 
+def test_run_gh_missing_binary_is_record_io_failed_not_timeout(tmp_path, monkeypatch):
+    _intent(tmp_path, attempt="att_gh_missing", branch="rails/missing")
+    delivery.record_pushed(tmp_path, "att_gh_missing", "a" * 40)
+
+    def missing_run(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "gh")
+
+    monkeypatch.setattr(delivery.subprocess, "run", missing_run)
+
+    result = delivery.sweep(tmp_path)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_gh_missing"
+    assert error["error"]["error"] == "record_io_failed"
+    assert "No such file or directory" in error["error"]["message"]
+
+
+def test_unexpected_error_message_is_capped_at_200_chars(tmp_path):
+    _intent(tmp_path, attempt="att_unexpected", branch="rails/unexpected")
+    delivery.record_pushed(tmp_path, "att_unexpected", "a" * 40)
+
+    def exploding_runner(args):
+        raise RuntimeError("x" * 500)
+
+    result = delivery.sweep(tmp_path, exploding_runner)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["error"]["error"] == "unexpected_error"
+    message = error["error"]["message"]
+    assert message.startswith("RuntimeError: ")
+    assert len(message) == 200
+
+
+def test_run_gh_timeout_names_the_actual_subcommand(tmp_path, monkeypatch):
+    _intent(tmp_path, attempt="att_gh_create_timeout", branch="rails/create")
+    delivery.record_pushed(tmp_path, "att_gh_create_timeout", "a" * 40)
+
+    def scripted_run(argv, *args, **kwargs):
+        subcommand = list(argv)[1:]
+        if subcommand[:2] == ["pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if subcommand[:2] == ["pr", "create"]:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=120)
+        raise AssertionError(f"unexpected gh call: {argv}")
+
+    monkeypatch.setattr(delivery.subprocess, "run", scripted_run)
+
+    result = delivery.sweep(tmp_path)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["error"]["error"] == "gh_timeout"
+    assert "gh pr create" in error["error"]["message"]
+
+
 def _assert_no_deliveries_written(state_dir):
     deliveries = Path(state_dir) / "deliveries"
-    assert not deliveries.exists() or list(deliveries.iterdir()) == []
+    assert not deliveries.exists()
 
 
 def test_t1_record_intent_rejects_slash_attempt_id_without_writing(tmp_path):
@@ -925,6 +982,9 @@ def test_t5_safe_attempt_id_round_trips(tmp_path):
     assert [row["attempt_id"] for row in result["opened"]] == ["att_ok-1.x"]
     assert set(gh.prs) == {"rails/ok"}
     assert delivery.pending(tmp_path) == []
+    stored = json.loads(record_path.read_text(encoding="utf-8"))
+    assert stored["state"] == delivery.STATE_PR_OPEN
+    assert stored["pr_url"]
 
 
 def test_t6_distinct_safe_ids_do_not_alias(tmp_path):
