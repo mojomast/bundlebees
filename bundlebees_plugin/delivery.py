@@ -234,6 +234,18 @@ def next_step(record: dict) -> str:
     return "done"
 
 
+_GH_RUN_FIX = ("Install gh or fix PATH so the sweep can reach GitHub, "
+               "then rerun; it is idempotent.")
+
+
+def _gh_run_failed(exc: OSError) -> DeliveryError:
+    return DeliveryError(
+        "gh_run_failed",
+        f"gh could not be run ({type(exc).__name__}): {str(exc)[:160]}",
+        _GH_RUN_FIX,
+    )
+
+
 def _run_gh(args: list[str]) -> tuple[int, str]:
     try:
         proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
@@ -241,7 +253,18 @@ def _run_gh(args: list[str]) -> tuple[int, str]:
         shape = " ".join(args[:2]) if len(args) >= 2 else " ".join(args[:1])
         raise DeliveryError("gh_timeout", f"gh {shape} timed out after 120s; the sweep is idempotent.",
                             "Check gh/network connectivity, then rerun the sweep.") from None
+    except OSError as exc:
+        raise _gh_run_failed(exc) from None
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def _guard_runner(runner: Callable[[list[str]], tuple[int, str]]) -> Callable[[list[str]], tuple[int, str]]:
+    def guarded(args: list[str]) -> tuple[int, str]:
+        try:
+            return runner(args)
+        except OSError as exc:
+            raise _gh_run_failed(exc) from None
+    return guarded
 
 
 def find_existing_pr(repo: str, branch: str, runner: Callable[[list[str]], tuple[int, str]] = _run_gh) -> str | None:
@@ -285,6 +308,8 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
     Idempotent and safe to run on a timer: an existing PR is recognized before any
     create call, so repeated sweeps never duplicate work.
     """
+    if runner is not _run_gh:
+        runner = _guard_runner(runner)
     scanned = scan(state_dir)
     result = {"opened": [], "existing": [], "blocked": [], "errors": [],
               "damaged": list(scanned["damaged"])}

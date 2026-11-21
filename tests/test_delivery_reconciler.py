@@ -870,7 +870,7 @@ def test_run_gh_timeout_becomes_gh_timeout_delivery_error(monkeypatch):
     assert calls and calls[0][1]["timeout"] == 120
 
 
-def test_run_gh_missing_binary_is_record_io_failed_not_timeout(tmp_path, monkeypatch):
+def test_run_gh_missing_binary_is_gh_run_failed_not_record_io_and_not_timeout(tmp_path, monkeypatch):
     _intent(tmp_path, attempt="att_gh_missing", branch="rails/missing")
     delivery.record_pushed(tmp_path, "att_gh_missing", "a" * 40)
 
@@ -884,8 +884,69 @@ def test_run_gh_missing_binary_is_record_io_failed_not_timeout(tmp_path, monkeyp
     assert len(result["errors"]) == 1
     error = result["errors"][0]
     assert error["attempt_id"] == "att_gh_missing"
-    assert error["error"]["error"] == "record_io_failed"
-    assert "No such file or directory" in error["error"]["message"]
+    payload = error["error"]
+    assert payload["error"] == "gh_run_failed"
+    assert "No such file or directory" in payload["message"]
+    assert "Install gh" in payload["fix"]
+    assert "idempotent" in payload["fix"]
+    assert payload["error"] not in ("record_io_failed", "gh_timeout")
+
+
+def test_run_gh_permission_error_is_gh_run_failed(tmp_path, monkeypatch):
+    _intent(tmp_path, attempt="att_gh_permission", branch="rails/permission")
+    delivery.record_pushed(tmp_path, "att_gh_permission", "a" * 40)
+
+    def denied_run(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", "/usr/bin/gh")
+
+    monkeypatch.setattr(delivery.subprocess, "run", denied_run)
+
+    result = delivery.sweep(tmp_path)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_gh_permission"
+    assert error["error"]["error"] == "gh_run_failed"
+    assert "PermissionError" in error["error"]["message"]
+    assert "Permission denied" in error["error"]["message"]
+
+
+def test_custom_runner_oserror_is_gh_run_failed_not_record_io(tmp_path):
+    _intent(tmp_path, attempt="att_gh_pipe", branch="rails/pipe")
+    delivery.record_pushed(tmp_path, "att_gh_pipe", "a" * 40)
+
+    def broken_runner(args):
+        raise OSError("simulated pipe failure")
+
+    result = delivery.sweep(tmp_path, broken_runner)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_gh_pipe"
+    assert error["error"]["error"] == "gh_run_failed"
+    assert "OSError" in error["error"]["message"]
+    assert "simulated pipe failure" in error["error"]["message"]
+
+
+def test_dry_run_missing_binary_is_gh_run_failed(tmp_path, monkeypatch):
+    _intent(tmp_path, attempt="att_gh_dry_missing", branch="rails/dry-missing")
+    delivery.record_pushed(tmp_path, "att_gh_dry_missing", "a" * 40)
+
+    def missing_run(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "gh")
+
+    monkeypatch.setattr(delivery.subprocess, "run", missing_run)
+
+    result = delivery.sweep(tmp_path, dry_run=True)
+
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["attempt_id"] == "att_gh_dry_missing"
+    assert error["error"]["error"] == "gh_run_failed"
+    assert [row["attempt_id"] for row in delivery.pending(tmp_path)] == ["att_gh_dry_missing"]
+    record = json.loads((tmp_path / "deliveries" / "att_gh_dry_missing.json").read_text(encoding="utf-8"))
+    assert record["state"] == delivery.STATE_PUSHED
+    assert record.get("pr_url") is None
 
 
 def test_unexpected_error_message_is_capped_at_200_chars(tmp_path):
