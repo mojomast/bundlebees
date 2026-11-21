@@ -30,6 +30,7 @@ BRANCH = "fix/verify-node-targets-" + "2026-11-18"
 ATTEMPT_ID = "att_" + "0123456789abcdef" * 2
 COMMIT = "a1" * 20
 INTERPRETER = "/opt/toolchains/python-3.14.9+20261021-linux-x64/bin/python3.14"
+FOREIGN_INTERPRETER = "/opt/toolchains/python-3.13.7+b4c1d2e3-linux-x64/bin/python3.13"
 PYTEST_FLAGS = (
     "-B",
     "-m",
@@ -414,6 +415,90 @@ def test_verify_record_still_scrubs_a_truncated_template(tmp_path, monkeypatch):
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
 
     assert len(text) > 2000
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_foreign_interpreter_pytest_argv(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([FOREIGN_INTERPRETER, *PYTEST_FLAGS, *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_pytest_argv_with_trailing_tokens(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests, "--maxfail=1"])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_node_argv_with_an_extra_flag(tmp_path):
+    tests = ["tests/" + "a1" * 20 + ".test.mjs", "tests/b.test.mjs"]
+    text = " ".join(["node", "--test", "--experimental-strip-types", *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_node_argv_missing_a_target(tmp_path):
+    tests = ["tests/" + "a1" * 20 + ".test.mjs", "tests/b.test.mjs"]
+    text = " ".join(["node", "--test", tests[0]])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_space_containing_target(
+    tmp_path, monkeypatch
+):
+    """Pin the documented fail-closed fallback for review-bb-pr228 F1(a).
+
+    Change this only when the match learns to preserve a space-containing
+    target.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/" + "a1" * 20 + " b.py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_an_acdd_subset_argv(tmp_path, monkeypatch):
+    """Pin the review-bb-pr228 F1(b) ACDD selected-subset fallback."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py", "tests/data.json"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"])
+
     record = _write_argv_record(tmp_path, tests, text)
     argv_text = record["evidence"]["test_argv"]
 
