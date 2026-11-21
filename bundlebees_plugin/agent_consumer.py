@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +80,7 @@ TOOL_COMPLETION_SCHEMA = "rizzstack.tool-completion/1"
 _TOOL_IDENTITY = "bundlebees-tools"
 _TOOL_HARNESS = "hyvv"
 _TOOL_COMPLETIONS_DIR = "tool-completions"
+_TOOL_COMPLETION_MAX_BYTES = 65536
 
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HEX64_RE = re.compile(r"^(?:[0-9a-fA-F]{64})$")
@@ -204,15 +206,79 @@ def _data_replay_matches(stored_data: Any, event_data: Any) -> bool:
     return all(stored_result.get(key) == value for key, value in event_result.items())
 
 
-def _prior_completion(state_path: Path, attempt: str) -> dict[str, Any] | None:
-    """The durable tool-completion record an attempt already has, if any."""
+def _read_completion_record(state_path: Path, attempt: str) -> bytes | None:
+    """Read ``<attempt>.json`` under the tool-completions directory, safely.
 
+    The directory itself is opened with a no-symlink guard and the record is
+    opened relative to that directory descriptor, so a ``tool-completions``
+    entry that is a symlink (or not a directory) is refused and nothing
+    outside the state directory is read.  The record must be a regular,
+    single-link file of at most 65536 bytes: a hardlink is not evidence this
+    writer produced the record.  Any refusal is ``None``.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    dir_fd: int | None = None
+    fd: int | None = None
     try:
-        raw = bee_events._read_regular(
-            state_path / _TOOL_COMPLETIONS_DIR / f"{attempt}.json"
-        )
-    except Exception:  # noqa: BLE001 - an unreadable record is only no marker
-        return None
+        try:
+            dir_fd = os.open(
+                state_path / _TOOL_COMPLETIONS_DIR,
+                os.O_RDONLY | directory | nofollow,
+            )
+        except (OSError, TypeError, NotImplementedError):
+            return None
+        try:
+            fd = os.open(
+                f"{attempt}.json",
+                os.O_RDONLY | nofollow | nonblock,
+                dir_fd=dir_fd,
+            )
+        except (OSError, TypeError, NotImplementedError):
+            return None
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_nlink != 1:
+            return None
+        if info.st_size > _TOOL_COMPLETION_MAX_BYTES:
+            return None
+        try:
+            raw = os.read(fd, _TOOL_COMPLETION_MAX_BYTES + 1)
+        except OSError:
+            return None
+        if len(raw) > _TOOL_COMPLETION_MAX_BYTES:
+            return None
+        return raw
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+
+
+def _prior_completion(state_path: Path, attempt: str) -> dict[str, Any] | None:
+    """The durable tool-completion record an attempt already has, if any.
+
+    The ``tool-completions`` directory is opened only through a
+    directory-level no-symlink guard, and the record must be a single-link
+    regular file of at most 65536 bytes.  Any refusal, an unreadable record
+    included, means "no prior record", so the completion is emitted rather
+    than suppressed.
+    """
+
+    raw = _read_completion_record(state_path, attempt)
     if raw is None:
         return None
     try:

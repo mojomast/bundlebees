@@ -17,6 +17,7 @@ one pull request.
 
 ### Changed (rizzstack cleanup, Nov 2026)
 
+- **Tool-completion dedupe reader hardened:** the reader now opens `tool-completions` with a directory-level no-symlink guard and a `dir_fd`-relative record open, refuses multi-link records, and bounds a record at 65536 bytes, so a planted prior record can no longer suppress the landing event.
 - **Contract gate, report-only in the live path:** `tools._dispatch_acdd` runs the provenance and acceptance-id checks and records would-refuse findings (`gate` block and `<state>/contract-gate/report-only.jsonl`, rotated at 1 MiB) without refusing. The switch is the constant `tools.CONTRACT_GATE_MODE`; enforcing needs a code change. The pinned workflow HEAD is cached per process (30 s) with a 5 s git timeout.
 - **Workflow pin:** the `PIN-THE-WORKFLOW-REV` placeholder is gone; scaffolds seal `pins.WORKFLOW_PIN`, which the doctor also checks.
 - **Reconciliation sweep backstop:** the factory driver runs the sweep classify-only through `LauncherAdapter`, at most every 1800 s, when started with `--sweep` (the shipped systemd unit passes it). Without a PR view it reports `pr_view: "unavailable"` and lists pushed-without-PR ledger records as `unverified` instead of gaps. git runs with `child_env()` and `GIT_TERMINAL_PROMPT=0`.

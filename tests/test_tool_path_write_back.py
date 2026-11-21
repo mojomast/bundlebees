@@ -25,6 +25,7 @@ own outbox.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -607,3 +608,157 @@ def test_a_completion_without_a_coordinator_lease_is_refused_not_failed(tmp_path
     assert write_back["emitted"] is False
     assert write_back["code"] == "lease_facts_missing"
     assert outbox_events(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# RED: a planted prior record must not suppress the landing event
+# ---------------------------------------------------------------------------
+
+
+def planted_completion(attempt_id: str, event_id: str) -> dict:
+    """A valid tool-completion record a prior writer could have left behind."""
+
+    return {
+        "schema": agent_consumer.TOOL_COMPLETION_SCHEMA,
+        "attempt_id": attempt_id,
+        "state": "succeeded",
+        "branch": "bee/planted",
+        "event_id": event_id,
+    }
+
+
+def write_planted(path: Path, record: dict, *, size: int | None = None) -> bytes:
+    """Write *record* as JSON, optionally space-padded to an exact size."""
+
+    raw = json.dumps(record).encode("utf-8")
+    if size is not None:
+        assert len(raw) <= size
+        raw = raw + b" " * (size - len(raw))
+    path.write_bytes(raw)
+    return raw
+
+
+def planted_outside(tmp_path: Path, name: str) -> Path:
+    """A real directory outside the plugin state dir."""
+
+    outside = tmp_path.parent / f"{tmp_path.name}-{name}"
+    outside.mkdir()
+    return outside
+
+
+def test_a_symlinked_completions_directory_cannot_suppress_a_completion(tmp_path):
+    attempt = "att-symdir"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "d" * 32
+    outside = planted_outside(tmp_path, "symdir")
+    planted_path = outside / f"{attempt}.json"
+    planted = write_planted(planted_path, planted_completion(attempt, planted_id))
+    (tmp_path / "tool-completions").symlink_to(outside, target_is_directory=True)
+
+    result = agent_consumer.record_tool_completion(
+        tmp_path, attempt, state="succeeded", now=T0
+    )
+
+    assert result["emitted"] is True
+    assert result["created"] is True
+    assert result["event_id"] != planted_id
+    events = outbox_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["id"] == result["event_id"]
+    assert all(event["id"] != planted_id for event in events)
+    assert planted_path.read_bytes() == planted
+
+
+def test_a_hardlinked_completion_record_cannot_suppress_a_completion(tmp_path):
+    attempt = "att-hlck"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "e" * 32
+    outside = planted_outside(tmp_path, "hlck")
+    planted_path = outside / f"{attempt}.json"
+    planted = write_planted(planted_path, planted_completion(attempt, planted_id))
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    linked = completions / f"{attempt}.json"
+    os.link(planted_path, linked)
+
+    assert os.stat(linked).st_nlink == 2
+
+    result = agent_consumer.record_tool_completion(
+        tmp_path, attempt, state="succeeded", now=T0
+    )
+
+    assert result["emitted"] is True
+    assert result["created"] is True
+    assert result["event_id"] != planted_id
+    events = outbox_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["id"] == result["event_id"]
+    assert all(event["id"] != planted_id for event in events)
+    assert planted_path.read_bytes() == planted
+
+
+def test_a_completion_record_over_65536_bytes_is_not_a_prior_record(tmp_path):
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+
+    ok_id = bee_events.EVENT_ID_PREFIX + "a" * 32
+    ok_path = completions / "att-bound-ok.json"
+    ok_raw = write_planted(
+        ok_path, planted_completion("att-bound-ok", ok_id), size=65536
+    )
+    assert len(ok_raw) == 65536
+
+    at_bound = agent_consumer.record_tool_completion(
+        tmp_path, "att-bound-ok", state="succeeded", now=T0
+    )
+
+    assert at_bound["emitted"] is True
+    assert at_bound["created"] is False
+    assert at_bound["event_id"] == ok_id
+    assert outbox_events(tmp_path) == []
+
+    dispatch(tmp_path, "att-bound-big")
+    big_id = bee_events.EVENT_ID_PREFIX + "b" * 32
+    big_path = completions / "att-bound-big.json"
+    big_raw = write_planted(
+        big_path, planted_completion("att-bound-big", big_id), size=65537
+    )
+    assert len(big_raw) == 65537
+
+    over_bound = agent_consumer.record_tool_completion(
+        tmp_path, "att-bound-big", state="succeeded", now=T0
+    )
+
+    assert over_bound["emitted"] is True
+    assert over_bound["created"] is True
+    assert over_bound["event_id"] != big_id
+    events = outbox_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["id"] == over_bound["event_id"]
+    assert events[0]["data"]["attempt_id"] == "att-bound-big"
+    assert all(event["id"] != big_id for event in events)
+
+
+def test_a_symlinked_completion_record_is_still_ignored(tmp_path):
+    attempt = "att-lnkrec"
+    dispatch(tmp_path, attempt)
+    planted_id = bee_events.EVENT_ID_PREFIX + "f" * 32
+    completions = tmp_path / "tool-completions"
+    completions.mkdir()
+    outside = planted_outside(tmp_path, "lnkrec")
+    planted_path = outside / f"{attempt}.json"
+    planted = write_planted(planted_path, planted_completion(attempt, planted_id))
+    (completions / f"{attempt}.json").symlink_to(planted_path)
+
+    result = agent_consumer.record_tool_completion(
+        tmp_path, attempt, state="succeeded", now=T0
+    )
+
+    assert result["emitted"] is True
+    assert result["created"] is True
+    assert result["event_id"] != planted_id
+    events = outbox_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["id"] == result["event_id"]
+    assert all(event["id"] != planted_id for event in events)
+    assert planted_path.read_bytes() == planted
