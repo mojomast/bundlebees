@@ -172,7 +172,7 @@ def scan(state_dir: str | os.PathLike) -> dict:
             damaged_rows.append(_damaged(path, "not_an_object"))
             continue
         attempt_id = record.get("attempt_id")
-        if not isinstance(attempt_id, str):
+        if not _nonempty_str(attempt_id):
             damaged_rows.append(_damaged(path, "missing_attempt_id"))
             continue
         if record.get("schema") != SCHEMA:
@@ -275,19 +275,19 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
             result["blocked"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
                                       "reason": "intent recorded but no pushed_sha: the push never landed"})
             continue
-        if step == "record_pr":
-            pr_url = record["pr_url"]
-            row = {"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
-                   "pr_url": pr_url}
-            if dry_run:
-                row["dry_run"] = True
-            else:
-                record_pr(state_dir, record["attempt_id"], pr_url)
-            result["existing"].append(row)
-            continue
-        if step != "open_pr":
-            continue
         try:
+            if step == "record_pr":
+                pr_url = record["pr_url"]
+                row = {"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
+                       "pr_url": pr_url}
+                if dry_run:
+                    row["dry_run"] = True
+                else:
+                    record_pr(state_dir, record["attempt_id"], pr_url)
+                result["existing"].append(row)
+                continue
+            if step != "open_pr":
+                continue
             if dry_run:
                 existing = find_existing_pr(record["repo"], record["branch"], runner)
                 key = "existing" if existing else "opened"
@@ -302,4 +302,8 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
         except DeliveryError as exc:
             result["errors"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
                                      "error": exc.to_dict()})
+        except OSError as exc:
+            result["errors"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
+                                     "error": {"error": "record_io_failed", "message": str(exc)[:200],
+                                               "fix": "Inspect the deliveries directory; the sweep can be rerun safely."}})
     return result

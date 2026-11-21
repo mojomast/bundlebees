@@ -26,6 +26,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -60,6 +62,14 @@ class FakeGh:
 def _intent(tmp, attempt="att_del000000001", repo="mojomast/bundlebees", branch="rails/r99-x"):
     return delivery.record_intent(tmp, attempt_id=attempt, repo=repo, branch=branch,
                                   base_sha="0" * 40, title="t", body="b")
+
+
+def _write_record(state_dir, filename, **fields):
+    deliveries = Path(state_dir) / "deliveries"
+    deliveries.mkdir(parents=True, exist_ok=True)
+    record = {"schema": delivery.SCHEMA, "created_at": 1.0}
+    record.update(fields)
+    (deliveries / filename).write_text(json.dumps(record), encoding="utf-8")
 
 
 class DeliveryLifecycle(unittest.TestCase):
@@ -538,6 +548,120 @@ def test_pr_open_completeness_is_state_aware(tmp_path, capsys):
     assert rc_bad == 2
     assert "damaged: att_prnull.json - incomplete_record" in bad_out
     assert "att_prgood" not in bad_out
+
+
+def test_pushed_record_without_pushed_sha_is_incomplete_and_not_swept(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_valid", branch="rails/valid")
+    delivery.record_pushed(state, "att_valid", "a" * 40)
+    _write_record(state, "att_nosha.json", attempt_id="att_nosha",
+                  repo="mojomast/bundlebees", branch="rails/nosha",
+                  state=delivery.STATE_PUSHED, pushed_sha=None, created_at=0.5)
+
+    scanned = delivery.scan(state)
+    assert scanned["damaged"] == [{"attempt_id": "att_nosha", "file": "att_nosha.json",
+                                   "reason": "incomplete_record"}]
+    assert [row["attempt_id"] for row in scanned["pending"]] == ["att_valid"]
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
+    assert set(gh.prs) == {"rails/valid"}
+    assert not [call for call in gh.calls if "rails/nosha" in call]
+
+
+@pytest.mark.parametrize("fields", [
+    {"branch": "rails/norepo"},
+    {"repo": "", "branch": "rails/emptyrepo"},
+])
+def test_intent_missing_repo_or_branch_is_incomplete_and_not_swept(tmp_path, fields):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_valid", branch="rails/valid")
+    delivery.record_pushed(state, "att_valid", "a" * 40)
+    _write_record(state, "att_bad.json", attempt_id="att_bad",
+                  state=delivery.STATE_INTENT, created_at=0.5, **fields)
+
+    scanned = delivery.scan(state)
+    assert scanned["damaged"] == [{"attempt_id": "att_bad", "file": "att_bad.json",
+                                   "reason": "incomplete_record"}]
+    assert [row["attempt_id"] for row in scanned["pending"]] == ["att_valid"]
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+    assert result["blocked"] == []
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
+    assert set(gh.prs) == {"rails/valid"}
+
+
+def test_empty_attempt_id_is_damaged_and_never_reaches_record_pr(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_valid", branch="rails/valid")
+    delivery.record_pushed(state, "att_valid", "a" * 40)
+    _write_record(state, ".json", attempt_id="", repo="mojomast/bundlebees",
+                  branch="rails/empty", state=delivery.STATE_PUSHED,
+                  pushed_sha="b" * 40, created_at=0.5)
+
+    scanned = delivery.scan(state)
+    assert scanned["damaged"] == [{"attempt_id": ".json", "file": ".json",
+                                   "reason": "missing_attempt_id"}]
+    assert [row["attempt_id"] for row in scanned["pending"]] == ["att_valid"]
+    assert [row["attempt_id"] for row in delivery.pending(state)] == ["att_valid"]
+
+    recorded = []
+    original = delivery.record_pr
+
+    def spy(state_dir, attempt_id, pr_url):
+        recorded.append(attempt_id)
+        return original(state_dir, attempt_id, pr_url)
+
+    monkeypatch.setattr(delivery, "record_pr", spy)
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_valid"]
+    assert recorded == ["att_valid"]
+    assert "" not in recorded
+    assert set(gh.prs) == {"rails/valid"}
+    assert not [call for call in gh.calls if "rails/empty" in call]
+
+
+def test_row_oserror_is_contained_and_remaining_rows_converge(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_first", branch="rails/first")
+    delivery.record_pushed(state, "att_first", "a" * 40)
+    _intent(state, attempt="att_second", branch="rails/second")
+    delivery.record_pushed(state, "att_second", "b" * 40)
+
+    original = delivery.record_pr
+
+    def flaky(state_dir, attempt_id, pr_url):
+        if attempt_id == "att_first":
+            raise OSError("simulated disk failure")
+        return original(state_dir, attempt_id, pr_url)
+
+    monkeypatch.setattr(delivery, "record_pr", flaky)
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+
+    assert result["errors"] == [{
+        "attempt_id": "att_first",
+        "branch": "rails/first",
+        "error": {"error": "record_io_failed", "message": "simulated disk failure",
+                  "fix": "Inspect the deliveries directory; the sweep can be rerun safely."},
+    }]
+    assert [row["attempt_id"] for row in result["opened"]] == ["att_second"]
+    second_record = json.loads((state / "deliveries" / "att_second.json").read_text(encoding="utf-8"))
+    assert second_record["state"] == delivery.STATE_PR_OPEN
+    assert [row["attempt_id"] for row in delivery.pending(state)] == ["att_first"]
+
+    monkeypatch.setattr(delivery, "record_pr", original)
+    gh_second = FakeGh()
+    second = delivery.sweep(state, gh_second)
+
+    assert [row["attempt_id"] for row in second["opened"]] == ["att_first"]
+    first_record = json.loads((state / "deliveries" / "att_first.json").read_text(encoding="utf-8"))
+    assert first_record["state"] == delivery.STATE_PR_OPEN
 
 
 if __name__ == "__main__":
