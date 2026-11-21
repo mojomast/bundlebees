@@ -18,6 +18,7 @@ Run: python -m pytest tests/test_delivery_reconciler.py -q
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -28,7 +29,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bundlebees_plugin import delivery  # noqa: E402
+from bundlebees_plugin import cli, delivery  # noqa: E402
+from tests.fakes import FakeCtx  # noqa: E402
 
 
 class FakeGh:
@@ -126,6 +128,149 @@ class DeliveryLifecycle(unittest.TestCase):
             result = delivery.sweep(d, FakeGh(fail_create="boom: network down"))
             self.assertEqual(result["errors"][0]["error"]["error"], "gh_create_failed")
             self.assertTrue(delivery.pending(d), "failed record stays pending for the next sweep")
+
+
+class DeliveryDamagedRecords(unittest.TestCase):
+    def test_truncated_record_is_damaged_and_valid_delivery_still_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            path = Path(d) / "deliveries" / "att_damaged.json"
+            path.write_text('{"schema": "rizzstack.delivery/1", "attempt_id": "att_damaged"',
+                            encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [{"attempt_id": "att_damaged",
+                                                  "file": "att_damaged.json",
+                                                  "reason": "unreadable_record"}])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(gh.prs["rails/r99-x"], result["opened"][0]["pr_url"])
+            self.assertEqual(delivery.pending(d), [])
+            record = json.loads((Path(d) / "deliveries" / "att_del000000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
+
+    def test_unknown_state_and_identity_mismatch_are_damaged_and_valid_delivery_converges(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_weird.json").write_text(json.dumps({
+                "schema": delivery.SCHEMA,
+                "attempt_id": "att_weird",
+                "repo": "mojomast/bundlebees",
+                "branch": "rails/weird",
+                "state": "pushedish",
+                "pushed_sha": "b" * 40,
+                "created_at": 1.0,
+            }), encoding="utf-8")
+            (deliveries / "att_alpha.json").write_text(json.dumps({
+                "schema": delivery.SCHEMA,
+                "attempt_id": "att_beta",
+                "repo": "mojomast/bundlebees",
+                "branch": "rails/beta",
+                "state": delivery.STATE_PUSHED,
+                "pushed_sha": "c" * 40,
+                "created_at": 2.0,
+            }), encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            reasons = {row["attempt_id"]: row["reason"] for row in result["damaged"]}
+            self.assertEqual(reasons.get("att_weird"), "unknown_state")
+            self.assertEqual(reasons.get("att_alpha"), "identity_mismatch")
+            self.assertFalse((deliveries / "att_beta.json").exists())
+            self.assertEqual(delivery.pending(d), [])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(
+                json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))["state"],
+                delivery.STATE_PR_OPEN,
+            )
+            self.assertEqual(set(gh.prs), {"rails/r99-x"})
+            self.assertEqual(len([c for c in gh.calls
+                                  if c[:2] == ["pr", "create"] and c[c.index("--head") + 1] == "rails/r99-x"]), 1)
+
+    def test_incomplete_pushed_record_does_not_abort_the_sweep(self):
+        with tempfile.TemporaryDirectory() as d:
+            _intent(d)
+            delivery.record_pushed(d, "att_del000000001", "a" * 40)
+            deliveries = Path(d) / "deliveries"
+            (deliveries / "att_nobranch.json").write_text(json.dumps({
+                "schema": delivery.SCHEMA,
+                "attempt_id": "att_nobranch",
+                "branch": "rails/nobranch",
+                "state": delivery.STATE_PUSHED,
+                "pushed_sha": "d" * 40,
+                "created_at": 0.5,
+            }), encoding="utf-8")
+            gh = FakeGh()
+            result = delivery.sweep(d, gh)
+            self.assertEqual(result["damaged"], [{"attempt_id": "att_nobranch",
+                                                  "file": "att_nobranch.json",
+                                                  "reason": "incomplete_record"}])
+            self.assertEqual(len(result["opened"]), 1)
+            self.assertEqual(result["opened"][0]["attempt_id"], "att_del000000001")
+            self.assertEqual(
+                json.loads((deliveries / "att_del000000001.json").read_text(encoding="utf-8"))["state"],
+                delivery.STATE_PR_OPEN,
+            )
+
+
+def test_cli_only_damaged_record_is_not_an_all_clear(tmp_path, capsys, monkeypatch):
+    state = tmp_path / "state"
+    deliveries = state / "deliveries"
+    deliveries.mkdir(parents=True)
+    (deliveries / "att_damaged.json").write_text("{not valid json", encoding="utf-8")
+
+    def forbidden_sweep(*args, **kwargs):
+        raise AssertionError("sweep must not be called when only damaged records exist")
+
+    monkeypatch.setattr(delivery, "sweep", forbidden_sweep)
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(state), dry_run=False))
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "damaged: att_damaged.json - unreadable_record" in out
+    assert "nothing pending" not in out
+
+
+def test_cli_reports_damaged_alongside_opened(tmp_path, capsys, monkeypatch):
+    state = tmp_path / "state"
+    delivery.record_intent(state, attempt_id="att_del000000001", repo="mojomast/bundlebees",
+                           branch="rails/r99-x", base_sha="0" * 40, title="t", body="b")
+    delivery.record_pushed(state, "att_del000000001", "a" * 40)
+    deliveries = state / "deliveries"
+    (deliveries / "att_damaged.json").write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(delivery, "sweep", lambda *args, **kwargs: {
+        "opened": [{"branch": "fix/x", "pr_url": "u", "attempt_id": "att_x"}],
+        "existing": [],
+        "blocked": [],
+        "errors": [],
+        "damaged": [{"attempt_id": "att_damaged", "file": "att_damaged.json",
+                     "reason": "unreadable_record"}],
+    })
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(state), dry_run=False))
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "opened: fix/x -> u" in out
+    assert "damaged: att_damaged.json - unreadable_record" in out
+    assert "damaged=1" in out
+
+
+def test_cli_pr_open_only_keeps_the_all_clear(tmp_path, capsys):
+    state = tmp_path / "state"
+    delivery.record_intent(state, attempt_id="att_done", repo="mojomast/bundlebees",
+                           branch="rails/done", base_sha="0" * 40, title="t", body="b")
+    delivery.record_pushed(state, "att_done", "a" * 40)
+    delivery.record_pr(state, "att_done", "https://github.com/mojomast/bundlebees/pull/1")
+
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(state), dry_run=False))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "deliver: nothing pending (every pushed delivery already has a PR)" in out
 
 
 if __name__ == "__main__":

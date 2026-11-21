@@ -495,10 +495,17 @@ def _build_parser(parser: Any) -> Any:
 def _cmd_deliver(ctx: Any, args: Any) -> int:
     """Reconcile pending deliveries (open missing PRs). Idempotent; safe on a timer."""
     state_dir = Path(getattr(args, "state_dir", None) or settings.state_dir(ctx))
-    rows = _delivery.pending(state_dir)
-    if not rows:
+    scanned = _delivery.scan(state_dir)
+    rows = scanned["pending"]
+    damaged = scanned["damaged"]
+    if not rows and not damaged:
         _print("deliver: nothing pending (every pushed delivery already has a PR)")
         return 0
+    if not rows:
+        for row in damaged:
+            _print(f"damaged: {row['file']} - {row['reason']}")
+        _print(f"deliver: opened=0 existing=0 blocked=0 errors=0 damaged={len(damaged)}")
+        return 2
     result = _delivery.sweep(state_dir, dry_run=getattr(args, "dry_run", False))
     for row in result["opened"]:
         _print(f"opened: {row['branch']} -> {row['pr_url']}")
@@ -508,9 +515,12 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
         _print(f"blocked: {row['branch']} - {row['reason']} (re-run verify)")
     for row in result["errors"]:
         _print(f"error: {row['branch']} - {row['error']['message']}")
+    for row in result["damaged"]:
+        _print(f"damaged: {row['file']} - {row['reason']}")
     _print(f"deliver: opened={len(result['opened'])} existing={len(result['existing'])} "
-           f"blocked={len(result['blocked'])} errors={len(result['errors'])}")
-    return 0 if not result["errors"] else 2
+           f"blocked={len(result['blocked'])} errors={len(result['errors'])} "
+           f"damaged={len(result['damaged'])}")
+    return 0 if not result["errors"] and not result["damaged"] else 2
 
 
 def _cmd_board_dispatch(ctx: Any, args: Any) -> int:

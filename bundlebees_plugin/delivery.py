@@ -127,18 +127,68 @@ def record_pr(state_dir: str | os.PathLike, attempt_id: str, pr_url: str) -> dic
     return record
 
 
-def pending(state_dir: str | os.PathLike) -> list[dict]:
-    """Every delivery record that is not yet ``pr_open``, oldest first."""
-    rows = []
+_PENDING_STATES = (STATE_INTENT, STATE_PUSHED)
+_KNOWN_STATES = (STATE_INTENT, STATE_PUSHED, STATE_PR_OPEN)
+
+
+def _damaged(path: Path, reason: str) -> dict:
+    return {"attempt_id": path.stem, "file": path.name, "reason": reason}
+
+
+def _nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def scan(state_dir: str | os.PathLike) -> dict:
+    """Classify every ``deliveries/*.json`` as pending, terminal, or damaged.
+
+    Each file is read exactly once. ``pending`` keeps the historical contract:
+    records in ``intent`` or ``pushed`` usable by :func:`next_step`, oldest first.
+    ``damaged`` entries carry the file stem, basename, and a stable reason code;
+    they are never passed to the relay or to any path builder.
+    """
+    pending_rows: list[dict] = []
+    damaged_rows: list[dict] = []
     for path in sorted(_deliveries_dir(state_dir).glob("*.json")):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            damaged_rows.append(_damaged(path, "unreadable_record"))
             continue
-        if record.get("state") in (STATE_INTENT, STATE_PUSHED):
+        if not isinstance(record, dict):
+            damaged_rows.append(_damaged(path, "not_an_object"))
+            continue
+        attempt_id = record.get("attempt_id")
+        if not isinstance(attempt_id, str):
+            damaged_rows.append(_damaged(path, "missing_attempt_id"))
+            continue
+        if record.get("schema") != SCHEMA:
+            damaged_rows.append(_damaged(path, "schema_mismatch"))
+            continue
+        if attempt_id != path.stem:
+            damaged_rows.append(_damaged(path, "identity_mismatch"))
+            continue
+        state = record.get("state")
+        if state not in _KNOWN_STATES:
+            damaged_rows.append(_damaged(path, "unknown_state"))
+            continue
+        if (not _nonempty_str(record.get("repo"))
+                or not _nonempty_str(record.get("branch"))
+                or (state == STATE_PUSHED and not _nonempty_str(record.get("pushed_sha")))):
+            damaged_rows.append(_damaged(path, "incomplete_record"))
+            continue
+        if state in _PENDING_STATES:
             record["state_dir"] = str(state_dir)
-            rows.append(record)
-    return sorted(rows, key=lambda r: r.get("created_at") or 0)
+            pending_rows.append(record)
+    return {
+        "pending": sorted(pending_rows, key=lambda r: r.get("created_at") or 0),
+        "damaged": damaged_rows,
+    }
+
+
+def pending(state_dir: str | os.PathLike) -> list[dict]:
+    """Every delivery record that is not yet ``pr_open``, oldest first."""
+    return scan(state_dir)["pending"]
 
 
 def next_step(record: dict) -> str:
@@ -196,8 +246,10 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
     Idempotent and safe to run on a timer: an existing PR is recognized before any
     create call, so repeated sweeps never duplicate work.
     """
-    result = {"opened": [], "existing": [], "blocked": [], "errors": []}
-    for record in pending(state_dir):
+    scanned = scan(state_dir)
+    result = {"opened": [], "existing": [], "blocked": [], "errors": [],
+              "damaged": list(scanned["damaged"])}
+    for record in scanned["pending"]:
         step = next_step(record)
         if step == "blocked_no_push":
             result["blocked"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
