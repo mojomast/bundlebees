@@ -29,6 +29,7 @@ evidence the coordinator actually tested.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -139,6 +140,18 @@ def _nonempty_str(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _created_key(record: dict) -> float:
+    """Total ordering key: any non-real ``created_at`` is unknown, so oldest (0.0)."""
+    value = record.get("created_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
 def scan(state_dir: str | os.PathLike) -> dict:
     """Classify every ``deliveries/*.json`` as pending, terminal, or damaged.
 
@@ -165,23 +178,29 @@ def scan(state_dir: str | os.PathLike) -> dict:
         if record.get("schema") != SCHEMA:
             damaged_rows.append(_damaged(path, "schema_mismatch"))
             continue
-        if attempt_id != path.stem:
+        if _record_path(state_dir, attempt_id).name != path.name:
             damaged_rows.append(_damaged(path, "identity_mismatch"))
             continue
         state = record.get("state")
         if state not in _KNOWN_STATES:
             damaged_rows.append(_damaged(path, "unknown_state"))
             continue
-        if (not _nonempty_str(record.get("repo"))
-                or not _nonempty_str(record.get("branch"))
-                or (state == STATE_PUSHED and not _nonempty_str(record.get("pushed_sha")))):
+        if state == STATE_PR_OPEN:
+            complete = _nonempty_str(record.get("pr_url"))
+        elif state == STATE_PUSHED:
+            complete = (_nonempty_str(record.get("repo"))
+                        and _nonempty_str(record.get("branch"))
+                        and _nonempty_str(record.get("pushed_sha")))
+        else:
+            complete = _nonempty_str(record.get("repo")) and _nonempty_str(record.get("branch"))
+        if not complete:
             damaged_rows.append(_damaged(path, "incomplete_record"))
             continue
         if state in _PENDING_STATES:
             record["state_dir"] = str(state_dir)
             pending_rows.append(record)
     return {
-        "pending": sorted(pending_rows, key=lambda r: r.get("created_at") or 0),
+        "pending": sorted(pending_rows, key=_created_key),
         "damaged": damaged_rows,
     }
 
@@ -193,9 +212,10 @@ def pending(state_dir: str | os.PathLike) -> list[dict]:
 
 def next_step(record: dict) -> str:
     """The single next reconcilable action for a record (level-triggered decision)."""
-    if record.get("state") == STATE_PUSHED and not record.get("pr_url"):
-        return "open_pr"
-    if record.get("state") == STATE_INTENT:
+    state = record.get("state")
+    if state == STATE_PUSHED:
+        return "record_pr" if _nonempty_str(record.get("pr_url")) else "open_pr"
+    if state == STATE_INTENT:
         return "blocked_no_push"
     return "done"
 
@@ -254,6 +274,16 @@ def sweep(state_dir: str | os.PathLike, runner: Callable[[list[str]], tuple[int,
         if step == "blocked_no_push":
             result["blocked"].append({"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
                                       "reason": "intent recorded but no pushed_sha: the push never landed"})
+            continue
+        if step == "record_pr":
+            pr_url = record["pr_url"]
+            row = {"attempt_id": record.get("attempt_id"), "branch": record.get("branch"),
+                   "pr_url": pr_url}
+            if dry_run:
+                row["dry_run"] = True
+            else:
+                record_pr(state_dir, record["attempt_id"], pr_url)
+            result["existing"].append(row)
             continue
         if step != "open_pr":
             continue

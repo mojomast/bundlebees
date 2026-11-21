@@ -395,5 +395,150 @@ def test_cli_pr_open_only_keeps_the_all_clear(tmp_path, capsys):
     assert "deliver: nothing pending (every pushed delivery already has a PR)" in out
 
 
+def test_non_numeric_created_at_is_total_and_sweeps_all(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_strtime", branch="rails/strtime")
+    delivery.record_pushed(state, "att_strtime", "a" * 40)
+    _intent(state, attempt="att_numtime", branch="rails/numtime")
+    delivery.record_pushed(state, "att_numtime", "b" * 40)
+
+    string_path = state / "deliveries" / "att_strtime.json"
+    record = json.loads(string_path.read_text(encoding="utf-8"))
+    record["created_at"] = "2026-11-20T00:00:00Z"
+    string_path.write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+
+    rows = delivery.pending(state)
+    assert [row["attempt_id"] for row in rows] == ["att_strtime", "att_numtime"]
+    assert rows[0]["created_at"] == "2026-11-20T00:00:00Z"
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+    assert {row["attempt_id"] for row in result["opened"]} == {"att_strtime", "att_numtime"}
+    assert len([call for call in gh.calls if call[:2] == ["pr", "create"]]) == 2
+    assert delivery.pending(state) == []
+
+
+def test_pushed_with_pr_url_converges_as_existing(tmp_path, capsys):
+    url = "https://github.com/mojomast/bundlebees/pull/321"
+
+    def make_store(name):
+        state = tmp_path / name
+        _intent(state, attempt="att_haspr", branch="rails/haspr")
+        delivery.record_pushed(state, "att_haspr", "c" * 40)
+        path = state / "deliveries" / "att_haspr.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["pr_url"] = url
+        path.write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+        return state, path
+
+    state, path = make_store("sweep")
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+    assert result["existing"] == [{"attempt_id": "att_haspr", "branch": "rails/haspr", "pr_url": url}]
+    assert result["opened"] == []
+    assert gh.calls == []
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == delivery.STATE_PR_OPEN
+
+    second = delivery.sweep(state, gh)
+    assert second == {"opened": [], "existing": [], "blocked": [], "errors": [], "damaged": []}
+    assert gh.calls == []
+
+    cli_state, _ = make_store("cli")
+    capsys.readouterr()
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(cli_state), dry_run=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "existing: rails/haspr -> " in out
+    assert "existing=1" in out
+
+    dry_state, dry_path = make_store("dry")
+    before = dry_path.read_text(encoding="utf-8")
+    gh_dry = FakeGh()
+    dry = delivery.sweep(dry_state, gh_dry, dry_run=True)
+    assert dry["existing"] == [{"attempt_id": "att_haspr", "branch": "rails/haspr",
+                                "pr_url": url, "dry_run": True}]
+    assert dry_path.read_text(encoding="utf-8") == before
+    assert json.loads(dry_path.read_text(encoding="utf-8"))["state"] == delivery.STATE_PUSHED
+    assert gh_dry.calls == []
+
+
+def test_non_round_trip_filenames_are_damaged_without_abort(tmp_path):
+    state = tmp_path / "state"
+    _intent(state, attempt="att_del000000001", branch="rails/r99-x")
+    delivery.record_pushed(state, "att_del000000001", "a" * 40)
+    deliveries = state / "deliveries"
+
+    (deliveries / ".json").write_text(json.dumps({
+        "schema": delivery.SCHEMA,
+        "attempt_id": ".json",
+        "repo": "mojomast/bundlebees",
+        "branch": "rails/dotjson",
+        "state": delivery.STATE_PUSHED,
+        "pushed_sha": "d" * 40,
+        "created_at": 0.5,
+    }), encoding="utf-8")
+    (deliveries / "att space.json").write_text(json.dumps({
+        "schema": delivery.SCHEMA,
+        "attempt_id": "att space",
+        "repo": "mojomast/bundlebees",
+        "branch": "rails/space",
+        "state": delivery.STATE_PUSHED,
+        "pushed_sha": "e" * 40,
+        "created_at": 0.6,
+    }), encoding="utf-8")
+
+    gh = FakeGh()
+    result = delivery.sweep(state, gh)
+
+    scanned = delivery.scan(state)
+    reasons = {row["file"]: row["reason"] for row in scanned["damaged"]}
+    assert reasons == {".json": "identity_mismatch", "att space.json": "identity_mismatch"}
+    assert len(result["opened"]) == 1
+    assert result["opened"][0]["attempt_id"] == "att_del000000001"
+    assert not (deliveries / ".json.json").exists()
+    assert not (deliveries / "att_space.json").exists()
+    assert delivery.pending(state) == []
+
+
+def test_pr_open_completeness_is_state_aware(tmp_path, capsys):
+    def write_pr_open(directory, attempt_id, pr_url):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{attempt_id}.json").write_text(json.dumps({
+            "schema": delivery.SCHEMA,
+            "attempt_id": attempt_id,
+            "state": delivery.STATE_PR_OPEN,
+            "pr_url": pr_url,
+            "created_at": 1.0,
+        }), encoding="utf-8")
+
+    good_state = tmp_path / "good"
+    write_pr_open(good_state / "deliveries", "att_prgood",
+                  "https://github.com/mojomast/bundlebees/pull/9")
+
+    scanned = delivery.scan(good_state)
+    assert scanned["pending"] == []
+    assert scanned["damaged"] == []
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(good_state), dry_run=False))
+    good_out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing pending" in good_out
+
+    bad_state = tmp_path / "bad"
+    write_pr_open(bad_state / "deliveries", "att_prgood",
+                  "https://github.com/mojomast/bundlebees/pull/9")
+    write_pr_open(bad_state / "deliveries", "att_prnull", None)
+
+    scanned_bad = delivery.scan(bad_state)
+    assert scanned_bad["pending"] == []
+    assert scanned_bad["damaged"] == [{"attempt_id": "att_prnull",
+                                       "file": "att_prnull.json",
+                                       "reason": "incomplete_record"}]
+    rc_bad = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=str(bad_state), dry_run=False))
+    bad_out = capsys.readouterr().out
+    assert rc_bad == 2
+    assert "damaged: att_prnull.json - incomplete_record" in bad_out
+    assert "att_prgood" not in bad_out
+
+
 if __name__ == "__main__":
     unittest.main()
