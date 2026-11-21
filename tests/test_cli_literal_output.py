@@ -504,3 +504,56 @@ def test_verify_record_still_scrubs_an_acdd_subset_argv(tmp_path, monkeypatch):
 
     assert argv_text != text
     assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_a_node_argv_with_a_trailing_token(tmp_path):
+    """Pin review-bb-pr229 F1: a trailing node token must never be echoed literally."""
+
+    tests = ["tests/" + "a1" * 20 + ".test.mjs", "tests/b.test.mjs"]
+    text = " ".join(
+        ["node", "--test", *tests, "--report=9f2c7d1e5a3b4c6d8e0f1a2b3c4d5e6f"]
+    )
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_final_suffix(
+    tmp_path, monkeypatch
+):
+    """Pin review-bb-pr229 F2: only exact equality with sys.executable may restore the argv literally."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    suffix_path = (
+        "/home/clanker01/.ssh/9f2c7d1e5a3b4c6d8e0f1a2b3c4d5e6f/bin/python3.14"
+    )
+    text = " ".join([suffix_path, *PYTEST_FLAGS, *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
+
+
+def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_basename(
+    tmp_path, monkeypatch
+):
+    """Pin review-bb-pr229 F2/N3: only exact sys.executable equality restores the argv literally."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    basename_path = (
+        "/home/clanker01/.ssh/9f2c7d1e5a3b4c6d8e0f1a2b3c4d5e6f/python3.14"
+    )
+    text = " ".join([basename_path, *PYTEST_FLAGS, *tests])
+
+    record = _write_argv_record(tmp_path, tests, text)
+    argv_text = record["evidence"]["test_argv"]
+
+    assert argv_text != text
+    assert "[redacted]" in argv_text
