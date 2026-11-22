@@ -44,7 +44,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import brief as _brief_mod
 from . import coverage as _coverage
@@ -2417,6 +2417,21 @@ def _test_argv_text(argv: list[str]) -> str:
     return " ".join(argv)[:2000]
 
 
+class _SandboxEvidence(dict):
+    """Sandbox result that carries the exact argv this process executed.
+
+    The argv lives on the object, not in the mapping: only code that actually
+    ran the sandbox can hand it to the verify record, so a record can never
+    describe an argv this process did not execute.
+    """
+
+    argv: tuple[str, ...]
+
+    def __init__(self, *args: Any, argv: Sequence[str] = (), **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.argv = tuple(argv)
+
+
 _PYTEST_ARGV_FLAGS = (
     "-B",
     "-m",
@@ -2503,7 +2518,7 @@ def _run_sandboxed(
             "node is not resolvable inside the sandbox: " + _tail(result.get("output_tail")),
             _FIX_NODE_MISSING,
         )
-    evidence = dict(result)
+    evidence = _SandboxEvidence(result, argv=argv)
     evidence["runner"] = runner
     evidence["test_argv"] = _test_argv_text(argv)
     return evidence
@@ -2664,6 +2679,7 @@ def _write_verify_result(
     files: list[str],
     tests: list[str],
     evidence: Mapping[str, Any] | None = None,
+    executed_argv: Sequence[str] | None = None,
     code: str | None = None,
     error: str | None = None,
     dry_run: bool = False,
@@ -2717,8 +2733,15 @@ def _write_verify_result(
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
     argv_text = _trusted_test_argv(evidence, list(tests))
-    if argv_text is not None:
+    executed_text = (
+        _test_argv_text(list(executed_argv)) if executed_argv is not None else None
+    )
+    if argv_text is not None and argv_text == executed_text:
         clean["evidence"]["test_argv"] = argv_text
+    elif executed_text is not None and argv_text is None:
+        # Provenance wins: the executed argv came from this process, so it is
+        # safe to record even when the evidence text is not a trusted shape.
+        clean["evidence"]["test_argv"] = executed_text
     data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
     tmp_path: str | None = None
     handle = None
@@ -2900,6 +2923,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
     repo: Path | None = None
     run_id = "default"
     evidence: dict[str, Any] = {}
+    test_evidence: dict[str, Any] | None = None
     repo_value = config.get("repo_path")
     if repo_value:
         try:
@@ -3059,6 +3083,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             target = _write_verify_result(
                 state_dir, attempt_id, ok=True, sha=None, branch=branch,
                 files=files, tests=tests, evidence=evidence, dry_run=True,
+                executed_argv=getattr(test_evidence, "argv", None),
             )
             _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="dry_run")
             _print("bundlebees verify")
@@ -3109,6 +3134,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         target = _write_verify_result(
             state_dir, attempt_id, ok=True, sha=sha, branch=branch,
             files=files, tests=tests, evidence=evidence,
+            executed_argv=getattr(test_evidence, "argv", None),
         )
         _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="verified", sha=sha)
 
@@ -3159,6 +3185,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 state_dir, attempt_id, ok=False, sha=sha, branch=branch,
                 files=files, tests=tests, evidence=evidence,
                 code=str(exc.code), error=reason, dry_run=dry_run,
+                executed_argv=getattr(test_evidence, "argv", None),
             )
         except CliError as record_exc:
             if record_exc.code == "state_dir_uncontained":

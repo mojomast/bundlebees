@@ -361,7 +361,7 @@ def test_verify_record_preserves_null_and_empty_branch(tmp_path, branch, expecte
     assert record["branch"] != "[redacted]"
 
 
-def _write_argv_record(tmp_path, tests, text):
+def _write_argv_record(tmp_path, tests, text, executed=None):
     state = tmp_path / "state"
     target = cli._write_verify_result(
         state,
@@ -372,6 +372,7 @@ def _write_argv_record(tmp_path, tests, text):
         files=[],
         tests=tests,
         evidence={"test_argv": text},
+        executed_argv=executed,
     )
     return json.loads(target.read_text(encoding="utf-8"))
 
@@ -381,7 +382,7 @@ def test_verify_record_keeps_cli_built_pytest_argv_literal(tmp_path, monkeypatch
     tests = ["tests/test_sample.py"]
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
 
-    record = _write_argv_record(tmp_path, tests, text)
+    record = _write_argv_record(tmp_path, tests, text, executed=text.split(" "))
 
     assert record["evidence"]["test_argv"] == text
     assert INTERPRETER in record["evidence"]["test_argv"]
@@ -391,7 +392,7 @@ def test_verify_record_keeps_node_argv_literal(tmp_path):
     tests = ["tests/" + "a1" * 20 + ".test.mjs", "tests/b.test.mjs"]
     text = " ".join(["node", "--test", *tests])
 
-    record = _write_argv_record(tmp_path, tests, text)
+    record = _write_argv_record(tmp_path, tests, text, executed=text.split(" "))
 
     assert record["evidence"]["test_argv"] == text
     assert tests[0] in record["evidence"]["test_argv"]
@@ -1003,3 +1004,77 @@ def test_trusted_argv_rejects_multi_target_conjunction_widenings(
     record = _write_argv_record(tmp_path, tests, text)
     assert record["evidence"]["test_argv"] != text
     assert "[redacted]" in record["evidence"]["test_argv"]
+
+
+def test_verify_record_does_not_restore_evidence_text_without_an_executed_argv(
+    tmp_path, monkeypatch
+):
+    """Forging evidence text alone must never produce an argv the process did not run.
+
+    The base restored it verbatim: the coordinator measured
+    ``forged_template_restored: True`` at ff59bb0.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        "att-prov",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-provenance",
+        files=[],
+        tests=tests,
+        evidence={"test_argv": text},
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert record["evidence"].get("test_argv") != text
+    assert "[redacted]" in record["evidence"]["test_argv"]
+
+
+def test_verify_record_prefers_the_executed_argv_over_evidence_text(
+    tmp_path, monkeypatch
+):
+    """The record describes what ran, never what a caller claimed."""
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    forged = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_other.py"])
+
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        "att-prov",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-provenance",
+        files=[],
+        tests=tests,
+        evidence={"test_argv": forged},
+        executed_argv=[INTERPRETER, *PYTEST_FLAGS, *tests],
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert record["evidence"]["test_argv"] == " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+    assert record["evidence"]["test_argv"] != forged
+
+
+def test_run_sandboxed_carries_the_executed_argv(tmp_path, monkeypatch):
+    def fake_run(workdir, argv, **kwargs):
+        return {
+            "backend": "fake",
+            "exit_code": 0,
+            "timed_out": False,
+            "output_tail": "",
+        }
+
+    monkeypatch.setattr(cli.sandbox, "run_in_sandbox", fake_run)
+
+    ev = cli._run_sandboxed(tmp_path, ["tests/test_sample.py"], {})
+
+    assert type(ev).__name__ == "_SandboxEvidence"
+    assert ev.argv == tuple(cli.sandbox.pytest_argv(["tests/test_sample.py"]))
+    assert ev["test_argv"] == " ".join(ev.argv)
+    assert isinstance(ev, dict)

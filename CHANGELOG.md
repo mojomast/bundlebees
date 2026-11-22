@@ -15,6 +15,8 @@ below lives in the coordinator, independent of which agent produced the work.
 Built as six file-leased DeepSeek bee slices (two waves) and integrated in
 one pull request.
 
+- `verify` records now carry a `test_argv` only when it equals the argv the same process executed (provenance via the sandbox evidence object), so evidence text alone can no longer restore a forged or secret-bearing argv however the shape comparison is widened (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2, closed as a class).
+
 ### Changed (rizzstack cleanup, Nov 2026)
 
 - **Tool-completion dedupe reader hardened:** the reader now opens `tool-completions` with a directory-level no-symlink guard and a `dir_fd`-relative record open, refuses multi-link records, and bounds a record at 65536 bytes, so a symlinked, hardlinked, or oversized planted record can no longer suppress the landing event (a planted record that is a real, single-link file of at most 65536 bytes is still trusted as the attempt's prior record).
