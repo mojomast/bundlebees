@@ -2428,7 +2428,7 @@ class _SandboxEvidence(dict):
     argv: it is that text verbatim when the evidence text is the exact trusted
     template for these tests and equals the executed argv; when the evidence
     text is not that template, the executed argv's scrubbed form is recorded;
-    and the key is absent when there is no executed argv, or when the evidence
+    and the key is absent when there is no executed argv (an empty argv sequence counts as none), or when the evidence
     text is that template but the executed argv is not. Evidence-only text is
     never restored, and the argv still lives only on the object.
     """
@@ -2742,9 +2742,9 @@ def _write_verify_result(
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
     clean["evidence"].pop("test_argv", None)
     argv_text = _trusted_test_argv(evidence, list(tests))
-    executed_text = (
-        _test_argv_text(list(executed_argv)) if executed_argv is not None else None
-    )
+    # An empty sequence means this process executed no argv.
+    executed = list(executed_argv) if executed_argv is not None else []
+    executed_text = _test_argv_text(executed) if executed else None
     if argv_text is not None and argv_text == executed_text:
         clean["evidence"]["test_argv"] = argv_text
     elif executed_text is not None and argv_text is None:
