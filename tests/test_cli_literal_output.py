@@ -1155,3 +1155,76 @@ def test_verify_record_keeps_a_scrub_clean_untrusted_executed_argv(tmp_path):
     record = json.loads(result.read_text(encoding="utf-8"))
 
     assert record["evidence"]["test_argv"] == " ".join(executed)
+
+
+def test_verify_record_omits_test_argv_for_an_empty_executed_argv(tmp_path):
+    """An empty executed argv is "no argv", so the key must be absent.
+
+    At bff4cfe the key is present with the empty string, so the record claims
+    an argv ran that did not.
+    """
+
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        "att-argv-empty",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-empty",
+        files=[],
+        tests=["tests/test_sample.py"],
+        executed_argv=[],
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert "test_argv" not in record["evidence"]
+
+
+def test_verify_record_omits_test_argv_for_non_template_evidence_and_an_empty_argv(
+    tmp_path,
+):
+    """The non-template lane must not turn evidence-only text into an argv claim.
+
+    An empty sequence, list or tuple, means this process executed no argv, so
+    the forged evidence text must not survive as the empty string.
+    """
+
+    for executed in ([], ()):
+        target = cli._write_verify_result(
+            tmp_path / "state",
+            "att-argv-empty-forged",
+            ok=True,
+            sha=None,
+            branch="fix/verify-record-argv-empty",
+            files=[],
+            tests=["tests/test_sample.py"],
+            evidence={"test_argv": "forged text"},
+            executed_argv=executed,
+        )
+        record = json.loads(target.read_text(encoding="utf-8"))
+
+        assert "test_argv" not in record["evidence"]
+
+
+def test_verify_record_records_a_non_empty_untrusted_executed_argv(tmp_path):
+    """Control, not a RED: a non-empty untrusted argv is still recorded.
+
+    This passes at the base commit too and pins the lane the empty-sequence fix
+    must not disturb.
+    """
+
+    executed = ["/usr/bin/python3", "-B", "-m", "pytest", "tests/test_sample.py"]
+
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        "att-argv-untrusted",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-empty",
+        files=[],
+        tests=["tests/test_sample.py"],
+        evidence={"test_argv": "forged text"},
+        executed_argv=executed,
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert record["evidence"]["test_argv"] == " ".join(executed)
