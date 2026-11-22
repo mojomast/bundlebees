@@ -2425,11 +2425,12 @@ class _SandboxEvidence(dict):
     describe an argv this process did not execute.
 
     The record's ``test_argv`` is present only when this process executed an
-    argv: it is that exact argv when it matches the trusted template, and that
-    argv's scrubbed form otherwise. When there is no executed argv, or when
-    evidence text disagrees with the executed argv, the key is absent;
-    evidence-only text is never restored, and the argv still lives only on the
-    object.
+    argv: it is that text verbatim when the evidence text is the exact trusted
+    template for these tests and equals the executed argv; when the evidence
+    text is not that template, the executed argv's scrubbed form is recorded;
+    and the key is absent when there is no executed argv, or when the evidence
+    text is that template but the executed argv is not. Evidence-only text is
+    never restored, and the argv still lives only on the object.
     """
 
     argv: tuple[str, ...]
