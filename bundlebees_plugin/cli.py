@@ -2424,9 +2424,11 @@ class _SandboxEvidence(dict):
     ran the sandbox can hand it to the verify record, so a record can never
     describe an argv this process did not execute.
 
-    The record's ``test_argv`` is either the exact argv this process executed
-    (when it matches the trusted template) or that argv's scrubbed form.
-    Evidence-only text is never restored; the argv still lives only on the
+    The record's ``test_argv`` is present only when this process executed an
+    argv: it is that exact argv when it matches the trusted template, and that
+    argv's scrubbed form otherwise. When there is no executed argv, or when
+    evidence text disagrees with the executed argv, the key is absent;
+    evidence-only text is never restored, and the argv still lives only on the
     object.
     """
 
