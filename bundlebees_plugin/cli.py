@@ -2732,6 +2732,7 @@ def _write_verify_result(
     # A git SHA is evidence, not a secret; scrub() cannot distinguish a 40-char
     # hex digest from a key-shaped string, so restore the validated digest.
     clean["sha"] = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    clean["evidence"].pop("test_argv", None)
     argv_text = _trusted_test_argv(evidence, list(tests))
     executed_text = (
         _test_argv_text(list(executed_argv)) if executed_argv is not None else None

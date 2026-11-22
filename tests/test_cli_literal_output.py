@@ -404,10 +404,7 @@ def test_verify_record_still_scrubs_a_non_template_argv(tmp_path, monkeypatch):
     text = INTERPRETER + " -m pytest tests/test_sample.py"
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_truncated_template(tmp_path, monkeypatch):
@@ -417,10 +414,7 @@ def test_verify_record_still_scrubs_a_truncated_template(tmp_path, monkeypatch):
 
     assert len(text) > 2000
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_foreign_interpreter_pytest_argv(
@@ -431,10 +425,7 @@ def test_verify_record_still_scrubs_a_foreign_interpreter_pytest_argv(
     text = " ".join([FOREIGN_INTERPRETER, *PYTEST_FLAGS, *tests])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_pytest_argv_with_trailing_tokens(
@@ -445,10 +436,7 @@ def test_verify_record_still_scrubs_a_pytest_argv_with_trailing_tokens(
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests, "--maxfail=1"])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_node_argv_with_an_extra_flag(tmp_path):
@@ -456,10 +444,7 @@ def test_verify_record_still_scrubs_a_node_argv_with_an_extra_flag(tmp_path):
     text = " ".join(["node", "--test", "--experimental-strip-types", *tests])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_node_argv_missing_a_target(tmp_path):
@@ -467,10 +452,7 @@ def test_verify_record_still_scrubs_a_node_argv_missing_a_target(tmp_path):
     text = " ".join(["node", "--test", tests[0]])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_space_containing_target(
@@ -487,10 +469,7 @@ def test_verify_record_still_scrubs_a_space_containing_target(
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_an_acdd_subset_argv(tmp_path, monkeypatch):
@@ -501,10 +480,7 @@ def test_verify_record_still_scrubs_an_acdd_subset_argv(tmp_path, monkeypatch):
     text = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_sample.py"])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_a_node_argv_with_a_trailing_token(tmp_path):
@@ -516,10 +492,7 @@ def test_verify_record_still_scrubs_a_node_argv_with_a_trailing_token(tmp_path):
     )
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_final_suffix(
@@ -535,10 +508,7 @@ def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_final_suffix
     text = " ".join([suffix_path, *PYTEST_FLAGS, *tests])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_basename(
@@ -554,10 +524,7 @@ def test_verify_record_still_scrubs_an_interpreter_sharing_only_the_basename(
     text = " ".join([basename_path, *PYTEST_FLAGS, *tests])
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 _NEAR_MISS_RUN = "9f2c7d1e5a3b4c6d8e0f1a2b3c4d5e6f"
@@ -607,10 +574,7 @@ def test_trusted_argv_rejects_every_near_miss_interpreter_shape(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 def test_trusted_argv_rejects_an_exact_interpreter_with_a_leading_token(
@@ -625,10 +589,7 @@ def test_trusted_argv_rejects_an_exact_interpreter_with_a_leading_token(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 RESIDUAL_ARGV_SHAPES = (
@@ -703,10 +664,7 @@ def test_trusted_argv_rejects_residual_widened_shapes(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    argv_text = record["evidence"]["test_argv"]
-
-    assert argv_text != text
-    assert "[redacted]" in argv_text
+    assert "test_argv" not in record["evidence"]
 
 
 _NEAR_MISS_DIR = "/home/clanker01/.ssh/" + _NEAR_MISS_RUN
@@ -815,8 +773,7 @@ def test_trusted_argv_rejects_a_one_token_mutation_at_every_position(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    assert record["evidence"]["test_argv"] != text
-    assert "[redacted]" in record["evidence"]["test_argv"]
+    assert "test_argv" not in record["evidence"]
 
 
 ARGV_SWEEP_POSITIVE_CASES = (
@@ -929,8 +886,7 @@ def test_trusted_argv_rejects_two_target_and_normalised_widenings(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    assert record["evidence"]["test_argv"] != text
-    assert "[redacted]" in record["evidence"]["test_argv"]
+    assert "test_argv" not in record["evidence"]
 
 
 def test_trusted_argv_two_target_exact_template_still_restores(monkeypatch):
@@ -1002,8 +958,7 @@ def test_trusted_argv_rejects_multi_target_conjunction_widenings(
     assert cli._trusted_test_argv({"test_argv": text}, tests) is None
 
     record = _write_argv_record(tmp_path, tests, text)
-    assert record["evidence"]["test_argv"] != text
-    assert "[redacted]" in record["evidence"]["test_argv"]
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_does_not_restore_evidence_text_without_an_executed_argv(
@@ -1011,13 +966,14 @@ def test_verify_record_does_not_restore_evidence_text_without_an_executed_argv(
 ):
     """Forging evidence text alone must never produce an argv the process did not run.
 
-    The base restored it verbatim: the coordinator measured
-    ``forged_template_restored: True`` at ff59bb0.
+    The interpreter is scrub-clean, so ``scrub`` cannot be what removes the
+    text: only provenance may keep it out of the record (review-bb-pr236 F3).
     """
 
-    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    interpreter = "/usr/bin/python3"
+    monkeypatch.setattr(cli.sys, "executable", interpreter)
     tests = ["tests/test_sample.py"]
-    text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+    text = " ".join([interpreter, *PYTEST_FLAGS, *tests])
 
     target = cli._write_verify_result(
         tmp_path / "state",
@@ -1031,8 +987,7 @@ def test_verify_record_does_not_restore_evidence_text_without_an_executed_argv(
     )
     record = json.loads(target.read_text(encoding="utf-8"))
 
-    assert record["evidence"].get("test_argv") != text
-    assert "[redacted]" in record["evidence"]["test_argv"]
+    assert "test_argv" not in record["evidence"]
 
 
 def test_verify_record_prefers_the_executed_argv_over_evidence_text(
@@ -1078,3 +1033,36 @@ def test_run_sandboxed_carries_the_executed_argv(tmp_path, monkeypatch):
     assert ev.argv == tuple(cli.sandbox.pytest_argv(["tests/test_sample.py"]))
     assert ev["test_argv"] == " ".join(ev.argv)
     assert isinstance(ev, dict)
+
+
+def test_verify_record_drops_canonical_evidence_text_when_the_executed_argv_disagrees(
+    tmp_path, monkeypatch
+):
+    """A canonical evidence text must not survive when the executed argv differs.
+
+    The evidence text is canonical for the record's tests, so the old shape
+    gate accepts it. The executed argv names a different target, so the first
+    branch's equality check fails; at 81c34be neither branch fired and the
+    evidence-text residual stayed in the record - the exact residual
+    review-bb-pr236 F1 measured.
+    """
+
+    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    tests = ["tests/test_sample.py"]
+    evidence_text = " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+    executed = [INTERPRETER, *PYTEST_FLAGS, "tests/test_other.py"]
+
+    target = cli._write_verify_result(
+        tmp_path / "state",
+        "att-prov-disagree",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-provenance",
+        files=[],
+        tests=tests,
+        evidence={"test_argv": evidence_text},
+        executed_argv=executed,
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+
+    assert "test_argv" not in record["evidence"]
