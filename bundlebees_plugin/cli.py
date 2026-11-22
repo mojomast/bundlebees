@@ -2423,6 +2423,11 @@ class _SandboxEvidence(dict):
     The argv lives on the object, not in the mapping: only code that actually
     ran the sandbox can hand it to the verify record, so a record can never
     describe an argv this process did not execute.
+
+    The record's ``test_argv`` is either the exact argv this process executed
+    (when it matches the trusted template) or that argv's scrubbed form.
+    Evidence-only text is never restored; the argv still lives only on the
+    object.
     """
 
     argv: tuple[str, ...]
@@ -2740,9 +2745,9 @@ def _write_verify_result(
     if argv_text is not None and argv_text == executed_text:
         clean["evidence"]["test_argv"] = argv_text
     elif executed_text is not None and argv_text is None:
-        # Provenance wins: the executed argv came from this process, so it is
-        # safe to record even when the evidence text is not a trusted shape.
-        clean["evidence"]["test_argv"] = executed_text
+        # Provenance wins but a non-template executed argv keeps the scrubbed
+        # form, so a token-shaped target is never written raw.
+        clean["evidence"]["test_argv"] = scrub(executed_text)
     data = (json.dumps(clean, indent=2, sort_keys=True) + "\n").encode("utf-8")
     tmp_path: str | None = None
     handle = None

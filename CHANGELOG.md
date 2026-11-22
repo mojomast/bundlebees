@@ -15,7 +15,7 @@ below lives in the coordinator, independent of which agent produced the work.
 Built as six file-leased DeepSeek bee slices (two waves) and integrated in
 one pull request.
 
-- `verify` records now carry a `test_argv` only when it is the argv this process executed; a record whose argv is not trusted omits the key entirely, so evidence text can never be recorded as something that ran (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2 as a class, plus review-bb-pr236 F1). The executed argv is recorded verbatim: it is built by this process from `sys.executable` and the validated targets, not from evidence text.
+- verify records now carry a test_argv only when it is the argv this process executed: the exact CLI-built pytest template is recorded verbatim, an executed argv that does not match that template (the ACDD non-strict lane, or a target containing a space) keeps the scrubbed form, and a record with neither omits the key entirely, so evidence text can never be recorded as something that ran (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2 as a class, plus review-bb-pr236 F1/F2).
 
 ### Changed (rizzstack cleanup, Nov 2026)
 
