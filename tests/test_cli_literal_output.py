@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from bundlebees_plugin import cli, verify_local
+from bundlebees_plugin.security import scrub
 from tests.test_cli import (
     IN_LEASE_PATCH,
     FakeClient,
@@ -993,11 +994,16 @@ def test_verify_record_does_not_restore_evidence_text_without_an_executed_argv(
 def test_verify_record_prefers_the_executed_argv_over_evidence_text(
     tmp_path, monkeypatch
 ):
-    """The record describes what ran, never what a caller claimed."""
+    """The record describes what ran, never what a caller claimed.
 
-    monkeypatch.setattr(cli.sys, "executable", INTERPRETER)
+    The executed argv does not match the trusted template, so the scrubbed
+    lane records it; a scrub-clean interpreter keeps the raw join visible.
+    """
+
+    interpreter = "/usr/bin/python3"
+    monkeypatch.setattr(cli.sys, "executable", interpreter)
     tests = ["tests/test_sample.py"]
-    forged = " ".join([INTERPRETER, *PYTEST_FLAGS, "tests/test_other.py"])
+    forged = " ".join([interpreter, *PYTEST_FLAGS, "tests/test_other.py"])
 
     target = cli._write_verify_result(
         tmp_path / "state",
@@ -1008,11 +1014,11 @@ def test_verify_record_prefers_the_executed_argv_over_evidence_text(
         files=[],
         tests=tests,
         evidence={"test_argv": forged},
-        executed_argv=[INTERPRETER, *PYTEST_FLAGS, *tests],
+        executed_argv=[interpreter, *PYTEST_FLAGS, *tests],
     )
     record = json.loads(target.read_text(encoding="utf-8"))
 
-    assert record["evidence"]["test_argv"] == " ".join([INTERPRETER, *PYTEST_FLAGS, *tests])
+    assert record["evidence"]["test_argv"] == " ".join([interpreter, *PYTEST_FLAGS, *tests])
     assert record["evidence"]["test_argv"] != forged
 
 
@@ -1066,3 +1072,86 @@ def test_verify_record_drops_canonical_evidence_text_when_the_executed_argv_disa
     record = json.loads(target.read_text(encoding="utf-8"))
 
     assert "test_argv" not in record["evidence"]
+
+
+def test_verify_record_scrubs_a_token_shaped_executed_target(tmp_path):
+    """At 8c5258e the record carries the token verbatim while ``tests`` redacts it.
+
+    That asymmetry is the exact defect review-bb-pr236 F2 measured.
+    """
+
+    target = "tests/" + "s" + "k-" + "A1b2C3d4E5f6.py"
+    executed = [INTERPRETER, *PYTEST_FLAGS, target]
+
+    result = cli._write_verify_result(
+        tmp_path / "state",
+        "att-argv-token",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-untrusted-scrub",
+        files=[],
+        tests=[target],
+        evidence={"test_argv": "forged text"},
+        executed_argv=executed,
+    )
+    record = json.loads(result.read_text(encoding="utf-8"))
+
+    assert record["evidence"]["test_argv"] == scrub(" ".join(executed))
+    assert scrub(record["evidence"]["test_argv"]) == record["evidence"]["test_argv"]
+    assert "s" + "k-" not in record["evidence"]["test_argv"]
+    assert record["tests"][0] == "tests/[redacted].py"
+
+
+def test_verify_record_scrubs_a_scrub_visible_executed_argv(tmp_path):
+    """The non-template lane records the scrubbed form, not the raw argv.
+
+    This covers the ACDD/space lane without a secret: the long install path is
+    scrub-visible, so an equality with the raw join would expose the
+    review-bb-pr236b L1 gap the older Unreleased bullet already rules out
+    ("keeps the scrubbed form").
+    """
+
+    fake_interpreter = (
+        "/home/"
+        + "clanker01/.hermes/installs/"
+        + "d6e67cbd6a082e64"
+        + "/venv/bin/python3"
+    )
+    executed = [fake_interpreter, *PYTEST_FLAGS, "tests/test_sample.py"]
+
+    result = cli._write_verify_result(
+        tmp_path / "state",
+        "att-argv-scrub-visible",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-untrusted-scrub",
+        files=[],
+        tests=["tests/test_sample.py"],
+        evidence={"test_argv": "forged text"},
+        executed_argv=executed,
+    )
+    record = json.loads(result.read_text(encoding="utf-8"))
+
+    assert record["evidence"]["test_argv"] == scrub(" ".join(executed))
+    assert record["evidence"]["test_argv"] != " ".join(executed)
+
+
+def test_verify_record_keeps_a_scrub_clean_untrusted_executed_argv(tmp_path):
+    """A non-template, scrub-clean executed argv is recorded unchanged."""
+
+    executed = ["/usr/bin/python3", "-B", "-m", "pytest", "tests/test_sample.py"]
+
+    result = cli._write_verify_result(
+        tmp_path / "state",
+        "att-argv-scrub-clean",
+        ok=True,
+        sha=None,
+        branch="fix/verify-record-argv-untrusted-scrub",
+        files=[],
+        tests=["tests/test_sample.py"],
+        evidence={"test_argv": "forged text"},
+        executed_argv=executed,
+    )
+    record = json.loads(result.read_text(encoding="utf-8"))
+
+    assert record["evidence"]["test_argv"] == " ".join(executed)
