@@ -230,6 +230,16 @@ def _fail_closed(reason: str) -> dict[str, Any]:
     return _advice("high", "high", False, [reason])
 
 
+def _declared_tier(brief: Mapping[str, Any]) -> tuple[Any, str | None]:
+    """Return ``(declared tier or None, problem)``; a malformed risk block is a problem."""
+    if "risk" not in brief:
+        return None, None
+    risk_value = brief["risk"]
+    if not isinstance(risk_value, Mapping):
+        return None, "brief.risk must be an object; failing closed to high"
+    return risk_value.get("tier"), None
+
+
 def advise_risk(brief: Any) -> dict[str, Any]:
     """Report an advisory risk tier for *brief* without enforcing anything.
 
@@ -240,15 +250,9 @@ def advise_risk(brief: Any) -> dict[str, Any]:
     try:
         if not isinstance(brief, Mapping):
             return _fail_closed("brief is not a mapping; failing closed to high")
-        declared: Any = None
-        if "risk" in brief:
-            risk_value = brief["risk"]
-            if not isinstance(risk_value, Mapping):
-                return _fail_closed(
-                    "brief.risk must be an object; failing closed to high"
-                )
-            if "tier" in risk_value:
-                declared = risk_value["tier"]
+        declared, problem = _declared_tier(brief)
+        if problem:
+            return _fail_closed(problem)
         result = effective_tier(declared, brief.get("assigned_files"))
         if not isinstance(result, Mapping):
             return _fail_closed("risk assessment failed; failing closed to high")
