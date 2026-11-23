@@ -1,0 +1,493 @@
+{
+  "__init__.py": {
+    "complexity": 1,
+    "swallowed-exception": 1
+  },
+  "bundlebees_plugin/acdd_cli.py": {
+    "complexity": 9
+  },
+  "bundlebees_plugin/adapters.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/agent_consumer.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/agent_work.py": {
+    "complexity": 7
+  },
+  "bundlebees_plugin/approval.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/attribution.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/beat_reconciliation.py": {
+    "complexity": 7
+  },
+  "bundlebees_plugin/bee_events.py": {
+    "complexity": 15
+  },
+  "bundlebees_plugin/board_dispatch.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/board_sync.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/brief.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/campaign.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/cli.py": {
+    "complexity": 27,
+    "swallowed-exception": 4
+  },
+  "bundlebees_plugin/client.py": {
+    "complexity": 13
+  },
+  "bundlebees_plugin/contract.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/contracts.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/coordinator_actions.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/coverage.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/delivery.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/descendants.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/doctor.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/event_consumer.py": {
+    "complexity": 9
+  },
+  "bundlebees_plugin/factory_driver.py": {
+    "complexity": 13,
+    "swallowed-exception": 5
+  },
+  "bundlebees_plugin/gate_watcher.py": {
+    "complexity": 5
+  },
+  "bundlebees_plugin/git_observer.py": {
+    "complexity": 5
+  },
+  "bundlebees_plugin/grants.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/handoff.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/hermes_adapter.py": {
+    "complexity": 16,
+    "swallowed-exception": 1
+  },
+  "bundlebees_plugin/hive_docket.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/integrate_job.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/job.py": {
+    "complexity": 9
+  },
+  "bundlebees_plugin/job_cli.py": {
+    "complexity": 7
+  },
+  "bundlebees_plugin/landing_bridge.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/leases.py": {
+    "complexity": 5
+  },
+  "bundlebees_plugin/metrics.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/project.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/provision_bind.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/provisioning.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/queue.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/rails_actions.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/rails_bundlebees_source.py": {
+    "complexity": 5
+  },
+  "bundlebees_plugin/rails_hermes_source.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/rails_outbox_source.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/rails_owner_bridge.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/rails_queue_source.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/rails_remote_source.py": {
+    "complexity": 16
+  },
+  "bundlebees_plugin/rails_return.py": {
+    "complexity": 6
+  },
+  "bundlebees_plugin/reconcile.py": {
+    "complexity": 11
+  },
+  "bundlebees_plugin/recovery.py": {
+    "complexity": 19,
+    "swallowed-exception": 1
+  },
+  "bundlebees_plugin/research_gate.py": {
+    "complexity": 6,
+    "swallowed-exception": 2
+  },
+  "bundlebees_plugin/return_report.py": {
+    "complexity": 17
+  },
+  "bundlebees_plugin/reviewers.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/revision.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/rework_metrics.py": {
+    "complexity": 3
+  },
+  "bundlebees_plugin/risk.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/sandbox.py": {
+    "complexity": 7
+  },
+  "bundlebees_plugin/security.py": {
+    "complexity": 5
+  },
+  "bundlebees_plugin/tdd.py": {
+    "complexity": 12
+  },
+  "bundlebees_plugin/test_receipts.py": {
+    "complexity": 4
+  },
+  "bundlebees_plugin/tools.py": {
+    "complexity": 7,
+    "swallowed-exception": 2
+  },
+  "bundlebees_plugin/transport.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/trial_harness.py": {
+    "complexity": 12
+  },
+  "bundlebees_plugin/trial_simulated_driver.py": {
+    "complexity": 1
+  },
+  "bundlebees_plugin/verify_local.py": {
+    "complexity": 3,
+    "swallowed-exception": 1
+  },
+  "bundlebees_plugin/verify_workers.py": {
+    "complexity": 8,
+    "swallowed-exception": 2
+  },
+  "bundlebees_plugin/wave_compat.py": {
+    "complexity": 2
+  },
+  "bundlebees_plugin/work_scheduler.py": {
+    "complexity": 4
+  },
+  "contrib/rizzstack_rails/contracts.py": {
+    "complexity": 5
+  },
+  "contrib/rizzstack_rails/export.py": {
+    "complexity": 1
+  },
+  "contrib/rizzstack_rails/feedback.py": {
+    "complexity": 2
+  },
+  "contrib/rizzstack_rails/importer.py": {
+    "complexity": 2
+  },
+  "contrib/rizzstack_rails/ledger.py": {
+    "complexity": 7,
+    "swallowed-exception": 1
+  },
+  "contrib/rizzstack_rails/markdown.py": {
+    "complexity": 1
+  },
+  "contrib/rizzstack_rails/projection.py": {
+    "complexity": 4
+  },
+  "contrib/rizzstack_rails/query.py": {
+    "complexity": 5
+  },
+  "contrib/rizzstack_rails/source.py": {
+    "complexity": 1
+  },
+  "contrib/vibeline/sessions.py": {
+    "complexity": 2
+  },
+  "contrib/vibeline/shell.py": {
+    "complexity": 2
+  },
+  "contrib/vibeline/swarm.py": {
+    "complexity": 2
+  },
+  "dashboard/plugin_api.py": {
+    "complexity": 8
+  },
+  "pilot/todo/acceptance.py": {
+    "complexity": 1
+  },
+  "scripts/rails_attempt_index.py": {
+    "complexity": 1
+  },
+  "scripts/vendor_rails.py": {
+    "complexity": 3
+  },
+  "tests/agent_consumer_harness.py": {
+    "complexity": 1
+  },
+  "tests/test_acceptance_requires_all_criteria.py": {
+    "complexity": 1
+  },
+  "tests/test_agent_work.py": {
+    "complexity": 5
+  },
+  "tests/test_approval.py": {
+    "complexity": 2
+  },
+  "tests/test_approval_integration.py": {
+    "complexity": 1
+  },
+  "tests/test_approval_ui.py": {
+    "complexity": 1
+  },
+  "tests/test_bee_events.py": {
+    "complexity": 3
+  },
+  "tests/test_bee_landing_e2e.py": {
+    "complexity": 1
+  },
+  "tests/test_board_stock.py": {
+    "complexity": 1
+  },
+  "tests/test_board_sync.py": {
+    "complexity": 4
+  },
+  "tests/test_cli.py": {
+    "complexity": 4
+  },
+  "tests/test_cli_acdd_integrate.py": {
+    "complexity": 1
+  },
+  "tests/test_cli_acdd_review.py": {
+    "complexity": 1
+  },
+  "tests/test_cli_attempts_status.py": {
+    "complexity": 1
+  },
+  "tests/test_client.py": {
+    "complexity": 6
+  },
+  "tests/test_completion_event_emit.py": {
+    "complexity": 4
+  },
+  "tests/test_contract_enforcement.py": {
+    "complexity": 2
+  },
+  "tests/test_coordinator_actions.py": {
+    "complexity": 2
+  },
+  "tests/test_crash_durability.py": {
+    "complexity": 6
+  },
+  "tests/test_crash_recovery_e2e.py": {
+    "complexity": 1,
+    "swallowed-exception": 1
+  },
+  "tests/test_cross_repo_landing.py": {
+    "complexity": 2
+  },
+  "tests/test_delivery_intent.py": {
+    "complexity": 1
+  },
+  "tests/test_delivery_reconciler.py": {
+    "complexity": 2
+  },
+  "tests/test_doctor.py": {
+    "complexity": 3
+  },
+  "tests/test_event_consumer.py": {
+    "complexity": 2
+  },
+  "tests/test_event_consumer_actions.py": {
+    "complexity": 8
+  },
+  "tests/test_factory_driver.py": {
+    "complexity": 4
+  },
+  "tests/test_factory_recovery.py": {
+    "complexity": 10
+  },
+  "tests/test_factory_service_mode.py": {
+    "complexity": 1
+  },
+  "tests/test_gate_watcher.py": {
+    "complexity": 2
+  },
+  "tests/test_git_observer.py": {
+    "complexity": 2
+  },
+  "tests/test_git_observer_integration_states.py": {
+    "complexity": 2
+  },
+  "tests/test_hermes_adapter.py": {
+    "complexity": 7
+  },
+  "tests/test_hive_docket.py": {
+    "complexity": 1
+  },
+  "tests/test_integration_replay.py": {
+    "complexity": 2
+  },
+  "tests/test_job_queue_cli.py": {
+    "complexity": 2
+  },
+  "tests/test_landing_bridge.py": {
+    "complexity": 4
+  },
+  "tests/test_leases.py": {
+    "complexity": 1
+  },
+  "tests/test_m3_corrections.py": {
+    "complexity": 1
+  },
+  "tests/test_m4_dogfood_e2e.py": {
+    "complexity": 1
+  },
+  "tests/test_memory_recall.py": {
+    "complexity": 1
+  },
+  "tests/test_metrics.py": {
+    "complexity": 2
+  },
+  "tests/test_orbit_artifact.py": {
+    "complexity": 2
+  },
+  "tests/test_orbit_roundtrip.py": {
+    "complexity": 1
+  },
+  "tests/test_plugin.py": {
+    "complexity": 1
+  },
+  "tests/test_plugin_api.py": {
+    "complexity": 2
+  },
+  "tests/test_rails_remote_source.py": {
+    "complexity": 1
+  },
+  "tests/test_rails_return.py": {
+    "complexity": 4
+  },
+  "tests/test_receipt_boundaries.py": {
+    "complexity": 1
+  },
+  "tests/test_reconciliation_report.py": {
+    "complexity": 1
+  },
+  "tests/test_recovery_authorization.py": {
+    "complexity": 1
+  },
+  "tests/test_recovery_conformance.py": {
+    "complexity": 3
+  },
+  "tests/test_recovery_m4.py": {
+    "complexity": 3
+  },
+  "tests/test_regression_attribution.py": {
+    "complexity": 1
+  },
+  "tests/test_remote_landing_export.py": {
+    "complexity": 4
+  },
+  "tests/test_repo_grants.py": {
+    "complexity": 1
+  },
+  "tests/test_research_gate.py": {
+    "complexity": 2
+  },
+  "tests/test_return_report.py": {
+    "complexity": 3
+  },
+  "tests/test_revision.py": {
+    "complexity": 2
+  },
+  "tests/test_sandbox.py": {
+    "complexity": 6
+  },
+  "tests/test_sandbox_pinned_sources.py": {
+    "complexity": 1
+  },
+  "tests/test_secret_scan_added_lines.py": {
+    "complexity": 1
+  },
+  "tests/test_self_integration.py": {
+    "complexity": 1
+  },
+  "tests/test_signed_report.py": {
+    "complexity": 1
+  },
+  "tests/test_sweep_landed_match.py": {
+    "complexity": 1
+  },
+  "tests/test_tdd.py": {
+    "complexity": 3
+  },
+  "tests/test_test_receipts.py": {
+    "complexity": 1
+  },
+  "tests/test_tool_path_write_back.py": {
+    "complexity": 4
+  },
+  "tests/test_tools.py": {
+    "complexity": 1
+  },
+  "tests/test_trial_harness.py": {
+    "complexity": 3
+  },
+  "tests/test_verify_dry_run_record.py": {
+    "complexity": 5
+  },
+  "tests/test_verify_refusal_record.py": {
+    "complexity": 1
+  },
+  "tests/test_verify_workers.py": {
+    "complexity": 2
+  },
+  "tests/test_wave_compat.py": {
+    "complexity": 1
+  },
+  "tests/test_work_scheduler.py": {
+    "complexity": 1
+  },
+  "tools/slop-lint/slop_lint/baseline.py": {
+    "complexity": 1
+  }
+}
