@@ -114,6 +114,26 @@
       "type": "array",
       "items": {"type": "string"},
       "description": "Test targets the worker should run."
+    },
+    "risk": {
+      "type": "object",
+      "required": ["tier"],
+      "properties": {
+        "tier": {
+          "enum": ["low", "medium", "high"],
+          "description": "Risk tier; may be raised above the path-derived floor, never lowered."
+        },
+        "reasons": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Why the tier was chosen."
+        },
+        "blast_radius": {
+          "type": "string",
+          "description": "What a failure would affect."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": true
