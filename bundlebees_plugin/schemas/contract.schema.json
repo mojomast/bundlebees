@@ -108,6 +108,16 @@
         "approved_at": {"type": "string", "minLength": 1},
         "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
+    },
+    "risk": {
+      "type": "object",
+      "required": ["tier"],
+      "properties": {
+        "tier": {"enum": ["low", "medium", "high"], "description": "Risk tier; may be raised above the path-derived floor, never lowered."},
+        "reasons": {"type": "array", "items": {"type": "string"}, "description": "Why the tier was chosen."},
+        "blast_radius": {"type": "string", "description": "What a failure would affect."}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": true
