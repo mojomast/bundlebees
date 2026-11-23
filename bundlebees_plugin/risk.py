@@ -1,7 +1,7 @@
 """Optional risk tiers for task briefs, derived from the touched paths.
 
 Pure data and pure functions only: nothing here is wired into dispatch and no
-gate enforces it. The path-derived floor is a lower bound a task cannot
+gate enforces the table. The path-derived floor is a lower bound a task cannot
 declare away; a human declaration may raise the tier above it.
 """
 
