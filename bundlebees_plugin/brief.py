@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from .risk import TIERS, effective_tier
 from .security import scrub
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "brief.schema.json"
@@ -211,3 +212,61 @@ def brief_sha256(brief: Mapping[str, Any]) -> str:
     """Hash a brief deterministically as compact, key-sorted JSON."""
     body = json.dumps(dict(brief), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _advice(
+    tier: str, floor: str, raised: bool, reasons: list[str]
+) -> dict[str, Any]:
+    return {
+        "advisory": True,
+        "tier": tier,
+        "floor": floor,
+        "raised": bool(raised),
+        "reasons": list(reasons),
+    }
+
+
+def _fail_closed(reason: str) -> dict[str, Any]:
+    return _advice("high", "high", False, [reason])
+
+
+def advise_risk(brief: Any) -> dict[str, Any]:
+    """Report an advisory risk tier for *brief* without enforcing anything.
+
+    This is informational only: it never raises, never mutates the input, and
+    is not consulted by :func:`validate_brief`, :func:`brief_sha256`, dispatch,
+    or any gate. Invalid input fails closed to a ``high`` advisory tier.
+    """
+    try:
+        if not isinstance(brief, Mapping):
+            return _fail_closed("brief is not a mapping; failing closed to high")
+        declared: Any = None
+        if "risk" in brief:
+            risk_value = brief["risk"]
+            if not isinstance(risk_value, Mapping):
+                return _fail_closed(
+                    "brief.risk must be an object; failing closed to high"
+                )
+            if "tier" in risk_value:
+                declared = risk_value["tier"]
+        result = effective_tier(declared, brief.get("assigned_files"))
+        if not isinstance(result, Mapping):
+            return _fail_closed("risk assessment failed; failing closed to high")
+        tier = result.get("tier")
+        floor = result.get("floor")
+        raised = result.get("raised", False)
+        reasons = result.get("reasons")
+        if not isinstance(tier, str) or tier not in TIERS:
+            return _fail_closed("invalid risk tier; failing closed to high")
+        if not isinstance(floor, str) or floor not in TIERS:
+            floor = tier
+        if not isinstance(reasons, list):
+            reasons = []
+        return _advice(
+            tier,
+            floor,
+            raised if isinstance(raised, bool) else False,
+            [str(reason) for reason in reasons],
+        )
+    except Exception:
+        return _fail_closed("risk assessment failed; failing closed to high")
