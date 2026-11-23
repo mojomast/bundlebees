@@ -1,8 +1,14 @@
 # Risk tiers
 
 `bundlebees_plugin/risk_policy.py` maps a risk tier to how much process a task
-gets. It is data and pure functions only: it is **report-only until the owner
-enables enforcement**, and it is not wired into dispatch or any gate.
+gets. It is data and pure functions only: the table is **report-only until the owner
+enables enforcement** and the phase and reviewer table below is still not wired into any gate.
+
+**Enforced at dispatch (owner approved, fail closed):** `bundlebees_plugin/tools.py::_dispatch` now
+refuses (1) a brief whose declared `risk.tier` is below the path-derived floor
+(`risk_tier_below_floor`) and (2) a high-tier brief, meaning sensitive, invalid or unknown paths or a
+human-raised tier, that has no frozen ACDD contract (`contract_missing`). Low and medium briefs are
+unchanged. Human gates, extra reviewers and minimum verifications for high tier are not yet enforced.
 
 | Tier | Phases | Reviewer | Plan | Human gates | Min verifications |
 |---|---|---|---|---|---|

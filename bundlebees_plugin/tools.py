@@ -592,6 +592,32 @@ def _dispatch(
     except BriefError as exc:
         return _err("brief_invalid", exc.error, exc.fix)
 
+    # RISK TIERS (enforced, fail closed): a declared tier below the path-derived floor is a
+    # false declaration and is refused; a high-tier brief (sensitive, invalid or unknown paths,
+    # or a human-raised tier) must carry a frozen ACDD contract so test-first provenance exists.
+    from . import risk as _risk
+
+    risk_block = brief.get("risk")
+    declared = risk_block.get("tier") if isinstance(risk_block, Mapping) else None
+    assessed = _risk.effective_tier(declared, brief.get("assigned_files"))
+    if assessed.get("raised"):
+        return _err(
+            "risk_tier_below_floor",
+            f"declared risk tier {declared!r} is below the path-derived floor {assessed.get('floor')!r}",
+            "Declare the floor tier or higher (a human may raise a tier, never lower it), or "
+            "narrow assigned_files.",
+        )
+    if assessed.get("tier") == "high":
+        if _contract.contract_from_brief(brief) is None:
+            return _err(
+                "contract_missing",
+                "high risk tier: " + "; ".join(str(r) for r in assessed.get("reasons", [])[:3])
+                + " - a high-tier brief needs a frozen ACDD contract",
+                "Attach a frozen acdd/1 contract under brief.contract before dispatch, or narrow "
+                "assigned_files to lower the tier.",
+            )
+        require_contract = True
+
     # RESEARCH-BEFORE-RETRY: a retry of a recorded failure is refused before
     # any launcher call until accepted findings exist for that failure id.
     # Imported lazily so the tool module's import graph stays free of queues.
