@@ -36,3 +36,23 @@ hermes bundlebees rails-import --source outbox --limit 100
 4. If interrupted, inspect the queue. A current holder can call `reconcile(queue_action_id, fence)` to acknowledge an already matching decision. An adopted claim can only reconcile, never initiate a decision. Missing or contradictory evidence stays held for the owner. Ingestion can replay both the immutable intake and the final queue result after a crash between either write and its publication to Rails.
 
 The source emits `intervention.requested` for intake and `intervention.result` with `approved` for a proved retry decision. Neither means a retry succeeded. No ghost is emitted from those facts. `rewind_retry` is unavailable: the current coordinator has no supported fenced Hermes rewind operation. The queue stores mutable claim snapshots, not a journal of every renewal or adoption; Rails does not reconstruct invisible transitions. No network action endpoint or new owner privilege is activated by the plugin.
+
+## Scheduled ingest outside a Hermes session
+
+`python -m bundlebees_plugin.rails_ingest --ledger /abs/ledger.sqlite3 --state-dir /abs/state --source bundlebees --source outbox`
+imports each named local source a bounded page at a time until it reports no
+more pages. Sources and the authorities each may write are exactly those
+`rails-import` grants (`bundlebees`, `outbox`, `queue`); the remote `launcher`
+and `hermes` sources stay with `rails-import`. The state is read only; only the
+ledger is written; one run holds an exclusive lock beside the ledger. Output is
+one JSON line with per-source counts or generic error codes, never a path.
+
+The bundlebees and outbox sources refuse a state root that a group or other
+user can write or traverse (`source_unsafe`). Keep the plugin data directory
+owner-only (`0700`). A plain file beside the contract directories under
+`evidence/` is skipped; a symlink there is still refused.
+
+`contrib/systemd/bundlebees-rails-ingest.{service,timer}` run it every minute
+from a pinned checkout with no network and the ledger directory as the only
+writable path. The Orbit Rails reader (`orbitdesktop contrib/rails_server`)
+then serves that ledger read-only.
