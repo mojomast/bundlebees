@@ -17,7 +17,7 @@ TAG="setup-pinned-sources"
 
 WORKFLOW_URL="https://github.com/mojomast/workflow.git"
 WORKFLOW_BRANCH="main"
-WORKFLOW_PIN="1dacd5bb2552cc7052f436dcba04601995c82167"
+WORKFLOW_PIN="ae9c080262ab593e7643e2fba79cd51a018f25df"
 HYVV_URL="https://github.com/mojomast/hyvv.git"
 HYVV_BRANCH="main"
 HYVV_PIN="fdd235446e8fb28f8074fa06ea5c6ee1e466e129"
