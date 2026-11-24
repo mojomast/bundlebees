@@ -151,14 +151,20 @@ content.
 
 ## Shadow mode and the switch
 
-The mode flag (`SETTINGS_KEY = "verify_workers"`, resolved by `resolve_mode`
-from an explicit argument or the settings mapping) has three values:
+The production switch is the `BUNDLEBEES_VERIFY_WORKERS` environment variable,
+resolved once before the tick by `verify_shadow.mode_from_env`. It has exactly
+two available modes:
 
 | mode | behaviour |
 | --- | --- |
-| `in-beat` (default) | the pipeline runs the serial verifier exactly as before |
+| `in-beat` (default when unset or empty) | the pipeline runs the serial verifier exactly as before; shadow writes nothing |
 | `shadow` | both paths run on a bounded sample set; the in-beat verdict stays authoritative; every comparison is recorded; divergence alarms |
-| `on` | the worker path is the verification; the in-beat verifier does not run |
+
+Mode `on` is refused with `mode_not_wired` and is deliberately not wired: the
+worker-only path does not exist on this checkout. Any other value is refused
+with `mode_invalid`. `SETTINGS_KEY = "verify_workers"` and `resolve_mode` are a
+library helper only; the pipeline does not consult them, it reads the
+environment variable.
 
 Shadow mode never switches anything by itself:
 
@@ -176,24 +182,31 @@ Shadow mode never switches anything by itself:
   into a payload flag while the in-beat verdict stays authoritative — shadow
   mode changes no pipeline outcome, it only measures.
 
-Switch procedure (the flag documents it):
+Switch procedure:
 
-1. Run with `verify_workers=shadow` until the sample set is exhausted with
-   zero alarms for the workloads that matter.
+1. Run with `BUNDLEBEES_VERIFY_WORKERS=shadow` until the sample set is
+   exhausted with zero alarms for the workloads that matter.
 2. Audit `comparisons/` directly: field-set equality and no semantic
    divergences, `worker_refusal` absent.
-3. Set `verify_workers=on`. Keep monitoring `shadow_alarms_present`; any
-   residual alarm is a named, durable record that must be explained before it
-   is removed by hand.
-4. Rollback is setting the flag back to `in-beat`; records already consumed
-   under `on` remain valid evidence (the queue and the record contract do not
-   change with the mode).
+3. Shadow stays enabled until the sample set is clean, and `on` is unavailable
+   on purpose: setting `BUNDLEBEES_VERIFY_WORKERS=on` is refused with
+   `mode_not_wired`. Keep monitoring `shadow_alarms_present`; any residual
+   alarm is a named, durable record that must be explained before it is
+   removed by hand.
+4. Rollback is setting `BUNDLEBEES_VERIFY_WORKERS=in-beat` (or unsetting it);
+   records already consumed remain valid evidence (the queue and the record
+   contract do not change with the mode).
 
 ## Wiring point
 
-The lane is additive and self-contained. The one-line integration is the
-pipeline's verifier closure calling `dispatch_verification` with
-`resolve_mode(config=settings)`; until that lands, the default (`in-beat`)
+The lane is additive and self-contained, and the wiring has landed in
+`job_cli.py`: the mode is resolved once, where the verifier closure is built
+and before the tick, with `verify_shadow.mode_from_env()`. After a successful
+in-beat `verify_local.verify_and_commit`, and only in shadow mode, the closure
+passes the verdict through `verify_shadow.observe`; `observe` dispatches the
+worker lane with that already-computed verdict as its authoritative answer and
+always returns the same verdict. The in-beat verdict stays authoritative, and
+in any other mode the closure returns it directly, so the default (`in-beat`)
 keeps the pipeline exactly as it is.
 
 ## Prior art and rejected alternatives
