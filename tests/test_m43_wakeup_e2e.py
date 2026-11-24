@@ -34,6 +34,7 @@ def _consumer_env(*, crash: bool = False) -> dict[str, str]:
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     if crash:
         env["BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL"] = "1"
+    env["BUNDLEBEES_TEST_ADAPTERS"] = "1"  # test-only adapters and crash switch (wave A slice A10)
     env["BUNDLEBEES_AUTHORIZED_SELECTOR"] = (
         "tools/acdd-lint/tests/test_check_reachability.py"
         "::Reachability::test_reachable_commit_is_silent")

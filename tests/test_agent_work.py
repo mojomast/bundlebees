@@ -782,6 +782,7 @@ def test_crash_after_proposal_is_adopted_on_restart_without_the_model(tmp_path):
             tmp_path,
             HERMES_BIN=str(binary),
             BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL="1",
+            BUNDLEBEES_TEST_ADAPTERS="1",
         ),
     )
     assert crashed.returncode == agent_consumer.CRASH_EXIT_CODE, crashed.stderr
