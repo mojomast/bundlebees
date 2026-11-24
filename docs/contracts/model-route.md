@@ -30,9 +30,27 @@ A brief is complex when ANY of these holds (each adds a reason):
 A `complexity: "simple"` hint never cancels C1-C6 (routing errs toward the
 stronger model).
 
+## Nous low-risk lane (owner t1660u, t1665u; Nov 24 2026)
+
+A brief that is not complex may take the Nous Portal lane (`nous:*` ids,
+the launcher's `nous` key kind). `lane` and `chain` in the result report it.
+
+| lane | when | model, then the launcher's fallback chain |
+|---|---|---|
+| `low` | effective tier `low` with at most 3 files on the first attempt (docs, tests-only), or a verify brief (`verify_of`) at tier low/medium | `nous:deepseek-v4.1-flash-1017` -> `nous:hy4-flash` -> `go:deepseek-v4.1-flash` |
+| `low-harder` | tier `low` with 4 files, one failed attempt, or `complexity: "moderate"`; or tier `medium`, `complexity: "simple"`, at most 2 files (small refactor) | `nous:hy4-flash` -> `go:deepseek-v4.1-flash` |
+| `default` | everything else, or `nous: false` on the brief | `go:deepseek-v4.1-flash` |
+
+1017 is the discounted DeepSeek flash (20/20 in the Nov 24 benchmark, about
+half Hy4's cost). When the launcher allow-list is given, the first allow-listed
+id in the chain is used with `fallback: true` and a reason. The launcher, not
+this module, falls back at run time (429 after retries, auth or 5xx, or a
+missing nous key) and paces every `nous:*` model combined (max 8 active per
+key, starts spaced 2 s) under the key's 180 requests/min.
+
 ## Acceptance criteria
 
-- AC-001: a low-risk docs brief with one file routes to the default model with no reasons - tests/test_model_route.py::TestSelectWorkerModel::test_simple_brief_uses_default
+- AC-001: a medium 3-file source brief that is not complex routes to the default model with no reasons - tests/test_model_route.py::TestSelectWorkerModel::test_simple_brief_uses_default
 - AC-002: a high-risk brief routes to the complex model with a C1 reason - tests/test_model_route.py::TestSelectWorkerModel::test_high_risk_is_complex
 - AC-003: a 5-file lease is complex (C2); a 4-file medium lease is not - tests/test_model_route.py::TestSelectWorkerModel::test_multi_file_threshold
 - AC-004: cross-repo briefs are complex (C3) - tests/test_model_route.py::TestSelectWorkerModel::test_cross_repo
@@ -43,11 +61,17 @@ stronger model).
 - AC-009: when the launcher allow-list is given and lacks the complex model, the result falls back to the default model with `fallback: true` and a reason (never silent) - tests/test_model_route.py::TestSelectWorkerModel::test_fallback_when_not_allowlisted
 - AC-010: `model_pinned: true` keeps the brief's own model and reports source `pinned` - tests/test_model_route.py::TestSelectWorkerModel::test_pinned_model
 - AC-011: a non-mapping brief or a negative/non-int failed_attempts raises ValueError (no dispatch on bad input) - tests/test_model_route.py::TestSelectWorkerModel::test_invalid_input_fails_closed
+- AC-013: a low-risk docs brief routes to `nous:deepseek-v4.1-flash-1017` with chain 1017 -> hy4 -> go - tests/test_model_route.py::TestLowRiskLane::test_low_risk_docs_brief_uses_the_discounted_flash
+- AC-014: tests-only and verify briefs take the low lane - tests/test_model_route.py::TestLowRiskLane::test_tests_only_brief_is_low, tests/test_model_route.py::TestLowRiskLane::test_verify_brief_is_low
+- AC-015: harder low-risk slices and small refactors use `nous:hy4-flash` - tests/test_model_route.py::TestLowRiskLane::test_harder_low_risk_slices_use_hy4, tests/test_model_route.py::TestLowRiskLane::test_small_refactor_uses_hy4
+- AC-016: any complex rule beats the low lane - tests/test_model_route.py::TestLowRiskLane::test_complex_always_beats_the_low_lane
+- AC-017: allow-list fallback inside the lane is never silent; `nous: false` opts out - tests/test_model_route.py::TestLowRiskLane::test_low_lane_falls_back_when_not_allowlisted, tests/test_model_route.py::TestLowRiskLane::test_brief_can_opt_out_of_nous
+- AC-018: Nous pacing constants mirror the launcher - tests/test_model_route.py::TestLowRiskLane::test_nous_pacing_is_documented
 - AC-012: the CLI prints the decision as JSON for a brief file and exits 0; a missing file exits 2 - tests/test_model_route.py::TestCli::test_cli_json
 
 ## Out of scope
 
-No launcher change, no restart, no new provider, no fallback provider in
-Hermes. The launcher already allow-lists `k3.1-pro` with its own key kind;
+No restart from this module. The Nous key kind, model entries, fallback chain
+and pacing live in the launcher (hyvv). No fallback provider in Hermes. The launcher already allow-lists `k3.1-pro` with its own key kind;
 this module only picks a model id. Human gates (merge, release, deploy,
 publish) are unchanged.
