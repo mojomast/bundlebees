@@ -1,6 +1,9 @@
-> **NOT WIRED.** No production path (beat, factory driver, tools, CLI) calls
-> this module; it is kept for research_gate's verify-result publishing path and
-> its tests, and may be removed or wired in cleanup phase 6.
+> **SHADOW ONLY.** Production reaches this module only through
+> `verify_shadow.observe`, and only when `BUNDLEBEES_VERIFY_WORKERS=shadow`.
+> Shadow runs alongside the in-beat verifier, whose verdict stays authoritative.
+> Comparisons and divergence alarms are written under
+> `<state>/verify-workers/shadow/`, shadow failures append to `errors.jsonl`
+> there, and mode `on` is refused (`mode_not_wired`).
 
 # Verify-worker bees: parallel verification on the action queue
 

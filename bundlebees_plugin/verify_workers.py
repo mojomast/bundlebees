@@ -1,6 +1,7 @@
-"""NOT WIRED: no production path (beat, factory driver, tools, CLI) calls this
-module. It is kept for research_gate's verify-result publishing path and its
-tests, and may be removed or wired in cleanup phase 6.
+"""SHADOW ONLY: production reaches this module only through
+:func:`bundlebees_plugin.verify_shadow.observe` when
+``BUNDLEBEES_VERIFY_WORKERS=shadow``. The in-beat verdict stays authoritative
+and mode ``on`` is not wired.
 
 Verify-worker bees: per-attempt verification as dispatchable queue actions.
 
@@ -134,8 +135,8 @@ __all__ = [
     "dispatch_verification",
 ]
 
-#: No production path imports this module; see the module docstring.
-WIRED = False
+#: Production reaches this module only through verify_shadow.observe, in shadow mode.
+WIRED = "shadow"
 
 EVIDENCE_SCHEMA = "bundlebees.verify-evidence/1"
 REQUEST_SCHEMA = "bundlebees.verify-request/1"
