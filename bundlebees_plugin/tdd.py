@@ -977,10 +977,8 @@ def load_collection(
     return dict(data)
 
 
-def frozen_approved_ids(
-    state_dir: os.PathLike[str] | str, preflight: Any
-) -> list[str] | None:
-    """Load and validate the test ids selected by a frozen collection pin."""
+def _collection_pin(preflight: Any) -> tuple[Mapping[str, Any], Any] | None:
+    """Return the dispatch contract and its frozen test-collection pin, if any."""
     if not isinstance(preflight, Mapping) or not isinstance(preflight.get("contract"), Mapping):
         return None
     contract = preflight["contract"]
@@ -988,33 +986,58 @@ def frozen_approved_ids(
     pin = review.get("test_collection")
     if pin is None:
         return None
+    return contract, pin
+
+
+def _frozen_manifest(
+    state_dir: os.PathLike[str] | str, contract: Mapping[str, Any], preflight: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Load the recorded collection manifest the dispatch pinned."""
+    return load_collection(
+        Path(state_dir),
+        str(contract.get("id") or ""),
+        str(preflight.get("sha") or ""),
+        preflight["key"],
+    )
+
+
+def _frozen_collection_ids(
+    contract: Mapping[str, Any], pin: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> list[str]:
+    """Validate a loaded collection manifest against the frozen pin."""
+    ids = manifest.get("collected_ids")
+    valid_ids = isinstance(ids, list) and all(
+        isinstance(node, str) and "::" in node for node in ids
+    )
+    collected = len(ids) if isinstance(ids, list) else None
+    if (
+        collection_digest(manifest) != pin.get("manifest_sha256")
+        or manifest.get("source_rev") != contract.get("source_rev")
+        or pin.get("source_rev") != contract.get("source_rev")
+        or not valid_ids
+        or pin.get("collected") != collected
+    ):
+        raise TddError(
+            "evidence_tampered", "collected test IDs do not match the frozen selection"
+        )
+    if not ids:
+        raise TddError("tests_mismatch", "the approved test-id list is empty")
+    return list(ids)
+
+
+def frozen_approved_ids(
+    state_dir: os.PathLike[str] | str, preflight: Any
+) -> list[str] | None:
+    """Load and validate the test ids selected by a frozen collection pin."""
+    found = _collection_pin(preflight)
+    if found is None:
+        return None
+    contract, pin = found
     try:
         if not isinstance(pin, Mapping):
             raise TddError("evidence_tampered", "frozen test-collection pin is invalid")
-        manifest = load_collection(
-            Path(state_dir),
-            str(contract.get("id") or ""),
-            str(preflight.get("sha") or ""),
-            preflight["key"],
-        )
-        ids = manifest.get("collected_ids")
-        valid_ids = isinstance(ids, list) and all(
-            isinstance(node, str) and "::" in node for node in ids
-        )
-        collected = len(ids) if isinstance(ids, list) else None
-        if (
-            collection_digest(manifest) != pin.get("manifest_sha256")
-            or manifest.get("source_rev") != contract.get("source_rev")
-            or pin.get("source_rev") != contract.get("source_rev")
-            or not valid_ids
-            or pin.get("collected") != collected
-        ):
-            raise TddError(
-                "evidence_tampered", "collected test IDs do not match the frozen selection"
-            )
-        if not ids:
-            raise TddError("tests_mismatch", "the approved test-id list is empty")
-        return list(ids)
+        manifest = _frozen_manifest(state_dir, contract, preflight)
+        return _frozen_collection_ids(contract, pin, manifest)
     except TddError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
