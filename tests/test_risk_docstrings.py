@@ -12,10 +12,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "bundlebees_plugin"
 
-# sha256 of ast.dump() of each module with its module docstring removed, at the W0-2 source_rev.
+# sha256 of each module's source text after its module docstring, at the W0-2 source_rev.
+# Source text (not ast.dump) so the fingerprint is the same on every supported Python (3.11+).
 CODE_FINGERPRINTS = {
-    "risk.py": "2680950e0c8d8dbae0bd59f0eecd4f1f56b4826a7c4d3eb3a828bee48b284688",
-    "risk_policy.py": "3cff4ee6aab0415686d971509bb7d8c34ba9360608d284564a8aaf5b035e5a41",
+    "risk.py": "0d26b6c178b41f39d5f014a5283c6b4004024a0e9fd668060892262218513255",
+    "risk_policy.py": "ebc4f0f1f3fff12fee6a32879845c0b55c6b68774ef396a26bbd0d997984b3b1",
 }
 
 
@@ -24,13 +25,14 @@ def _doc(name: str) -> str:
 
 
 def _code_fingerprint(name: str) -> str:
-    tree = ast.parse((ROOT / name).read_text(encoding="utf-8"))
-    body = tree.body
+    text = (ROOT / name).read_text(encoding="utf-8")
+    body = ast.parse(text).body
+    start = 0
     if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
             and isinstance(body[0].value.value, str):
-        body = body[1:]
-    tree.body = body
-    return hashlib.sha256(ast.dump(tree).encode("utf-8")).hexdigest()
+        start = body[0].end_lineno
+    rest = "\n".join(text.splitlines()[start:])
+    return hashlib.sha256(rest.encode("utf-8")).hexdigest()
 
 
 class TestRiskDocstrings:
