@@ -391,8 +391,9 @@ def test_pressure_starts_a_cooldown(tmp_path: Path):
                                policy=policy(), now=lambda: NOW + 30)
     adm = gate2.begin_pass()
     assert adm["free_slots"] == 0 and "pressure_cooldown" in adm["reasons"]
-    gate3 = go_max.FactoryGate(state, capacity_reader=lambda: cap(), allowed_reader=lambda: [],
-                               policy=policy(), now=lambda: NOW + 30 + go_max.PRESSURE_COOLDOWN_S)
+    later = NOW + 30 + go_max.PRESSURE_COOLDOWN_S
+    gate3 = go_max.FactoryGate(state, capacity_reader=lambda: cap(observed_at=later), allowed_reader=lambda: [],
+                               policy=policy(), now=lambda: later)
     assert gate3.begin_pass()["free_slots"] > 0
 
 

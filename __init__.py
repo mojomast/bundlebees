@@ -14,8 +14,10 @@ BUNDLEBEES_SYSTEM_PROMPT_SECTION = (
     "Bundlebees orchestrates CUA bees (cheap coding workers in disposable "
     "sandboxes on a worker machine the user controls). Drive it ONLY with "
     "bundlebees_status, bundlebees_dispatch, bundlebees_attempt, "
-    "bundlebees_host_prompt, and bundlebees_route_preview (toolset "
-    "bundlebees). If those tools are not in your visible list, call "
+    "bundlebees_host_prompt, bundlebees_route_preview and bundlebees_go_max "
+    "(toolset bundlebees). When the owner says 'go max' or asks for as much "
+    "parallel work as possible, call bundlebees_go_max with action on, then "
+    "report its summary. If those tools are not in your visible list, call "
     'tool_search(["bundlebees"]) or '
     'skill_view("bundlebees:bundlebees-operator"), then use them. '
     "Do not shell out to curl against the launcher or invent a client. "

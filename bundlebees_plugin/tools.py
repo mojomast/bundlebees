@@ -1186,15 +1186,64 @@ _ROUTE_PREVIEW_SCHEMA = _schema(
     },
 )
 
+_GO_MAX_SCHEMA = _schema(
+    "bundlebees_go_max",
+    "go-max: when the owner asks to run as much as possible at once ('go max', "
+    "'max parallel'), turn it on; the factory then fills free bee slots up to the "
+    "shared cap with approved ready slices, per lane, under host and provider "
+    "admission control. status explains per-lane counts and why slots stay empty. "
+    "Never cancels or approves anything.",
+    {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["on", "off", "status"], "description": "on, off or status."},
+            "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440,
+                            "description": "How long go-max stays on (default 480)."},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+)
+
 _SCHEMAS: tuple[tuple[str, dict[str, Any]], ...] = (
     (_STATUS_SCHEMA["name"], _STATUS_SCHEMA),
     (_DISPATCH_SCHEMA["name"], _DISPATCH_SCHEMA),
     (_ATTEMPT_SCHEMA["name"], _ATTEMPT_SCHEMA),
     (_HOST_PROMPT_SCHEMA["name"], _HOST_PROMPT_SCHEMA),
     (_ROUTE_PREVIEW_SCHEMA["name"], _ROUTE_PREVIEW_SCHEMA),
+    (_GO_MAX_SCHEMA["name"], _GO_MAX_SCHEMA),
 )
 
 _DESCRIPTIONS = {name: schema["description"] for name, schema in _SCHEMAS}
+
+
+def _go_max(ctx: Any, data: Mapping[str, Any], kwargs: Mapping[str, Any]) -> str:
+    from . import go_max as go_max_mod
+
+    state_dir = _state_dir_for(ctx)
+    if state_dir is None:
+        return _err("not_configured", "the plugin data directory is unavailable",
+                    "Run inside Hermes with the bundlebees plugin enabled.")
+    try:
+        client = _client_for(ctx, kwargs)
+    except Exception:  # noqa: BLE001 - on/off never need the launcher; status reports it
+        client = None
+    try:
+        settings = settings_from_ctx(ctx)
+    except Exception:  # noqa: BLE001
+        settings = {}
+    try:
+        out = go_max_mod.run_action(
+            state_dir,
+            str(data.get("action") or ""),
+            client=client,
+            ttl_minutes=data.get("ttl_minutes"),
+            by="hermes-chat",
+            policy=go_max_mod.Policy.from_settings(settings if isinstance(settings, Mapping) else {}),
+        )
+    except go_max_mod.GoMaxError as exc:
+        return _err(exc.code, exc.message, exc.fix or "Use action on, off or status.")
+    return _ok(**out)
 
 
 def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
@@ -1204,6 +1253,8 @@ def _make_handler(ctx: Any, tool_name: str) -> Callable[..., str]:
             data = _coerce_args(args)
             if tool_name == "bundlebees_host_prompt":
                 return _host_prompt(data)
+            if tool_name == "bundlebees_go_max":
+                return _go_max(ctx, data, kwargs)
             client = _client_for(ctx, kwargs)
             if tool_name == "bundlebees_status":
                 return _status(client, data)

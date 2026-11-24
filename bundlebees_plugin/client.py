@@ -880,6 +880,12 @@ class LauncherClient(_BaseClient):
     def capacity(self) -> dict[str, Any]:
         return self.health()
 
+    def host_capacity(self) -> dict[str, Any] | None:
+        """``GET /v1/capacity`` (hyvv.capacity/1), documented fields only; None if unreadable."""
+        from .go_max import public_capacity
+
+        return public_capacity(self.request_json("GET", "/v1/capacity"))
+
     def attempts_raw(self) -> list[Any]:
         data = self.request_json("GET", "/v1/attempts")
         return _as_list(data, "attempts", "items")
