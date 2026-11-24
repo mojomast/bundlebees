@@ -687,13 +687,23 @@ def _dispatch(
             else client.attempts()
         )
     except Exception:
-        raw_attempts = []
+        return _err(
+            "launcher_unreadable",
+            "live attempts are unreadable, so the lease-overlap check cannot run",
+            "Restore launcher access and retry; nothing was dispatched.",
+        )
+    if not isinstance(raw_attempts, list):
+        return _err(
+            "launcher_unreadable",
+            "live attempts did not return a list, so the lease-overlap check cannot run",
+            "Fix the launcher response and retry; nothing was dispatched.",
+        )
     if _lease_overlap(raw_attempts, brief):
         return _err(
             "lease_overlap",
             "assigned_files overlap a running attempt on the same project and branch",
             "Wait for the running attempt or choose non-overlapping files. Lease "
-            "checks are best-effort against live attempts.",
+            "checks require a readable live attempt list.",
         )
 
     # No model means "the launcher decides": its default is the cheapest usable route on that host
