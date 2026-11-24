@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-11-24
 
-- Release prep (no tag): `pyproject.toml`, `dashboard/manifest.json` and `docs/stack-manifest.md` now say **0.2.0**, matching `plugin.yaml` and this changelog (the 0.1.1 / 0.2.0 split inside the repo is gone). `HYVV_PIN` / launcher 0.1.18 re-pin follows once the hyvv 0.1.18 bump lands. Tagging v0.2.0 still needs Kyle's typed yes.
+- Release prep (no tag): `pyproject.toml`, `dashboard/manifest.json` and `docs/stack-manifest.md` now say **0.2.0**, matching `plugin.yaml` and this changelog (the 0.1.1 / 0.2.0 split inside the repo is gone). `HYVV_PIN` is re-pinned to the hyvv 0.1.18 merge `ae8680a4c0289ce91dab52169eff1433cb694533` (hyvv #41) and `LAUNCHER_PIN` to `0.1.18` in every copy (pins.py, CI checkout, setup script, pinned-sources, stack manifest, README); the deployed worker launcher still reports 0.1.17 until it is upgraded, so doctor shows that drift after a deploy. Tagging v0.2.0 still needs Kyle's typed yes.
 
 Verifier and contract hardening from an external review of the workflow. The
 unit of progress is an accepted artifact with evidence, and every guarantee
