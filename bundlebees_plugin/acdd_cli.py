@@ -790,8 +790,11 @@ def record_green(state_dir: Path, acdd_state: Mapping[str, Any], workdir: Path, 
         environment=_environment(evidence), notes=note,
     )
     try:
+        approved_ids = tdd.frozen_approved_ids(state_dir, acdd_state)
+        tdd.check_green(
+            contract, sha, acdd_state["red"], record, approved_ids=approved_ids
+        )
         tdd.write_record(state_dir, record, acdd_state["key"])
-        tdd.check_green(contract, sha, acdd_state["red"], record)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
     return record
@@ -854,7 +857,9 @@ def integrate_preflight(state_dir: Path, attempt_ids: list[str]) -> list[dict[st
             raise _error("green_failed", f"no GREEN evidence for contract {contract['id']} ({attempt_id})",
                          "Verify the attempt with `hermes bundlebees verify` before integrating.")
         try:
-            tdd.check_green(contract, sha, red, green)
+            preflight = {"contract": contract, "sha": sha, "key": key}
+            approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
+            tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
         if "refactor" in [str(phase) for phase in contract.get("evidence_required") or []]:

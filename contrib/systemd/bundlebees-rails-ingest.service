@@ -1,0 +1,21 @@
+[Unit]
+Description=Bundlebees Rails ingest (coordinator records -> local Rails ledger)
+Documentation=file://%h/rizzstack-ingest/bundlebees/docs/RAILS.md
+
+[Service]
+Type=oneshot
+# A pinned, reviewed checkout of this repository; not the live plugin worktree.
+WorkingDirectory=%h/rizzstack-ingest/bundlebees
+ExecStart=%h/rizzstack/.venv/bin/python -B -m bundlebees_plugin.rails_ingest --ledger %h/.local/state/rizzstack-rails/ledger.sqlite3 --state-dir %h/.hermes/plugin-data/bundlebees --source bundlebees --source outbox
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The only writable path: the ledger directory. The bundlebees state is read.
+ReadWritePaths=%h/.local/state/rizzstack-rails
+MemoryMax=512M

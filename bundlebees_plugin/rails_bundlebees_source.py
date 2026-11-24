@@ -162,6 +162,14 @@ class _Scan:
             raise SourceError('source_unavailable') from None
 
 
+def _regular_file(name, parent):
+    try:
+        info = os.stat(name, dir_fd=parent[0], follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
 def _disk_entries(root):
     budget = _Scan()
 
@@ -183,7 +191,11 @@ def _disk_entries(root):
             with _directory(category, state, optional=True) as directory:
                 if category == 'evidence':
                     for contract in budget.names(directory):
-                        if contract.startswith('.'):
+                        if contract.startswith('.') or _regular_file(contract, directory):
+                            # A plain file beside the contract directories (an
+                            # exported report, say) holds no contract evidence.
+                            # Symlinks and other types still reach _directory,
+                            # which refuses them.
                             continue
                         with _directory(contract, directory) as fd:
                             entries.extend(files(fd, category, contract))
