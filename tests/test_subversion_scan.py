@@ -332,6 +332,12 @@ def test_deleting_a_non_empty_conftest_is_not_a_finding():
     assert _scan()(_delete("tests/conftest.py", "import os", "os._exit(0)")) == []
 
 
+def test_verify_accepts_deleting_a_conftest():
+    assert verify_local.check_patch_subversion(_empty_delete("tests/conftest.py")) == []
+    deleted = _delete("tests/conftest.py", "import os", "os._exit(0)")
+    assert verify_local.check_patch_subversion(deleted) == []
+
+
 def test_deletion_only_edit_of_conftest_is_not_a_finding():
     patch = (
         "diff --git a/tests/conftest.py b/tests/conftest.py\n"
