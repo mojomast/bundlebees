@@ -48,10 +48,8 @@ client against the launcher.
 | `bundlebees_host_prompt` | `os` (`linux`/`macos`/`windows`), `reach` (`same-machine`/`lan`/`vpn`/`ssh`), `provider`, `repos`, `max_concurrent` (1-10), optional `branch_rules` | Fill the host setup template. No addresses or secrets in or out. |
 | `bundlebees_route_preview` | optional `kind`, `model`, `tier`, `brief` | Preview the model route a dispatch would take; starts no attempt. |
 
-Default model: `deepseek-v4.1-flash`; pass another only when the user asks and
-the launcher allows it. Complex slices (high risk, 5+ files, cross-repo, security paths, Rails
-harness, failed twice) use `k3.1-pro`: run `python -m bundlebees_plugin.model_route <brief.json>`
-and pass its `model`; a `fallback: true` result names the reason.
+Default model: `deepseek-v4.1-flash`. Complex slices get `k3.1-pro` from
+`python -m bundlebees_plugin.model_route <brief>`; others only on request.
 
 User-typed CLI (never a model tool):
 
