@@ -17,10 +17,10 @@ TAG="setup-pinned-sources"
 
 WORKFLOW_URL="https://github.com/mojomast/workflow.git"
 WORKFLOW_BRANCH="main"
-WORKFLOW_PIN="c8ef4c8e62ea550e1541fd0562c857404f900bdb"
+WORKFLOW_PIN="1dacd5bb2552cc7052f436dcba04601995c82167"
 HYVV_URL="https://github.com/mojomast/hyvv.git"
 HYVV_BRANCH="main"
-HYVV_PIN="9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb"
+HYVV_PIN="fdd235446e8fb28f8074fa06ea5c6ee1e466e129"
 
 GITLEAKS_VERSION="8.28.0"
 GITLEAKS_SHA256_LINUX_X64="a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"

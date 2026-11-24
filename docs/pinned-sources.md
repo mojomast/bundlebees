@@ -47,8 +47,8 @@ emit a safe export line).
 
 What the script does and does not do:
 
-- It clones at the revisions CI pins (`workflow` `c8ef4c8e62ea550e1541fd0562c857404f900bdb`
-  on `main`, `hyvv` `9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb` on
+- It clones at the revisions CI pins (`workflow` `1dacd5bb2552cc7052f436dcba04601995c82167`
+  on `main`, `hyvv` `fdd235446e8fb28f8074fa06ea5c6ee1e466e129` on
   `main`) and verifies each checkout's HEAD against that pin
   and the marker files. A checkout already at the pin is left untouched and no
   network round trip is made.
@@ -94,11 +94,11 @@ runner:
    it to `GITHUB_PATH` and sets `GITLEAKS`.
 2. **workflow** — `git clone`s `mojomast/workflow`, fetches
    `refs/heads/main`, checks out
-   `c8ef4c8e62ea550e1541fd0562c857404f900bdb`, asserts
+   `1dacd5bb2552cc7052f436dcba04601995c82167`, asserts
    `git rev-parse HEAD` equals the pin, then sets `WORKFLOW_SRC` and
    `REQUIRE_WORKFLOW=1`.
 3. **hyvv** — the same for `mojomast/hyvv` (`main`,
-   `9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb`), setting `HYVV_SRC` and
+   `fdd235446e8fb28f8074fa06ea5c6ee1e466e129`), setting `HYVV_SRC` and
    `REQUIRE_HYVV=1`.
 
 The script mirrors those exact steps so a local run and CI exercise the same

@@ -321,8 +321,8 @@ The runtime runs a fixed protocol revision, not whatever is on a branch tip:
 | `REQUIRE_WORKFLOW=1` | a missing or unreadable checkout is a test/operation failure, not a skip |
 | `HYVV_SRC` | checkout of `hyvv` containing the provisioning contract; `REQUIRE_HYVV=1` makes it mandatory |
 
-CI pins workflow `c8ef4c8e62ea550e1541fd0562c857404f900bdb` and hyvv
-`9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb` (reviewed protocol revisions), verifies each checkout's HEAD, and fails closed
+CI pins workflow `1dacd5bb2552cc7052f436dcba04601995c82167` and hyvv
+`fdd235446e8fb28f8074fa06ea5c6ee1e466e129` (reviewed protocol revisions), verifies each checkout's HEAD, and fails closed
 when either is absent. At runtime, a missing workflow checkout refuses packet admission and every recovery
 operation (`recovery_protocol_unavailable`); there is no local fallback validator.
 
@@ -552,10 +552,10 @@ python -m pip install -e '.[dev]'
 eval "$(sh scripts/setup-pinned-sources.sh)"
 
 # Deterministic suite. CI pins both protocol checkouts by commit and makes them mandatory:
-#   workflow c8ef4c8e62ea550e1541fd0562c857404f900bdb  (reviewed protocol revision)
-#   hyvv     9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb  (reviewed provisioning revision)
-WORKFLOW_SRC=<checkout-of-c8ef4c8> REQUIRE_WORKFLOW=1 \
-HYVV_SRC=<checkout-of-9691837> REQUIRE_HYVV=1 \
+#   workflow 1dacd5bb2552cc7052f436dcba04601995c82167  (reviewed protocol revision)
+#   hyvv     fdd235446e8fb28f8074fa06ea5c6ee1e466e129  (reviewed provisioning revision)
+WORKFLOW_SRC=<checkout-of-1dacd5b> REQUIRE_WORKFLOW=1 \
+HYVV_SRC=<checkout-of-fdd2354> REQUIRE_HYVV=1 \
 GITLEAKS="$(command -v gitleaks)" \
 python -m pytest -rs
 
