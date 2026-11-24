@@ -65,43 +65,65 @@ def _loads_pytest_plugin(path: str, line: str) -> bool:
     )
 
 
+def _hunk_start(diff_line: str) -> int | None:
+    match = _HUNK_RE.match(diff_line)
+    return int(match.group(1)) if match else None
+
+
+def _header_state(
+    diff_line: str, path: str | None, in_hunk: bool, new_line: int
+) -> tuple[bool, str | None, bool, int]:
+    """Apply one diff header line; return ``(handled, path, in_hunk, new_line)``."""
+    if diff_line.startswith("diff --git "):
+        return True, None, False, new_line
+    if not in_hunk and diff_line.startswith("+++ "):
+        return True, _new_path(diff_line), in_hunk, new_line
+    start = _hunk_start(diff_line)
+    if start is not None:
+        return True, path, True, start
+    return False, path, in_hunk, new_line
+
+
+def _body_step(
+    diff_line: str, in_hunk: bool, path: str | None, new_line: int
+) -> tuple[bool, int, tuple[str, int] | None]:
+    """Advance one hunk body line; return ``(in_hunk, new_line, added)``.
+
+    ``added`` is ``(content, line)`` when the line was added, else ``None``.
+    """
+    if not in_hunk or path is None or not diff_line:
+        return in_hunk, new_line, None
+    marker = diff_line[0]
+    if marker == "+":
+        return in_hunk, new_line + 1, (diff_line[1:], new_line)
+    if marker == " ":
+        return in_hunk, new_line + 1, None
+    if marker == "-":
+        return in_hunk, new_line, None
+    return False, new_line, None
+
+
+def _added_line_findings(path: str, content: str, line: int) -> list[Finding]:
+    """Return every finding for one added line of *path* at new-file line *line*."""
+    findings = [Finding(kind=kind, path=path, line=line) for kind in _path_kinds(path)]
+    if _loads_pytest_plugin(path, content):
+        findings.append(Finding(kind="pytest_plugin", path=path, line=line))
+    for kind, pattern in _CONTENT_PATTERNS:
+        if pattern.search(content):
+            findings.append(Finding(kind=kind, path=path, line=line))
+    return findings
+
+
 def scan_patch(patch: str) -> list[Finding]:
     findings: list[Finding] = []
     path: str | None = None
     new_line = 0
     in_hunk = False
-
     for diff_line in patch.splitlines():
-        if diff_line.startswith("diff --git "):
-            path = None
-            in_hunk = False
+        handled, path, in_hunk, new_line = _header_state(diff_line, path, in_hunk, new_line)
+        if handled:
             continue
-        if not in_hunk and diff_line.startswith("+++ "):
-            path = _new_path(diff_line)
-            continue
-        hunk = _HUNK_RE.match(diff_line)
-        if hunk:
-            new_line = int(hunk.group(1))
-            in_hunk = True
-            continue
-        if not in_hunk or path is None or not diff_line:
-            continue
-        marker = diff_line[0]
-        if marker == "+":
-            for kind in _path_kinds(path):
-                findings.append(Finding(kind=kind, path=path, line=new_line))
-            content = diff_line[1:]
-            if _loads_pytest_plugin(path, content):
-                findings.append(Finding(kind="pytest_plugin", path=path, line=new_line))
-            for kind, pattern in _CONTENT_PATTERNS:
-                if pattern.search(content):
-                    findings.append(Finding(kind=kind, path=path, line=new_line))
-            new_line += 1
-        elif marker == " ":
-            new_line += 1
-        elif marker == "-":
-            continue
-        else:
-            in_hunk = False
-
+        in_hunk, new_line, added = _body_step(diff_line, in_hunk, path, new_line)
+        if added is not None and path is not None:
+            findings.extend(_added_line_findings(path, *added))
     return findings
