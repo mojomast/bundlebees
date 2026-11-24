@@ -472,6 +472,17 @@ def record_lease(
     }
     if dispatch_chain_id is not None:
         record["dispatch_chain_id"] = dispatch_chain_id
+    # Dispatch identity for the fleet view: the task the brief names (its
+    # ``task_id``, else the coordinator's own ``label``) and the job it names.
+    # A job id is only ever the brief's own; a wave is not a job document, so
+    # none is derived. Unsafe or absent values add no key, keeping older lease
+    # shapes byte-identical. Both sit inside the MAC below.
+    task_id = _identity(normalized.get("task_id")) or _identity(normalized.get("label"))
+    if task_id is not None:
+        record["task_id"] = task_id
+    job_id = _identity(normalized.get("job_id"))
+    if job_id is not None:
+        record["job_id"] = job_id
     # Recall is advisory and cannot widen scope. It runs after the brief has
     # been frozen and before the MAC, so the context is covered by the MAC but
     # never enters the brief or brief_sha256. A disabled flag returns None and
@@ -485,6 +496,19 @@ def record_lease(
     record["mac"] = _sign(record, key)
     _write_record(leases / f"{attempt}.json", record)
     return record
+
+
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _identity(value: Any) -> str | None:
+    """A public dispatch identity token, or None for anything else."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _IDENTITY_RE.fullmatch(text) or ".." in text:
+        return None
+    return text
 
 
 def load_lease(state_dir: Path, attempt_id: str) -> dict[str, Any]:
