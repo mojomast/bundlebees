@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- **Every GREEN recorder enforces the frozen collected-test ids (WA-A1B-FUP1):** the frozen-pin loader moves into `bundlebees_plugin/tdd.py::frozen_approved_ids`, and `acdd_cli.record_green` / `acdd_cli.integrate_preflight` now load it and pass `approved_ids=` into `check_green` before anything is signed, so `hermes bundlebees verify` refuses a partial run with `tests_mismatch` and writes no GREEN — WA-A1B had wired the pin only into the commit-local `verify_and_commit` lane, and that lane now also persists the checked record through `write_record` instead of discarding it; `check_collected_ids` counts only a case whose outcome is `passed` (skipped/xfailed/error never counts), `check_green` raises `green_failed` before `tests_mismatch`, `parse_junit_cases` defaults to the new `MAX_JUNIT_CASES = 20_000` so a large contract is not falsely refused, and a non-numeric JUnit counter is a `VerifyError` (`evidence_invalid`) instead of a `ValueError`.
 - Leases record a top-level `task_id` (brief `task_id`, else the coordinator `label`) and the brief's own `job_id`; `attempts` rows carry `task_id`.
 - `route_sync`: record the launcher-reported model/route per leased attempt; `attempts` uses it when no verified attribution exists.
 - `rails_ingest`: scheduled Rails ledger ingest from the bundlebees and outbox sources, with systemd units.
