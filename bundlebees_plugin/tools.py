@@ -59,6 +59,16 @@ _SKILL_TEMPLATE = (
 )
 
 _STATUS_OPS = {"health", "capacity", "attempts", "events", "containers", "projects"}
+_STATUS_ATTEMPTS_DEFAULT_LIMIT = 20
+_STATUS_ATTEMPTS_MAX_LIMIT = 200
+_STATUS_ATTEMPT_COMPACT_KEYS = (
+    "attempt_id",
+    "state",
+    "project",
+    "branch",
+    "model",
+    "updated_at",
+)
 _ATTEMPT_OPS = {"get", "events", "cancel", "review"}
 _OS_VALUES = {"linux", "macos", "windows"}
 _REACH_VALUES = {"same-machine", "lan", "vpn", "ssh"}
@@ -328,6 +338,73 @@ def _lease_overlap(attempts: Any, brief: Mapping[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _attempt_sort_key(attempt: Mapping[str, Any]) -> tuple[str, str]:
+    updated = attempt.get("updated_at") or attempt.get("created_at") or ""
+    created = attempt.get("created_at") or ""
+    return (str(updated), str(created))
+
+
+def _compact_attempt(attempt: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: attempt[key]
+        for key in _STATUS_ATTEMPT_COMPACT_KEYS
+        if key in attempt and attempt[key] is not None
+    }
+
+
+def _status_attempts(client: Any, args: Mapping[str, Any]) -> str:
+    limit = args.get("limit", _STATUS_ATTEMPTS_DEFAULT_LIMIT)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        return _err(
+            "invalid_argument",
+            "limit must be a positive integer",
+            "Pass a small limit; the list is capped at "
+            f"{_STATUS_ATTEMPTS_MAX_LIMIT}.",
+        )
+    limit = min(limit, _STATUS_ATTEMPTS_MAX_LIMIT)
+
+    state = args.get("state")
+    if state is not None:
+        if not isinstance(state, str) or not state.strip():
+            return _err(
+                "invalid_argument",
+                "state must be a non-empty string",
+                "Pass an attempt state such as running or succeeded, or omit it.",
+            )
+        state = state.strip().lower()
+
+    detail = args.get("detail", False)
+    if not isinstance(detail, bool):
+        return _err(
+            "invalid_argument",
+            "detail must be a boolean",
+            "Pass true for full public rows or false for compact rows.",
+        )
+
+    raw = client.attempts()
+    if isinstance(raw, (list, tuple)):
+        attempts = [item for item in raw if isinstance(item, Mapping)]
+    else:
+        attempts = []
+    if state is not None:
+        attempts = [
+            item
+            for item in attempts
+            if str(item.get("state") or item.get("status") or "").strip().lower() == state
+        ]
+    attempts.sort(key=_attempt_sort_key, reverse=True)
+    total = len(attempts)
+    page = attempts[:limit]
+    rows = [dict(item) for item in page] if detail else [_compact_attempt(item) for item in page]
+    return _ok(
+        op="attempts",
+        attempts=rows,
+        total=total,
+        truncated=total > len(rows),
+        untrusted=True,
+    )
+
+
 def _status(client: Any, args: Mapping[str, Any]) -> str:
     op = args.get("op")
     if op not in _STATUS_OPS:
@@ -341,7 +418,7 @@ def _status(client: Any, args: Mapping[str, Any]) -> str:
     if op == "capacity":
         return _ok(op=op, capacity=client.health())
     if op == "attempts":
-        return _ok(op=op, attempts=client.attempts(), untrusted=True)
+        return _status_attempts(client, args)
     if op == "events":
         attempt_id = args.get("attempt_id")
         if not isinstance(attempt_id, str) or not attempt_id.strip():
@@ -1082,6 +1159,20 @@ _STATUS_SCHEMA = _schema(
             },
             "attempt_id": {"type": "string", "description": "Attempt id (events)."},
             "cursor": {"type": "integer", "description": "Event cursor."},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _STATUS_ATTEMPTS_MAX_LIMIT,
+                "description": "Attempts to return (default 20, maximum 200).",
+            },
+            "state": {
+                "type": "string",
+                "description": "Only attempts in this state.",
+            },
+            "detail": {
+                "type": "boolean",
+                "description": "Return full public rows instead of compact rows.",
+            },
         },
         "required": ["op"],
         "additionalProperties": False,
