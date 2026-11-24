@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import agent_work, approval, integrate_job, job as jobs, leases, reconcile, recovery, return_report, verify_local
-from . import hermes_adapter
+from . import agent_work, approval, integrate_job, job as jobs, leases, pins, reconcile, recovery, return_report, verify_local
+from . import hermes_adapter, verify_shadow
 from .launcher_adapter import LauncherAdapter, LeaseBinder
 
 
@@ -475,6 +475,10 @@ def tick(
     if bindings:
         adapter = provision_bind.BoundLauncher(adapter, bindings, validators)
 
+    # Resolve once, before the tick: a misconfigured mode fails closed here
+    # instead of surfacing mid-verification.
+    shadow_mode = verify_shadow.mode_from_env()
+
     def verifier(ctx: Mapping[str, Any]) -> Mapping[str, Any]:
         from . import acdd_cli, cli, sandbox
 
@@ -549,7 +553,27 @@ def tick(
             return {'ok': False, 'evidence': f'{exc.code}: {exc.error}'}
         except verify_local.VerifyError as exc:
             return {"ok": False, "evidence": _failure_evidence(exc, tests)}
-        return {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}
+        verdict = {"ok": True, "evidence": f"commit {record['sha'][:12]} verified locally"}
+        if shadow_mode == "shadow":
+            lease_brief = lease_record.get("brief")
+            brief = lease_brief if isinstance(lease_brief, Mapping) else {}
+            return verify_shadow.observe(
+                state_dir,
+                repo,
+                mode=shadow_mode,
+                request_fields={
+                    "attempt_id": attempt_id,
+                    "source_rev": source,
+                    "workflow_ref": str(brief.get("workflow_ref") or pins.WORKFLOW_PIN),
+                    "patch": patch,
+                    "declared_files": files,
+                    "tests": tests,
+                    "suite_command": list(suite_command),
+                    "gitleaks": gitleaks or "",
+                },
+                in_beat_verdict=verdict,
+            )
+        return verdict
 
     def integrator(job_doc: Mapping[str, Any]) -> Mapping[str, Any]:
         try:

@@ -35,6 +35,7 @@ from . import job as jobs, recovery, revision, sandbox, test_receipts as receipt
 
 DEFAULT_SANDBOX_TIMEOUT_S = 900
 _MAX_SANDBOX_TIMEOUT_S = 7200
+GIT_TIMEOUT_S = 300
 SuiteRunner = Callable[[Path, Sequence[str]], Mapping[str, Any]]
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _ZERO = "0" * 40
@@ -64,15 +65,31 @@ class IntegrateError(Exception):
         self.fix = fix
 
 
-def _git(args: Sequence[str], cwd: Path, *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        ["git", "-c", "user.name=bundlebees", "-c", "user.email=bees@localhost", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        input=input_text,
-        text=True,
-        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
-    )
+def _git(
+    args: Sequence[str],
+    cwd: Path,
+    *,
+    check: bool = True,
+    input_text: str | None = None,
+    timeout_s: float | None = None,
+) -> subprocess.CompletedProcess:
+    timeout = GIT_TIMEOUT_S if timeout_s is None else timeout_s
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "user.name=bundlebees", "-c", "user.email=bees@localhost", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            input=input_text,
+            text=True,
+            timeout=timeout,
+            env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": str(Path.home())},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrateError(
+            "git_timeout",
+            f"git {' '.join(args)} timed out after {timeout}s",
+            "Check for a hung remote, credential prompt or stale lock, then retry.",
+        ) from exc
     if check and proc.returncode != 0:
         raise IntegrateError("git_error", f"git {' '.join(args)} failed: {proc.stderr.strip()[:300]}", "Inspect the integration worktree.")
     return proc
