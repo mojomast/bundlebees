@@ -23,7 +23,7 @@ A brief is complex when ANY of these holds (each adds a reason):
 | C2 | the lease (`assigned_files`) names 5 or more files (multi-file) |
 | C3 | the brief spans repos: `cross_repo: true`, or `repos` lists 2+ distinct repos |
 | C4 | the lease touches a security or approval-gate path (path floor reason from `risk.derive_floor`) |
-| C5 | Rails harness work: `rails` as a word in project, track, label, branch or title, or a `rails` path segment |
+| C5 | Rails harness work: both `rails` and `harness` as words in project, track, label, branch or title, or a `rails` path segment |
 | C6 | the slice already failed twice: `failed_attempts` argument or brief field is 2 or more |
 | C7 | the brief asks for it: `complexity: "complex"` |
 
@@ -37,7 +37,7 @@ stronger model).
 - AC-003: a 5-file lease is complex (C2); a 4-file medium lease is not - tests/test_model_route.py::TestSelectWorkerModel::test_multi_file_threshold
 - AC-004: cross-repo briefs are complex (C3) - tests/test_model_route.py::TestSelectWorkerModel::test_cross_repo
 - AC-005: a security/approval path is complex even when the declared tier is low (C4 and C1) - tests/test_model_route.py::TestSelectWorkerModel::test_security_path
-- AC-006: Rails harness briefs are complex (C5), and "trails" does not match - tests/test_model_route.py::TestSelectWorkerModel::test_rails_harness
+- AC-006: Rails harness briefs are complex (C5); "trails" and a Rails decision memo without harness work do not match - tests/test_model_route.py::TestSelectWorkerModel::test_rails_harness
 - AC-007: two failed attempts make a slice complex (C6); one does not - tests/test_model_route.py::TestSelectWorkerModel::test_failed_twice
 - AC-008: `complexity: complex` forces C7; `complexity: simple` cannot cancel a rule - tests/test_model_route.py::TestSelectWorkerModel::test_complexity_hints
 - AC-009: when the launcher allow-list is given and lacks the complex model, the result falls back to the default model with `fallback: true` and a reason (never silent) - tests/test_model_route.py::TestSelectWorkerModel::test_fallback_when_not_allowlisted

@@ -54,7 +54,8 @@ class TestSelectWorkerModel:
         assert r["complex"] and any(x.startswith("C5") for x in r["reasons"])
         r2 = mr.select_worker_model(brief(files=("harness/rails/p1.py",), tier="medium"))
         assert any(x.startswith("C5") for x in r2["reasons"])
-        assert mr.select_worker_model(brief(title="trails docs"))["complex"] is False
+        assert mr.select_worker_model(brief(title="trails harness docs"))["complex"] is False
+        assert mr.select_worker_model(brief(title="Rails decision memo"))["complex"] is False
 
     def test_failed_twice(self):
         assert mr.select_worker_model(brief(), failed_attempts=1)["complex"] is False
