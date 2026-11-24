@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- CI speed-up (owner yes t1659s8401): the `tests (sandbox included)` job in `.github/workflows/ci.yml` runs as four parallel shards. `.github/scripts/shard_tests.py` balances the test files by the seconds in `.github/test-weights.json` (per-file times from a CI run of the shards) (a new file gets the median weight) and fails if the shards are not an exact partition of every collectable test file; each shard re-checks this before it runs, and `--against-pytest` also compares it with pytest's own `--collect-only` file set (review finding on #268), so no test is skipped. Required check names (`ci-gate`, `gitleaks`, `slop-lint`) are unchanged, and `ci-gate` still needs `tests`, which fails if any shard fails. `tests/test_shard_tests.py` covers the partition.
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
 - **Preflight honours `require_contract`:** `bundlebees_plugin/preflight.py` takes a keyword-only `require_contract=` and gains a `--require-contract` flag, both threaded into the same `tools._gate` the dispatcher uses, and the registered `preflight` command reads the `require_contract` setting through `config_flag(settings_from_ctx(ctx))` exactly like `tools._require_contract`, so preflight and dispatch return the same verdict when the setting is on.
 
