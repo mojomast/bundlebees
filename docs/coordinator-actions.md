@@ -38,7 +38,7 @@ processes, not merely threads.
   "kind": "merge",
   "repo": "mojomast/bundlebees",
   "target": "",
-  "workflow_ref": "9c69d3a987ea9544a77cdd9b5a259904eb36f006",
+  "workflow_ref": "c8ef4c8e62ea550e1541fd0562c857404f900bdb",
   "payload": {"pr": 42},
   "status": "claimed",
   "fence_seq": 2,
