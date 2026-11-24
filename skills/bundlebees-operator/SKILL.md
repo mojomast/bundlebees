@@ -13,9 +13,8 @@ metadata:
 
 # bundlebees operator
 
-Skill id: `bundlebees:bundlebees-operator`. The plugin also registers the bare
-name `bundlebees-operator`; always refer to the qualified id in a session,
-never a `plugin:` prefix.
+Skill id: `bundlebees:bundlebees-operator` (also registered bare); use the
+qualified id in a session, never a `plugin:` prefix.
 
 ## When to Use
 
@@ -167,8 +166,8 @@ A dispatch is not success until all of these hold:
 6. The push target is the feature branch. If the user asks for `--dry-run`,
    no push happens. If anything is red, do not advance the card to review.
 
-The model never runs verify or deploy, a real SSH deploy, or a launcher
-restart, and never accepts a review without the user's explicit decision.
+The model never runs verify, deploy, or a launcher restart, and never
+accepts a review without the user's explicit decision.
 
 ## Hard Rules
 
