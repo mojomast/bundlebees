@@ -13,7 +13,7 @@ derived from `pyproject.toml`.
 | Hermes | `>=0.23.0` | plugin host API floor (`requires_hermes`) |
 | launcher | `0.1.17` | local worker launcher result envelope |
 | python | `3.12` | tested interpreter (project floor: `>=3.11`) |
-| bundlebees package | `0.1.1` | `pyproject.toml` build identity |
+| bundlebees package | `0.2.0` | `pyproject.toml` build identity |
 
 ## Verify heads
 

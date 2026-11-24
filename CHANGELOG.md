@@ -7,7 +7,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-24
+
+- Release prep (no tag): `pyproject.toml`, `dashboard/manifest.json` and `docs/stack-manifest.md` now say **0.2.0**, matching `plugin.yaml` and this changelog (the 0.1.1 / 0.2.0 split inside the repo is gone). `HYVV_PIN` / launcher 0.1.18 re-pin follows once the hyvv 0.1.18 bump lands. Tagging v0.2.0 still needs Kyle's typed yes.
 
 Verifier and contract hardening from an external review of the workflow. The
 unit of progress is an accepted artifact with evidence, and every guarantee

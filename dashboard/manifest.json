@@ -3,7 +3,7 @@
   "label": "Bundlebees",
   "description": "Backend routes for the bundlebees Desktop pane: launcher health, containers, models, concurrency, authorized projects, live attempts, verify results, and the remote-host prompt. Reports configured or not configured only; never returns tokens or host addresses.",
   "icon": "Activity",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "tab": {
     "path": "/bundlebees",
     "hidden": true
