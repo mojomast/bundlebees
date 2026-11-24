@@ -83,7 +83,7 @@ jobs:
       - name: Run test suite (shard ${{ matrix.shard }} of 4)
         run: |
           set -euo pipefail
-          python3 .github/scripts/shard_tests.py --check 4
+          python .github/scripts/shard_tests.py --check 4 --against-pytest
           mapfile -t files < <(python3 .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
           test "${#files[@]}" -gt 0
           python -m pytest -rs "${files[@]}"

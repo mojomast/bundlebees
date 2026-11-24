@@ -3,13 +3,16 @@
 
     python3 .github/scripts/shard_tests.py <index> <total>   # print the files for shard <index> (1-based)
     python3 .github/scripts/shard_tests.py --check <total>   # verify the shards partition every test file
+    python3 .github/scripts/shard_tests.py --check <total> --against-pytest   # also compare with pytest's own collection
 
 Every collectable test file lands in exactly one shard, so sharding never drops a test. The split is
 deterministic. Files are balanced greedily by the seconds recorded in .github/test-weights.json; a file
 missing from that table counts as the median weight, so a new test file still runs, only less balanced.
 """
 import json
+import re
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,7 +39,27 @@ def shards(total):
     return [sorted(x[2]) for x in loads]
 
 
-def check(total):
+def pytest_files():
+    """The test files pytest itself collects for the whole suite (independent of test_files())."""
+    out = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+                         cwd=ROOT, capture_output=True, text=True, timeout=600)
+    if out.returncode not in (0, 5):
+        sys.exit("pytest collection failed:\n" + out.stdout[-2000:] + out.stderr[-2000:])
+    files = set()
+    for line in out.stdout.splitlines():
+        m = re.match(r"^([^\s:]+\.py)(::|: \d+$)", line.strip())
+        if m:
+            files.add(m.group(1))
+    if not files:
+        sys.exit("pytest collected no test files")
+    return files
+
+
+def check(total, against_pytest=False):
+    if against_pytest:
+        missing = sorted(pytest_files() - set(test_files()))
+        if missing:
+            sys.exit("pytest collects files the shards would not run: " + ", ".join(missing))
     parts = shards(total)
     flat = [f for part in parts for f in part]
     if sorted(flat) != test_files() or len(flat) != len(set(flat)):
@@ -47,8 +70,8 @@ def check(total):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--check":
-        check(int(sys.argv[2]))
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--check" and sys.argv[3:] in ([], ["--against-pytest"]):
+        check(int(sys.argv[2]), against_pytest=sys.argv[3:] == ["--against-pytest"])
     elif len(sys.argv) == 3:
         index, total = int(sys.argv[1]), int(sys.argv[2])
         if not 1 <= index <= total:

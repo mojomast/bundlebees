@@ -28,6 +28,11 @@ class ShardPartition(unittest.TestCase):
         self.assertIn("shard: [1, 2, 3, 4]", ci)
         self.assertIn("shard_tests.py --check 4", ci)
         self.assertIn("fail-fast: false", ci)
+        self.assertIn("--check 4 --against-pytest", ci)
+
+    def test_pytest_collects_nothing_the_shards_miss(self):
+        # Independent of test_files(): ask pytest which files it collects for the whole suite.
+        self.assertLessEqual(shard_tests.pytest_files(), set(shard_tests.test_files()))
 
 
 if __name__ == "__main__":
