@@ -731,6 +731,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             argv = [str(args.brief)]
             if getattr(args, "state_dir", None):
                 argv.extend(["--state-dir", str(args.state_dir)])
+            if config_flag(_config(ctx).get("require_contract"), False):
+                argv.append("--require-contract")
             return _preflight.main(argv)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)

@@ -20,7 +20,9 @@ mechanical reconciler.
 
 Test-only crash boundary
 ------------------------
-When ``BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL=1`` is set in the consumer, the
+The ``authorized`` adapter and the crash switch are reachable only when
+``BUNDLEBEES_TEST_ADAPTERS=1`` is also set. When
+``BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL=1`` is set in the consumer, the
 Hermes path installs a guard around ``recovery.record_decision``. The guard runs
 after ``decide_with_hermes`` has persisted the proposal and immediately before
 the decision would be recorded: it writes a fsynced marker under ``recovery/``
@@ -48,7 +50,64 @@ CRASH_ENV = "BUNDLEBEES_AGENT_CRASH_AFTER_PROPOSAL"
 CRASH_EXIT_CODE = 97
 CRASH_SCHEMA = "rizzstack.agent-crash/1"
 
+TEST_ADAPTERS_ENV = "BUNDLEBEES_TEST_ADAPTERS"
+
 ADAPTERS: tuple[str, ...] = ("hermes", "deterministic", "authorized")
+
+#: Adapters that are safe in production. The ``authorized`` adapter derives a
+#: superseding contract and exists only for the crash/wake-up acceptance tests.
+PRODUCTION_ADAPTERS: tuple[str, ...] = ("hermes", "deterministic")
+
+#: Adapters that are test-only and need ``BUNDLEBEES_TEST_ADAPTERS=1``.
+TEST_ONLY_ADAPTERS: tuple[str, ...] = ("authorized",)
+
+
+def _test_adapters_enabled() -> bool:
+    """Only the exact value ``1`` arms the test-only consumer controls."""
+
+    return os.environ.get(TEST_ADAPTERS_ENV) == "1"
+
+
+def allowed_adapters() -> tuple[str, ...]:
+    """The adapters reachable in this process's environment.
+
+    Production always has hermes and deterministic; the test-only adapters are
+    appended only when ``BUNDLEBEES_TEST_ADAPTERS`` is exactly ``1``.
+    """
+
+    if _test_adapters_enabled():
+        return PRODUCTION_ADAPTERS + TEST_ONLY_ADAPTERS
+    return PRODUCTION_ADAPTERS
+
+
+def resolve_adapter(explicit: str | None, item: Mapping[str, Any]) -> str:
+    """The adapter to run: the explicit choice, then the item hint, then hermes.
+
+    A test-only adapter is refused unless the test flag arms it, whether it
+    came from the CLI or from a work item's adapter hint.
+    """
+
+    chosen = str(explicit or item.get("adapter") or "hermes")
+    if chosen in TEST_ONLY_ADAPTERS and not _test_adapters_enabled():
+        raise ConsumerError(
+            "adapter_test_only",
+            f"adapter {chosen!r} is test-only and requires {TEST_ADAPTERS_ENV}=1",
+            f"Unset the adapter hint, or set {TEST_ADAPTERS_ENV}=1 for the acceptance tests.",
+        )
+    if chosen not in allowed_adapters():
+        raise ConsumerError(
+            "adapter_unknown",
+            f"adapter {chosen!r} is not one of {', '.join(allowed_adapters())}",
+            "Use --adapter hermes or --adapter deterministic.",
+        )
+    return chosen
+
+
+def crash_armed() -> bool:
+    """Whether the test-only crash boundary may run: both switches exactly ``1``."""
+
+    return _test_adapters_enabled() and os.environ.get(CRASH_ENV) == "1"
+
 
 # ---------------------------------------------------------------------------
 # Tool-path write-back
@@ -760,7 +819,7 @@ def _decide_with_hermes(
     now: Any,
 ) -> dict[str, Any]:
     original = recovery.record_decision
-    if os.environ.get(CRASH_ENV) == "1":
+    if crash_armed():
         recovery.record_decision = _crash_guard(Path(state_dir), item)  # type: ignore[assignment]
     try:
         return hermes_adapter.decide_with_hermes(
@@ -895,13 +954,7 @@ def _run_item(
         )
         return _summary("adopted", completed, consumer=consumer, decision=adopted, proposal=proposal_ref)
 
-    chosen = str(adapter or item.get("adapter") or "hermes")
-    if chosen not in ADAPTERS:
-        raise ConsumerError(
-            "adapter_unknown",
-            f"adapter {chosen!r} is not one of {', '.join(ADAPTERS)}",
-            "Use --adapter hermes, --adapter deterministic or --adapter authorized.",
-        )
+    chosen = resolve_adapter(adapter, item)
     # A claim beyond the budget may still adopt a proposal or observe a decision
     # (both are inference-free), but it must never call an adapter again.
     claims = int(item.get("claims") or item.get("attempts") or 0)
@@ -1097,7 +1150,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state", required=True, help="Bundlebees state directory.")
     parser.add_argument("--consumer", required=True, help="Consumer name recorded on the claim.")
-    parser.add_argument("--adapter", choices=ADAPTERS, default=None,
+    parser.add_argument("--adapter", choices=allowed_adapters(), default=None,
                         help="Decision adapter; defaults to the item's hint, then hermes.")
     parser.add_argument("--once", action="store_true", help="Process at most one item and exit.")
     parser.add_argument("--interval", type=int, default=None,
