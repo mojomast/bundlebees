@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- **Verify-workers shadow truth and a recorder that cannot raise (T1-VWSHADOW2 follow-up):** `bundlebees_plugin/verify_workers.py` now tells the truth in its body — production has exactly `in-beat` and `shadow`, mode `on` is refused as `mode_not_wired`, and the library keeps the `on` code path for its tests only — and `_FIX_MODE` names `in-beat or shadow`; `docs/verify-workers.md` no longer claims the `on` path is absent from the library, only that production does not wire it; and `verify_shadow.observe` moves the error record's timestamp inside its guarded block and wraps the `_record_error` call in `contextlib.suppress(Exception)`, so error recording can never raise out of `observe` and the in-beat verdict is always returned (the success path is unchanged).
+
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
 
 ## [0.2.0] - 2026-11-24
