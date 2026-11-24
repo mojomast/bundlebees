@@ -1,0 +1,84 @@
+{
+  "schema": "bundlebees.risk-floor/1",
+  "default": "medium",
+  "high": [
+    {
+      "pattern": "security.py",
+      "reason": "sensitive security module"
+    },
+    {
+      "pattern": "sandbox.py",
+      "reason": "sensitive sandbox module"
+    },
+    {
+      "pattern": "contract_gate.py",
+      "reason": "sensitive contract gate module"
+    },
+    {
+      "pattern": "verify_local.py",
+      "reason": "sensitive local verification module"
+    },
+    {
+      "pattern": "auth*",
+      "reason": "authentication or approval code"
+    },
+    {
+      "pattern": "approvals*",
+      "reason": "authentication or approval code"
+    },
+    {
+      "pattern": "*security.mjs",
+      "reason": "security module"
+    },
+    {
+      "pattern": "**/schemas/*.json",
+      "reason": "schema contract under a schemas/ directory"
+    },
+    {
+      "pattern": "**/.github/workflows/**",
+      "reason": "CI workflow under .github/workflows/"
+    },
+    {
+      "pattern": "**/conftest.py",
+      "reason": "pytest configuration can change approved test execution"
+    },
+    {
+      "pattern": "tests/fixtures/**",
+      "reason": "test fixtures can change approved test behavior"
+    },
+    {
+      "pattern": "pytest.ini",
+      "reason": "test runner configuration can change approved test execution"
+    },
+    {
+      "pattern": "tox.ini",
+      "reason": "test runner configuration can change approved test execution"
+    },
+    {
+      "pattern": "setup.cfg",
+      "reason": "test runner configuration can change approved test execution"
+    },
+    {
+      "pattern": "noxfile.py",
+      "reason": "test runner configuration can change approved test execution"
+    },
+    {
+      "pattern": "sitecustomize.py",
+      "reason": "interpreter customization can change approved test execution"
+    }
+  ],
+  "low": [
+    {
+      "pattern": "*.md",
+      "reason": "documentation path"
+    },
+    {
+      "pattern": "docs/**",
+      "reason": "documentation path"
+    },
+    {
+      "pattern": "tests/**",
+      "reason": "test path"
+    }
+  ]
+}
