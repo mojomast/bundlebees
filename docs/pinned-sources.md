@@ -48,7 +48,7 @@ emit a safe export line).
 What the script does and does not do:
 
 - It clones at the revisions CI pins (`workflow` `ae9c080262ab593e7643e2fba79cd51a018f25df`
-  on `main`, `hyvv` `fdd235446e8fb28f8074fa06ea5c6ee1e466e129` on
+  on `main`, `hyvv` `ae8680a4c0289ce91dab52169eff1433cb694533` on
   `main`) and verifies each checkout's HEAD against that pin
   and the marker files. A checkout already at the pin is left untouched and no
   network round trip is made.
@@ -98,7 +98,7 @@ runner:
    `git rev-parse HEAD` equals the pin, then sets `WORKFLOW_SRC` and
    `REQUIRE_WORKFLOW=1`.
 3. **hyvv** — the same for `mojomast/hyvv` (`main`,
-   `fdd235446e8fb28f8074fa06ea5c6ee1e466e129`), setting `HYVV_SRC` and
+   `ae8680a4c0289ce91dab52169eff1433cb694533`), setting `HYVV_SRC` and
    `REQUIRE_HYVV=1`.
 
 The script mirrors those exact steps so a local run and CI exercise the same
