@@ -115,23 +115,50 @@ def _complex_reasons(brief: Mapping[str, Any], failed: int) -> list[str]:
     return [r for r in (rule(brief, files, failed) for rule in _RULES) if r]
 
 
+def _tier(brief: Mapping[str, Any], files: list[str]) -> str:
+    risk = brief.get("risk")
+    return effective_tier(risk.get("tier") if isinstance(risk, Mapping) else None, files)["tier"]
+
+
+def _low_tier_lane(count: int, failed: int, hint: Any) -> str:
+    first_try_small = count <= LOW_LANE_MAX_FILES and failed == 0 and hint != "moderate"
+    return "low" if first_try_small else "low-harder"
+
+
 def _low_lane(brief: Mapping[str, Any], failed: int) -> str | None:
     """'low', 'low-harder' or None for a brief that is already known not to be complex."""
     if brief.get("nous") is False:
         return None
     files = _files(brief)
-    risk = brief.get("risk")
-    tier = effective_tier(risk.get("tier") if isinstance(risk, Mapping) else None, files)["tier"]
-    hint = brief.get("complexity")
+    tier, count, hint = _tier(brief, files), len(set(files)), brief.get("complexity")
     if brief.get("verify_of") and tier in ("low", "medium") and failed == 0:
         return "low"
     if tier == "low":
-        if len(set(files)) <= LOW_LANE_MAX_FILES and failed == 0 and hint != "moderate":
-            return "low"
-        return "low-harder"
-    if tier == "medium" and hint == "simple" and 0 < len(set(files)) <= SMALL_REFACTOR_MAX_FILES:
-        return "low-harder"
-    return None
+        return _low_tier_lane(count, failed, hint)
+    small_refactor = tier == "medium" and hint == "simple" and 0 < count <= SMALL_REFACTOR_MAX_FILES
+    return "low-harder" if small_refactor else None
+
+
+def _lane_result(lane: str, reasons: list[str], allowed_models: Iterable[str] | None,
+                 default_model: str) -> dict[str, Any]:
+    chain = list(_CHAINS[LOW_RISK_MODEL if lane == "low" else LOW_RISK_HARDER_MODEL])
+    fallback = False
+    if allowed_models is not None:
+        allowed = {m for m in allowed_models if isinstance(m, str)}
+        usable = [m for m in chain if m in allowed] or [default_model]
+        if usable[0] != chain[0]:
+            reasons = reasons + [f"{chain[0]} is not allow-listed on the launcher; using {usable[0]}"]
+            chain, fallback = usable, True
+    return {"model": chain[0], "complex": False, "reasons": reasons, "fallback": fallback,
+            "source": "rule", "lane": lane, "chain": chain}
+
+
+def _pinned(brief: Mapping[str, Any], is_complex: bool, reasons: list[str]) -> dict[str, Any]:
+    pinned = brief.get("model")
+    if not isinstance(pinned, str) or not pinned.strip():
+        raise ValueError("model_pinned needs a non-empty brief.model")
+    return {"model": pinned.strip(), "complex": is_complex, "reasons": reasons,
+            "fallback": False, "source": "pinned", "lane": "pinned", "chain": [pinned.strip()]}
 
 
 def select_worker_model(brief: Any, *, failed_attempts: int | None = None,
@@ -146,23 +173,10 @@ def select_worker_model(brief: Any, *, failed_attempts: int | None = None,
     reasons = _complex_reasons(brief, failed)
     is_complex = bool(reasons)
     if brief.get("model_pinned") is True:
-        pinned = brief.get("model")
-        if not isinstance(pinned, str) or not pinned.strip():
-            raise ValueError("model_pinned needs a non-empty brief.model")
-        return {"model": pinned.strip(), "complex": is_complex, "reasons": reasons,
-                "fallback": False, "source": "pinned", "lane": "pinned", "chain": [pinned.strip()]}
+        return _pinned(brief, is_complex, reasons)
     lane = "complex" if is_complex else (_low_lane(brief, failed) or "default")
     if lane in ("low", "low-harder"):
-        chain = list(_CHAINS[LOW_RISK_MODEL if lane == "low" else LOW_RISK_HARDER_MODEL])
-        if allowed_models is not None:
-            allowed = {m for m in allowed_models if isinstance(m, str)}
-            usable = [m for m in chain if m in allowed] or [default_model]
-            if usable[0] != chain[0]:
-                reasons = reasons + [f"{chain[0]} is not allow-listed on the launcher; using {usable[0]}"]
-                return {"model": usable[0], "complex": False, "reasons": reasons, "fallback": True,
-                        "source": "rule", "lane": lane, "chain": usable}
-        return {"model": chain[0], "complex": False, "reasons": reasons, "fallback": False,
-                "source": "rule", "lane": lane, "chain": chain}
+        return _lane_result(lane, reasons, allowed_models, default_model)
     model, fallback = (complex_model if is_complex else default_model), False
     if is_complex and allowed_models is not None:
         allowed = [m for m in allowed_models if isinstance(m, str)]
