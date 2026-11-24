@@ -266,6 +266,59 @@ def test_quoted_path_control_characters_cannot_spoof_the_refusal_message():
     assert "\n" not in caught.value.message and "\r" not in caught.value.message
 
 
+# --- review minor 2: Unicode line/paragraph separators in quoted paths ---
+
+
+@pytest.mark.parametrize("escape", ["\\u2028", "\\u2029"])
+def test_quoted_path_unicode_separators_cannot_spoof_the_refusal_message(escape):
+    patch = (
+        "diff --git a/src/evil.py b/src/evil.py\n"
+        "--- /dev/null\n"
+        f'+++ "b/src/x{escape}spoof.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+os._exit(0)\n"
+    )
+    findings = _scan()(patch)
+    assert findings
+    for finding in findings:
+        assert "\u2028" not in finding["path"] and "\u2029" not in finding["path"]
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.check_patch_subversion(patch)
+    message = caught.value.message
+    assert "\u2028" not in message and "\u2029" not in message
+    assert "\n" not in message and "\r" not in message
+
+
+# --- review minor 3: equivalent TOML for the pytest11 entry-point table ---
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[project.entry-points."pytest11"]',
+        "[project . entry-points . pytest11]",
+        "[ project.entry-points . 'pytest11' ]",
+    ],
+)
+def test_quoted_pytest11_table_is_a_finding(line):
+    assert "pytest_plugin" in _kinds(_edit("pyproject.toml", [line]))
+
+
+# --- review minor 4: -p at end of an addopts continuation line ------------
+
+
+@pytest.mark.parametrize(
+    "path,lines",
+    [
+        ("pyproject.toml", ['addopts = """', "-q", "-p", "myplugin", '"""']),
+        ("setup.cfg", ["addopts =", "    -q", "    -p", "    myplugin"]),
+        ("pytest.ini", ["addopts = -q -p", "    myplugin"]),
+    ],
+)
+def test_addopts_plugin_option_at_end_of_line_is_a_finding(path, lines):
+    assert "pytest_plugin" in _kinds(_edit(path, lines))
+
+
 # --- review finding 8: report every finding up to a small limit ----------
 
 
