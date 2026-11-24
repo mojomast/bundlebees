@@ -284,3 +284,79 @@ def test_refusal_message_lists_findings_and_counts_them():
     assert "conftest@tests/conftest.py:1" in message
     assert message.count("@") == 5
     assert "+2 more" in message
+
+
+# --- follow-up: a file-level finding needs a created or renamed file ----
+
+
+def _empty_delete(path: str) -> str:
+    """What git emits for deleting an empty file: no ---/+++ header and no hunk."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "deleted file mode 100644\n"
+        "index e69de29..0000000\n"
+    )
+
+
+def _delete(path: str, *lines: str) -> str:
+    """What git emits for deleting a non-empty file."""
+    body = "".join(f"-{line}\n" for line in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "deleted file mode 100644\n"
+        f"--- a/{path}\n"
+        "+++ /dev/null\n"
+        f"@@ -1,{len(lines)} +0,0 @@\n{body}"
+    )
+
+
+def _mode_change(path: str) -> str:
+    """What git emits for a mode-only change: no ---/+++ header and no hunk."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+    )
+
+
+def test_deleting_an_empty_conftest_is_not_a_finding():
+    assert _scan()(_empty_delete("tests/conftest.py")) == []
+
+
+@pytest.mark.parametrize("path", ["sitecustomize.py", "src/evil.pth"])
+def test_deleting_an_empty_risky_file_is_not_a_finding(path):
+    assert _scan()(_empty_delete(path)) == []
+
+
+def test_deleting_a_non_empty_conftest_is_not_a_finding():
+    assert _scan()(_delete("tests/conftest.py", "import os", "os._exit(0)")) == []
+
+
+def test_deletion_only_edit_of_conftest_is_not_a_finding():
+    patch = (
+        "diff --git a/tests/conftest.py b/tests/conftest.py\n"
+        "index c01d8a7..21b405d 100644\n"
+        "--- a/tests/conftest.py\n"
+        "+++ b/tests/conftest.py\n"
+        "@@ -1,2 +1 @@\n"
+        " import os\n"
+        "-os._exit(0)\n"
+    )
+    assert _scan()(patch) == []
+
+
+def test_mode_only_change_of_conftest_is_not_a_finding():
+    assert _scan()(_mode_change("tests/conftest.py")) == []
+
+
+def test_edit_that_adds_a_line_to_conftest_is_still_a_finding():
+    patch = _edit("tests/conftest.py", ["import pytest"], ["import os"])
+    assert [(f["kind"], f["line"]) for f in _scan()(patch)] == [("conftest", 1)]
+
+
+# --- follow-up: a user-defined _exit helper is not a forced exit ---------
+
+
+def test_user_defined_exit_helper_is_not_a_forced_exit():
+    patch = _edit("src/pkg/core.py", ["def _exit(code):", "    raise SystemExit(code)"])
+    assert "forced_exit" not in _kinds(patch)
