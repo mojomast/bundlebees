@@ -482,6 +482,14 @@ def _build_parser(parser: Any) -> Any:
     board_dispatch_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     board_dispatch_cmd.set_defaults(command="board-dispatch")
 
+    preflight_cmd = subparsers.add_parser(
+        "preflight",
+        help="Run the dispatch gates without dispatching (side-effect free).",
+    )
+    preflight_cmd.add_argument("brief", help="Path to a JSON brief file.")
+    preflight_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    preflight_cmd.set_defaults(command="preflight")
+
     from . import rails_cli
     rails_cli.add_parsers(subparsers)
     ingest = subparsers.add_parser('rails-import', help='Import one bounded page from a configured Rails source.')
@@ -718,6 +726,12 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_board_sync(ctx, args)
         if command == "board-dispatch":
             return _cmd_board_dispatch(ctx, args)
+        if command == "preflight":
+            from . import preflight as _preflight
+            argv = [str(args.brief)]
+            if getattr(args, "state_dir", None):
+                argv.extend(["--state-dir", str(args.state_dir)])
+            return _preflight.main(argv)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
         if command == "tdd":

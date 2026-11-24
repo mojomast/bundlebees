@@ -565,13 +565,19 @@ def _state_dir_for(ctx: Any) -> Path | None:
     return plugin_state_dir()
 
 
-def _dispatch(
-    client: Any,
+def _gate(
     args: Mapping[str, Any],
     state_dir: Path | None = None,
     *,
     require_contract: bool = False,
-) -> str:
+) -> str | tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Run the dispatch gates without dispatching.
+
+    Returns an error envelope string when a gate refuses, otherwise
+    ``(brief, acdd, assessed)`` where ``acdd`` is the contract envelope block
+    and ``assessed`` is the ``risk.effective_tier`` result. Side-effect free:
+    it never builds a client, opens a socket or writes into ``state_dir``.
+    """
     raw = args.get("brief")
     if isinstance(raw, str):
         try:
@@ -634,6 +640,21 @@ def _dispatch(
     acdd = _dispatch_acdd(brief, require_contract)
     if isinstance(acdd, str):
         return acdd
+
+    return brief, acdd, assessed
+
+
+def _dispatch(
+    client: Any,
+    args: Mapping[str, Any],
+    state_dir: Path | None = None,
+    *,
+    require_contract: bool = False,
+) -> str:
+    gated = _gate(args, state_dir, require_contract=require_contract)
+    if isinstance(gated, str):
+        return gated
+    brief, acdd, _assessed = gated
 
     if state_dir is None:
         return _err(
