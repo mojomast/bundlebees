@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- **Unwired modules moved to `contrib/` (owner decision, Kyle t1650u):** `trial_harness`, `trial_simulated_driver`, `risk_policy`, `rework_metrics`, `rails_owner_bridge`, `hive_docket` and `wave_compat` leave `bundlebees_plugin/` for `contrib/trial/` and `contrib/unwired/`; each moved module imports its old package absolutely, module-path constants and checkout-root calculations follow the move, `verify_workers` and `contract_gate` stay, and `risk_policy.py`'s body is byte-identical (its sha256 pin still holds). `slop-baseline.json` carries the same per-file allowances to the new paths (counts unchanged).
 - Leases record a top-level `task_id` (brief `task_id`, else the coordinator `label`) and the brief's own `job_id`; `attempts` rows carry `task_id`.
 - `route_sync`: record the launcher-reported model/route per leased attempt; `attempts` uses it when no verified attribution exists.
 - `rails_ingest`: scheduled Rails ledger ingest from the bundlebees and outbox sources, with systemd units.
