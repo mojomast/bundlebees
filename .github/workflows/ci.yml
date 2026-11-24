@@ -18,9 +18,16 @@ concurrency:
 
 jobs:
   tests:
-    name: tests (sandbox included)
+    # Four shards of the same suite run in parallel (bundlebees CI speed-up, owner yes t1659s8401).
+    # .github/scripts/shard_tests.py partitions every collectable test file, and each shard re-checks
+    # that partition, so no test is skipped. ci-gate needs `tests`, which fails if any shard fails.
+    name: tests (sandbox included) (${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -73,9 +80,15 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "ae8680a4c0289ce91dab52169eff1433cb694533"
           echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
           echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
-      - name: Run test suite
-        run: python -m pytest -rs
+      - name: Run test suite (shard ${{ matrix.shard }} of 4)
+        run: |
+          set -euo pipefail
+          python .github/scripts/shard_tests.py --check 4 --against-pytest
+          mapfile -t files < <(python3 .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
+          test "${#files[@]}" -gt 0
+          python -m pytest -rs "${files[@]}"
       - name: Measure tool-schema tokens
+        if: ${{ matrix.shard == 1 }}
         run: python scripts/measure_schemas.py
 
   orbit-roundtrip:
