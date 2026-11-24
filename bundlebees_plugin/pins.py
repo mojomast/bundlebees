@@ -8,6 +8,6 @@ scaffold and the doctor's ``pinned_workflow`` check can never disagree.
 from __future__ import annotations
 
 #: The pinned workflow commit (the deployed WORKFLOW_SRC checkout revision).
-WORKFLOW_PIN = "9c69d3a987ea9544a77cdd9b5a259904eb36f006"
-HYVV_PIN = "1fcf1039e67ec5fd07e2111cba1808f793c7b5bd"
+WORKFLOW_PIN = "c8ef4c8e62ea550e1541fd0562c857404f900bdb"
+HYVV_PIN = "9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb"
 LAUNCHER_PIN = "0.1.17"
