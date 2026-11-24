@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from bundlebees_plugin import coverage, factory_driver, hive_docket, job, leases, queue, verify_local, work_scheduler
+from bundlebees_plugin import coverage, factory_driver, job, leases, queue, verify_local, work_scheduler
+from contrib.unwired import hive_docket
 from tests.test_verify_local import make_patch, make_repo, sandboxed
 
 

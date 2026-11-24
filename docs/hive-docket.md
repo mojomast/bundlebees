@@ -3,7 +3,7 @@
 `hive.queue/1` is an operator-invoked observation of one **public feature and job pair**. Use the exact IDs, not their titles. The application has no coordinator connection. Publication requires a separate directory; granting a consumer read access to that directory is a separate decision.
 
 ```sh
-python3 -m bundlebees_plugin.hive_docket \
+python3 -m contrib.unwired.hive_docket \
   --state-dir "$PRIVATE_STATE" --publication-dir "$PUBLICATION" \
   --feature-id F1 --job-id job_a
 ```

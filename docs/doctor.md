@@ -27,8 +27,8 @@ From the BundleBees checkout, point the standalone checker at an operator-suppli
 snapshot. Use **one** of these commands; neither discovers a default state directory:
 
 ```sh
-python3 -B -m bundlebees_plugin.wave_compat --waves-dir /path/to/copied-waves
-python3 -B -m bundlebees_plugin.wave_compat --state-dir /path/to/copied-state
+python3 -B -m contrib.unwired.wave_compat --waves-dir /path/to/copied-waves
+python3 -B -m contrib.unwired.wave_compat --state-dir /path/to/copied-state
 ```
 
 Both inspect only the immediate `*.json` entries in the waves directory

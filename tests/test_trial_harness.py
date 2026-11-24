@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from bundlebees_plugin import campaign, job as jobs, queue as queue_mod, reconcile, revision, verify_local
-from bundlebees_plugin import trial_harness as th
+from contrib.trial import trial_harness as th
 
 PY = sys.executable
 SHA = "a" * 40
@@ -1330,7 +1330,7 @@ class Preflight:
             f"reached start_driver with argv {started[0]!r}; preflight must refuse it first"
         )
         assert caught.value.code == "rehearsal_requires_simulated_driver"
-        assert "bundlebees_plugin.trial_simulated_driver" in caught.value.message
+        assert "contrib.trial.trial_simulated_driver" in caught.value.message
         assert "rehearsal" in caught.value.message
 
 
@@ -1389,7 +1389,7 @@ class Rehearsal:
         trial_dir = state / "trials" / "x"
         trial_dir.mkdir(parents=True)
         done = subprocess.run(
-            [PY, "-m", "bundlebees_plugin.trial_simulated_driver",
+            [PY, "-m", "contrib.trial.trial_simulated_driver",
              "--state", str(state), "--trial-dir", str(trial_dir), "--pass", "1"],
             capture_output=True,
             text=True,
@@ -1467,7 +1467,7 @@ def _is_rehearsal_child(pid: int) -> bool:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    return b"bundlebees_plugin.trial_simulated_driver" in raw
+    return b"contrib.trial.trial_simulated_driver" in raw
 
 
 @pytest.fixture(autouse=True)

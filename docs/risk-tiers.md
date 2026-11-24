@@ -1,6 +1,6 @@
 # Risk tiers
 
-`bundlebees_plugin/risk_policy.py` maps a risk tier to how much process a task
+`contrib/unwired/risk_policy.py` maps a risk tier to how much process a task
 gets. It is data and pure functions only: the table is **report-only until the owner
 enables enforcement** and the phase and reviewer table below is still not wired into any gate.
 
