@@ -352,46 +352,69 @@ def _compact_attempt(attempt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _status_attempts(client: Any, args: Mapping[str, Any]) -> str:
-    limit = args.get("limit", _STATUS_ATTEMPTS_DEFAULT_LIMIT)
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
-        return _err(
+def _attempt_state(attempt: Mapping[str, Any]) -> str:
+    return str(attempt.get("state") or attempt.get("status") or "").strip().lower()
+
+
+def _attempts_limit(value: Any) -> tuple[int | None, str | None]:
+    """Return (limit, error) for the requested row count."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return None, _err(
             "invalid_argument",
             "limit must be a positive integer",
             "Pass a small limit; the list is capped at "
             f"{_STATUS_ATTEMPTS_MAX_LIMIT}.",
         )
-    limit = min(limit, _STATUS_ATTEMPTS_MAX_LIMIT)
+    return min(value, _STATUS_ATTEMPTS_MAX_LIMIT), None
 
-    state = args.get("state")
-    if state is not None:
-        if not isinstance(state, str) or not state.strip():
-            return _err(
-                "invalid_argument",
-                "state must be a non-empty string",
-                "Pass an attempt state such as running or succeeded, or omit it.",
-            )
-        state = state.strip().lower()
 
-    detail = args.get("detail", False)
-    if not isinstance(detail, bool):
-        return _err(
+def _attempts_state(value: Any) -> tuple[str | None, str | None]:
+    """Return (state, error); a missing value means no filter."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or not value.strip():
+        return None, _err(
+            "invalid_argument",
+            "state must be a non-empty string",
+            "Pass an attempt state such as running or succeeded, or omit it.",
+        )
+    return value.strip().lower(), None
+
+
+def _attempts_detail(value: Any) -> tuple[bool | None, str | None]:
+    """Return (detail, error) for the compact/full row switch."""
+    if not isinstance(value, bool):
+        return None, _err(
             "invalid_argument",
             "detail must be a boolean",
             "Pass true for full public rows or false for compact rows.",
         )
+    return value, None
 
-    raw = client.attempts()
+
+def _attempts_rows(raw: Any, state: str | None) -> list[Mapping[str, Any]]:
+    """Return the public attempt rows, filtered by state when one is given."""
     if isinstance(raw, (list, tuple)):
         attempts = [item for item in raw if isinstance(item, Mapping)]
     else:
         attempts = []
-    if state is not None:
-        attempts = [
-            item
-            for item in attempts
-            if str(item.get("state") or item.get("status") or "").strip().lower() == state
-        ]
+    if state is None:
+        return attempts
+    return [item for item in attempts if _attempt_state(item) == state]
+
+
+def _status_attempts(client: Any, args: Mapping[str, Any]) -> str:
+    limit, error = _attempts_limit(args.get("limit", _STATUS_ATTEMPTS_DEFAULT_LIMIT))
+    if error is not None:
+        return error
+    state, error = _attempts_state(args.get("state"))
+    if error is not None:
+        return error
+    detail, error = _attempts_detail(args.get("detail", False))
+    if error is not None:
+        return error
+
+    attempts = _attempts_rows(client.attempts(), state)
     attempts.sort(key=_attempt_sort_key, reverse=True)
     total = len(attempts)
     page = attempts[:limit]
@@ -1148,30 +1171,30 @@ def _schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str
 
 _STATUS_SCHEMA = _schema(
     "bundlebees_status",
-    "Check worker launcher health, capacity, attempts, events, containers, or authorized projects. Never returns tokens or hosts.",
+    "Launcher health, capacity, attempts, events, containers, or authorized projects. No tokens or hosts.",
     {
         "type": "object",
         "properties": {
             "op": {
                 "type": "string",
                 "enum": sorted(_STATUS_OPS),
-                "description": "Status view.",
+                "description": "View.",
             },
-            "attempt_id": {"type": "string", "description": "Attempt id (events)."},
+            "attempt_id": {"type": "string", "description": "Attempt id for events."},
             "cursor": {"type": "integer", "description": "Event cursor."},
             "limit": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": _STATUS_ATTEMPTS_MAX_LIMIT,
-                "description": "Attempts to return (default 20, maximum 200).",
+                "description": "Rows returned; default 20, max 200.",
             },
             "state": {
                 "type": "string",
-                "description": "Only attempts in this state.",
+                "description": "Filter by attempt state.",
             },
             "detail": {
                 "type": "boolean",
-                "description": "Return full public rows instead of compact rows.",
+                "description": "Full rows, not compact.",
             },
         },
         "required": ["op"],
@@ -1181,21 +1204,21 @@ _STATUS_SCHEMA = _schema(
 
 _DISPATCH_SCHEMA = _schema(
     "bundlebees_dispatch",
-    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. An optional acdd/1 contract is validated and enforced. Does not apply patches, run tests, or deploy.",
+    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. Optional acdd/1 contract enforced. No patches, tests, or deploys.",
     {
         "type": "object",
         "properties": {
             "brief": {
                 "type": ["object", "string"],
-                "description": "Brief object or JSON object string; validated in code.",
+                "description": "Object or JSON string; validated in code.",
             },
             "model": {
                 "type": "string",
-                "description": "Launcher-allowed model id; omit to use the launcher's preferred route.",
+                "description": "Allowed model id; omit for the launcher default.",
             },
             "kanban_task_id": {
                 "type": "string",
-                "description": "Optional Hermes kanban task id to record and return.",
+                "description": "Kanban task id to record.",
             },
         },
         "required": ["brief"],
@@ -1205,23 +1228,23 @@ _DISPATCH_SCHEMA = _schema(
 
 _ATTEMPT_SCHEMA = _schema(
     "bundlebees_attempt",
-    "Get, stream events for, cancel, or review one bee attempt. cancel and review require confirm=true.",
+    "Get, stream events, cancel, or review an attempt. cancel and review need confirm=true.",
     {
         "type": "object",
         "properties": {
             "op": {
                 "type": "string",
                 "enum": sorted(_ATTEMPT_OPS),
-                "description": "Attempt operation.",
+                "description": "Action.",
             },
             "attempt_id": {"type": "string", "description": "Attempt id."},
             "cursor": {"type": "integer", "description": "Event cursor."},
             "confirm": {
                 "type": "boolean",
-                "description": "Must be true for cancel and review.",
+                "description": "Required true for cancel/review.",
             },
             "accepted": {"type": "boolean", "description": "Review decision."},
-            "note": {"type": "string", "description": "Optional review note; scrubbed."},
+            "note": {"type": "string", "description": "Optional note; scrubbed."},
         },
         "required": ["op", "attempt_id"],
         "additionalProperties": False,
@@ -1230,7 +1253,7 @@ _ATTEMPT_SCHEMA = _schema(
 
 _HOST_PROMPT_SCHEMA = _schema(
     "bundlebees_host_prompt",
-    "Generate a paste-ready setup prompt for an agent on a remote host. No secrets or host addresses in, no secrets or host addresses out.",
+    "Paste-ready setup prompt for a remote host agent. No secrets or addresses in or out.",
     {
         "type": "object",
         "properties": {
@@ -1261,16 +1284,16 @@ _HOST_PROMPT_SCHEMA = _schema(
 
 _ROUTE_PREVIEW_SCHEMA = _schema(
     "bundlebees_route_preview",
-    "Preview the model and credential route a brief would take. Starts no attempt.",
+    "Preview the model and credential route a brief would take. Starts nothing.",
     {
         "type": "object",
         "properties": {
             "kind": {"type": "string", "description": "Route kind."},
-            "model": {"type": "string", "description": "Model id to preview."},
+            "model": {"type": "string", "description": "Model id."},
             "tier": {"type": "string", "description": "Launcher tier."},
             "brief": {
                 "type": "object",
-                "description": "Only kind, priority and model are sent.",
+                "description": "Only kind, priority, model sent.",
             },
         },
         "additionalProperties": False,
