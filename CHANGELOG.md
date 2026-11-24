@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- CI speed-up (owner yes t1659s8401): the `tests (sandbox included)` job in `.github/workflows/ci.yml` runs as four parallel shards. `.github/scripts/shard_tests.py` balances the test files by the seconds in `.github/test-weights.json` (a new file gets the median weight) and fails if the shards are not an exact partition of every collectable test file; each shard re-checks this before it runs, so no test is skipped. Required check names (`ci-gate`, `gitleaks`, `slop-lint`) are unchanged, and `ci-gate` still needs `tests`, which fails if any shard fails. `tests/test_shard_tests.py` covers the partition.
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
 
 ## [0.2.0] - 2026-11-24
