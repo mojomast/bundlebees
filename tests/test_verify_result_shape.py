@@ -85,7 +85,7 @@ def real_envelope() -> dict:
         "source": {
             "project": "bundlebees",
             "repo_rev": "aeda8f8b7ceb7e0b451ede230245d0cd7b96c805",
-            "launcher": "0.1.18"
+            "launcher": "0.1.17"
         },
         "observed": {
             "status": "idle",
