@@ -16,11 +16,11 @@ set -u
 TAG="setup-pinned-sources"
 
 WORKFLOW_URL="https://github.com/mojomast/workflow.git"
-WORKFLOW_BRANCH="feat/bee-landed"
-WORKFLOW_PIN="9c69d3a987ea9544a77cdd9b5a259904eb36f006"
+WORKFLOW_BRANCH="main"
+WORKFLOW_PIN="c8ef4c8e62ea550e1541fd0562c857404f900bdb"
 HYVV_URL="https://github.com/mojomast/hyvv.git"
-HYVV_BRANCH="feat/bee-landed-events"
-HYVV_PIN="1fcf1039e67ec5fd07e2111cba1808f793c7b5bd"
+HYVV_BRANCH="main"
+HYVV_PIN="9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb"
 
 GITLEAKS_VERSION="8.28.0"
 GITLEAKS_SHA256_LINUX_X64="a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"

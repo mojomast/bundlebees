@@ -47,9 +47,9 @@ emit a safe export line).
 
 What the script does and does not do:
 
-- It clones at the revisions CI pins (`workflow` `9c69d3a987ea9544a77cdd9b5a259904eb36f006`
-  on `feat/bee-landed`, `hyvv` `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd` on
-  `feat/bee-landed-events`) and verifies each checkout's HEAD against that pin
+- It clones at the revisions CI pins (`workflow` `c8ef4c8e62ea550e1541fd0562c857404f900bdb`
+  on `main`, `hyvv` `9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb` on
+  `main`) and verifies each checkout's HEAD against that pin
   and the marker files. A checkout already at the pin is left untouched and no
   network round trip is made.
 - It never deletes, resets, cleans or force-pushes anything. When it cannot
@@ -93,12 +93,12 @@ runner:
 1. **gitleaks** — downloads the v8.28.0 release into `$RUNNER_TEMP/bin`, adds
    it to `GITHUB_PATH` and sets `GITLEAKS`.
 2. **workflow** — `git clone`s `mojomast/workflow`, fetches
-   `refs/heads/feat/bee-landed`, checks out
-   `9c69d3a987ea9544a77cdd9b5a259904eb36f006`, asserts
+   `refs/heads/main`, checks out
+   `c8ef4c8e62ea550e1541fd0562c857404f900bdb`, asserts
    `git rev-parse HEAD` equals the pin, then sets `WORKFLOW_SRC` and
    `REQUIRE_WORKFLOW=1`.
-3. **hyvv** — the same for `mojomast/hyvv` (`feat/bee-landed-events`,
-   `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd`), setting `HYVV_SRC` and
+3. **hyvv** — the same for `mojomast/hyvv` (`main`,
+   `9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb`), setting `HYVV_SRC` and
    `REQUIRE_HYVV=1`.
 
 The script mirrors those exact steps so a local run and CI exercise the same
