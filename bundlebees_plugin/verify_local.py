@@ -24,7 +24,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
-from . import leases, sandbox, test_receipts as receipts
+from . import leases, sandbox, subversion_scan, test_receipts as receipts
 
 RECORD_DIR = "verify-results"
 DEFAULT_SANDBOX_TIMEOUT_S = 600
@@ -101,6 +101,18 @@ class VerifyError(Exception):
         self.code = code
         self.message = message
         self.fix = fix
+
+
+def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
+    findings = subversion_scan.scan_patch(patch)
+    if findings:
+        first = findings[0]
+        raise VerifyError(
+            "test_subversion",
+            f"patch can subvert the approved test run: {first['kind']} at {first['path']}:{first['line']}",
+            "Remove test-runner subversion from the patch.",
+        )
+    return findings
 
 
 def _child_env() -> dict[str, str]:
@@ -939,6 +951,7 @@ def _verify_and_commit_locked(
     state_dir = Path(state_dir)
     repo = Path(repo)
     stats = stats if stats is not None else _test_cache_stats()
+    check_patch_subversion(patch)
 
     # Fail closed on missing evidence rather than recording a hollow pass.
     if tests_required and not list(tests):
