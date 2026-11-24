@@ -52,12 +52,18 @@ def _declares_tier(brief: Mapping[str, Any]) -> bool:
     return isinstance(tier, str) and bool(tier.strip())
 
 
-def preflight(brief: Any, state_dir: Any = None) -> dict[str, Any]:
+def preflight(
+    brief: Any,
+    state_dir: Any = None,
+    *,
+    require_contract: bool = False,
+) -> dict[str, Any]:
     """Run the dispatch gates for *brief* and report the verdict.
 
     *brief* may be a dict or a JSON object string. A box-shaped brief keeps its
-    extra keys and is gated exactly like the bare brief. Refusals return
-    ``{ok: false, code, error, fix}``; success returns
+    extra keys and is gated exactly like the bare brief. *require_contract*
+    mirrors the dispatch setting of the same name so preflight and dispatch
+    agree. Refusals return ``{ok: false, code, error, fix}``; success returns
     ``{ok: true, tier, floor, reasons, acdd_mode}``.
     """
     parsed = _parse(brief)
@@ -75,7 +81,9 @@ def preflight(brief: Any, state_dir: Any = None) -> dict[str, Any]:
             _FIX_TIER,
         )
 
-    gated = tools._gate({"brief": parsed}, state_dir)
+    gated = tools._gate(
+        {"brief": parsed}, state_dir, require_contract=require_contract
+    )
     if isinstance(gated, str):
         envelope = json.loads(gated)
         return _refusal(
@@ -102,6 +110,11 @@ def main(argv: Any = None) -> int:
     )
     parser.add_argument("brief", help="Path to a JSON brief file.")
     parser.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    parser.add_argument(
+        "--require-contract",
+        action="store_true",
+        help="Require a frozen ACDD contract, mirroring the dispatch setting.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -116,7 +129,9 @@ def main(argv: Any = None) -> int:
         )))
         return 2
 
-    result = preflight(payload, args.state_dir)
+    result = preflight(
+        payload, args.state_dir, require_contract=args.require_contract
+    )
     print(json.dumps(result))
     return 0 if result.get("ok") else 3
 

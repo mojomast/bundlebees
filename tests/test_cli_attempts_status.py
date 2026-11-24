@@ -55,6 +55,7 @@ ROW_FIELDS = {
     "attributed_model",
     "project",
     "job_id",
+    "task_id",
     "repo",
     "created_at",
     "updated_at",

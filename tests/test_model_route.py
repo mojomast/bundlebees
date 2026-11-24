@@ -19,10 +19,12 @@ def brief(files=("docs/notes.md",), tier="low", **extra):
 
 class TestSelectWorkerModel:
     def test_simple_brief_uses_default(self):
-        r = mr.select_worker_model(brief())
+        # Owner t1660u/t1665u: low-risk slices go to the Nous low lane; a medium source slice
+        # that is not complex stays on the default model.
+        r = mr.select_worker_model(brief(files=("src/x.py", "src/y.py", "src/z.py"), tier="medium"))
         assert r["model"] == mr.DEFAULT_MODEL == "go:deepseek-v4.1-flash"
         assert r["complex"] is False and r["reasons"] == [] and r["fallback"] is False
-        assert r["source"] == "rule"
+        assert r["source"] == "rule" and r["lane"] == "default"
 
     def test_high_risk_is_complex(self):
         r = mr.select_worker_model(brief(files=("src/x.py",), tier="high"))
@@ -92,6 +94,56 @@ class TestSelectWorkerModel:
             mr.select_worker_model(brief(), failed_attempts="2")
         with pytest.raises(ValueError):
             mr.select_worker_model(brief(model_pinned=True, model=""))
+
+
+class TestLowRiskLane:
+    def test_low_risk_docs_brief_uses_the_discounted_flash(self):
+        r = mr.select_worker_model(brief())
+        assert r["model"] == mr.LOW_RISK_MODEL == "nous:deepseek-v4.1-flash-1017"
+        assert r["lane"] == "low" and r["complex"] is False and r["fallback"] is False
+        assert r["chain"] == ["nous:deepseek-v4.1-flash-1017", "nous:hy4-flash", "go:deepseek-v4.1-flash"]
+
+    def test_tests_only_brief_is_low(self):
+        r = mr.select_worker_model(brief(files=("tests/test_a.py", "tests/test_b.py"), tier="low"))
+        assert r["lane"] == "low" and r["model"] == mr.LOW_RISK_MODEL
+
+    def test_verify_brief_is_low(self):
+        r = mr.select_worker_model(brief(files=("src/x.py",), tier="medium", verify_of="att_x"))
+        assert r["lane"] == "low" and r["model"] == mr.LOW_RISK_MODEL
+
+    def test_harder_low_risk_slices_use_hy4(self):
+        four = [f"docs/d{i}.md" for i in range(4)]
+        assert mr.select_worker_model(brief(files=four))["model"] == mr.LOW_RISK_HARDER_MODEL == "nous:hy4-flash"
+        r = mr.select_worker_model(brief(), failed_attempts=1)
+        assert r["lane"] == "low-harder" and r["model"] == mr.LOW_RISK_HARDER_MODEL
+        assert r["chain"] == ["nous:hy4-flash", "go:deepseek-v4.1-flash"]
+        assert mr.select_worker_model(brief(complexity="moderate"))["model"] == mr.LOW_RISK_HARDER_MODEL
+
+    def test_small_refactor_uses_hy4(self):
+        r = mr.select_worker_model(brief(files=("src/x.py", "src/y.py"), tier="medium", complexity="simple"))
+        assert r["lane"] == "low-harder" and r["model"] == mr.LOW_RISK_HARDER_MODEL
+        r3 = mr.select_worker_model(brief(files=("src/a.py", "src/b.py", "src/c.py"), tier="medium", complexity="simple"))
+        assert r3["model"] == mr.DEFAULT_MODEL
+
+    def test_complex_always_beats_the_low_lane(self):
+        r = mr.select_worker_model(brief(files=("bundlebees_plugin/approvals.py",), tier="low"))
+        assert r["model"] == mr.COMPLEX_MODEL and r["lane"] == "complex"
+        assert mr.select_worker_model(brief(), failed_attempts=2)["model"] == mr.COMPLEX_MODEL
+
+    def test_low_lane_falls_back_when_not_allowlisted(self):
+        r = mr.select_worker_model(brief(), allowed_models=["go:deepseek-v4.1-flash", "nous:hy4-flash"])
+        assert r["model"] == "nous:hy4-flash" and r["fallback"] is True
+        assert any("not allow-listed" in x for x in r["reasons"])
+        r2 = mr.select_worker_model(brief(), allowed_models=["go:deepseek-v4.1-flash"])
+        assert r2["model"] == mr.DEFAULT_MODEL and r2["fallback"] is True
+
+    def test_brief_can_opt_out_of_nous(self):
+        r = mr.select_worker_model(brief(nous=False))
+        assert r["model"] == mr.DEFAULT_MODEL and r["lane"] == "default"
+
+    def test_nous_pacing_is_documented(self):
+        assert mr.NOUS_REQUESTS_PER_MINUTE == 180
+        assert 1 <= mr.NOUS_MAX_ACTIVE <= 8
 
 
 class TestCli:

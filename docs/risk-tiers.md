@@ -50,5 +50,19 @@ model `tier` is never read as a risk tier.
 ## Where the floor comes from
 
 The floor comes from path-based derivation: the tier follows the files a task
-touches, not what the brief claims. `risk_policy` only describes the process a
-tier receives; deriving the tier itself is the caller's job.
+touches, not what the brief claims. `risk.derive_floor` reads the versioned
+`bundlebees_plugin/policy/risk-floor.json` policy (`bundlebees.risk-floor/1`).
+Its case-insensitive basename and path-pattern rules classify high and low
+paths, with medium as the default. `risk_policy` separately describes the
+process a tier receives.
+
+Absolute paths, traversal, sensitive security and verification modules,
+schemas, CI workflows and authentication or approval code are high. Test
+infrastructure is high too: every `conftest.py`, everything under
+`tests/fixtures/`, `pytest.ini`, `tox.ini`, `setup.cfg`, `noxfile.py` and
+`sitecustomize.py`. Ordinary test and documentation paths remain low.
+
+A policy that is missing, unreadable, malformed or uses the wrong schema fails
+closed to high and adds a policy reason. Empty or invalid path lists also fail
+closed to high. Callers may pass `policy_path` to `derive_floor` to select
+another policy; a load failure never falls back to a lower tier.
