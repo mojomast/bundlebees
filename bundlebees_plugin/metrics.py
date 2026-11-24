@@ -740,6 +740,78 @@ def _window_end(value: Any) -> _dt.datetime:
     return parsed
 
 
+def _attempt_key(run_id: str, event: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the attempt key when the event carries a usable attempt id."""
+
+    attempt_id = event.get("attempt_id")
+    if isinstance(attempt_id, str) and _ID_RE.fullmatch(attempt_id):
+        return (run_id, attempt_id)
+    return None
+
+
+def _window_events(
+    state_dir: Path, start: _dt.datetime, end: _dt.datetime
+) -> Iterable[tuple[str, dict[str, Any]]]:
+    """Yield ``(run_id, event)`` for events inside the inclusive window."""
+
+    for run_id in list_runs(state_dir):
+        for event in read_events(state_dir, run_id):
+            at = _timestamp(event.get("at"))
+            if at is None or at < start or at > end:
+                continue
+            yield run_id, event
+
+
+def _scan_window(
+    state_dir: Path, start: _dt.datetime, end: _dt.datetime
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]], dict[tuple[str, str], float], int]:
+    """Collect dispatches, verified attempts, token reports and anonymous dispatches."""
+
+    dispatched: set[tuple[str, str]] = set()
+    verified: set[tuple[str, str]] = set()
+    tokens_by_attempt: dict[tuple[str, str], float] = {}
+    anonymous_dispatches = 0
+
+    for run_id, event in _window_events(state_dir, start, end):
+        key = _attempt_key(run_id, event)
+        name = event.get("event")
+        if name == "dispatch":
+            if key is None:
+                anonymous_dispatches += 1
+            else:
+                dispatched.add(key)
+        elif name == "verify" and key is not None and bool(event.get("ok")):
+            verified.add(key)
+        tokens = _usage_tokens(event.get("tokens"))
+        if key is not None and tokens is not None:
+            tokens_by_attempt[key] = tokens
+
+    return dispatched, verified, tokens_by_attempt, anonymous_dispatches
+
+
+def _window_totals(
+    dispatched: set[tuple[str, str]],
+    tokens_by_attempt: Mapping[tuple[str, str], float],
+    anonymous_dispatches: int,
+) -> tuple[int, int | float | None, int | float | None, int]:
+    """Derive attempts, total tokens, known subtotal and token coverage."""
+
+    with_tokens = sum(1 for key in dispatched if key in tokens_by_attempt)
+    attempts = len(dispatched) + anonymous_dispatches
+    known_subtotal = (
+        _tidy(sum(tokens_by_attempt[key] for key in dispatched if key in tokens_by_attempt))
+        if with_tokens
+        else None
+    )
+    complete = (
+        known_subtotal is not None
+        and anonymous_dispatches == 0
+        and with_tokens == len(dispatched)
+    )
+    tokens_total = known_subtotal if complete else None
+    return attempts, tokens_total, known_subtotal, with_tokens
+
+
 def weekly(
     state_dir: Path,
     *,
@@ -764,47 +836,12 @@ def weekly(
     end = _window_end(now)
     start = end - _dt.timedelta(days=window_days)
 
-    dispatched: set[tuple[str, str]] = set()
-    verified: set[tuple[str, str]] = set()
-    tokens_by_attempt: dict[tuple[str, str], float] = {}
-    anonymous_dispatches = 0
-
-    for run_id in list_runs(state_dir):
-        for event in read_events(state_dir, run_id):
-            at = _timestamp(event.get("at"))
-            if at is None or at < start or at > end:
-                continue
-            name = event.get("event")
-            attempt_id = event.get("attempt_id")
-            key = (
-                (run_id, attempt_id)
-                if isinstance(attempt_id, str) and _ID_RE.fullmatch(attempt_id)
-                else None
-            )
-            if name == "dispatch":
-                if key is None:
-                    anonymous_dispatches += 1
-                else:
-                    dispatched.add(key)
-            elif name == "verify" and key is not None and bool(event.get("ok")):
-                verified.add(key)
-            tokens = _usage_tokens(event.get("tokens"))
-            if key is not None and tokens is not None:
-                tokens_by_attempt[key] = tokens
-
-    with_tokens = sum(1 for key in dispatched if key in tokens_by_attempt)
-    attempts = len(dispatched) + anonymous_dispatches
-    known_subtotal = (
-        _tidy(sum(tokens_by_attempt[key] for key in dispatched if key in tokens_by_attempt))
-        if with_tokens
-        else None
+    dispatched, verified, tokens_by_attempt, anonymous_dispatches = _scan_window(
+        state_dir, start, end
     )
-    complete = (
-        known_subtotal is not None
-        and anonymous_dispatches == 0
-        and with_tokens == len(dispatched)
+    attempts, tokens_total, known_subtotal, with_tokens = _window_totals(
+        dispatched, tokens_by_attempt, anonymous_dispatches
     )
-    tokens_total = known_subtotal if complete else None
     verified_patches = len(verified)
     return {
         "window_days": window_days,
