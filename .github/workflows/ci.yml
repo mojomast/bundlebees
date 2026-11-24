@@ -60,8 +60,8 @@ jobs:
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/workflow.git "$RUNNER_TEMP/workflow"
           git -C "$RUNNER_TEMP/workflow" fetch --quiet origin refs/heads/main
-          git -C "$RUNNER_TEMP/workflow" checkout --quiet c8ef4c8e62ea550e1541fd0562c857404f900bdb
-          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "c8ef4c8e62ea550e1541fd0562c857404f900bdb"
+          git -C "$RUNNER_TEMP/workflow" checkout --quiet 1dacd5bb2552cc7052f436dcba04601995c82167
+          test "$(git -C "$RUNNER_TEMP/workflow" rev-parse HEAD)" = "1dacd5bb2552cc7052f436dcba04601995c82167"
           echo "WORKFLOW_SRC=$RUNNER_TEMP/workflow" >> "$GITHUB_ENV"
           echo "REQUIRE_WORKFLOW=1" >> "$GITHUB_ENV"
       - name: Check out hyvv provisioning contract (pinned)
@@ -69,8 +69,8 @@ jobs:
           set -euo pipefail
           git clone --quiet https://github.com/mojomast/hyvv.git "$RUNNER_TEMP/hyvv-contract"
           git -C "$RUNNER_TEMP/hyvv-contract" fetch --quiet origin refs/heads/main
-          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet 9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb
-          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb"
+          git -C "$RUNNER_TEMP/hyvv-contract" checkout --quiet fdd235446e8fb28f8074fa06ea5c6ee1e466e129
+          test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "fdd235446e8fb28f8074fa06ea5c6ee1e466e129"
           echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
           echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
       - name: Run test suite

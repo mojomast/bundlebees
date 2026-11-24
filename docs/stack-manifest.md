@@ -7,9 +7,9 @@ derived from `pyproject.toml`.
 
 | Component | Pin | Role |
 |---|---|---|
-| workflow | `c8ef4c8e62ea550e1541fd0562c857404f900bdb` | canonical packets, landing events, recovery and RETURN validators |
+| workflow | `1dacd5bb2552cc7052f436dcba04601995c82167` | canonical packets, landing events, recovery and RETURN validators |
 | bundlebees | `HEAD` | current checkout; build identity is generated below, never self-pinned |
-| hyvv | `9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb` | governed provisioning contract and launcher outbox |
+| hyvv | `fdd235446e8fb28f8074fa06ea5c6ee1e466e129` | governed provisioning contract and launcher outbox |
 | Hermes | `>=0.23.0` | plugin host API floor (`requires_hermes`) |
 | launcher | `0.1.17` | local worker launcher result envelope |
 | python | `3.12` | tested interpreter (project floor: `>=3.11`) |
