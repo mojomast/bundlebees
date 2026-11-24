@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Model routing: Nous low-risk lane. Low-risk slices (docs, tests-only, verify) route to `nous:deepseek-v4.1-flash-1017`, slightly harder ones and small refactors to `nous:hy4-flash`; the launcher chains 1017 -> hy4 -> `go:deepseek-v4.1-flash` and paces all Nous models under 180 requests/min. Complex slices stay on Kimi.
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
 
 ## [0.2.0] - 2026-11-24
