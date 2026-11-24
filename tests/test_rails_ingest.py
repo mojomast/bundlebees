@@ -102,7 +102,7 @@ def test_a_stray_file_under_evidence_does_not_block_the_bundlebees_source(tmp_pa
     (evidence / "contract-1").mkdir(mode=0o700)
     (evidence / "report-2026-11-16.bundle").write_bytes(b"not a contract directory")
     # A regular file beside the contract directories is skipped, not a refusal.
-    assert source.collect_snapshot(str(state)) == []
+    assert source.collect_snapshot(str(state))["records"] == []
 
 
 def test_a_symlinked_contract_directory_is_still_refused(tmp_path: Path):
