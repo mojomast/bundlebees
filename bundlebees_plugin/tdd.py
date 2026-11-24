@@ -1051,21 +1051,25 @@ def check_red(contract: Mapping[str, Any], contract_sha256: str, record: Mapping
     return record
 
 
-def check_collected_ids(
-    approved: Sequence[str],
-    cases: Iterable[Mapping[str, Any]],
-) -> None:
-    """Require exactly one executed case for every frozen collected-test id."""
-    approved_ids = list(approved)
-    approved_counts: dict[str, int] = {}
-    observed: dict[str, int] = {}
-    invalid_stages: set[str] = set()
+def _approved_id_counts(approved: Sequence[str]) -> tuple[dict[str, int], bool]:
+    """Count each valid approved id and note malformed entries."""
+    counts: dict[str, int] = {}
     malformed = False
-    for test_id in approved_ids:
+    for test_id in approved:
         if not isinstance(test_id, str) or not test_id:
             malformed = True
             continue
-        approved_counts[test_id] = approved_counts.get(test_id, 0) + 1
+        counts[test_id] = counts.get(test_id, 0) + 1
+    return counts, malformed
+
+
+def _observed_id_counts(
+    cases: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, int], set[str], bool]:
+    """Count call-stage cases, noting malformed cases and non-call stages."""
+    observed: dict[str, int] = {}
+    invalid_stages: set[str] = set()
+    malformed = False
     for case in cases:
         if not isinstance(case, Mapping) or not isinstance(case.get("id"), str) or not case.get("id"):
             malformed = True
@@ -1075,6 +1079,17 @@ def check_collected_ids(
             invalid_stages.add(test_id)
             continue
         observed[test_id] = observed.get(test_id, 0) + 1
+    return observed, invalid_stages, malformed
+
+
+def _id_mismatch_problems(
+    approved_ids: Sequence[str],
+    approved_counts: Mapping[str, int],
+    observed: Mapping[str, int],
+    invalid_stages: set[str],
+    malformed: bool,
+) -> list[str]:
+    """Describe every way the observed ids diverge from the approved ones."""
     approved_set = set(approved_counts)
     observed_set = set(observed)
     missing = sorted(approved_set - observed_set)
@@ -1096,11 +1111,59 @@ def check_collected_ids(
         problems.append("cases did not reach the call stage: " + ", ".join(sorted(invalid_stages)[:20]))
     if malformed:
         problems.append("malformed cases without a string id")
+    return problems
+
+
+def check_collected_ids(
+    approved: Sequence[str],
+    cases: Iterable[Mapping[str, Any]],
+) -> None:
+    """Require exactly one executed case for every frozen collected-test id."""
+    approved_ids = list(approved)
+    approved_counts, approved_malformed = _approved_id_counts(approved_ids)
+    observed, invalid_stages, cases_malformed = _observed_id_counts(cases)
+    problems = _id_mismatch_problems(
+        approved_ids,
+        approved_counts,
+        observed,
+        invalid_stages,
+        approved_malformed or cases_malformed,
+    )
     if problems:
         raise TddError(
             "tests_mismatch",
             "GREEN did not run exactly the frozen collected-test ids; " + "; ".join(problems),
             "Run every frozen collected-test id exactly once, with no other tests or collection-only cases.",
+        )
+
+
+def _require_red_pairing(
+    contract: Mapping[str, Any],
+    contract_sha256: str,
+    red: Mapping[str, Any] | None,
+    test_first: bool,
+) -> None:
+    """Require RED when test-first applies, else validate the RED that is present."""
+    if red is None:
+        if test_first:
+            raise TddError(
+                "red_missing",
+                "GREEN has no RED record but the contract requires test-first",
+                "Record a valid RED against source_rev, or set tdd.test_first: false honestly.",
+            )
+        return
+    check_red(contract, contract_sha256, red)
+
+
+def _require_same_fingerprints(red: Mapping[str, Any] | None, green: Mapping[str, Any]) -> None:
+    """Refuse a GREEN measured against different test files than RED."""
+    if red is None:
+        return
+    if (green.get("test_fingerprints") or {}) != (red.get("test_fingerprints") or {}):
+        raise TddError(
+            "tests_tampered",
+            "GREEN test fingerprints differ from RED",
+            "Run the same approved test files unchanged; do not edit or substitute them.",
         )
 
 
@@ -1115,23 +1178,9 @@ def check_green(
     """Raise a named failure unless GREEN follows valid RED with identical tests."""
     _check_identity(contract, contract_sha256, green, "GREEN")
     test_first = (contract.get("tdd") or {}).get("test_first") is not False
-    if red is None:
-        if test_first:
-            raise TddError(
-                "red_missing",
-                "GREEN has no RED record but the contract requires test-first",
-                "Record a valid RED against source_rev, or set tdd.test_first: false honestly.",
-            )
-    else:
-        check_red(contract, contract_sha256, red)
+    _require_red_pairing(contract, contract_sha256, red, test_first)
     _check_verifier(green, "green_failed", "GREEN")
-    if red is not None:
-        if (green.get("test_fingerprints") or {}) != (red.get("test_fingerprints") or {}):
-            raise TddError(
-                "tests_tampered",
-                "GREEN test fingerprints differ from RED",
-                "Run the same approved test files unchanged; do not edit or substitute them.",
-            )
+    _require_same_fingerprints(red, green)
     if approved_ids is not None:
         check_collected_ids(approved_ids, (green.get("result") or {}).get("cases") or [])
     if green.get("classification") != "passed":
