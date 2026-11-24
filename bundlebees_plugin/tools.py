@@ -680,18 +680,28 @@ def _dispatch(
                     _FIX_PROJECT,
                 )
 
-    try:
-        raw_attempts = (
-            client.attempts_raw()
-            if hasattr(client, "attempts_raw")
-            else client.attempts()
-        )
-    except Exception:
-        return _err(
-            "launcher_unreadable",
-            "live attempts are unreadable, so the lease-overlap check cannot run",
-            "Restore launcher access and retry; nothing was dispatched.",
-        )
+    # A backend may expose attempts_raw (preferred) or attempts; a minimal
+    # WorkerBackend with only create + result exposes NEITHER. "Neither" means
+    # the adapter has no attempts capability at all, so there are no live
+    # attempts to overlap with and dispatch proceeds. Once the capability
+    # EXISTS, an unreadable or malformed read still fails closed below.
+    reader: Any = None
+    for capability in ("attempts_raw", "attempts"):
+        candidate = getattr(client, capability, None)
+        if callable(candidate):
+            reader = candidate
+            break
+    if reader is None:
+        raw_attempts: list[Any] = []
+    else:
+        try:
+            raw_attempts = reader()
+        except Exception:
+            return _err(
+                "launcher_unreadable",
+                "live attempts are unreadable, so the lease-overlap check cannot run",
+                "Restore launcher access and retry; nothing was dispatched.",
+            )
     if not isinstance(raw_attempts, list):
         return _err(
             "launcher_unreadable",
