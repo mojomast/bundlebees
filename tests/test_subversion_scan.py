@@ -269,7 +269,7 @@ def test_quoted_path_control_characters_cannot_spoof_the_refusal_message():
 # --- review minor 2: Unicode line/paragraph separators in quoted paths ---
 
 
-@pytest.mark.parametrize("escape", ["\\u2028", "\\u2029"])
+@pytest.mark.parametrize("escape", ["\\u2028", "\\u2029"], ids=["u2028", "u2029"])
 def test_quoted_path_unicode_separators_cannot_spoof_the_refusal_message(escape):
     patch = (
         "diff --git a/src/evil.py b/src/evil.py\n"
@@ -297,8 +297,9 @@ def test_quoted_path_unicode_separators_cannot_spoof_the_refusal_message(escape)
     [
         '[project.entry-points."pytest11"]',
         "[project . entry-points . pytest11]",
-        "[ project.entry-points . 'pytest11' ]",
+        "[ project . entry-points . 'pytest11' ]",
     ],
+    ids=["double-quoted", "dotted-spaces", "single-quoted-spaces"],
 )
 def test_quoted_pytest11_table_is_a_finding(line):
     assert "pytest_plugin" in _kinds(_edit("pyproject.toml", [line]))
