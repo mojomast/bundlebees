@@ -186,6 +186,13 @@ class TestPreflightParity:
             assert pf.preflight(brief, state_dir=tmp_path)["ok"] is True
 
 
+def _last_json_line(capsys, exactly_one=False):
+    lines = capsys.readouterr().out.strip().splitlines()
+    if exactly_one:
+        assert len(lines) == 1, lines
+    return json.loads(lines[-1])
+
+
 class TestPreflightCli:
     def test_exit_codes(self, tmp_path, capsys):
         pf = _preflight_mod()
@@ -198,17 +205,15 @@ class TestPreflightCli:
         missing = tmp_path / "missing.json"
 
         assert pf.main([str(good), "--state-dir", str(tmp_path / "s")]) == 0
-        line = capsys.readouterr().out.strip().splitlines()
-        assert len(line) == 1 and json.loads(line[0])["ok"] is True
+        assert _last_json_line(capsys, exactly_one=True)["ok"] is True
 
         assert pf.main([str(bad), "--state-dir", str(tmp_path / "s")]) == 3
-        line = capsys.readouterr().out.strip().splitlines()
-        assert len(line) == 1 and json.loads(line[0])["code"] == "risk_tier_below_floor"
+        assert _last_json_line(capsys, exactly_one=True)["code"] == "risk_tier_below_floor"
 
         assert pf.main([str(junk)]) == 2
-        assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["ok"] is False
+        assert _last_json_line(capsys)["ok"] is False
         assert pf.main([str(missing)]) == 2
-        assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["ok"] is False
+        assert _last_json_line(capsys)["ok"] is False
 
     def test_hermes_subcommand_registered(self):
         from bundlebees_plugin import cli
