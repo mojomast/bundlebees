@@ -1,7 +1,6 @@
 # ADR 0001: adapters for harness, model, sandbox, forge and coordinator
 
-Status: **proposed** (design only). Wave E of the Nov 24 next-level review
-([rizzstack #17](https://github.com/mojomast/rizzstack/pull/17)).
+Status: **accepted as design** (Kyle, chat t1650u). Design only. Wave E of the Nov 24 next-level review ([rizzstack #17](https://github.com/mojomast/rizzstack/pull/17)). Recommendation recorded: the first second-harness spike is Claude Code over ACP (its headless JSON mode is the fallback); nothing is switched on by this ADR.
 
 ## Why bundlebees owns this ADR
 
