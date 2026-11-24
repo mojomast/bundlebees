@@ -452,6 +452,17 @@ def _tidy(value: float) -> int | float:
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
+def _usage_tokens(value: Any) -> float | None:
+    """A reported token count, or ``None`` when the value cannot be trusted."""
+    try:
+        number = _number(value)
+    except OverflowError:
+        return None
+    if number is None or not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 def _event_attempts(event: Mapping[str, Any]) -> list[str]:
     """Attempt ids an event refers to: ``attempt_id`` plus an ``attempts`` list."""
     ids: list[str] = []
@@ -706,6 +717,147 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         "failed_worker_recoveries": failed_recoveries,
         "waves_accepted": len(accepted_waves),
         "waves_rejected": len(rejected_waves),
+    }
+
+
+def _window_days(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise MetricsError("invalid_field", "days must be a positive integer")
+    return value
+
+
+def _window_end(value: Any) -> _dt.datetime:
+    if value is None:
+        value = _utc_now()
+    if isinstance(value, _dt.datetime):
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+        return parsed
+    parsed = _timestamp(value)
+    if parsed is None:
+        raise MetricsError("invalid_field", "now is not a valid ISO-8601 timestamp")
+    return parsed
+
+
+def _attempt_key(run_id: str, event: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the attempt key when the event carries a usable attempt id."""
+
+    attempt_id = event.get("attempt_id")
+    if isinstance(attempt_id, str) and _ID_RE.fullmatch(attempt_id):
+        return (run_id, attempt_id)
+    return None
+
+
+def _window_events(
+    state_dir: Path, start: _dt.datetime, end: _dt.datetime
+) -> Iterable[tuple[str, dict[str, Any]]]:
+    """Yield ``(run_id, event)`` for events inside the inclusive window."""
+
+    for run_id in list_runs(state_dir):
+        for event in read_events(state_dir, run_id):
+            at = _timestamp(event.get("at"))
+            if at is None or at < start or at > end:
+                continue
+            yield run_id, event
+
+
+def _scan_window(
+    state_dir: Path, start: _dt.datetime, end: _dt.datetime
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]], dict[tuple[str, str], float], int]:
+    """Collect dispatches, verified attempts, token reports and anonymous dispatches."""
+
+    dispatched: set[tuple[str, str]] = set()
+    verified: set[tuple[str, str]] = set()
+    tokens_by_attempt: dict[tuple[str, str], float] = {}
+    anonymous_dispatches = 0
+
+    for run_id, event in _window_events(state_dir, start, end):
+        key = _attempt_key(run_id, event)
+        name = event.get("event")
+        if name == "dispatch":
+            if key is None:
+                anonymous_dispatches += 1
+            else:
+                dispatched.add(key)
+        elif name == "verify" and key is not None and bool(event.get("ok")):
+            verified.add(key)
+        tokens = _usage_tokens(event.get("tokens"))
+        if key is not None and tokens is not None:
+            tokens_by_attempt[key] = tokens
+
+    return dispatched, verified, tokens_by_attempt, anonymous_dispatches
+
+
+def _window_totals(
+    dispatched: set[tuple[str, str]],
+    tokens_by_attempt: Mapping[tuple[str, str], float],
+    anonymous_dispatches: int,
+) -> tuple[int, int | float | None, int | float | None, int]:
+    """Derive attempts, total tokens, known subtotal and token coverage."""
+
+    with_tokens = sum(1 for key in dispatched if key in tokens_by_attempt)
+    attempts = len(dispatched) + anonymous_dispatches
+    known_subtotal = (
+        _tidy(sum(tokens_by_attempt[key] for key in dispatched if key in tokens_by_attempt))
+        if with_tokens
+        else None
+    )
+    complete = (
+        known_subtotal is not None
+        and anonymous_dispatches == 0
+        and with_tokens == len(dispatched)
+    )
+    tokens_total = known_subtotal if complete else None
+    return attempts, tokens_total, known_subtotal, with_tokens
+
+
+def weekly(
+    state_dir: Path,
+    *,
+    now: str | None = None,
+    days: int = 7,
+) -> dict[str, Any]:
+    """Aggregate tokens per verified patch across every run in a trailing window.
+
+    A verified patch is one distinct attempt (within a run) with a passing
+    ``verify`` event in ``[now - days, now]``. Attempts are the distinct
+    attempts dispatched in that window; dispatch events without a usable
+    attempt id each count as one attempt that cannot be attributed. Token
+    usage is cumulative per attempt, so the last valid report wins.
+
+    ``tokens_total`` is ``None`` unless every attempt reported usable tokens;
+    a genuine zero report is still zero. ``tokens_known_subtotal`` carries the
+    partial sum, and ``coverage`` counts attempts with and without tokens. The
+    rate is ``None`` when the total or the number of verified patches is
+    unknown or empty, never a fabricated zero.
+    """
+    window_days = _window_days(days)
+    end = _window_end(now)
+    start = end - _dt.timedelta(days=window_days)
+
+    dispatched, verified, tokens_by_attempt, anonymous_dispatches = _scan_window(
+        state_dir, start, end
+    )
+    attempts, tokens_total, known_subtotal, with_tokens = _window_totals(
+        dispatched, tokens_by_attempt, anonymous_dispatches
+    )
+    verified_patches = len(verified)
+    return {
+        "window_days": window_days,
+        "verified_patches": verified_patches,
+        "attempts": attempts,
+        "tokens_total": tokens_total,
+        "tokens_per_verified_patch": (
+            _tidy(tokens_total / verified_patches)
+            if tokens_total is not None and verified_patches
+            else None
+        ),
+        "tokens_known_subtotal": known_subtotal,
+        "coverage": {
+            "attempts_with_tokens": with_tokens,
+            "attempts_without_tokens": attempts - with_tokens,
+        },
     }
 
 
