@@ -28,6 +28,8 @@ one pull request.
 
 - `verify` records now carry a `test_argv` only when it is the argv this process executed: when the evidence text is the exact trusted template for these tests (pytest with the fixed flags, or `node --test`) and equals the executed argv, it is recorded verbatim — including a path component that the scrubber would redact, because that argv is the CLI-built evidence; when the evidence text is not that template, the executed argv is recorded in its scrubbed form; and the key is omitted when there is no executed argv (an empty argv sequence counts as none), or when the evidence text is that template but the executed argv is not (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2 as a class, plus review-bb-pr236 F1/F2 and review-bb-pr237 F1-F5 / pr238 F1).
 
+- **`metrics.weekly()`**: new trailing-window rollup across every run that returns `window_days`, `verified_patches` (distinct attempts with a passing `verify` event), `attempts`, `tokens_total`, `tokens_per_verified_patch`, `tokens_known_subtotal` and `coverage`. Token usage is cumulative per attempt so the last valid report wins; an unknown usage report makes `tokens_total` and the rate `None` (never zero) while `tokens_known_subtotal` carries the partial sum, and a genuine zero report is still zero.
+
 ### Changed (rizzstack cleanup, Nov 2026)
 
 - **Tool-completion dedupe reader hardened:** the reader now opens `tool-completions` with a directory-level no-symlink guard and a `dir_fd`-relative record open, refuses multi-link records, and bounds a record at 65536 bytes, so a symlinked, hardlinked, or oversized planted record can no longer suppress the landing event (a planted record that is a real, single-link file of at most 65536 bytes is still trusted as the attempt's prior record).
