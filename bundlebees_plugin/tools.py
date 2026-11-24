@@ -680,20 +680,40 @@ def _dispatch(
                     _FIX_PROJECT,
                 )
 
-    try:
-        raw_attempts = (
-            client.attempts_raw()
-            if hasattr(client, "attempts_raw")
-            else client.attempts()
+    # A backend may expose attempts_raw (preferred) or attempts; a minimal
+    # WorkerBackend with only create + result exposes NEITHER. "Neither" means
+    # the adapter has no attempts capability at all, so there are no live
+    # attempts to overlap with and dispatch proceeds. Once the capability
+    # EXISTS, an unreadable or malformed read still fails closed below.
+    reader: Any = None
+    for capability in ("attempts_raw", "attempts"):
+        candidate = getattr(client, capability, None)
+        if callable(candidate):
+            reader = candidate
+            break
+    if reader is None:
+        raw_attempts: list[Any] = []
+    else:
+        try:
+            raw_attempts = reader()
+        except Exception:
+            return _err(
+                "launcher_unreadable",
+                "live attempts are unreadable, so the lease-overlap check cannot run",
+                "Restore launcher access and retry; nothing was dispatched.",
+            )
+    if not isinstance(raw_attempts, list):
+        return _err(
+            "launcher_unreadable",
+            "live attempts did not return a list, so the lease-overlap check cannot run",
+            "Fix the launcher response and retry; nothing was dispatched.",
         )
-    except Exception:
-        raw_attempts = []
     if _lease_overlap(raw_attempts, brief):
         return _err(
             "lease_overlap",
             "assigned_files overlap a running attempt on the same project and branch",
             "Wait for the running attempt or choose non-overlapping files. Lease "
-            "checks are best-effort against live attempts.",
+            "checks require a readable live attempt list.",
         )
 
     # No model means "the launcher decides": its default is the cheapest usable route on that host
