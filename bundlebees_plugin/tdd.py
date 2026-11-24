@@ -66,6 +66,7 @@ FAILURE_CODES: tuple[str, ...] = (
     "tests_tampered",
     "scope_violation",
     "green_failed",
+    "tests_mismatch",
     "refactor_failed",
     "integration_failed",
     "review_failed",
@@ -1050,11 +1051,66 @@ def check_red(contract: Mapping[str, Any], contract_sha256: str, record: Mapping
     return record
 
 
+def check_collected_ids(
+    approved: Sequence[str],
+    cases: Iterable[Mapping[str, Any]],
+) -> None:
+    """Require exactly one executed case for every frozen collected-test id."""
+    approved_ids = list(approved)
+    approved_counts: dict[str, int] = {}
+    observed: dict[str, int] = {}
+    invalid_stages: set[str] = set()
+    malformed = False
+    for test_id in approved_ids:
+        if not isinstance(test_id, str) or not test_id:
+            malformed = True
+            continue
+        approved_counts[test_id] = approved_counts.get(test_id, 0) + 1
+    for case in cases:
+        if not isinstance(case, Mapping) or not isinstance(case.get("id"), str) or not case.get("id"):
+            malformed = True
+            continue
+        test_id = str(case["id"])
+        if case.get("stage") != "call":
+            invalid_stages.add(test_id)
+            continue
+        observed[test_id] = observed.get(test_id, 0) + 1
+    approved_set = set(approved_counts)
+    observed_set = set(observed)
+    missing = sorted(approved_set - observed_set)
+    extra = sorted(observed_set - approved_set)
+    duplicates = sorted(test_id for test_id, count in observed.items() if count != 1)
+    duplicate_approved = sorted(test_id for test_id, count in approved_counts.items() if count != 1)
+    problems: list[str] = []
+    if not approved_ids:
+        problems.append("the approved test-id list is empty")
+    if duplicate_approved:
+        problems.append("duplicate approved ids: " + ", ".join(duplicate_approved[:20]))
+    if missing:
+        problems.append("missing ids: " + ", ".join(missing[:20]))
+    if extra:
+        problems.append("extra ids: " + ", ".join(extra[:20]))
+    if duplicates:
+        problems.append("duplicate run ids: " + ", ".join(duplicates[:20]))
+    if invalid_stages:
+        problems.append("cases did not reach the call stage: " + ", ".join(sorted(invalid_stages)[:20]))
+    if malformed:
+        problems.append("malformed cases without a string id")
+    if problems:
+        raise TddError(
+            "tests_mismatch",
+            "GREEN did not run exactly the frozen collected-test ids; " + "; ".join(problems),
+            "Run every frozen collected-test id exactly once, with no other tests or collection-only cases.",
+        )
+
+
 def check_green(
     contract: Mapping[str, Any],
     contract_sha256: str,
     red: Mapping[str, Any] | None,
     green: Mapping[str, Any],
+    *,
+    approved_ids: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     """Raise a named failure unless GREEN follows valid RED with identical tests."""
     _check_identity(contract, contract_sha256, green, "GREEN")
@@ -1076,6 +1132,8 @@ def check_green(
                 "GREEN test fingerprints differ from RED",
                 "Run the same approved test files unchanged; do not edit or substitute them.",
             )
+    if approved_ids is not None:
+        check_collected_ids(approved_ids, (green.get("result") or {}).get("cases") or [])
     if green.get("classification") != "passed":
         raise TddError(
             "green_failed",
