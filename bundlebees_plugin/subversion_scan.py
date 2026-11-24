@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
-from typing import TypedDict
+from typing import Any, TypedDict
 
 
 class Finding(TypedDict):
@@ -188,43 +188,67 @@ def _file_level_findings(path: str) -> list[Finding]:
     return [Finding(kind=kind, path=path, line=1) for kind in _path_kinds(path)]
 
 
+_ScanState = dict[str, Any]
+
+
+def _new_scan_state() -> _ScanState:
+    return {
+        "findings": [],
+        "path": None,
+        "new_line": 0,
+        "in_hunk": False,
+        "path_reported": False,
+        "addopts": None,
+    }
+
+
+def _flush_file(state: _ScanState) -> None:
+    """Emit the file-level kinds for the file that just ended, if any."""
+    path = state["path"]
+    if path is not None and not state["path_reported"]:
+        state["findings"].extend(_file_level_findings(path))
+    state["path_reported"] = False
+    state["addopts"] = None
+
+
+def _context_line(diff_line: str, in_hunk: bool, path: str | None) -> str | None:
+    """Return the content of a hunk context line, else ``None``."""
+    if in_hunk and path is not None and diff_line.startswith(" "):
+        return diff_line[1:]
+    return None
+
+
+def _scan_added_line(state: _ScanState, path: str, added: tuple[str, int]) -> None:
+    content, line = added
+    state["findings"].extend(_added_line_findings(path, content, line, state["addopts"]))
+    if _path_kinds(path):
+        state["path_reported"] = True
+    state["addopts"] = _next_addopts_continuation(path, content, state["addopts"])
+
+
+def _scan_context_line(state: _ScanState, path: str, context: str) -> None:
+    state["addopts"] = _next_addopts_continuation(path, context, state["addopts"])
+
+
 def scan_patch(patch: str) -> list[Finding]:
-    findings: list[Finding] = []
-    path: str | None = None
-    new_line = 0
-    in_hunk = False
-    path_reported = False
-    addopts_continuation: str | None = None
+    state = _new_scan_state()
     for diff_line in patch.splitlines():
         if diff_line.startswith("diff --git "):
-            if path is not None and not path_reported:
-                findings.extend(_file_level_findings(path))
-            path_reported = False
-            addopts_continuation = None
+            _flush_file(state)
         if _hunk_start(diff_line) is not None:
-            addopts_continuation = None
-        handled, path, in_hunk, new_line = _header_state(diff_line, path, in_hunk, new_line)
+            state["addopts"] = None
+        handled, state["path"], state["in_hunk"], state["new_line"] = _header_state(
+            diff_line, state["path"], state["in_hunk"], state["new_line"]
+        )
         if handled:
             continue
-        context = (
-            diff_line[1:]
-            if in_hunk and path is not None and diff_line.startswith(" ")
-            else None
+        context = _context_line(diff_line, state["in_hunk"], state["path"])
+        state["in_hunk"], state["new_line"], added = _body_step(
+            diff_line, state["in_hunk"], state["path"], state["new_line"]
         )
-        in_hunk, new_line, added = _body_step(diff_line, in_hunk, path, new_line)
-        if added is not None and path is not None:
-            findings.extend(
-                _added_line_findings(path, *added, addopts_continuation)
-            )
-            if _path_kinds(path):
-                path_reported = True
-            addopts_continuation = _next_addopts_continuation(
-                path, added[0], addopts_continuation
-            )
-        elif context is not None and path is not None:
-            addopts_continuation = _next_addopts_continuation(
-                path, context, addopts_continuation
-            )
-    if path is not None and not path_reported:
-        findings.extend(_file_level_findings(path))
-    return findings
+        if added is not None and state["path"] is not None:
+            _scan_added_line(state, state["path"], added)
+        elif context is not None and state["path"] is not None:
+            _scan_context_line(state, state["path"], context)
+    _flush_file(state)
+    return state["findings"]
