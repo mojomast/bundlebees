@@ -64,7 +64,7 @@ Helper files:
 
 - `${HERMES_SKILL_DIR}/references/kanban.md` - Hermes board only.
 - `${HERMES_SKILL_DIR}/references/briefs-and-leases.md` - brief fields, leases, budgets.
-- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - exact commands the user types, including ACDD.
+- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - step 7: exact user commands incl. ACDD.
 - `${HERMES_SKILL_DIR}/references/security.md` - secrets, hosts, untrusted text.
 - `${HERMES_SKILL_DIR}/templates/host-setup-prompt.md` - template used by `bundlebees_host_prompt`.
 
@@ -127,9 +127,9 @@ Helper files:
   `sandbox_unavailable`, `integration_required`, `unsupported_*` - see the
   code table in `references/verify-and-deploy.md`. Never edit lease files,
   hand-edit a patch, or suggest the unsafe local sandbox flag.
-- `lease_overlap` - the live-attempt check found shared `assigned_files` on the
-  same project and branch. Wait, or split the lease differently. The check is
-  best-effort.
+- `lease_overlap` - live attempts share `assigned_files` on this project and
+  branch. The check fails closed: unreadable attempts refuse dispatch.
+  Wait, or split the lease.
 - `model_not_allowed` - use `deepseek-v4.1-flash` or another allow-listed id.
 - `launcher_unavailable` - the configured adapter is down or unreachable.
   Report configured state and ask the user to check the host.
