@@ -204,10 +204,18 @@ class VerifyError(Exception):
 def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
     findings = subversion_scan.scan_patch(patch)
     if findings:
-        first = findings[0]
+        listed = ", ".join(
+            f"{finding['kind']}@{finding['path']}:{finding['line']}"
+            for finding in findings[:5]
+        )
+        message = (
+            f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
+        )
+        if len(findings) > 5:
+            message += f" (+{len(findings) - 5} more)"
         raise VerifyError(
             "test_subversion",
-            f"patch can subvert the approved test run: {first['kind']} at {first['path']}:{first['line']}",
+            message,
             "Remove test-runner subversion from the patch.",
         )
     return findings
@@ -1066,10 +1074,10 @@ def _verify_and_commit_locked(
     on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    check_patch_subversion(patch)
     state_dir = Path(state_dir)
     repo = Path(repo)
     stats = stats if stats is not None else _test_cache_stats()
-    check_patch_subversion(patch)
 
     # Fail closed on missing evidence rather than recording a hollow pass.
     if tests_required and not list(tests):
