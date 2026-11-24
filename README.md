@@ -555,7 +555,7 @@ eval "$(sh scripts/setup-pinned-sources.sh)"
 #   workflow c8ef4c8e62ea550e1541fd0562c857404f900bdb  (reviewed protocol revision)
 #   hyvv     9691837b0ef3bd2d5c23f7d5b539c6c22d7c8ebb  (reviewed provisioning revision)
 WORKFLOW_SRC=<checkout-of-c8ef4c8> REQUIRE_WORKFLOW=1 \
-HYVV_SRC=<checkout-of-1fcf103> REQUIRE_HYVV=1 \
+HYVV_SRC=<checkout-of-9691837> REQUIRE_HYVV=1 \
 GITLEAKS="$(command -v gitleaks)" \
 python -m pytest -rs
 
