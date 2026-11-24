@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
+- **Preflight honours `require_contract`:** `bundlebees_plugin/preflight.py` takes a keyword-only `require_contract=` and gains a `--require-contract` flag, both threaded into the same `tools._gate` the dispatcher uses, and the registered `preflight` command reads the `require_contract` setting through `config_flag(settings_from_ctx(ctx))` exactly like `tools._require_contract`, so preflight and dispatch return the same verdict when the setting is on.
 
 ## [0.2.0] - 2026-11-24
 
