@@ -1,0 +1,43 @@
+{
+  "files": [
+    {
+      "bytes": 3223,
+      "path": "README.md",
+      "sha256": "45d5556f285cac724157e006d9a4c13af948ba80c5be44446525549fb36ba2fd"
+    },
+    {
+      "bytes": 106,
+      "path": "slop_lint/__init__.py",
+      "sha256": "18aaf93f04ecc5c7f3dbb4f92b46bf42f5a19855fbaba6fd40b8b8c091085d40"
+    },
+    {
+      "bytes": 57,
+      "path": "slop_lint/__main__.py",
+      "sha256": "39e5765accae63c26a1b08db19df55bfb2f698735db373ea8faf3917e6ba2802"
+    },
+    {
+      "bytes": 3913,
+      "path": "slop_lint/baseline.py",
+      "sha256": "dcbb5c16960aa7eac865b62f7a425dd91d4660df2cbe955d631a5f9c15387129"
+    },
+    {
+      "bytes": 6814,
+      "path": "slop_lint/cli.py",
+      "sha256": "c1bc11a002cfa9f1facfb5a68a8ada39dc9328b3f95f197ccb437d6d7ecbb395"
+    },
+    {
+      "bytes": 1947,
+      "path": "slop_lint/engine.py",
+      "sha256": "3fbc1a4a3fd3374c1c4656722a6ac4b078828a5b43fa4da66dd9406d1c58a23b"
+    },
+    {
+      "bytes": 3244,
+      "path": "slop_lint/rules.py",
+      "sha256": "e7bcf2145fa2c49cd02acbf5ef30be1ca3856df2f71930aae15c08ffde5a6a0a"
+    }
+  ],
+  "schema": "rizzstack.slop-lint-vendor/1",
+  "source_commit": "c8ef4c8e62ea550e1541fd0562c857404f900bdb",
+  "source_path": "tools/slop-lint",
+  "source_repo": "mojomast/workflow"
+}

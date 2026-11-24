@@ -1,0 +1,2 @@
+# The slop-lint vendor manifest pins physical bytes, including on Windows auto-CRLF checkouts.
+tools/slop-lint/** text eol=lf

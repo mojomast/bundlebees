@@ -24,6 +24,10 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+      # The vendored copy must be byte-identical to the workflow commit pinned in
+      # tools/slop-lint/vendor-manifest.json (offline; refresh with --refresh).
+      - name: Vendored slop-lint matches its pinned manifest
+        run: python3 scripts/vendor_slop_lint.py --check
       # Blocking ratchet: fails on findings above the committed baseline (new or
       # higher counts) and on a missing or invalid baseline. Entries that no longer
       # occur are tolerated (--pass-on-unpruned); shrink the baseline with `prune`.
