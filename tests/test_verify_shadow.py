@@ -21,7 +21,29 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import verify_shadow, verify_workers
+from bundlebees_plugin import verify_workers
+
+
+class _LazyModule:
+    """Import the module under test on first use, inside the test body.
+
+    At source_rev the module does not exist yet; importing it at module level
+    would make pytest fail collection for this file (and abort the session), so
+    the approved test ids would not be collected and RED could not be recorded.
+    A deferred import keeps every test collectable and makes each one fail on
+    the missing interface instead.
+    """
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        import importlib
+
+        return getattr(importlib.import_module(self._name), attr)
+
+
+verify_shadow = _LazyModule("bundlebees_plugin.verify_shadow")
 from bundlebees_plugin.verify_workers import VerifyWorkersError
 
 ROOT = Path(__file__).resolve().parents[1]
