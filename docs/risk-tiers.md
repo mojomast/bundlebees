@@ -19,6 +19,22 @@ unchanged. Human gates, extra reviewers and minimum verifications for high tier 
 `policy_for(tier)` returns a fresh deep copy each call; mutating it never
 changes the table.
 
+## Preflight
+
+Every dispatcher outside Hermes (for example the coordinator box posting straight
+to the launcher) must run the gates first and refuse on a non-zero exit:
+
+```
+python -m bundlebees_plugin.preflight brief.json --state-dir plugin-data
+```
+
+It runs the same validation, risk-floor, contract and research gates as
+`bundlebees_plugin/tools.py::_dispatch`, but never builds a client, opens a socket
+or writes state. It exits `0` when the brief passes, `3` when the gates refuse
+(JSON `code`, `error`, `fix`), and `2` when the brief file is unreadable or not
+JSON. Unlike `_dispatch`, preflight requires an explicit `risk.tier`; a box-level
+model `tier` is never read as a risk tier.
+
 ## Fail-closed rules
 
 - A tier is exactly the string `low`, `medium` or `high`. Anything else —

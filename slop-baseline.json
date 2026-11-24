@@ -186,7 +186,7 @@
     "complexity": 4
   },
   "bundlebees_plugin/tools.py": {
-    "complexity": 7,
+    "complexity": 8,
     "swallowed-exception": 2
   },
   "bundlebees_plugin/transport.py": {
