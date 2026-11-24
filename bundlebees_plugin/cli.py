@@ -2935,6 +2935,8 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
 
 
 def _cmd_verify(ctx: Any, args: Any) -> int:
+    from . import verify_local
+
     attempt_id = _safe_attempt_id(getattr(args, "attempt_id", None))
     state_dir = _state_dir(ctx, args)
     config = _config(ctx)
@@ -2996,6 +2998,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "the worker result has no patch yet",
                 "Wait for the worker to finish and collect a result with a patch.",
             )
+        try:
+            verify_local.check_patch_subversion(patch)
+        except verify_local.VerifyError as exc:
+            raise _as_cli_error(exc) from exc
 
         # ACDD: a contract in the lease makes approved tests read-only and
         # requires a valid RED before anything is applied. None = legacy.
