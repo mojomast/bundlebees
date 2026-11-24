@@ -1,0 +1,20 @@
+[Unit]
+Description=Bundlebees route sync (launcher-reported model/route per leased attempt)
+Documentation=file://%h/rizzstack-ingest/bundlebees/docs/route-sync.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/rizzstack-ingest/bundlebees
+# 0600 file holding BUNDLEBEES_LAUNCHER_URL and BUNDLEBEES_LAUNCHER_TOKEN only.
+EnvironmentFile=%h/.config/bundlebees/route-sync.env
+ExecStart=%h/rizzstack/.venv/bin/python -B -m bundlebees_plugin.route_sync --state-dir %h/.hermes/plugin-data/bundlebees
+Nice=15
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Create the directory once (0700) before enabling; it is the only write.
+ReadWritePaths=%h/.hermes/plugin-data/bundlebees/attempt-routes
+MemoryMax=256M
