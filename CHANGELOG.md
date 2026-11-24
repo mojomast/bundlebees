@@ -7,7 +7,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-24
+
+- Release prep (no tag): `pyproject.toml`, `dashboard/manifest.json` and `docs/stack-manifest.md` now say **0.2.0**, matching `plugin.yaml` and this changelog (the 0.1.1 / 0.2.0 split inside the repo is gone). `HYVV_PIN` is re-pinned to the hyvv 0.1.18 merge `ae8680a4c0289ce91dab52169eff1433cb694533` (hyvv #41) in every copy (pins.py, CI checkout, setup script, pinned-sources, stack manifest, README). `LAUNCHER_PIN` stays `0.1.17`: the pin must match a recorded real launcher envelope (`tests/test_verify_result_shape.py`), and no 0.1.18 launcher has been deployed or recorded yet. Tagging v0.2.0 still needs Kyle's typed yes.
 
 Verifier and contract hardening from an external review of the workflow. The
 unit of progress is an accepted artifact with evidence, and every guarantee
@@ -32,6 +34,7 @@ one pull request.
 
 ### Added
 
+- **Complex-slice model routing:** `bundlebees_plugin.model_route.select_worker_model` (and `python -m bundlebees_plugin.model_route <brief.json>`) picks the worker model per brief: complex slices (effective risk high, a lease of 5+ files, cross-repo, a security or approval-gate path, Rails harness work, two failed attempts, or `complexity: complex`) get the launcher's Kimi route `k3.1-pro`; everything else stays on `go:deepseek-v4.1-flash`. Pure and offline; a complex model missing from the launcher allow-list falls back visibly (`fallback: true` with a reason). Contract: `docs/contracts/model-route.md`.
 - **Board → dispatcher bridge:** `hermes bundlebees board-dispatch --once` connects the Kanban `ready` column to the factory driver. A ready card with a durable approval record (`factory/board-approvals/<task_id>.json`) that carries a strict-valid brief and an existing authorized job gets one `queue.json` feature (envelope preserved) plus one `factory/dispatch-approvals/<work_id>.json` record, idempotently, so the resident service picks it up on its next pass. Cards without an approval record are never stocked, a replay changes nothing, and a conflicting identity is refused rather than overwritten (`bundlebees_plugin/board_dispatch.py`, `docs/board-dispatch.md`).
 - **Factory dispatch wiring:** the factory driver reads the live docket envelope (`bundlebees.queue/1`, a `features` list) as well as the legacy feature map, updates a feature in place and refuses any other shape with a typed `queue_invalid` instead of the attribute error the live queue stage hit. The shipped service unit passes the launcher URL, repo and gitleaks from a mandatory 0600 `EnvironmentFile` and starts with `--require-dispatch-config`, which exits with the missing variable names instead of silently running the observation tick; `WORKFLOW_SRC` is documented as required for landing validation and recovery.
 - **Docs-sync companion (this PR):** registers #107 and #108 in the coverage registry with their Unreleased bullets, so a full-history run of the changelog guard stops reporting them as undocumented merges.
