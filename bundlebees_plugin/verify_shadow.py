@@ -90,19 +90,19 @@ def _shadow_dir(state_dir: Any) -> Path:
 
 
 def _record_error(state_dir: Any, *, attempt_id: str, code: str, now: Any) -> None:
-    record = {
-        "schema": ERROR_SCHEMA,
-        "at": _iso(now),
-        "attempt_id": attempt_id,
-        "code": code,
-    }
     try:
+        record = {
+            "schema": ERROR_SCHEMA,
+            "at": _iso(now),
+            "attempt_id": attempt_id,
+            "code": code,
+        }
         path = _shadow_dir(state_dir) / "errors.jsonl"
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-    except OSError:
+    except Exception:  # noqa: BLE001 - recording an error may never raise
         pass
 
 
@@ -145,5 +145,8 @@ def observe(
         )
     except Exception as exc:  # noqa: BLE001 - shadow may never change the verdict
         code = exc.code if isinstance(exc, verify_workers.VerifyWorkersError) else type(exc).__name__
-        _record_error(state_dir, attempt_id=attempt_id, code=str(code), now=now)
+        try:
+            _record_error(state_dir, attempt_id=attempt_id, code=str(code), now=now)
+        except Exception:  # noqa: BLE001 - recording must never break the verdict guarantee
+            pass
     return in_beat_verdict

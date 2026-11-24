@@ -56,16 +56,19 @@ test. Completion goes through the queue's fenced ``complete``, so a worker
 superseded by an adoption is refused with the queue's own ``stale_fence`` and
 replay is idempotent by ``action_key``.
 
-Shadow mode. Modes are ``in-beat`` (the default — the flag never switches on
-its own), ``shadow`` and ``on``. Shadow runs BOTH paths on a bounded sample
-set: the in-beat verdict stays authoritative, the worker path runs for real
-(record reuse and receipt reuse disabled, so the execution is observed, not
-inherited), and the two records are compared field by field. Every comparison
-is recorded durably; a divergence raises the named ``shadow_divergence``
-alarm and appends to ``alarms.jsonl`` — never a silent switch. The switch
-procedure lives in ``docs/verify-workers.md``: prove shadow equality on the
-full bounded set with zero alarms, audit the comparisons, then set the flag
-to ``on``; rollback is setting it back to ``in-beat``.
+Shadow mode. Production has exactly two modes: ``in-beat`` (the default — the
+flag never switches on its own) and ``shadow``. ``on`` is refused with
+``mode_not_wired`` and is not wired by the pipeline; the library keeps the
+``on`` code path (:func:`dispatch_verification`, :func:`resolve_mode`) for its
+tests only. Shadow runs BOTH paths on a bounded sample set: the in-beat
+verdict stays authoritative, the worker path runs for real (record reuse and
+receipt reuse disabled, so the execution is observed, not inherited), and the
+two records are compared field by field. Every comparison is recorded durably;
+a divergence raises the named ``shadow_divergence`` alarm and appends to
+``alarms.jsonl`` — never a silent switch. The procedure lives in
+``docs/verify-workers.md``: prove shadow equality on the full bounded set with
+zero alarms and audit the comparisons; rollback is setting the flag back to
+``in-beat``.
 
 Prior art, recorded so it stays rejected: gutting the signed-evidence fixtures
 to plain strings, or deleting the signature checks, to satisfy a credential
@@ -229,7 +232,7 @@ _WORKER_KWARGS = (
 
 _FIX_ATTEMPT = "Use the attempt id the lease was recorded under."
 _FIX_KEY = "Pass the provisioned signing key bytes explicitly; never a weak or absent key."
-_FIX_MODE = "Set the flag to in-beat, shadow or on."
+_FIX_MODE = "Set the flag to in-beat or shadow."
 _FIX_REQUEST = "Build the request with build_request so every binding field is validated."
 _FIX_STATE = "Inspect the shadow state by hand; a corrupt counter must not widen the sample set."
 

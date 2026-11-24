@@ -160,8 +160,8 @@ two available modes:
 | `in-beat` (default when unset or empty) | the pipeline runs the serial verifier exactly as before; shadow writes nothing |
 | `shadow` | both paths run on a bounded sample set; the in-beat verdict stays authoritative; every comparison is recorded; divergence alarms |
 
-Mode `on` is refused with `mode_not_wired` and is deliberately not wired: the
-worker-only path does not exist on this checkout. Any other value is refused
+Mode `on` is refused with `mode_not_wired`: the library retains the `on` code
+path for its tests, but production does not wire it. Any other value is refused
 with `mode_invalid`. `SETTINGS_KEY = "verify_workers"` and `resolve_mode` are a
 library helper only; the pipeline does not consult them, it reads the
 environment variable.
