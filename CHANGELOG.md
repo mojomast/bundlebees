@@ -33,6 +33,10 @@ one pull request.
 
 - `verify` records now carry a `test_argv` only when it is the argv this process executed: when the evidence text is the exact trusted template for these tests (pytest with the fixed flags, or `node --test`) and equals the executed argv, it is recorded verbatim — including a path component that the scrubber would redact, because that argv is the CLI-built evidence; when the evidence text is not that template, the executed argv is recorded in its scrubbed form; and the key is omitted when there is no executed argv (an empty argv sequence counts as none), or when the evidence text is that template but the executed argv is not (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2 as a class, plus review-bb-pr236 F1/F2 and review-bb-pr237 F1-F5 / pr238 F1).
 
+### Changed (launcher release pin, Nov 2026)
+
+- **Launcher pin moved to `0.1.19`:** `pins.LAUNCHER_PIN` names the deployed `0.1.19` build (hyvv `227f4686`), the stack manifest and README report the same version and commit, and the doctor compares the running launcher against that pin (tag `v0.1.19`, worker deploy owner-approved 2026-11-24; Kimi and Nous lanes smoke-tested on the new build).
+
 ### Added (wave A, Nov 2026)
 
 - **Versioned risk-floor policy (`bundlebees.risk-floor/1`):** the path floor now comes from `bundlebees_plugin/policy/risk-floor.json`, and test-harness files (`conftest.py`, `tests/fixtures/**`, `pytest.ini`, `tox.ini`, `setup.cfg`, `noxfile.py`, `sitecustomize.py`) are high; `derive_floor` takes an optional `policy_path` and fails closed to high when the policy is missing, unreadable or invalid, and the hardcoded `_SENSITIVE_MODULES` set is gone (WA-A7).

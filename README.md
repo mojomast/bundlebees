@@ -66,8 +66,8 @@ split.
 - hyvv PR #5 (`feat/bee-landed-events`, merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) supplies
   provisioning, the canonical outbox and authenticated integer-position export. PR #4 was closed as
   superseded by #5;
-- the running worker launcher is the released `0.1.17` build (hyvv `1fcf1039e67ec5fd07e2111cba1808f793c7b5bd`,
-  applied Nov 17, 2026); its provisioning capabilities read reports `rizzstack.provisioning/1`, and the
+- the running worker launcher is the released `0.1.19` build (hyvv `227f4686e7d13bdd6637fbd1a481bf22c334c71a`,
+  applied Nov 24, 2026); its provisioning capabilities read reports `rizzstack.provisioning/1`, and the
   real-bee factory canary remains **NOT RUN**;
 - merges, pushes to protected branches, releases, deploys, policy enrollment and real-TTY authorization
   are human acts. This campaign's merges were explicitly approved; no deployment was performed.
