@@ -49,7 +49,9 @@ client against the launcher.
 | `bundlebees_route_preview` | optional `kind`, `model`, `tier`, `brief` | Preview the model route a dispatch would take; starts no attempt. |
 
 Default model: `deepseek-v4.1-flash`; pass another only when the user asks and
-the launcher allows it.
+the launcher allows it. Complex slices (high risk, 5+ files, cross-repo, security paths, Rails
+harness, failed twice) use `k3.1-pro`: run `python -m bundlebees_plugin.model_route <brief.json>`
+and pass its `model`; a `fallback: true` result names the reason.
 
 User-typed CLI (never a model tool):
 
