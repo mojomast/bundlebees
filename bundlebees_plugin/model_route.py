@@ -43,34 +43,60 @@ def _files(brief: Mapping[str, Any]) -> list[str]:
     return [f for f in files if isinstance(f, str) and f.strip()]
 
 
-def _complex_reasons(brief: Mapping[str, Any], failed: int) -> list[str]:
-    reasons: list[str] = []
-    files = _files(brief)
+def _c1_high_risk(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
     risk = brief.get("risk")
     declared = risk.get("tier") if isinstance(risk, Mapping) else None
-    eff = effective_tier(declared, files)
-    if eff["tier"] == "high":
-        reasons.append("C1 effective risk tier is high")
-    if len(set(files)) >= MULTI_FILE_THRESHOLD:
-        reasons.append(f"C2 lease names {len(set(files))} files (>= {MULTI_FILE_THRESHOLD})")
+    if effective_tier(declared, files)["tier"] == "high":
+        return "C1 effective risk tier is high"
+    return None
+
+
+def _c2_multi_file(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
+    count = len(set(files))
+    if count >= MULTI_FILE_THRESHOLD:
+        return f"C2 lease names {count} files (>= {MULTI_FILE_THRESHOLD})"
+    return None
+
+
+def _c3_cross_repo(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
     repos = brief.get("repos")
     distinct = {r for r in repos if isinstance(r, str) and r.strip()} if isinstance(repos, list) else set()
     if brief.get("cross_repo") is True or len(distinct) >= 2:
-        reasons.append("C3 slice spans more than one repo")
-    if files:
-        floor = derive_floor(files)
-        if floor["tier"] == "high":
-            reasons.append("C4 lease touches a security or approval-gate path")
+        return "C3 slice spans more than one repo"
+    return None
+
+
+def _c4_security_path(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
+    if files and derive_floor(files)["tier"] == "high":
+        return "C4 lease touches a security or approval-gate path"
+    return None
+
+
+def _c5_rails_harness(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
     text = " ".join(t for t in (brief.get(k) for k in ("project", "track", "label", "branch", "title"))
                     if isinstance(t, str))
-    if (_RAILS.search(text) and _HARNESS.search(text)) or any(
-            part.lower() == "rails" for f in files for part in f.replace("\\", "/").split("/")):
-        reasons.append("C5 Rails harness work")
+    in_text = bool(_RAILS.search(text) and _HARNESS.search(text))
+    in_path = any(part.lower() == "rails" for f in files for part in f.replace("\\", "/").split("/"))
+    return "C5 Rails harness work" if in_text or in_path else None
+
+
+def _c6_failed_twice(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
     if failed >= FAILED_ATTEMPTS_THRESHOLD:
-        reasons.append(f"C6 slice already failed {failed} times")
-    if brief.get("complexity") == "complex":
-        reasons.append("C7 brief asks for complex routing")
-    return reasons
+        return f"C6 slice already failed {failed} times"
+    return None
+
+
+def _c7_hint(brief: Mapping[str, Any], files: list[str], failed: int) -> str | None:
+    return "C7 brief asks for complex routing" if brief.get("complexity") == "complex" else None
+
+
+_RULES = (_c1_high_risk, _c2_multi_file, _c3_cross_repo, _c4_security_path, _c5_rails_harness,
+          _c6_failed_twice, _c7_hint)
+
+
+def _complex_reasons(brief: Mapping[str, Any], failed: int) -> list[str]:
+    files = _files(brief)
+    return [r for r in (rule(brief, files, failed) for rule in _RULES) if r]
 
 
 def select_worker_model(brief: Any, *, failed_attempts: int | None = None,
