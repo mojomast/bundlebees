@@ -91,6 +91,7 @@ _ERROR_LINE_RE = re.compile(
     re.MULTILINE,
 )
 _MAX_JUNIT_BYTES = 2_000_000
+MAX_JUNIT_CASES = 20_000
 _MAX_MESSAGE = 500
 _DEFAULT_FIX = (
     "Rerun the approved tests in the sandbox and record verifier evidence for "
@@ -260,7 +261,7 @@ def _case_outcome(testcase: ET.Element) -> tuple[str, ET.Element | None]:
     return "passed", None
 
 
-def parse_junit_cases(path: os.PathLike[str] | str, *, limit: int = 2000) -> list[dict]:
+def parse_junit_cases(path: os.PathLike[str] | str, *, limit: int = MAX_JUNIT_CASES) -> list[dict]:
     """Parse pytest's JUnit XML into bounded, scrubbed per-case outcomes."""
     target = Path(path)
     try:
@@ -976,6 +977,75 @@ def load_collection(
     return dict(data)
 
 
+def _collection_pin(preflight: Any) -> tuple[Mapping[str, Any], Any] | None:
+    """Return the dispatch contract and its frozen test-collection pin, if any."""
+    if not isinstance(preflight, Mapping) or not isinstance(preflight.get("contract"), Mapping):
+        return None
+    contract = preflight["contract"]
+    review = contract.get("review") if isinstance(contract.get("review"), Mapping) else {}
+    pin = review.get("test_collection")
+    if pin is None:
+        return None
+    return contract, pin
+
+
+def _frozen_manifest(
+    state_dir: os.PathLike[str] | str, contract: Mapping[str, Any], preflight: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Load the recorded collection manifest the dispatch pinned."""
+    return load_collection(
+        Path(state_dir),
+        str(contract.get("id") or ""),
+        str(preflight.get("sha") or ""),
+        preflight["key"],
+    )
+
+
+def _frozen_collection_ids(
+    contract: Mapping[str, Any], pin: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> list[str]:
+    """Validate a loaded collection manifest against the frozen pin."""
+    ids = manifest.get("collected_ids")
+    valid_ids = isinstance(ids, list) and all(
+        isinstance(node, str) and "::" in node for node in ids
+    )
+    collected = len(ids) if isinstance(ids, list) else None
+    if (
+        collection_digest(manifest) != pin.get("manifest_sha256")
+        or manifest.get("source_rev") != contract.get("source_rev")
+        or pin.get("source_rev") != contract.get("source_rev")
+        or not valid_ids
+        or pin.get("collected") != collected
+    ):
+        raise TddError(
+            "evidence_tampered", "collected test IDs do not match the frozen selection"
+        )
+    if not ids:
+        raise TddError("tests_mismatch", "the approved test-id list is empty")
+    return list(ids)
+
+
+def frozen_approved_ids(
+    state_dir: os.PathLike[str] | str, preflight: Any
+) -> list[str] | None:
+    """Load and validate the test ids selected by a frozen collection pin."""
+    found = _collection_pin(preflight)
+    if found is None:
+        return None
+    contract, pin = found
+    try:
+        if not isinstance(pin, Mapping):
+            raise TddError("evidence_tampered", "frozen test-collection pin is invalid")
+        manifest = _frozen_manifest(state_dir, contract, preflight)
+        return _frozen_collection_ids(contract, pin, manifest)
+    except TddError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TddError(
+            "evidence_tampered", "frozen test-collection evidence is invalid"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # RED / GREEN / REFACTOR checks
 # ---------------------------------------------------------------------------
@@ -1066,27 +1136,27 @@ def _approved_id_counts(approved: Sequence[str]) -> tuple[dict[str, int], bool]:
 def _observed_id_counts(
     cases: Iterable[Mapping[str, Any]],
 ) -> tuple[dict[str, int], set[str], bool]:
-    """Count call-stage cases, noting malformed cases and non-call stages."""
+    """Count passed call-stage cases, noting malformed and unexecuted cases."""
     observed: dict[str, int] = {}
-    invalid_stages: set[str] = set()
+    unexecuted: set[str] = set()
     malformed = False
     for case in cases:
         if not isinstance(case, Mapping) or not isinstance(case.get("id"), str) or not case.get("id"):
             malformed = True
             continue
         test_id = str(case["id"])
-        if case.get("stage") != "call":
-            invalid_stages.add(test_id)
+        if case.get("stage") != "call" or case.get("outcome") != "passed":
+            unexecuted.add(test_id)
             continue
         observed[test_id] = observed.get(test_id, 0) + 1
-    return observed, invalid_stages, malformed
+    return observed, unexecuted, malformed
 
 
 def _id_mismatch_problems(
     approved_ids: Sequence[str],
     approved_counts: Mapping[str, int],
     observed: Mapping[str, int],
-    invalid_stages: set[str],
+    unexecuted: set[str],
     malformed: bool,
 ) -> list[str]:
     """Describe every way the observed ids diverge from the approved ones."""
@@ -1107,8 +1177,8 @@ def _id_mismatch_problems(
         problems.append("extra ids: " + ", ".join(extra[:20]))
     if duplicates:
         problems.append("duplicate run ids: " + ", ".join(duplicates[:20]))
-    if invalid_stages:
-        problems.append("cases did not reach the call stage: " + ", ".join(sorted(invalid_stages)[:20]))
+    if unexecuted:
+        problems.append("cases were not passed call-stage executions: " + ", ".join(sorted(unexecuted)[:20]))
     if malformed:
         problems.append("malformed cases without a string id")
     return problems
@@ -1121,12 +1191,12 @@ def check_collected_ids(
     """Require exactly one executed case for every frozen collected-test id."""
     approved_ids = list(approved)
     approved_counts, approved_malformed = _approved_id_counts(approved_ids)
-    observed, invalid_stages, cases_malformed = _observed_id_counts(cases)
+    observed, unexecuted, cases_malformed = _observed_id_counts(cases)
     problems = _id_mismatch_problems(
         approved_ids,
         approved_counts,
         observed,
-        invalid_stages,
+        unexecuted,
         approved_malformed or cases_malformed,
     )
     if problems:
@@ -1181,14 +1251,14 @@ def check_green(
     _require_red_pairing(contract, contract_sha256, red, test_first)
     _check_verifier(green, "green_failed", "GREEN")
     _require_same_fingerprints(red, green)
-    if approved_ids is not None:
-        check_collected_ids(approved_ids, (green.get("result") or {}).get("cases") or [])
     if green.get("classification") != "passed":
         raise TddError(
             "green_failed",
             f"GREEN classified as {green.get('classification')}, expected passed",
             "Make the implementation pass the approved tests without changing them.",
         )
+    if approved_ids is not None:
+        check_collected_ids(approved_ids, (green.get("result") or {}).get("cases") or [])
     return green
 
 

@@ -69,64 +69,20 @@ def _receipt_scope(lease: Mapping[str, Any], preflight: Any) -> tuple[str, str, 
     raise VerifyError("receipt_scope_mismatch", "Cannot bind this receipt to a checked dispatch contract.")
 
 
-def _collection_pin(preflight: Any) -> tuple[Mapping[str, Any], Any] | None:
-    """Return the dispatch contract and its frozen test-collection pin, if any."""
-    if not isinstance(preflight, Mapping) or not isinstance(preflight.get("contract"), Mapping):
-        return None
-    contract = preflight["contract"]
-    review = contract.get("review") if isinstance(contract.get("review"), Mapping) else {}
-    pin = review.get("test_collection")
-    if pin is None:
-        return None
-    return contract, pin
-
-
-def _frozen_manifest(
-    state_dir: Path, contract: Mapping[str, Any], preflight: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    """Load the recorded collection manifest the dispatch pinned."""
-    return tdd.load_collection(
-        Path(state_dir),
-        str(contract.get("id") or ""),
-        str(preflight.get("sha") or ""),
-        preflight["key"],
-    )
-
-
-def _frozen_collection_ids(
-    contract: Mapping[str, Any], pin: Mapping[str, Any], manifest: Mapping[str, Any]
-) -> list[str]:
-    """Validate a loaded collection manifest against the frozen pin."""
-    ids = manifest.get("collected_ids")
-    valid_ids = isinstance(ids, list) and all(isinstance(node, str) and "::" in node for node in ids)
-    collected = len(ids) if isinstance(ids, list) else None
-    if (
-        tdd.collection_digest(manifest) != pin.get("manifest_sha256")
-        or manifest.get("source_rev") != contract.get("source_rev")
-        or pin.get("source_rev") != contract.get("source_rev")
-        or not valid_ids
-        or pin.get("collected") != collected
-    ):
-        raise tdd.TddError("evidence_tampered", "collected test IDs do not match the frozen selection")
-    if not ids:
-        raise tdd.TddError("tests_mismatch", "the approved test-id list is empty")
-    return list(ids)
-
-
 def _frozen_approved_ids(state_dir: Path, preflight: Any) -> list[str] | None:
-    found = _collection_pin(preflight)
-    if found is None:
-        return None
-    contract, pin = found
     try:
-        if not isinstance(pin, Mapping):
-            raise tdd.TddError("evidence_tampered", "frozen test-collection pin is invalid")
-        manifest = _frozen_manifest(state_dir, contract, preflight)
-        return _frozen_collection_ids(contract, pin, manifest)
+        return tdd.frozen_approved_ids(state_dir, preflight)
     except tdd.TddError as exc:
         raise VerifyError(exc.code, exc.error, exc.fix) from exc
-    except (KeyError, TypeError, ValueError) as exc:
-        raise VerifyError("evidence_tampered", "frozen test-collection evidence is invalid") from exc
+
+
+def _junit_counter(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise VerifyError(
+            "evidence_invalid", f"JUnit {name} counter is not an integer"
+        ) from exc
 
 
 def _check_frozen_green(
@@ -136,17 +92,17 @@ def _check_frozen_green(
     evidence: Mapping[str, Any],
     revision: str,
     suite_command: Sequence[str] | None,
-) -> None:
+) -> dict[str, Any]:
     contract = preflight["contract"]
     tests = [str(test) for test in preflight["tests"]]
     junit = evidence.get("junit") if isinstance(evidence.get("junit"), Mapping) else {}
     cases = list(evidence.get("cases") or [])
     result = {
         "exit_code": evidence.get("exit_code"),
-        "tests": int(junit.get("tests") or len(cases)),
-        "failures": int(junit.get("failures") or 0),
-        "errors": int(junit.get("errors") or 0),
-        "skipped": int(junit.get("skipped") or 0),
+        "tests": _junit_counter(junit.get("tests") or len(cases), "tests"),
+        "failures": _junit_counter(junit.get("failures") or 0, "failures"),
+        "errors": _junit_counter(junit.get("errors") or 0, "errors"),
+        "skipped": _junit_counter(junit.get("skipped") or 0, "skipped"),
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
     }
@@ -165,6 +121,7 @@ def _check_frozen_green(
         tdd.check_green(contract, str(preflight["sha"]), preflight.get("red"), record, approved_ids=approved_ids)
     except tdd.TddError as exc:
         raise VerifyError(exc.code, exc.error, exc.fix) from exc
+    return record
 
 
 _TREE_DOMAIN = b"bundlebees-source-tree:v1\x00"
@@ -204,10 +161,18 @@ class VerifyError(Exception):
 def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
     findings = subversion_scan.scan_patch(patch)
     if findings:
-        first = findings[0]
+        listed = ", ".join(
+            f"{finding['kind']}@{finding['path']}:{finding['line']}"
+            for finding in findings[:5]
+        )
+        message = (
+            f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
+        )
+        if len(findings) > 5:
+            message += f" (+{len(findings) - 5} more)"
         raise VerifyError(
             "test_subversion",
-            f"patch can subvert the approved test run: {first['kind']} at {first['path']}:{first['line']}",
+            message,
             "Remove test-runner subversion from the patch.",
         )
     return findings
@@ -1066,10 +1031,10 @@ def _verify_and_commit_locked(
     on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    check_patch_subversion(patch)
     state_dir = Path(state_dir)
     repo = Path(repo)
     stats = stats if stats is not None else _test_cache_stats()
-    check_patch_subversion(patch)
 
     # Fail closed on missing evidence rather than recording a hollow pass.
     if tests_required and not list(tests):
@@ -1351,9 +1316,13 @@ def _verify_and_commit_locked(
             raise VerifyError("commit_failed", f"the verification commit failed: {commit.stderr.strip()[:200]}", "Inspect the worktree.")
         sha = _rev(worktree, "HEAD")
         if approved_ids is not None:
-            _check_frozen_green(
-                outcome, approved_ids, worktree, green, sha, named_suite_command
-            )
+            try:
+                record = _check_frozen_green(
+                    outcome, approved_ids, worktree, green, sha, named_suite_command
+                )
+                tdd.write_record(state_dir, record, outcome["key"])
+            except tdd.TddError as exc:
+                raise VerifyError(exc.code, exc.error, exc.fix) from exc
     finally:
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
 
