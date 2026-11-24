@@ -9,7 +9,10 @@ task cannot declare away; a human declaration may raise the tier above it.
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 __all__ = ["TIERS", "derive_floor", "effective_tier"]
@@ -17,10 +20,10 @@ __all__ = ["TIERS", "derive_floor", "effective_tier"]
 TIERS: tuple[str, str, str] = ("low", "medium", "high")
 _RANK = {tier: rank for rank, tier in enumerate(TIERS)}
 
-_SENSITIVE_MODULES = frozenset(
-    {"security.py", "sandbox.py", "contract_gate.py", "verify_local.py"}
-)
+_POLICY_SCHEMA = "bundlebees.risk-floor/1"
+_DEFAULT_POLICY_PATH = Path(__file__).resolve().parent / "policy" / "risk-floor.json"
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_SELECTORS = ("absolute", "traversal", "basename", "pattern")
 
 
 def _invalid() -> dict[str, Any]:
@@ -36,40 +39,93 @@ def _is_absolute(path: str) -> bool:
     return normalized.startswith("/") or bool(_DRIVE_RE.match(normalized))
 
 
-def _high_reason(path: str) -> str | None:
-    if _is_absolute(path):
-        return f"{path}: absolute paths are high risk"
+def _policy_failure() -> dict[str, Any]:
+    return {
+        "tier": "high",
+        "reasons": ["risk floor policy is missing, unreadable, or invalid; failing closed to high"],
+    }
+
+
+def _policy_rules(data: dict[str, Any], key: str, *, required: bool) -> list[dict[str, Any]]:
+    if key not in data:
+        if required:
+            raise ValueError(f"policy is missing {key} rules")
+        return []
+    rules = data[key]
+    if not isinstance(rules, list):
+        raise ValueError(f"policy {key} rules must be a list")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise ValueError(f"policy {key} rule must be an object")
+        reason = rule.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"policy {key} rule needs a reason")
+        selectors = [selector for selector in _SELECTORS if selector in rule]
+        if len(selectors) != 1:
+            raise ValueError(f"policy {key} rule needs exactly one selector")
+        selector = selectors[0]
+        value = rule[selector]
+        if selector in ("absolute", "traversal"):
+            if value is not True:
+                raise ValueError(f"policy {selector} selector must be true")
+        elif not isinstance(value, str) or not value:
+            raise ValueError(f"policy {selector} selector must be a non-empty string")
+    return rules
+
+
+def _load_policy(policy_path: Any) -> dict[str, Any]:
+    path = _DEFAULT_POLICY_PATH if policy_path is None else Path(policy_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("schema") != _POLICY_SCHEMA:
+        raise ValueError("unsupported risk floor policy")
+    default = data.get("default", "medium")
+    if default not in TIERS:
+        raise ValueError("invalid risk floor policy default")
+    return {
+        "default": default,
+        "high": _policy_rules(data, "high", required=True),
+        "low": _policy_rules(data, "low", required=False),
+    }
+
+
+def _pattern_matches(normalized: str, name: str, pattern: str) -> bool:
+    pattern = pattern.replace("\\", "/").lower()
+    if "/" not in pattern:
+        return fnmatch.fnmatchcase(name, pattern)
+    if fnmatch.fnmatchcase(normalized, pattern):
+        return True
+    return pattern.startswith("**/") and fnmatch.fnmatchcase(normalized, pattern[3:])
+
+
+def _matching_reason(path: str, rules: list[dict[str, Any]]) -> str | None:
     parts = _parts(path)
     lowered = [part.lower() for part in parts]
-    if ".." in parts:
-        return f"{path}: path traversal ('..') is high risk"
-    if not lowered:
-        return None
-    name = lowered[-1]
-    if name in _SENSITIVE_MODULES:
-        return f"{path}: sensitive module {parts[-1]}"
-    if name.startswith("auth") or name.startswith("approvals"):
-        return f"{path}: authentication or approval code {parts[-1]}"
-    if name.endswith("security.mjs"):
-        return f"{path}: security module {parts[-1]}"
-    if name.endswith(".json") and "schemas" in lowered[:-1]:
-        return f"{path}: schema contract under a schemas/ directory"
-    for index in range(len(lowered) - 1):
-        if lowered[index] == ".github" and lowered[index + 1] == "workflows":
-            return f"{path}: CI workflow under .github/workflows/"
+    normalized = "/".join(lowered)
+    name = lowered[-1] if lowered else ""
+    for rule in rules:
+        matched = False
+        if rule.get("absolute") is True:
+            matched = _is_absolute(path)
+        elif rule.get("traversal") is True:
+            matched = ".." in parts
+        elif "basename" in rule:
+            matched = name == rule["basename"].lower()
+        elif "pattern" in rule:
+            matched = _pattern_matches(normalized, name, rule["pattern"])
+        if matched:
+            return f"{path}: {rule['reason']}"
     return None
 
 
-def _is_low(path: str) -> bool:
-    parts = _parts(path)
-    if not parts:
-        return False
-    if parts[-1].lower().endswith(".md"):
-        return True
-    return len(parts) > 1 and parts[0].lower() in ("docs", "tests")
+def _high_reason(path: str, rules: list[dict[str, Any]]) -> str | None:
+    if _is_absolute(path):
+        return f"{path}: absolute paths are high risk"
+    if ".." in _parts(path):
+        return f"{path}: path traversal ('..') is high risk"
+    return _matching_reason(path, rules)
 
 
-def derive_floor(paths: Any) -> dict[str, Any]:
+def derive_floor(paths: Any, policy_path: Any = None) -> dict[str, Any]:
     """Return the lowest allowed tier for ``paths`` plus the matching reasons."""
     if not isinstance(paths, list) or not paths:
         return _invalid()
@@ -77,28 +133,39 @@ def derive_floor(paths: Any) -> dict[str, Any]:
         if not isinstance(path, str) or not path.strip():
             return _invalid()
 
+    try:
+        policy = _load_policy(policy_path)
+    except (OSError, TypeError, ValueError):
+        return _policy_failure()
+
     high_reasons: list[str] = []
-    medium_paths: list[str] = []
+    low_reasons: list[str] = []
+    unmatched_paths: list[str] = []
     for path in paths:
-        reason = _high_reason(path)
+        reason = _high_reason(path, policy["high"])
         if reason is not None:
             high_reasons.append(reason)
-        elif not _is_low(path):
-            medium_paths.append(path)
+            continue
+        reason = _matching_reason(path, policy["low"])
+        if reason is not None:
+            low_reasons.append(reason)
+        else:
+            unmatched_paths.append(path)
 
     if high_reasons:
         return {"tier": "high", "reasons": high_reasons}
-    if medium_paths:
-        return {
-            "tier": "medium",
-            "reasons": [
-                f"{path}: source path outside docs/ and tests/" for path in medium_paths
-            ],
-        }
-    return {
-        "tier": "low",
-        "reasons": [f"{path}: documentation or test path" for path in paths],
-    }
+    if not unmatched_paths:
+        return {"tier": "low", "reasons": low_reasons}
+
+    default = policy["default"]
+    default_reasons = []
+    for path in unmatched_paths:
+        if default == "medium":
+            reason = f"{path}: source path outside docs/ and tests/"
+        else:
+            reason = f"{path}: policy default tier {default!r}"
+        default_reasons.append(reason)
+    return {"tier": default, "reasons": low_reasons + default_reasons}
 
 
 def effective_tier(declared: Any, paths: Any) -> dict[str, Any]:

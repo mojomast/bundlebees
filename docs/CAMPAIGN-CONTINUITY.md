@@ -258,3 +258,7 @@ why the pauses in the transcript were mostly "the turn ended and no scheduler
 woke it", not "the job was stuck". The layer above is the path for the next
 authorized campaign; it does not retroactively claim the Jackpot pauses were
 handled automatically.
+
+## Heartbeat lanes
+
+Dispatch and evidence run as two cron lanes over one queue, serialized by the coordinator claim: a fast lane (every 5 minutes) folds owner decisions and dispatches queued slices, and a slow lane (every 30 minutes) verifies, merges, deploys and records. See [heartbeat-lanes.md](heartbeat-lanes.md).
