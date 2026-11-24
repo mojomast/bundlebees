@@ -56,4 +56,7 @@ def test_moved_module_imports_from_its_new_home(module, home):
     spec = importlib.util.spec_from_file_location(f"contrib_{home}_{module}", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolves string annotations through sys.modules[cls.__module__],
+    # so the module must be registered before exec_module (tests/fakes.py does the same).
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
