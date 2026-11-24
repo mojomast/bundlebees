@@ -1,8 +1,10 @@
-"""Optional risk tiers for task briefs, derived from the touched paths.
+"""Risk tiers for task briefs, derived from the touched paths.
 
-Pure data and pure functions only: nothing here is wired into dispatch and no
-gate enforces the table. The path-derived floor is a lower bound a task cannot
-declare away; a human declaration may raise the tier above it.
+The path-derived floor and the effective tier ARE enforced at dispatch by
+``tools._dispatch``: a declared tier below the floor is refused with
+``risk_tier_below_floor``, and a high effective tier requires a frozen
+``acdd/1`` contract before the brief is accepted. The floor is a lower bound a
+task cannot declare away; a human declaration may raise the tier above it.
 """
 
 from __future__ import annotations

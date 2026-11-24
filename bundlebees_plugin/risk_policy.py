@@ -1,7 +1,10 @@
 """Risk-tier to process policy.
 
-Data and pure functions only. Nothing here is wired into dispatch or any
-gate: the live path is report-only until the owner enables enforcement.
+The tier -> process table in this module is report-only: it is not enforced
+at dispatch or by any gate. Enforcement of the path floor and effective tier
+lives in ``tools._dispatch`` (with the tier math in ``risk.py``), which refuses
+``risk_tier_below_floor`` and requires a frozen ``acdd/1`` contract for high
+risk.
 
 A tier is one of exactly ``"low"``, ``"medium"`` or ``"high"``. Any other
 value (``None``, an empty string, an unknown string, a non-string) fails
