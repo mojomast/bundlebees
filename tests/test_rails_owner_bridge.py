@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from bundlebees_plugin import job, rails_owner_bridge as bridge
+from bundlebees_plugin import job
+from contrib.unwired import rails_owner_bridge as bridge
 from rizzstack_rails import RailsLedger
 from rizzstack_rails.feedback import history
 

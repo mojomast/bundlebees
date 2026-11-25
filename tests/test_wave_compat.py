@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import wave_compat
+from contrib.unwired import wave_compat
 
 
 def _run(capsys, *args):
@@ -52,7 +52,7 @@ def test_state_snapshot_mixed_evidence_cli(tmp_path):
     (waves / "array.json").write_text("[]")
     before = _snapshot(tmp_path)
     proc = subprocess.run(
-        [sys.executable, "-B", "-m", "bundlebees_plugin.wave_compat", "--state-dir", str(tmp_path)],
+        [sys.executable, "-B", "-m", "contrib.unwired.wave_compat", "--state-dir", str(tmp_path)],
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10,
     )
     assert proc.returncode == 1 and not proc.stderr

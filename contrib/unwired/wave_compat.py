@@ -10,8 +10,8 @@ from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import revision
-from .security import scrub
+from bundlebees_plugin import revision
+from bundlebees_plugin.security import scrub
 
 
 MAX_RECORD_BYTES = 4 * 1024 * 1024

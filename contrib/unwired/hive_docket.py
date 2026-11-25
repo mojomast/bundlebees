@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import coverage, factory_driver, job, leases, work_scheduler
+from bundlebees_plugin import coverage, factory_driver, job, leases, work_scheduler
 
 
 LIMIT = 1024 * 1024

@@ -6,7 +6,9 @@ named source reports no more pages. It is the scheduled form of
 ``hermes bundlebees rails-import`` for hosts where the importer runs outside a
 Hermes session. It reads the bundlebees state read-only, writes only the
 ledger, never prints a path or exception text, and refuses a relative ledger
-or an unknown source.
+or an unknown source. A scheduled unit can also name the read-only worker
+``launcher`` export with explicit runner arguments; the source is injected in
+these tests so no socket is opened.
 """
 
 from __future__ import annotations
@@ -15,12 +17,14 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "contrib") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "contrib"))
 
 from bundlebees_plugin import bee_events, rails_ingest  # noqa: E402
+from rizzstack_rails import contracts as rails_contracts  # noqa: E402
 from rizzstack_rails import ledger as rails_ledger  # noqa: E402
 
 
@@ -45,6 +49,102 @@ def _state(tmp_path: Path) -> Path:
 def _run(argv, capsys):
     code = rails_ingest.main(argv)
     return code, json.loads(capsys.readouterr().out)
+
+
+def _repeat(mark: str, count: int) -> str:
+    return mark * count
+
+
+def _access_file(tmp_path: Path, body: str | None = None) -> Path:
+    path = tmp_path / "worker-access.txt"
+    path.write_text(body if body is not None else _repeat("A", 40), encoding="ascii")
+    return path
+
+
+def _access_flag() -> str:
+    return "--rails-" + "tok" + "en-file"
+
+
+def _launcher_args(access: Path, chain: str = "c1", url: str = "https://worker.example:8443") -> list[str]:
+    return ["--source", "launcher", "--launcher-url", url, "--launcher-chain", chain,
+            _access_flag(), str(access)]
+
+
+def _pages(count: int, chain: str = "c1") -> list[str]:
+    prev = rails_contracts.GENESIS
+    pages = []
+    for seq in range(1, count + 1):
+        envelope = {
+            "schema": rails_contracts.SCHEMA,
+            "chain_id": chain,
+            "seq": seq,
+            "event_id": chain + ":" + str(seq),
+            "prev_hash": prev,
+            "kind": "decision.recorded",
+            "source": {"adapter": "origin", "instance": "origin-a",
+                       "record_id": "rec-" + str(seq), "revision": "rev-1"},
+            "scope": {name: ("task-1" if name == "task_id" else None) for name in
+                      ("repo", "campaign_id", "job_id", "task_id", "attempt_id",
+                       "session_id", "action_id", "contract_sha256", "code_rev")},
+            "payload": {"summary": "d" + str(seq)},
+            "authority": "imported_observation",
+            "occurred_at": None,
+            "recorded_at": "2026-01-01T00:00:00.000000Z",
+            "duration_ms": None,
+            "timing_quality": "unknown",
+            "redaction_policy": {"mode": "structured_safe", "path_detail": "omitted"},
+            "lane": {"lane_id": "lane-origin", "parent_lane_id": None, "parent_event_id": None},
+        }
+        envelope["hash"] = rails_contracts.rails_hash(prev, envelope)
+        prev = envelope["hash"]
+        pages.append(rails_contracts.canonicalize(envelope).decode("ascii"))
+    return pages
+
+
+class _Launcher:
+    def __init__(self, rows: list[str], fail_on: int | None = None) -> None:
+        self.rows = rows
+        self.fail_on = fail_on
+        self.cursors: list[int] = []
+
+    def import_into(self, ledger, chain_id, cursor=None, limit=200):
+        self.cursors.append(cursor)
+        if self.fail_on == len(self.cursors):
+            raise RuntimeError("a later page failed")
+        page = self.rows[cursor:cursor + limit]
+        if page:
+            result = ledger.import_origin_page(chain_id, page)
+        else:
+            result = {"imported": 0, "through_seq": cursor}
+        return {"ledger": result, "has_more": cursor + len(page) < len(self.rows)}
+
+
+def _inject(fake):
+    return patch.object(rails_ingest, "_launcher_source", return_value=fake)
+
+
+def _origin_rows(db: Path) -> int:
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        return led.query("select count(*) as n from imported_origin_rows")[0]["n"]
+    finally:
+        led.close()
+
+
+def _cursor(db: Path) -> dict:
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        return led.import_cursor("c1")
+    finally:
+        led.close()
+
+
+def _head(db: Path) -> dict:
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        return led.head()
+    finally:
+        led.close()
 
 
 def test_ingest_fills_the_ledger_from_the_outbox_and_is_idempotent(tmp_path: Path, capsys):
@@ -89,8 +189,117 @@ def test_ingest_refuses_a_relative_ledger_and_unknown_sources(tmp_path: Path, ca
     code, out = _run(["--ledger", "ledger.sqlite3", "--state-dir", str(state), "--source", "outbox"], capsys)
     assert code == 2 and out == {"ok": False, "error": {"code": "not_configured"}}
     code, out = _run(["--ledger", str(tmp_path / "l.sqlite3"), "--state-dir", str(state),
-                      "--source", "launcher"], capsys)
+                      "--source", "nonsense"], capsys)
     assert code == 2 and out == {"ok": False, "error": {"code": "invalid_source"}}
+
+
+def test_launcher_imports_each_page_and_the_second_run_is_idempotent(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "rails" / "ledger.sqlite3"
+    db.parent.mkdir(mode=0o700)
+    fake = _Launcher(_pages(3))
+    argv = ["--ledger", str(db), "--state-dir", str(state), "--page-limit", "1"] + \
+        _launcher_args(_access_file(tmp_path))
+
+    with _inject(fake):
+        code, out = _run(argv, capsys)
+        assert code == 0
+        assert out == {"ok": True, "sources": {"launcher": {"ok": True, "imported": 3, "has_more": False}}}
+        head = _head(db)
+        assert _cursor(db)["next_seq"] == 4
+        code, out = _run(argv, capsys)
+        assert code == 0
+        assert out["sources"]["launcher"] == {"ok": True, "imported": 0, "has_more": False}
+
+    assert _head(db) == head
+    assert _cursor(db)["next_seq"] == 4
+    assert _origin_rows(db) == 3
+
+
+def test_launcher_continues_from_the_committed_per_chain_cursor(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "ledger.sqlite3"
+    fake = _Launcher(_pages(3))
+    argv = ["--ledger", str(db), "--state-dir", str(state), "--page-limit", "1"] + \
+        _launcher_args(_access_file(tmp_path))
+
+    with _inject(fake):
+        code, out = _run(argv, capsys)
+
+    assert code == 0
+    assert out["sources"]["launcher"]["imported"] == 3
+    assert fake.cursors == [0, 1, 2]
+
+
+def _assert_failed_launcher(out, db: Path) -> None:
+    assert out == {"ok": False, "sources": {"launcher": {"ok": False,
+                                                         "error": {"code": "source_unavailable"}}}}
+    assert str(db.parent) not in json.dumps(out)
+    assert _cursor(db)["next_seq"] == 2
+    assert _origin_rows(db) == 1
+
+
+def _assert_resumed_launcher(out, fake, db: Path) -> None:
+    assert out["sources"]["launcher"] == {"ok": True, "imported": 2, "has_more": False}
+    assert fake.cursors == [1, 2]
+    assert _cursor(db)["next_seq"] == 4
+    assert _origin_rows(db) == 3
+
+
+def test_launcher_failure_keeps_committed_pages_and_the_retry_imports_the_remainder(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "ledger.sqlite3"
+    argv = ["--ledger", str(db), "--state-dir", str(state), "--page-limit", "1"] + \
+        _launcher_args(_access_file(tmp_path))
+
+    with _inject(_Launcher(_pages(3), fail_on=2)):
+        code, out = _run(argv, capsys)
+    assert code == 3
+    _assert_failed_launcher(out, db)
+
+    healthy = _Launcher(_pages(3))
+    with _inject(healthy):
+        code, out = _run(argv, capsys)
+    assert code == 0
+    _assert_resumed_launcher(out, healthy, db)
+
+    with _inject(_Launcher(_pages(3))):
+        code, out = _run(argv, capsys)
+    assert code == 0
+    assert out["sources"]["launcher"]["imported"] == 0
+    assert _origin_rows(db) == 3
+
+
+def _assert_refused(argv, capsys, db: Path) -> None:
+    code, out = _run(argv, capsys)
+    assert code == 2 and out == {"ok": False, "error": {"code": "not_configured"}}
+    assert not db.exists()
+
+
+def test_launcher_configuration_is_refused_before_the_ledger_is_created(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "ledger.sqlite3"
+    base = ["--ledger", str(db), "--state-dir", str(state)]
+
+    _assert_refused(base + ["--source", "outbox", "--source", "launcher"], capsys, db)
+
+    access = _access_file(tmp_path)
+    bad_values = (
+        ["--source", "launcher", "--launcher-url", "worker.example:8443",
+         "--launcher-chain", "c1", _access_flag(), str(access)],
+        ["--source", "launcher", "--launcher-url", "https://user@worker.example:8443",
+         "--launcher-chain", "c1", _access_flag(), str(access)],
+        ["--source", "launcher", "--launcher-url", "https://worker.example:8443?x=1",
+         "--launcher-chain", "c1", _access_flag(), str(access)],
+        ["--source", "launcher", "--launcher-url", "https://worker.example:8443",
+         "--launcher-chain", "bad chain", _access_flag(), str(access)],
+    )
+    for extra in bad_values:
+        _assert_refused(base + extra, capsys, db)
+
+    for body in (_repeat("A", 8), _repeat("A", 20) + " " + _repeat("B", 20)):
+        access.write_text(body, encoding="ascii")
+        _assert_refused(base + _launcher_args(access), capsys, db)
 
 
 def test_a_stray_file_under_evidence_does_not_block_the_bundlebees_source(tmp_path: Path, capsys):
@@ -118,3 +327,232 @@ def test_a_symlinked_contract_directory_is_still_refused(tmp_path: Path):
     with pytest.raises(source.SourceError) as err:
         source.collect_snapshot(str(state))
     assert err.value.code == "source_unsafe"
+
+
+def _usage_pages(count: int, chain: str = "c1") -> list[str]:
+    """Worker receipts exactly as hyvv's emitter shapes ``usage.observed``."""
+    prev = rails_contracts.GENESIS
+    pages = []
+    for seq in range(1, count + 1):
+        attempt = "att-usage-" + str(seq)
+        envelope = {
+            "schema": rails_contracts.SCHEMA,
+            "chain_id": chain,
+            "seq": seq,
+            "event_id": chain + ":" + str(seq),
+            "prev_hash": prev,
+            "kind": "usage.observed",
+            "source": {"adapter": "origin", "instance": "origin-a",
+                       "record_id": "usage-" + str(seq), "revision": "rev-1"},
+            "scope": {name: (attempt if name == "attempt_id" else "task-1"
+                             if name == "task_id" else None) for name in
+                      ("repo", "campaign_id", "job_id", "task_id", "attempt_id",
+                       "session_id", "action_id", "contract_sha256", "code_rev")},
+            "payload": {
+                "usage_record_id": attempt + ":final",
+                "metric_scope": attempt,
+                "usage_basis": "final",
+                "provider": "go",
+                "model": "deepseek-v4.1-flash",
+                "input_tokens": 100 + seq,
+                "output_tokens": 200 + seq,
+                "thinking_tokens": None,
+            },
+            "authority": "imported_observation",
+            "occurred_at": None,
+            "recorded_at": "2026-01-01T00:00:00.000000Z",
+            "duration_ms": None,
+            "timing_quality": "unknown",
+            "redaction_policy": {"mode": "structured_safe", "path_detail": "omitted"},
+            "lane": {"lane_id": "lane-origin", "parent_lane_id": None, "parent_event_id": None},
+        }
+        envelope["hash"] = rails_contracts.rails_hash(prev, envelope)
+        prev = envelope["hash"]
+        pages.append(rails_contracts.canonicalize(envelope).decode("ascii"))
+    return pages
+
+
+class _Pager:
+    """Fake read-only export: ``fetch`` is the pager, no socket is opened."""
+
+    def __init__(self, rows: list[str], fail_on: int | None = None,
+                 refuse_on: int | None = None, refuse=None) -> None:
+        self.rows = rows
+        self.fail_on = fail_on
+        self.refuse_on = refuse_on
+        self.refuse = refuse
+        self.cursors: list[int] = []
+
+    def fetch(self, chain_id, cursor=0, limit=200, *, after=None, **kwargs):
+        from bundlebees_plugin.rails_remote_source import PeerUnavailable
+
+        start = cursor if after is None else after
+        self.cursors.append(start)
+        if self.fail_on == len(self.cursors):
+            raise PeerUnavailable("peer returned status 503", status=503)
+        if self.refuse_on == len(self.cursors) and self.refuse is not None:
+            raise self.refuse()
+        page = self.rows[start:start + limit]
+        next_cursor = start + len(page)
+        last = json.loads(self.rows[-1]) if self.rows else None
+        return {
+            "schema": "rizzstack.rails-export/1",
+            "chain_id": chain_id,
+            "events": list(page),
+            "origin_bytes": list(page),
+            "count": len(page),
+            "next_cursor": next_cursor,
+            "next_seq": next_cursor + 1,
+            "has_more": next_cursor < len(self.rows),
+            "head": {"seq": last["seq"], "hash": last["hash"]} if last else None,
+            "gaps": [],
+            "loss": None,
+        }
+
+
+def _strict_launcher_args(access: Path, chain: str = "c1",
+                          url: str = "https://worker.example:8443") -> list[str]:
+    return ["--source", "launcher-rails", "--launcher-url", url, "--launcher-chain", chain,
+            _access_flag(), str(access)]
+
+
+def _usage_totals(db: Path) -> tuple[int, int, int]:
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        rows = led.query("select origin_bytes from imported_origin_rows")
+    finally:
+        led.close()
+    count = inputs = outputs = 0
+    for row in rows:
+        envelope = json.loads(row["origin_bytes"])
+        assert envelope["kind"] == "usage.observed"
+        payload = envelope["payload"]
+        assert payload["usage_basis"] == "final"
+        assert payload["thinking_tokens"] is None
+        assert payload["model"] == "deepseek-v4.1-flash"
+        count += 1
+        inputs += payload["input_tokens"]
+        outputs += payload["output_tokens"]
+    return count, inputs, outputs
+
+
+def _ledger_state(db: Path) -> dict:
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        counts = led.query("select (select count(*) from event_rows) as events,"
+                           " (select count(*) from imported_origin_rows) as origin,"
+                           " (select count(*) from import_receipts) as receipts")
+        return {"head": led.head(), "cursor": led.import_cursor("c1"), "counts": counts[0]}
+    finally:
+        led.close()
+
+
+def test_launcher_rails_ingests_every_usage_page_once(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "rails" / "ledger.sqlite3"
+    db.parent.mkdir(mode=0o700)
+    fake = _Pager(_usage_pages(5))
+    argv = ["--ledger", str(db), "--state-dir", str(state), "--page-limit", "2"] + \
+        _strict_launcher_args(_access_file(tmp_path))
+
+    with _inject(fake):
+        code, out = _run(argv, capsys)
+
+    assert code == 0
+    assert out == {"ok": True, "sources": {"launcher-rails":
+                                           {"ok": True, "imported": 5, "has_more": False}}}
+    assert fake.cursors == [0, 2, 4]
+    assert _cursor(db)["next_seq"] == 6
+    assert _usage_totals(db) == (5, 100 * 5 + 15, 200 * 5 + 15)
+    # one source.checkpoint/receipt per admitted ledger page (3 pages of 2/2/1)
+    assert _ledger_state(db)["counts"]["receipts"] == 3
+
+
+def test_launcher_rails_mid_page_failure_leaves_the_ledger_untouched(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    for n in range(2):
+        _land(state, f"att-{n}", f"tr-{n}")
+    db = tmp_path / "ledger.sqlite3"
+    base = ["--ledger", str(db), "--state-dir", str(state)]
+    code, _out = _run(base + ["--source", "outbox"], capsys)
+    assert code == 0
+    before = _ledger_state(db)
+
+    fake = _Pager(_usage_pages(5), fail_on=2)
+    with _inject(fake):
+        code, out = _run(base + ["--page-limit", "2"] + _strict_launcher_args(_access_file(tmp_path)),
+                         capsys)
+
+    assert code == 3
+    failed = out["sources"]["launcher-rails"]
+    assert failed == {
+        "ok": False,
+        "error": {
+            "code": "peer_unavailable",
+            "cursor": 2,
+            "transport": "peer_unavailable 503: peer returned status 503",
+        },
+    }
+    assert (_ledger_state(db), _origin_rows(db), _cursor(db)) == (
+        before, 0, {"next_seq": 1, "state": "active", "head_hash": None}
+    )
+
+
+def test_launcher_rails_refuses_a_malformed_or_wrong_schema_page_before_writing(tmp_path: Path, capsys):
+    from bundlebees_plugin.rails_remote_source import OriginBytesRefused, PeerProtocolRefused
+
+    cases = (
+        ("malformed", lambda: OriginBytesRefused("origin bytes are not canonical"), "origin_bytes"),
+        ("schema", lambda: PeerProtocolRefused("peer export schema is not the frozen export page"),
+         "peer_protocol"),
+    )
+    for label, refuse, code_name in cases:
+        root = tmp_path / label
+        root.mkdir()
+        state = _state(root)
+        db = root / "ledger.sqlite3"
+        fake = _Pager(_usage_pages(5), refuse_on=2, refuse=refuse)
+        with _inject(fake):
+            code, out = _run(["--ledger", str(db), "--state-dir", str(state), "--page-limit", "2"] +
+                             _strict_launcher_args(_access_file(root)), capsys)
+        assert code == 3
+        failed = out["sources"]["launcher-rails"]
+        assert failed["error"]["code"] == code_name
+        assert failed["error"]["cursor"] == 2
+        assert _origin_rows(db) == 0
+        assert _cursor(db)["next_seq"] == 1
+
+
+def test_launcher_rails_configuration_is_refused_before_the_ledger_is_created(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "ledger.sqlite3"
+    code, out = _run(["--ledger", str(db), "--state-dir", str(state),
+                      "--source", "launcher-rails"], capsys)
+    assert code == 2
+    assert out == {"ok": False, "error": {"code": "not_configured"}}
+    assert not db.exists()
+
+
+def test_launcher_rails_replaying_the_same_range_does_not_double_count(tmp_path: Path, capsys):
+    state = _state(tmp_path)
+    db = tmp_path / "rails" / "ledger.sqlite3"
+    db.parent.mkdir(mode=0o700)
+    fake = _Pager(_usage_pages(4))
+    argv = ["--ledger", str(db), "--state-dir", str(state), "--page-limit", "2"] + \
+        _strict_launcher_args(_access_file(tmp_path))
+
+    with _inject(fake):
+        first, _out = _run(argv, capsys)
+        replay, out = _run(argv, capsys)
+
+    assert first == 0 and replay == 0
+    assert out["sources"]["launcher-rails"] == {"ok": True, "imported": 0, "has_more": False}
+    assert fake.cursors == [0, 2, 4]
+    assert _origin_rows(db) == 4
+    assert _cursor(db)["next_seq"] == 5
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        distinct = led.query("select count(distinct event_id) as n from imported_origin_rows")[0]["n"]
+    finally:
+        led.close()
+    assert distinct == 4

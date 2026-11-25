@@ -17,8 +17,8 @@ import tempfile
 import time
 from uuid import UUID
 
-from . import job
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'contrib'))
+from bundlebees_plugin import job
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'contrib'))
 from rizzstack_rails import RailsLedger, contracts, feedback
 
 NAMESPACE='rizzstack-rails-feedback-v1'

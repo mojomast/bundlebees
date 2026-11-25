@@ -259,6 +259,31 @@ class HttpResponse:
         return self.body
 
 
+_PLAINTEXT_LOOPBACK_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+)
+_PLAINTEXT_PRIVATE_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+)
+
+
+def _plaintext_peer_allowed(hostname, allow_private):
+    """Return whether a literal address is in the exact plain-HTTP peer set."""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except (TypeError, ValueError):
+        return False
+    if any(address in network for network in _PLAINTEXT_LOOPBACK_NETWORKS):
+        return True
+    if not allow_private:
+        return False
+    return any(address in network for network in _PLAINTEXT_PRIVATE_NETWORKS)
+
+
 class LauncherTransport:
     """Use the launcher's authenticated pinned-address transport, without redirects."""
 
@@ -270,14 +295,11 @@ class LauncherTransport:
     def request(self, url, headers=None, timeout=None):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https":
-            # Do not send credentials over plaintext network transports. A
-            # configured local tunnel can terminate on a literal loopback IP.
-            try:
-                local = ipaddress.ip_address(parsed.hostname).is_loopback
-            except ValueError:
-                local = False
-            if not local:
-                raise EnrollmentRefused("use HTTPS or a local loopback tunnel for peer authentication")
+            if not _plaintext_peer_allowed(parsed.hostname, self.allow_private):
+                raise EnrollmentRefused(
+                    "use HTTPS, a literal private/CGNAT address with allow_private, "
+                    "or a local loopback tunnel for peer authentication"
+                )
         token = self.token_provider() if self.token_provider else None
         if not isinstance(token, str) or not token.strip() or '\r' in token or '\n' in token:
             raise EnrollmentRefused("peer read credential is unavailable")

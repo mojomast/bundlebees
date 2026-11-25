@@ -114,3 +114,227 @@ def test_verify_refuses_a_patch_with_findings():
 def test_verify_accepts_a_clean_patch():
     patch = _edit("src/pkg/core.py", ["    return 2"], ["    return 1"])
     assert verify_local.check_patch_subversion(patch) == []
+
+
+# --- review finding 2: file-level shapes must not need an added line -------
+
+
+def _new_empty_file(path: str) -> str:
+    """What git emits for an empty new file: no ---/+++ header and no hunk."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "index 0000000..e69de29\n"
+    )
+
+
+def _rename(old: str, new: str) -> str:
+    """A pure rename diff: no ---/+++ header and no hunk."""
+    return (
+        f"diff --git a/{old} b/{new}\n"
+        "similarity index 100%\n"
+        f"rename from {old}\n"
+        f"rename to {new}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "path,kind",
+    [
+        ("tests/conftest.py", "conftest"),
+        ("sitecustomize.py", "startup_hook"),
+        ("src/evil.pth", "pth_file"),
+    ],
+)
+def test_empty_added_file_is_a_finding(path, kind):
+    findings = _scan()(_new_empty_file(path))
+    assert [(f["path"], f["line"]) for f in findings if f["kind"] == kind] == [(path, 1)]
+
+
+def test_pure_rename_to_conftest_is_a_finding():
+    findings = _scan()(_rename("tests/old_helpers.py", "tests/conftest.py"))
+    assert [(f["path"], f["line"]) for f in findings if f["kind"] == "conftest"] == [
+        ("tests/conftest.py", 1)
+    ]
+
+
+def test_rename_away_from_conftest_is_not_a_finding():
+    assert _scan()(_rename("tests/conftest.py", "tests/helpers.py")) == []
+
+
+# --- review finding 3: cheap evasion hardening --------------------------
+
+
+@pytest.mark.parametrize(
+    "line,kind",
+    [
+        ("from os import _exit", "forced_exit"),
+        ("from os import _exit; _exit(0)", "forced_exit"),
+        ("import os as o; o._exit(0)", "forced_exit"),
+        ("import atexit as a; a.register(_rewrite)", "atexit"),
+    ],
+)
+def test_evasive_runner_subversion_is_a_finding(line, kind):
+    assert kind in _kinds(_edit("src/pkg/core.py", [line]))
+
+
+# --- review finding 4: plugin loads outside addopts/pytest_plugins -------
+
+
+@pytest.mark.parametrize(
+    "path,line",
+    [
+        ("pyproject.toml", "[project.entry-points.pytest11]"),
+        ("setup.cfg", "pytest11 = mypkg.hooks"),
+    ],
+)
+def test_pytest11_entry_point_is_a_finding(path, line):
+    assert "pytest_plugin" in _kinds(_edit(path, [line]))
+
+
+@pytest.mark.parametrize(
+    "path,lines",
+    [
+        ("pyproject.toml", ['addopts = """', "-q", "-p myplugin", '"""']),
+        ("setup.cfg", ["addopts =", "    -q", "    -p myplugin"]),
+    ],
+)
+def test_multiline_addopts_plugin_is_a_finding(path, lines):
+    assert "pytest_plugin" in _kinds(_edit(path, lines))
+
+
+# --- review finding 5: no false positives on prose and comparisons -------
+
+
+def test_doc_prose_about_runner_hooks_is_not_a_finding():
+    patch = _edit("docs/runner-notes.md", ["Never call os._exit(0).", "Prefer atexit.register(_close)."])
+    assert _scan()(patch) == []
+
+
+def test_legitimate_addopts_plugin_option_is_still_a_finding():
+    assert "pytest_plugin" in _kinds(_edit("pyproject.toml", ['addopts = "-q -p no:cacheprovider"']))
+
+
+def test_assertion_comparison_is_not_a_patched_assertion():
+    assert "patched_assertion" not in _kinds(_edit("tests/test_x.py", ["assert AssertionError == type(e)"]))
+
+
+def test_pytest_plugins_in_docs_is_not_a_finding():
+    assert _scan()(_edit("docs/plugins.md", ['pytest_plugins = ["pkg.hooks"]'])) == []
+
+
+# --- review finding 6: the locked verify path is wired -------------------
+
+
+def _exploding_runner(*args, **kwargs):
+    raise AssertionError("the test runner must not be invoked")
+
+
+def test_locked_verify_refuses_subversion_before_runner_or_worktree(tmp_path):
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local._verify_and_commit_locked(
+            tmp_path / "state",
+            tmp_path / "repo",
+            "att-0000000000000000",
+            patch=_new_file("tests/conftest.py", "import pytest"),
+            declared_files=["tests/conftest.py"],
+            base_rev="0" * 40,
+            tests=["tests/test_subversion_scan.py"],
+            runner=_exploding_runner,
+            worktree_root=tmp_path,
+        )
+    assert caught.value.code == "test_subversion"
+    assert not (tmp_path / "wt").exists()
+
+
+# --- review finding 7: quoted paths cannot spoof the refusal message -----
+
+
+def test_quoted_path_control_characters_cannot_spoof_the_refusal_message():
+    body = "+os._exit(0)\n"
+    patch = (
+        "diff --git a/src/evil.py b/src/evil.py\n"
+        "--- /dev/null\n"
+        '+++ "b/src/x\\nspoof.py"\n'
+        "@@ -0,0 +1,1 @@\n" + body
+    )
+    findings = _scan()(patch)
+    assert findings
+    assert all("\n" not in f["path"] and "\r" not in f["path"] for f in findings)
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.check_patch_subversion(patch)
+    assert "\n" not in caught.value.message and "\r" not in caught.value.message
+
+
+# --- review minor 2: Unicode line/paragraph separators in quoted paths ---
+
+
+@pytest.mark.parametrize("escape", ["\\u2028", "\\u2029"], ids=["u2028", "u2029"])
+def test_quoted_path_unicode_separators_cannot_spoof_the_refusal_message(escape):
+    patch = (
+        "diff --git a/src/evil.py b/src/evil.py\n"
+        "--- /dev/null\n"
+        f'+++ "b/src/x{escape}spoof.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+os._exit(0)\n"
+    )
+    findings = _scan()(patch)
+    assert findings
+    for finding in findings:
+        assert "\u2028" not in finding["path"] and "\u2029" not in finding["path"]
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.check_patch_subversion(patch)
+    message = caught.value.message
+    assert "\u2028" not in message and "\u2029" not in message
+    assert "\n" not in message and "\r" not in message
+
+
+# --- review minor 3: equivalent TOML for the pytest11 entry-point table ---
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[project.entry-points."pytest11"]',
+        "[project . entry-points . pytest11]",
+        "[ project . entry-points . 'pytest11' ]",
+    ],
+    ids=["double-quoted", "dotted-spaces", "single-quoted-spaces"],
+)
+def test_quoted_pytest11_table_is_a_finding(line):
+    assert "pytest_plugin" in _kinds(_edit("pyproject.toml", [line]))
+
+
+# --- review minor 4: -p at end of an addopts continuation line ------------
+
+
+@pytest.mark.parametrize(
+    "path,lines",
+    [
+        ("pyproject.toml", ['addopts = """', "-q", "-p", "myplugin", '"""']),
+        ("setup.cfg", ["addopts =", "    -q", "    -p", "    myplugin"]),
+        ("pytest.ini", ["addopts = -q -p", "    myplugin"]),
+    ],
+)
+def test_addopts_plugin_option_at_end_of_line_is_a_finding(path, lines):
+    assert "pytest_plugin" in _kinds(_edit(path, lines))
+
+
+# --- review finding 8: report every finding up to a small limit ----------
+
+
+def test_refusal_message_lists_findings_and_counts_them():
+    patch = _new_file(
+        "tests/conftest.py",
+        "import os",
+        "os._exit(0)",
+        "atexit.register(_rewrite)",
+        "os._exit(1)",
+    )
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.check_patch_subversion(patch)
+    message = caught.value.message
+    assert "7 finding" in message
+    assert "conftest@tests/conftest.py:1" in message
+    assert message.count("@") == 5
+    assert "+2 more" in message

@@ -12,6 +12,9 @@ from tests.test_cli_acdd import (ATTEMPT_ID, BRANCH, FakeClient, _ctx, _git, _in
 # Built at runtime so the repository's own secret scanners do not flag this file.
 PRE_EXISTING = "print(f\"tok" + "en: {'configured'}\")  # " + "secret" + ": documented\n"
 ADDED_SECRET = "pass" + "word=" + "Zq9" * 6 + "\n"  # unquoted: the scanner's value pattern stops at quotes
+AUTHORIZATION_REQUEST_HEADER_OBJECT_LITERAL = "Author" + "ization: auth" + "HeaderValue}"
+SECRET_NAMED_KEY = "BUNDLEBEES_APPROVAL_" + "SEC" + "RET"
+NONCREDENTIAL_LITERAL_ASSIGNMENT = SECRET_NAMED_KEY + ": '<test " + "fixture>'"
 
 
 def _repo_with_existing_secret_like_line(tmp_path):
@@ -120,3 +123,28 @@ def test_oversize_file_still_refuses_without_line_evidence(tmp_path):
         ("big.bin", None, None, None)
     ]
     assert cli._secret_scan(tmp_path, ["big.bin"]) == ["big.bin"]
+
+
+def test_authorization_request_header_object_literal_does_not_trip():
+    from bundlebees_plugin import security
+
+    assert not security.looks_like_secret(AUTHORIZATION_REQUEST_HEADER_OBJECT_LITERAL)
+
+
+def test_secret_named_assignment_with_noncredential_literal_does_not_trip():
+    from bundlebees_plugin import security
+
+    assert not security.looks_like_secret(NONCREDENTIAL_LITERAL_ASSIGNMENT)
+    assert not security.looks_like_secret(SECRET_NAMED_KEY + ": ''")
+
+
+def test_real_credential_shaped_literal_still_trips():
+    from bundlebees_plugin import security
+
+    credential = "a1" * 20
+    assert len(credential) == 40
+    assert any(char.isdigit() for char in credential)
+    assert any(char.isalpha() for char in credential)
+    line = SECRET_NAMED_KEY + ": '" + credential + "'"
+    assert security.looks_like_secret(line)
+    assert security.first_secret_rule(line) == "assignment"
