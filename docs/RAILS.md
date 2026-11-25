@@ -24,6 +24,22 @@ hermes bundlebees rails-import --source outbox --limit 100
 | `hermes` | The local `rails_hermes_db`, restricted to the explicit `rails_session_aliases` JSON mapping from enrolled IDs to public aliases. |
 | `launcher` | The existing `adapter: launcher`, configured `launcher_url`, `allow_private` policy and enrolled `rails_launcher_chain`. Configure `BUNDLEBEES_RAILS_READ_TOKEN` in the profile's existing Hermes secret store to match the worker's dedicated Rails read credential. No fallback to the launcher's administrative credential. |
 
+The `launcher` source's supported transport is a direct request to the peer's
+literal address. Plain `http` is accepted for a literal loopback address, or —
+when `--allow-private` (or the equivalent `allow_private` setting) is enabled —
+for a literal RFC 1918 or RFC 6598 carrier-grade NAT address such as the worker's
+`100.125.58.63`. The request still carries the dedicated bearer token from
+`BUNDLEBEES_RAILS_READ_TOKEN`; `allow_private` never removes authentication. A
+DNS hostname or a public literal over plain `http` is refused before the token
+is read or any network I/O occurs, so use `https` for those. The worker's Rails
+reader accepts exactly one `Host` header equal to the connection's own
+address and port and refuses any `Origin`; a direct literal request satisfies
+that without rewriting. The separately installed `rails_host_proxy.py` loopback
+forwarder (`rizzstack-rails-host-proxy.service`, `127.0.0.1:47923` to
+`127.0.0.1:47922`) rewrites `Host` and is a temporary workaround only, not the
+supported path; it is not needed for the direct literal transport and does not
+satisfy the peer's Host check.
+
 `has_more` means another page is available. Restart the same command with no cursor: local source pages commit their cursor, facts and checkpoint together; the remote source resumes at the ledger's committed origin sequence. A stale cursor or changed immutable prefix is an error, not permission to discard a checkpoint. Reads and doctor never perform an import. Do not put SQLite on a network share.
 
 ## Owner retry and crash recovery

@@ -44,6 +44,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 
 from . import client as launcher_client
+from . import security as security_policy
 
 try:
     from rizzstack_rails import contracts as rails_contracts
@@ -259,6 +260,29 @@ class HttpResponse:
         return self.body
 
 
+def _plaintext_peer_allowed(hostname, allow_private):
+    """Return True only for a literal loopback or an opted-in private/CGNAT peer."""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except (TypeError, ValueError):
+        # A DNS hostname cannot prove a local or private destination before I/O.
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    if address.is_loopback:
+        return True
+    if not allow_private:
+        return False
+    try:
+        security_policy._check_ip(
+            address, allow_loopback=False, allow_private=True
+        )
+    except security_policy.UnsafeURLError:
+        return False
+    return not address.is_global
+
+
 class LauncherTransport:
     """Use the launcher's authenticated pinned-address transport, without redirects."""
 
@@ -270,14 +294,15 @@ class LauncherTransport:
     def request(self, url, headers=None, timeout=None):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https":
-            # Do not send credentials over plaintext network transports. A
-            # configured local tunnel can terminate on a literal loopback IP.
-            try:
-                local = ipaddress.ip_address(parsed.hostname).is_loopback
-            except ValueError:
-                local = False
-            if not local:
-                raise EnrollmentRefused("use HTTPS or a local loopback tunnel for peer authentication")
+            # Do not send credentials over plaintext network transports except
+            # to a literal loopback address or, with explicit allow_private, a
+            # literal RFC1918/RFC6598 peer. Hostnames and public literals are
+            # refused before the token is read or any network I/O happens.
+            if not _plaintext_peer_allowed(parsed.hostname, self.allow_private):
+                raise EnrollmentRefused(
+                    "use HTTPS, a literal private/CGNAT address with allow_private, "
+                    "or a local loopback tunnel for peer authentication"
+                )
         token = self.token_provider() if self.token_provider else None
         if not isinstance(token, str) or not token.strip() or '\r' in token or '\n' in token:
             raise EnrollmentRefused("peer read credential is unavailable")

@@ -7,6 +7,7 @@ derived at run time; no literal digest or credential is stored here.
 """
 
 import hashlib
+import http.client
 import json
 import os
 import sys
@@ -161,6 +162,142 @@ def _response(body, status=200, headers=None, url=None):
         headers=headers,
         url=url,
     )
+
+
+class LauncherTransportPolicyTests(unittest.TestCase):
+    def _transport(self, allow_private, value=None):
+        calls = []
+        if value is None:
+            value = "unit-" + "secret"
+
+        def token_provider():
+            calls.append("token")
+            return value
+
+        return (
+            remote.LauncherTransport(token_provider, 1024, allow_private),
+            calls,
+            value,
+        )
+
+    def test_plaintext_private_and_cgnat_literals_reach_pinned_transport(self):
+        for host in (
+            "100.125.58.63:47821",
+            "100.64.0.1:8080",
+            "10.0.0.5:8080",
+            "172.16.2.3:8080",
+            "192.168.1.9:8080",
+        ):
+            with self.subTest(host=host):
+                transport, calls, value = self._transport(True)
+                with patch.object(
+                    remote.launcher_client,
+                    "_pinned_request",
+                    return_value=(200, {}, b"{}"),
+                ) as pinned:
+                    response = transport.request(
+                        "http://" + host + "/v1/rails/events?after=0&limit=10"
+                    )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(calls, ["token"])
+                pinned.assert_called_once()
+                request = pinned.call_args.args[0]
+                self.assertEqual(
+                    request.get_header("Authorization"), "Bearer " + value
+                )
+                self.assertIs(pinned.call_args.kwargs["allow_private"], True)
+
+    def test_plaintext_private_and_cgnat_literals_require_allow_private(self):
+        for host in ("100.125.58.63:47821", "10.0.0.5:8080"):
+            with self.subTest(host=host):
+                transport, calls, value = self._transport(False)
+                with patch.object(
+                    remote.launcher_client, "_pinned_request"
+                ) as pinned, self.assertRaises(remote.EnrollmentRefused):
+                    transport.request(
+                        "http://" + host + "/v1/rails/events?after=0&limit=10"
+                    )
+                self.assertEqual(calls, [])
+                pinned.assert_not_called()
+
+    def test_plaintext_public_literal_and_hostname_are_refused(self):
+        for url in (
+            "http://8.8.8.8:8080/v1/rails/events?after=0&limit=10",
+            "http://peer.example:8443/v1/rails/events?after=0&limit=10",
+        ):
+            with self.subTest(url=url):
+                transport, calls, value = self._transport(True)
+                with patch.object(
+                    remote.launcher_client, "_pinned_request"
+                ) as pinned, self.assertRaises(remote.EnrollmentRefused):
+                    transport.request(url)
+                self.assertEqual(calls, [])
+                pinned.assert_not_called()
+
+    def test_https_private_and_plaintext_loopback_keep_previous_outcomes(self):
+        for url in (
+            "https://10.0.0.5:8443/v1/rails/events?after=0&limit=10",
+            "http://127.0.0.1:47922/v1/rails/events?after=0&limit=10",
+        ):
+            with self.subTest(url=url):
+                transport, calls, value = self._transport(False)
+                with patch.object(
+                    remote.launcher_client,
+                    "_pinned_request",
+                    return_value=(200, {}, b"{}"),
+                ) as pinned:
+                    self.assertEqual(transport.request(url).status, 200)
+                self.assertEqual(calls, ["token"])
+                pinned.assert_called_once()
+
+
+class LauncherHostHeaderTests(unittest.TestCase):
+    def test_direct_literal_transport_matches_peer_host_without_rewriting(self):
+        value = "unit-" + "secret"
+        observed = []
+
+        class Peer(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hosts = self.headers.get_all("Host") or []
+                expected = "%s:%d" % self.connection.getsockname()[:2]
+                origin = self.headers.get("Origin")
+                observed.append((hosts, origin))
+                ok = len(hosts) == 1 and hosts[0] == expected and origin is None
+                self.send_response(200 if ok else 403)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_):
+                pass
+
+        with HTTPServer(("127.0.0.1", 0), Peer) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = (
+                    "http://127.0.0.1:%d/v1/rails/events?after=0&limit=1"
+                    % server.server_port
+                )
+                transport = remote.LauncherTransport(lambda: value, 1024, False)
+                self.assertEqual(transport.request(url).status, 200)
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                try:
+                    connection.request(
+                        "GET",
+                        "/v1/rails/events?after=0&limit=1",
+                        headers={"Host": "127.0.0.1:47922"},
+                    )
+                    reply = connection.getresponse()
+                    self.assertEqual(reply.status, 403)
+                    reply.read()
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertEqual(observed[0], (["127.0.0.1:%d" % server.server_port], None))
 
 
 class RemoteSourceCase(unittest.TestCase):
