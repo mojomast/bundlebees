@@ -761,6 +761,15 @@ def _gated_failure_id(brief: Mapping[str, Any], state_dir: Path | None) -> str |
     return str(failure.get("failure_id") or "")
 
 
+def _supplied_findings(brief: Mapping[str, Any], fid: str) -> Mapping[str, Any] | None:
+    supplied = brief.get("findings")
+    if not isinstance(supplied, Mapping):
+        return None
+    if str(supplied.get("failure_id") or "") != fid:
+        return None
+    return supplied
+
+
 def _attach_accepted_findings(
     brief: dict[str, Any], state_dir: Path | None
 ) -> dict[str, Any] | str:
@@ -769,10 +778,8 @@ def _attach_accepted_findings(
     The research gate has already proven an accepted artifact exists. The
     launcher renders ``brief.findings`` into the worker prompt, so the dispatch
     must carry the same artifact the gate validated. A findings block supplied
-    by the caller stays authoritative and is never replaced by the state copy.
+    by the caller stays authoritative only when it names the gated failure.
     """
-    if isinstance(brief.get("findings"), Mapping):
-        return brief
     if not brief.get("failure_id"):
         if not brief.get("retry_of"):
             return brief
@@ -783,6 +790,8 @@ def _attach_accepted_findings(
     except rg.ResearchGateError as exc:
         return _err(exc.code, exc.message, exc.fix)
     if not fid:
+        return brief
+    if _supplied_findings(brief, fid) is not None:
         return brief
     if state_dir is None:
         return _err(
