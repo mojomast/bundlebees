@@ -80,9 +80,11 @@ def _receipt_scope(lease: Mapping[str, Any], preflight: Any) -> tuple[str, str, 
     raise VerifyError("receipt_scope_mismatch", "Cannot bind this receipt to a checked dispatch contract.")
 
 
-def _frozen_approved_ids(state_dir: Path, preflight: Any) -> list[str] | None:
+def _frozen_approved_selection(
+    state_dir: Path, preflight: Any
+) -> tuple[list[str], list[str]] | None:
     try:
-        return tdd.frozen_approved_ids(state_dir, preflight)
+        return tdd.frozen_approved_selection(state_dir, preflight)
     except tdd.TddError as exc:
         raise VerifyError(exc.code, exc.error, exc.fix) from exc
 
@@ -103,6 +105,8 @@ def _check_frozen_green(
     evidence: Mapping[str, Any],
     revision: str,
     suite_command: Sequence[str] | None,
+    *,
+    static_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     contract = preflight["contract"]
     tests = [str(test) for test in preflight["tests"]]
@@ -129,7 +133,14 @@ def _check_frozen_green(
             produced_by={"role": "verifier", "name": "bundlebees verify-local"},
             test_first=(contract.get("tdd") or {}).get("test_first") is not False,
         )
-        tdd.check_green(contract, str(preflight["sha"]), preflight.get("red"), record, approved_ids=approved_ids)
+        tdd.check_green(
+            contract,
+            str(preflight["sha"]),
+            preflight.get("red"),
+            record,
+            approved_ids=approved_ids,
+            static_ids=static_ids,
+        )
     except tdd.TddError as exc:
         raise VerifyError(exc.code, exc.error, exc.fix) from exc
     return record
@@ -1121,7 +1132,8 @@ def _verify_and_commit_locked(
                 "Refusing to verify a contracted task in legacy mode.",
             )
 
-    approved_ids = _frozen_approved_ids(state_dir, outcome)
+    selection = _frozen_approved_selection(state_dir, outcome)
+    approved_ids, static_ids = selection if selection is not None else (None, None)
     named_suite_command = sandbox.pytest_argv([]) if approved_ids is not None else suite_command
 
     # 1. The lease is the authority; worker claims never widen it.
@@ -1308,7 +1320,9 @@ def _verify_and_commit_locked(
             )
         if approved_ids is not None:
             try:
-                tdd.check_collected_ids(approved_ids, green.get("cases") or [])
+                tdd.check_collected_ids(
+                    approved_ids, green.get("cases") or [], static_ids=static_ids
+                )
             except tdd.TddError as exc:
                 raise VerifyError(exc.code, exc.error, exc.fix) from exc
         if green["exit_code"] != 0:
@@ -1359,7 +1373,13 @@ def _verify_and_commit_locked(
         if approved_ids is not None:
             try:
                 record = _check_frozen_green(
-                    outcome, approved_ids, worktree, green, sha, named_suite_command
+                    outcome,
+                    approved_ids,
+                    worktree,
+                    green,
+                    sha,
+                    named_suite_command,
+                    static_ids=static_ids,
                 )
                 tdd.write_record(state_dir, record, outcome["key"])
             except tdd.TddError as exc:
