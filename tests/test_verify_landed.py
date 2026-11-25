@@ -71,6 +71,23 @@ def _repo_with_drifted_landing(tmp_path: Path, name: str = "repo") -> tuple[Path
     return repo, verified, landed
 
 
+def _repo_with_landed_tests(tmp_path: Path, files: Mapping[str, str]) -> tuple[Path, str]:
+    """A repository whose landing commit adds *files* to ``tests/``."""
+    repo = tmp_path / "runner-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Landed Verify Test")
+    _git(repo, "config", "user.email", "landed@example.invalid")
+    (repo / "src").mkdir()
+    (repo / "src" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    _commit(repo, "base")
+    for relative, text in files.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return repo, _commit(repo, f"bundlebees: apply verified attempt {ATTEMPT}")
+
+
 def _worktree_paths(repo: Path) -> list[str]:
     """Every path git has registered as a worktree of *repo*."""
     out = _git(repo, "worktree", "list", "--porcelain").stdout
@@ -197,6 +214,7 @@ def _assert_landed_record(record, path, state, landed, tests) -> None:
         },
         "sandbox": {
             "backend": "stub",
+            "runner": "pytest",
             "exit_code": 0,
             "timed_out": False,
             "duration_s": 0.5,
@@ -247,6 +265,122 @@ def test_verify_landed_writes_the_record_for_the_landed_tree(tmp_path: Path):
 
     # The schema the writer emits is the one integration consumes.
     assert revision.LANDED_VERIFY_SCHEMA == verify_local.LANDED_RECORD_SCHEMA
+    assert record["sandbox"]["runner"] == "pytest"
+
+
+# ---------------------------------------------------------------------------
+# verify-landed runner selection
+# ---------------------------------------------------------------------------
+
+
+def test_verify_landed_runs_node_test_for_mjs_targets(tmp_path: Path):
+    repo, landed = _repo_with_landed_tests(
+        tmp_path, {"tests/workspace-guide.test.mjs": "import test from 'node:test';\n"}
+    )
+    state = _state(tmp_path)
+    calls: list[tuple[Path, list[str], str]] = []
+    tests = ["tests/workspace-guide.test.mjs"]
+
+    record = verify_local.verify_landed(
+        state,
+        repo,
+        landed,
+        tests,
+        runner=_runner(
+            calls=calls,
+            evidence={"junit": None, "output_tail": "# tests 1\n# pass 1\n"},
+        ),
+        now="2026-11-24T12:00:00Z",
+    )
+
+    assert record["sandbox"]["runner"] == "node-test"
+    assert record["ok"] is True
+    assert record["counts"] == {
+        "targets": 1,
+        "tests": None,
+        "failures": None,
+        "errors": None,
+        "skipped": None,
+        "passed": None,
+    }
+    assert len(calls) == 1
+    worktree, argv, revision_seen = calls[0]
+    assert revision_seen == landed
+    assert worktree != repo
+    assert argv == ["node", "--test", *tests]
+    assert json.loads(
+        (state / "verify-results" / f"landed-{landed}.json").read_text(encoding="utf-8")
+    ) == record
+
+
+def test_verify_landed_keeps_pytest_for_python_targets(tmp_path: Path):
+    repo, landed = _repo_with_landed_tests(
+        tmp_path, {"tests/test_sample.py": "def test_ok():\n    assert True\n"}
+    )
+    state = _state(tmp_path)
+    calls: list[tuple[Path, list[str], str]] = []
+
+    record = verify_local.verify_landed(
+        state,
+        repo,
+        landed,
+        ["tests/test_sample.py"],
+        runner=_runner(calls=calls),
+    )
+
+    assert record["sandbox"]["runner"] == "pytest"
+    assert len(calls) == 1
+    argv = calls[0][1]
+    assert argv[1:5] == ["-B", "-m", "pytest", "-p"]
+    assert argv[-1] == "tests/test_sample.py"
+
+
+def test_verify_landed_refuses_a_mixed_python_and_node_list(tmp_path: Path):
+    repo, landed = _repo_with_landed_tests(
+        tmp_path,
+        {
+            "tests/test_sample.py": "def test_ok():\n    assert True\n",
+            "tests/sample.test.mjs": "import test from 'node:test';\n",
+        },
+    )
+    state = _state(tmp_path)
+    calls: list[tuple[Path, list[str], str]] = []
+
+    with pytest.raises(verify_local.VerifyError) as refused:
+        verify_local.verify_landed(
+            state,
+            repo,
+            landed,
+            ["tests/test_sample.py", "tests/sample.test.mjs"],
+            runner=_runner(calls=calls),
+        )
+
+    assert refused.value.code == "mixed_test_runners"
+    assert "tests/test_sample.py" in refused.value.message
+    assert "tests/sample.test.mjs" in refused.value.message
+    assert calls == []
+    assert not list((state / "verify-results").glob("landed-*.json"))
+    assert _worktree_paths(repo) == [str(repo)]
+
+
+def test_verify_landed_refuses_a_node_target_missing_at_the_landed_commit(tmp_path: Path):
+    repo, landed = _repo_with_landed_tests(tmp_path, {"src/b.py": "value = 2\n"})
+    state = _state(tmp_path)
+    calls: list[tuple[Path, list[str], str]] = []
+
+    with pytest.raises(verify_local.VerifyError) as refused:
+        verify_local.verify_landed(
+            state,
+            repo,
+            landed,
+            ["tests/absent.test.mjs"],
+            runner=_runner(calls=calls),
+        )
+
+    assert refused.value.code == "invalid_test_target"
+    assert "does not exist" in refused.value.message
+    assert calls == []
+    assert not list((state / "verify-results").glob("landed-*.json"))
 
 
 # ---------------------------------------------------------------------------

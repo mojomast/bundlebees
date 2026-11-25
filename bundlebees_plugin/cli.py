@@ -321,7 +321,10 @@ def _build_parser(parser: Any) -> Any:
         nargs="+",
         action="extend",
         required=True,
-        help="Test targets to run at the landed commit.",
+        help=(
+            "Test targets to run at the landed commit: Python test files/node ids "
+            "or Node .mjs/.cjs/.js files (not both)."
+        ),
     )
     verify_landed.add_argument(
         "--state-dir",
@@ -3008,7 +3011,8 @@ def _cmd_verify_landed(ctx: Any, args: Any) -> int:
     except verify_local.VerifyError as exc:
         raise CliError(exc.code, exc.message, exc.fix) from exc
 
-    sandbox = record.get("sandbox") if isinstance(record.get("sandbox"), Mapping) else {}
+    evidence = record.get("sandbox")
+    sandbox = evidence if isinstance(evidence, Mapping) else {}
     _print("bundlebees verify-landed")
     _print_sha(record["sha"])
     _print(f"tests: {', '.join(record['tests'])}")
@@ -3016,7 +3020,8 @@ def _cmd_verify_landed(ctx: Any, args: Any) -> int:
     # record path is echoed literally instead of through scrub()'s hash redaction.
     print(f"record: verify-results/landed-{record['sha']}.json")
     _print(
-        f"ok: {record['ok']} (exit {sandbox.get('exit_code')} via {sandbox.get('backend')})"
+        f"ok: {record['ok']} (exit {sandbox.get('exit_code')} via "
+        f"{sandbox.get('backend')}, runner {sandbox.get('runner')})"
     )
     if not record["ok"]:
         _print(f"output: {sandbox.get('output_tail')}")
