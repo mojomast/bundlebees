@@ -9,23 +9,6 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Short recovery hint if Tool Search defers the tools.
-BUNDLEBEES_SYSTEM_PROMPT_SECTION = (
-    "Bundlebees orchestrates CUA bees (cheap coding workers in disposable "
-    "sandboxes on a worker machine the user controls). Drive it ONLY with "
-    "bundlebees_status, bundlebees_dispatch, bundlebees_attempt, "
-    "bundlebees_host_prompt, bundlebees_route_preview and bundlebees_go_max "
-    "(toolset bundlebees). When the owner says 'go max' or asks for as much "
-    "parallel work as possible, call bundlebees_go_max with action on, then "
-    "report its summary. If those tools are not in your visible list, call "
-    'tool_search(["bundlebees"]) or '
-    'skill_view("bundlebees:bundlebees-operator"), then use them. '
-    "Do not shell out to curl against the launcher or invent a client. "
-    "verify and deploy are user-run CLI commands, not model tools. "
-    "Never print tokens, private URLs, or bind addresses."
-)
-
-
 _APPROVAL_OPS = {"cancel", "review"}
 
 
@@ -82,12 +65,3 @@ def register(ctx) -> None:
         from bundlebees_plugin.cli import register_cli
 
         register_cli(ctx)
-
-    if hasattr(ctx, "register_system_prompt_section"):
-        try:
-            ctx.register_system_prompt_section(
-                "bundlebees-operator",
-                BUNDLEBEES_SYSTEM_PROMPT_SECTION,
-            )
-        except Exception:
-            pass

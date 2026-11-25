@@ -120,17 +120,22 @@ def _test_first(contract: Mapping[str, Any]) -> bool:
 
 
 def _result(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    from . import verify_local
+
     junit = evidence.get("junit") if isinstance(evidence.get("junit"), Mapping) else {}
     cases = [case for case in evidence.get("cases") or [] if isinstance(case, Mapping)]
-    return {
-        "exit_code": evidence.get("exit_code"),
-        "tests": int(junit.get("tests") or len(cases)),
-        "failures": int(junit.get("failures") or 0),
-        "errors": int(junit.get("errors") or 0),
-        "skipped": int(junit.get("skipped") or 0),
-        "timed_out": bool(evidence.get("timed_out")),
-        "cases": cases,
-    }
+    try:
+        return {
+            "exit_code": evidence.get("exit_code"),
+            "tests": verify_local._junit_counter(junit.get("tests") or len(cases), "tests"),
+            "failures": verify_local._junit_counter(junit.get("failures") or 0, "failures"),
+            "errors": verify_local._junit_counter(junit.get("errors") or 0, "errors"),
+            "skipped": verify_local._junit_counter(junit.get("skipped") or 0, "skipped"),
+            "timed_out": bool(evidence.get("timed_out")),
+            "cases": cases,
+        }
+    except verify_local.VerifyError as exc:
+        raise _error("evidence_invalid", exc.message, exc.fix) from exc
 
 
 def _environment(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -262,7 +267,7 @@ def _collect_manifest(ctx: Any, contract: Mapping[str, Any], sha: str, workdir: 
                 raise _error("tests_uncollectable", f"approved test file {path} is unreadable",
                              "Commit the approved test file at source_rev.") from exc
             ids.extend(_static_ids(path, source))
-            methods[path] = "static"
+            methods[path] = tdd.STATIC_COLLECTION
         ids = sorted(set(_bounded_ids(ids)))
 
     resolved: dict[str, dict[str, list[str]]] = {}
@@ -413,7 +418,10 @@ def cmd_contract(ctx: Any, args: Any) -> int:
         print(f"contract: {scrub(str(frozen.get('id')))} approved")
         _print_hex("contract_sha256", frozen["review"]["contract_sha256"])
         if manifest is not None:
-            static = sorted(path for path, how in manifest["methods"].items() if how == "static")
+            static = sorted(
+                path for path, how in manifest["methods"].items()
+                if how == tdd.STATIC_COLLECTION
+            )
             print(f"tests collected: {len(manifest['collected_ids'])} ids at source_rev, every AC reference resolved")
             if static:
                 print("read statically (import-type collection error at source_rev): " + scrub(", ".join(static)))
@@ -493,7 +501,9 @@ def _cmd_refactor(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
         raise _error("green_failed", "no GREEN evidence for this contract",
                      "Run `hermes bundlebees verify` on the implementation revision first.")
     try:
-        tdd.check_green(contract, sha, red, green)
+        preflight = {"contract": contract, "sha": sha, "key": key}
+        approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
+        tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
 
@@ -571,7 +581,9 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
         raise _error("green_failed", "no GREEN evidence for this contract",
                      "Run `hermes bundlebees verify` on the implementation revision first.")
     try:
-        tdd.check_green(contract, sha, red, green)
+        preflight = {"contract": contract, "sha": sha, "key": key}
+        approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
+        tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
 
@@ -790,8 +802,17 @@ def record_green(state_dir: Path, acdd_state: Mapping[str, Any], workdir: Path, 
         environment=_environment(evidence), notes=note,
     )
     try:
+        selection = tdd.frozen_approved_selection(state_dir, acdd_state)
+        approved_ids, static_ids = selection if selection is not None else (None, None)
+        tdd.check_green(
+            contract,
+            sha,
+            acdd_state["red"],
+            record,
+            approved_ids=approved_ids,
+            static_ids=static_ids,
+        )
         tdd.write_record(state_dir, record, acdd_state["key"])
-        tdd.check_green(contract, sha, acdd_state["red"], record)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
     return record
@@ -854,7 +875,17 @@ def integrate_preflight(state_dir: Path, attempt_ids: list[str]) -> list[dict[st
             raise _error("green_failed", f"no GREEN evidence for contract {contract['id']} ({attempt_id})",
                          "Verify the attempt with `hermes bundlebees verify` before integrating.")
         try:
-            tdd.check_green(contract, sha, red, green)
+            preflight = {"contract": contract, "sha": sha, "key": key}
+            selection = tdd.frozen_approved_selection(state_dir, preflight)
+            approved_ids, static_ids = selection if selection is not None else (None, None)
+            tdd.check_green(
+                contract,
+                sha,
+                red,
+                green,
+                approved_ids=approved_ids,
+                static_ids=static_ids,
+            )
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
         if "refactor" in [str(phase) for phase in contract.get("evidence_required") or []]:
