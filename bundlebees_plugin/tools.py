@@ -28,6 +28,7 @@ from .adapters import UnsupportedAdapter
 from . import contract as _contract
 from . import contracts as _contracts
 from . import attribution as _attribution
+from . import flags
 from . import leases as _leases
 from . import metrics as _metrics
 from . import revision as _revision
@@ -764,15 +765,35 @@ def _gated_failure_id(brief: Mapping[str, Any], state_dir: Path | None) -> str |
 def _attach_accepted_findings(
     brief: dict[str, Any], state_dir: Path | None
 ) -> dict[str, Any] | str:
-    """Return the gated brief with its accepted findings, or an error envelope.
+    """Attach the gated failure's accepted findings to the brief, or refuse.
 
-    The research gate has already proven an accepted artifact exists. The
-    launcher renders ``brief.findings`` into the worker prompt, so the dispatch
-    must carry the same artifact the gate validated. A findings block supplied
-    by the caller stays authoritative and is never replaced by the state copy.
+    A findings block supplied by the caller stays authoritative and is never
+    replaced by the state copy. The attach itself is dark by default: with
+    ``ATTACH_FINDINGS`` not exactly ``1`` the brief is returned untouched, so
+    the research gate still demands an accepted artifact while no state copy
+    travels to the worker. Caller-supplied findings win either way, so the
+    flag never touches them.
     """
     if isinstance(brief.get("findings"), Mapping):
         return brief
+    if not flags.enabled(flags.FLAG_ATTACH_FINDINGS):
+        return brief
+    return _attach_state_findings(brief, state_dir)
+
+
+def _attach_state_findings(
+    brief: dict[str, Any], state_dir: Path | None
+) -> dict[str, Any] | str:
+    """The enabled path: read the gated artifact, cap it, copy it onto *brief*.
+
+    The research gate has already proven an accepted artifact exists, and the
+    launcher renders ``brief.findings`` into the worker prompt, so the dispatch
+    carries the same artifact the gate validated. A brief with neither
+    ``failure_id`` nor ``retry_of`` carries none. An artifact beyond
+    :data:`bundlebees_plugin.research_gate.ATTACH_MAX_ENTRIES` entries or
+    :data:`bundlebees_plugin.research_gate.ATTACH_MAX_BYTES` bytes is refused
+    with a recorded reason instead of trimmed.
+    """
     if not brief.get("failure_id"):
         if not brief.get("retry_of"):
             return brief
@@ -799,6 +820,16 @@ def _attach_accepted_findings(
             "research_required",
             f"no accepted findings artifact for failure {fid}",
             "Record accepted findings before retrying; nothing was dispatched.",
+        )
+    over_cap = rg.attachment_cap(artifact)
+    if over_cap is not None:
+        return _err(
+            "findings_too_large",
+            f"accepted findings for failure {fid} exceed the attach cap "
+            f"({over_cap['entries']} entries, {over_cap['bytes']} bytes; "
+            f"reason={over_cap['reason']}; limits {over_cap['max_entries']} entries, "
+            f"{over_cap['max_bytes']} bytes)",
+            "Record a smaller accepted findings artifact before retrying; nothing was dispatched.",
         )
     attached = dict(brief)
     attached["findings"] = artifact

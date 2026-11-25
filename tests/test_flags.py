@@ -22,14 +22,18 @@ def _shared_file(tmp_path, text: str):
 
 
 def _isolate(monkeypatch, path):
-    monkeypatch.delenv(flags.FLAG_MEMORY, raising=False)
-    monkeypatch.delenv(flags.FLAG_BOARD_STOCK, raising=False)
+    for name in flags.FLAGS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(flags.FLAGS_FILE_ENV, str(path))
 
 
 def test_missing_file_keeps_every_flag_off(tmp_path, monkeypatch):
     _isolate(monkeypatch, tmp_path / "absent.env")
-    assert flags.effective_flags() == {flags.FLAG_MEMORY: False, flags.FLAG_BOARD_STOCK: False}
+    assert flags.effective_flags() == {
+        flags.FLAG_MEMORY: False,
+        flags.FLAG_BOARD_STOCK: False,
+        flags.FLAG_ATTACH_FINDINGS: False,
+    }
 
 
 def test_one_shared_file_turns_both_readers_on(tmp_path, monkeypatch):
@@ -38,7 +42,11 @@ def test_one_shared_file_turns_both_readers_on(tmp_path, monkeypatch):
         "# flags only, never a credential\nMEMORY_ENABLED=1\nBUNDLEBEES_BOARD_STOCK=1\n",
     )
     _isolate(monkeypatch, path)
-    assert flags.effective_flags() == {flags.FLAG_MEMORY: True, flags.FLAG_BOARD_STOCK: True}
+    assert flags.effective_flags() == {
+        flags.FLAG_MEMORY: True,
+        flags.FLAG_BOARD_STOCK: True,
+        flags.FLAG_ATTACH_FINDINGS: False,
+    }
     assert memory_recall.enabled() is True
     assert board_stock.enabled() is True
 
@@ -87,7 +95,7 @@ def test_startup_line_names_every_effective_flag(tmp_path, monkeypatch):
     path = _shared_file(tmp_path, "BUNDLEBEES_BOARD_STOCK=1\n")
     _isolate(monkeypatch, path)
     assert flags.startup_line() == (
-        f"bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=1 "
+        f"bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=1 ATTACH_FINDINGS=0 "
         f"flags_file={path} (present)"
     )
 
@@ -121,5 +129,5 @@ def test_factory_driver_logs_flags_before_a_startup_refusal(tmp_path, monkeypatc
     with pytest.raises(SystemExit) as stop:
         factory_driver.main(["--state", str(tmp_path), "--once", "--require-dispatch-config"])
     err = capsys.readouterr().err
-    assert "bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=1" in err
+    assert "bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=1 ATTACH_FINDINGS=0" in err
     assert "refusing to start" in str(stop.value)

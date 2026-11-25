@@ -35,6 +35,7 @@ from typing import Mapping, TextIO
 
 __all__ = [
     "DEFAULT_FLAGS_FILE",
+    "FLAG_ATTACH_FINDINGS",
     "FLAG_BOARD_STOCK",
     "FLAG_MEMORY",
     "FLAGS",
@@ -51,8 +52,10 @@ __all__ = [
 FLAG_MEMORY = "MEMORY_ENABLED"
 #: Ready-column stocking in the factory driver.
 FLAG_BOARD_STOCK = "BUNDLEBEES_BOARD_STOCK"
+#: Carry accepted research findings on a retry dispatch. Dark by default.
+FLAG_ATTACH_FINDINGS = "ATTACH_FINDINGS"
 #: Every flag the startup line prints, in this order.
-FLAGS = (FLAG_MEMORY, FLAG_BOARD_STOCK)
+FLAGS = (FLAG_MEMORY, FLAG_BOARD_STOCK, FLAG_ATTACH_FINDINGS)
 
 #: Names the shared file both processes read.
 FLAGS_FILE_ENV = "BUNDLEBEES_FLAGS_FILE"
