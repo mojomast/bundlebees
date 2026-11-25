@@ -142,6 +142,25 @@ def _wave_record(*, accepted=True):
     }
 
 
+def _wire_rows(s):
+    rows = []
+    for row in s.events():
+        body = rails_contracts.event_body(
+            row["kind"], row["source"], row["scope"], row["payload"], row["authority"],
+            row.get("lane"), row.get("occurred_at"), row.get("duration_ms"),
+            row.get("timing_quality", "unknown"), row.get("redaction_policy"),
+        )
+        rows.append(dict(body, schema="rizzstack.rails-candidate/1", dedupe_key=row["dedupe_key"]))
+    return rows
+
+
+def _legacy_cursor(s, n, stop):
+    hashes = [source._hash([s.adapter_id, s.instance])]
+    for row in _wire_rows(s):
+        hashes.append(source._hash([hashes[-1], row]))
+    return f"{n}:{stop}:{hashes[n]}:{hashes[stop]}"
+
+
 class SnapshotCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="rails-r05-")
@@ -404,6 +423,115 @@ class SignatureTests(SnapshotCase):
 
 
 class LedgerReplayTests(SnapshotCase):
+    def test_prefix_insertion_resume_dedupes_full_import(self):
+        from rizzstack_rails.importer import Importer
+
+        for attempt, order in (("att-b", 2), ("att-d", 4), ("att-f", 6)):
+            path = self.write(f"verify-results/{attempt}.json", _verify_record(attempt))
+            os.utime(path, (order, order))
+        ledger = rails_ledger.RailsLedger(os.path.join(self.state, "rails.sqlite"))
+        self.addCleanup(ledger.close)
+        imp = Importer(ledger, authorities=("coordinator_record", "imported_observation"))
+        first = imp.import_once(source.BundlebeesSource(self.state), limit=1, byte_limit=4096)
+        second = imp.import_once(source.BundlebeesSource(self.state), limit=1, byte_limit=4096)
+        desc = source.BundlebeesSource(self.state).describe()
+        cursor = imp.cursor(desc["adapter_id"], desc["source_instance"])
+
+        inserted = self.write("verify-results/att-a.json", _verify_record("att-a"))
+        os.utime(inserted, (1, 1))
+        page = source.BundlebeesSource(self.state).read_batch(cursor, 1, 4096)
+        self.assertEqual(["att-f"], [row["scope"]["attempt_id"] for row in page["records"]])
+        self.assertFalse(page["has_more"])
+        self.assertEqual("r1." + page["records"][-1]["dedupe_key"], page["next_cursor"])
+
+        resumed = imp.import_once(source.BundlebeesSource(self.state), limit=1, byte_limit=4096)
+        replay = imp.import_once(source.BundlebeesSource(self.state), limit=1, byte_limit=4096)
+        self.assertEqual([1, 1, 1, 0], [first["imported"], second["imported"],
+                                       resumed["imported"], replay["imported"]])
+        keys = [row["dedupe_key"] for row in ledger.query(
+            "SELECT dedupe_key FROM dedupe_index WHERE dedupe_key LIKE 'bb:%'")]
+        self.assertEqual(3, len(keys))
+        self.assertEqual(3, len(set(keys)))
+
+    def test_noncheckpoint_prefix_deletion_resume(self):
+        paths = []
+        for attempt, order in (("att-a", 1), ("att-b", 2), ("att-c", 3)):
+            path = self.write(f"verify-results/{attempt}.json", _verify_record(attempt))
+            os.utime(path, (order, order))
+            paths.append(path)
+        s = source.BundlebeesSource(self.state)
+        page1 = s.read_batch(None, 1, 4096)
+        page2 = s.read_batch(page1["next_cursor"], 1, 4096)
+        Path(paths[0]).unlink()
+        resumed = source.BundlebeesSource(self.state).read_batch(page2["next_cursor"], 1, 4096)
+        self.assertEqual(["att-c"], [row["scope"]["attempt_id"] for row in resumed["records"]])
+        self.assertFalse(resumed["has_more"])
+
+    def test_checkpoint_record_deleted_is_source_gap(self):
+        checkpoint = self.write("verify-results/att-a.json", _verify_record("att-a"))
+        self.write("verify-results/att-b.json", _verify_record("att-b"))
+        s = source.BundlebeesSource(self.state)
+        page = s.read_batch(None, 1, 4096)
+        self.assertEqual("r1." + page["records"][-1]["dedupe_key"], page["next_cursor"])
+        Path(checkpoint).unlink()
+        with self.assertRaises(source.SourceError) as err:
+            source.BundlebeesSource(self.state).read_batch(page["next_cursor"], 1, 4096)
+        self.assertEqual("source_gap", err.exception.code)
+
+    def test_unknown_identity_is_source_gap(self):
+        self.write("verify-results/att-a.json", _verify_record("att-a"))
+        s = source.BundlebeesSource(self.state)
+        with self.assertRaises(source.SourceError) as err:
+            s.read_batch("r1.unknown", 1, 4096)
+        self.assertEqual("source_gap", err.exception.code)
+        for cursor in ("r1.", "r1.bad/path"):
+            with self.subTest(cursor=cursor), self.assertRaises(source.SourceError) as invalid:
+                s.read_batch(cursor, 1, 4096)
+            self.assertEqual("invalid_cursor", invalid.exception.code)
+
+    def test_legacy_exact_replay(self):
+        for attempt, order in (("att-a", 1), ("att-b", 2), ("att-c", 3)):
+            path = self.write(f"verify-results/{attempt}.json", _verify_record(attempt))
+            os.utime(path, (order, order))
+        s = source.BundlebeesSource(self.state)
+        legacy = _legacy_cursor(s, 1, 3)
+        expected = dict(schema="rizzstack.rails-read-batch-result/1", records=[_wire_rows(s)[1]],
+                        next_cursor=_legacy_cursor(s, 2, 3), has_more=True,
+                        source_head=_legacy_cursor(s, 3, 3), diagnostics=[])
+        self.assertEqual(expected, s.read_batch(legacy, 1, 4096))
+        self.assertEqual(expected, source.BundlebeesSource(self.state).read_batch(legacy, 1, 4096))
+
+    def test_legacy_chain_mismatch_is_source_gap(self):
+        for attempt, order in (("att-b", 2), ("att-c", 3)):
+            path = self.write(f"verify-results/{attempt}.json", _verify_record(attempt))
+            os.utime(path, (order, order))
+        s = source.BundlebeesSource(self.state)
+        legacy = _legacy_cursor(s, 1, 2)
+        inserted = self.write("verify-results/att-a.json", _verify_record("att-a"))
+        os.utime(inserted, (1, 1))
+        with self.assertRaises(source.SourceError) as err:
+            source.BundlebeesSource(self.state).read_batch(legacy, 1, 4096)
+        self.assertEqual("source_gap", err.exception.code)
+
+    def test_identity_cursor_charset_length_and_importer_validation(self):
+        from rizzstack_rails.importer import Importer
+
+        self.write("verify-results/att-a.json", _verify_record("att-a"))
+        s = source.BundlebeesSource(self.state)
+        page = s.read_batch(None, 1, 4096)
+        cursor = page["next_cursor"]
+        self.assertEqual("r1." + page["records"][-1]["dedupe_key"], cursor)
+        self.assertLessEqual(len(cursor), 1024)
+        self.assertRegex(cursor, r"\Ar1\.[A-Za-z0-9._:=+~-]+\Z")
+        self.assertEqual(cursor, page["source_head"])
+
+        ledger = rails_ledger.RailsLedger(os.path.join(self.state, "rails.sqlite"))
+        self.addCleanup(ledger.close)
+        imp = Importer(ledger)
+        result = imp.commit_batch(s.adapter_id, s.instance, [], expected_cursor=None, next_cursor=cursor)
+        self.assertEqual(0, result["imported"])
+        self.assertEqual(cursor, imp.cursor(s.adapter_id, s.instance))
+
     def test_appends_during_paging_wait_for_next_head(self):
         def put(n):
             attempt = f'att-{n}'
@@ -414,6 +542,8 @@ class LedgerReplayTests(SnapshotCase):
         put(2)
         s = source.BundlebeesSource(self.state)
         page1 = s.read_batch(None, 1, 4096)
+        page1 = dict(page1, next_cursor=_legacy_cursor(s, 1, 2),
+                     source_head=_legacy_cursor(s, 2, 2))
         page2 = s.read_batch(page1['next_cursor'], 1, 4096)
         put(3)
         restarted = source.BundlebeesSource(self.state)
@@ -423,6 +553,26 @@ class LedgerReplayTests(SnapshotCase):
         page3 = restarted.read_batch(page2['next_cursor'], 1, 4096)
         self.assertEqual('att-3', page3['records'][0]['scope']['attempt_id'])
         self.assertNotEqual(page3['source_head'], page1['source_head'])
+
+    def test_identity_resume_uses_current_snapshot_head(self):
+        def put(n):
+            attempt = f'att-{n}'
+            path = self.write(f'verify-results/{attempt}.json', _verify_record(attempt))
+            os.utime(path, (n, n))
+
+        put(1)
+        put(2)
+        s = source.BundlebeesSource(self.state)
+        page1 = s.read_batch(None, 1, 4096)
+        put(3)
+        restarted = source.BundlebeesSource(self.state)
+        page2 = restarted.read_batch(page1['next_cursor'], 1, 4096)
+        self.assertEqual('att-2', page2['records'][0]['scope']['attempt_id'])
+        self.assertTrue(page2['has_more'])
+        page3 = restarted.read_batch(page2['next_cursor'], 1, 4096)
+        self.assertEqual('att-3', page3['records'][0]['scope']['attempt_id'])
+        self.assertFalse(page3['has_more'])
+        self.assertEqual(page3['next_cursor'], page2['source_head'])
 
     def test_restart_after_committed_page_and_prefix_loss(self):
         from rizzstack_rails.importer import Importer
