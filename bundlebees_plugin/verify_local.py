@@ -25,7 +25,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
-from . import leases, sandbox, test_receipts as receipts
+from . import leases, sandbox, subversion_scan, tdd, test_receipts as receipts
 from .security import scrub
 
 RECORD_DIR = "verify-results"
@@ -80,6 +80,61 @@ def _receipt_scope(lease: Mapping[str, Any], preflight: Any) -> tuple[str, str, 
     raise VerifyError("receipt_scope_mismatch", "Cannot bind this receipt to a checked dispatch contract.")
 
 
+def _frozen_approved_ids(state_dir: Path, preflight: Any) -> list[str] | None:
+    try:
+        return tdd.frozen_approved_ids(state_dir, preflight)
+    except tdd.TddError as exc:
+        raise VerifyError(exc.code, exc.error, exc.fix) from exc
+
+
+def _junit_counter(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise VerifyError(
+            "evidence_invalid", f"JUnit {name} counter is not an integer"
+        ) from exc
+
+
+def _check_frozen_green(
+    preflight: Mapping[str, Any],
+    approved_ids: Sequence[str],
+    worktree: Path,
+    evidence: Mapping[str, Any],
+    revision: str,
+    suite_command: Sequence[str] | None,
+) -> dict[str, Any]:
+    contract = preflight["contract"]
+    tests = [str(test) for test in preflight["tests"]]
+    junit = evidence.get("junit") if isinstance(evidence.get("junit"), Mapping) else {}
+    cases = list(evidence.get("cases") or [])
+    result = {
+        "exit_code": evidence.get("exit_code"),
+        "tests": _junit_counter(junit.get("tests") or len(cases), "tests"),
+        "failures": _junit_counter(junit.get("failures") or 0, "failures"),
+        "errors": _junit_counter(junit.get("errors") or 0, "errors"),
+        "skipped": _junit_counter(junit.get("skipped") or 0, "skipped"),
+        "timed_out": bool(evidence.get("timed_out")),
+        "cases": cases,
+    }
+    try:
+        record = tdd.make_record(
+            contract,
+            str(preflight["sha"]),
+            phase="green",
+            revision=revision,
+            test_fingerprints=tdd.fingerprint_files(worktree, tests),
+            command=_test_command(tests, suite_command) or [],
+            result=result,
+            produced_by={"role": "verifier", "name": "bundlebees verify-local"},
+            test_first=(contract.get("tdd") or {}).get("test_first") is not False,
+        )
+        tdd.check_green(contract, str(preflight["sha"]), preflight.get("red"), record, approved_ids=approved_ids)
+    except tdd.TddError as exc:
+        raise VerifyError(exc.code, exc.error, exc.fix) from exc
+    return record
+
+
 _TREE_DOMAIN = b"bundlebees-source-tree:v1\x00"
 _TEST_SOURCES_DOMAIN = b"bundlebees-test-sources:v1\x00"
 _DEPENDENCIES_DOMAIN = b"bundlebees-dependencies:v1\x00"
@@ -112,6 +167,26 @@ class VerifyError(Exception):
         self.code = code
         self.message = message
         self.fix = fix
+
+
+def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
+    findings = subversion_scan.scan_patch(patch)
+    if findings:
+        listed = ", ".join(
+            f"{finding['kind']}@{finding['path']}:{finding['line']}"
+            for finding in findings[:5]
+        )
+        message = (
+            f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
+        )
+        if len(findings) > 5:
+            message += f" (+{len(findings) - 5} more)"
+        raise VerifyError(
+            "test_subversion",
+            message,
+            "Remove test-runner subversion from the patch.",
+        )
+    return findings
 
 
 def _child_env() -> dict[str, str]:
@@ -234,11 +309,18 @@ def _test_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     tail = evidence.get("output_tail")
     if tail is None:
         tail = evidence.get("tail", "")
-    return {
+    normalized = {
         "exit_code": exit_code,
         "timed_out": bool(evidence.get("timed_out")),
         "tail": str(tail or "").strip()[-300:],
     }
+    if "cases" in evidence:
+        normalized["cases"] = evidence.get("cases")
+    if "junit" in evidence:
+        normalized["junit"] = evidence.get("junit")
+    if "backend" in evidence:
+        normalized["backend"] = evidence.get("backend")
+    return normalized
 
 
 def _sha256(domain: bytes, payload: bytes) -> str:
@@ -459,8 +541,9 @@ def _receipt_key_inputs(
     allow_unsafe_local: bool,
     allow_weak: bool,
     timeout: int,
+    approved_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    identity = {
         "source_tree_sha256": source_tree_sha256,
         "patch_sha256": patch_sha256,
         "test_sources_sha256": _test_sources_digest(worktree, tests),
@@ -477,6 +560,9 @@ def _receipt_key_inputs(
         ),
         "stage": str(stage),
     }
+    if approved_ids is not None:
+        identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
+    return identity
 
 
 def _test_command(
@@ -512,6 +598,7 @@ def _verification_identity(
     timeout: int,
     require_gitleaks: bool,
     gitleaks: str | None,
+    approved_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Everything that can change the observed verification result.
 
@@ -521,13 +608,15 @@ def _verification_identity(
     re-earns the record instead of inheriting an accepted result.
     """
 
-    return {
+    identity = {
         "base_rev": str(base_rev),
         "source_tree_sha256": str(source_tree_sha256),
         "patch_sha256": str(patch_sha256),
         "test_sources_sha256": _test_sources_digest(worktree, tests),
         "tests": [str(test) for test in tests],
-        "command": _test_command(tests, suite_command),
+        "command": _test_command(
+            tests, sandbox.pytest_argv([]) if approved_ids is not None else suite_command
+        ),
         "suite_command": (
             None if suite_command is None else [str(item) for item in suite_command]
         ),
@@ -544,6 +633,9 @@ def _verification_identity(
         ),
         "gitleaks": _gitleaks_identity(require_gitleaks, gitleaks),
     }
+    if approved_ids is not None:
+        identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
+    return identity
 
 
 def _receipt_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
@@ -594,6 +686,8 @@ def _receipt_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
         evidence["junit"] = result.get("junit")
     if "backend" in result:
         evidence["backend"] = result.get("backend")
+    if "cases" in result:
+        evidence["cases"] = result.get("cases")
     return evidence
 
 
@@ -709,6 +803,7 @@ def _run_test_command(
         allow_unsafe_local=allow_unsafe_local,
         allow_weak=allow_weak,
         timeout=timeout,
+        approved_ids=context.get("approved_ids"),
     )
 
     try:
@@ -977,6 +1072,7 @@ def _verify_and_commit_locked(
     on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    check_patch_subversion(patch)
     state_dir = Path(state_dir)
     repo = Path(repo)
     stats = stats if stats is not None else _test_cache_stats()
@@ -1024,6 +1120,9 @@ def _verify_and_commit_locked(
                 "the task declares a frozen contract but the preflight found none",
                 "Refusing to verify a contracted task in legacy mode.",
             )
+
+    approved_ids = _frozen_approved_ids(state_dir, outcome)
+    named_suite_command = sandbox.pytest_argv([]) if approved_ids is not None else suite_command
 
     # 1. The lease is the authority; worker claims never widen it.
     try:
@@ -1077,6 +1176,7 @@ def _verify_and_commit_locked(
             timeout=sandbox_timeout,
             gitleaks=gitleaks,
             source_tree_sha256=source_tree_sha256,
+            approved_ids=approved_ids,
         ):
             _assert_sandbox_usable(
                 runner,
@@ -1100,6 +1200,7 @@ def _verify_and_commit_locked(
             "tests": list(tests),
             "cacheable": cacheable,
             "stats": stats,
+            "approved_ids": approved_ids,
         }
 
     branch = _branch(attempt_id)
@@ -1127,7 +1228,7 @@ def _verify_and_commit_locked(
             red = _run_tests(
                 worktree,
                 tests,
-                suite_command,
+                named_suite_command,
                 runner=runner,
                 backend=sandbox_backend,
                 allow_unsafe_local=sandbox_allow_unsafe_local,
@@ -1184,13 +1285,14 @@ def _verify_and_commit_locked(
             timeout=sandbox_timeout,
             require_gitleaks=require_gitleaks,
             gitleaks=gitleaks,
+            approved_ids=approved_ids,
         )
 
         # 6. GREEN after the patch.
         green = _run_tests(
             worktree,
             tests,
-            suite_command,
+            named_suite_command,
             runner=runner,
             backend=sandbox_backend,
             allow_unsafe_local=sandbox_allow_unsafe_local,
@@ -1204,6 +1306,11 @@ def _verify_and_commit_locked(
                 "the named tests timed out after the patch",
                 "Increase the sandbox timeout or fix the test; a timeout is not a pass.",
             )
+        if approved_ids is not None:
+            try:
+                tdd.check_collected_ids(approved_ids, green.get("cases") or [])
+            except tdd.TddError as exc:
+                raise VerifyError(exc.code, exc.error, exc.fix) from exc
         if green["exit_code"] != 0:
             raise VerifyError(
                 "tests_failed",
@@ -1249,6 +1356,14 @@ def _verify_and_commit_locked(
         if commit.returncode != 0:
             raise VerifyError("commit_failed", f"the verification commit failed: {commit.stderr.strip()[:200]}", "Inspect the worktree.")
         sha = _rev(worktree, "HEAD")
+        if approved_ids is not None:
+            try:
+                record = _check_frozen_green(
+                    outcome, approved_ids, worktree, green, sha, named_suite_command
+                )
+                tdd.write_record(state_dir, record, outcome["key"])
+            except tdd.TddError as exc:
+                raise VerifyError(exc.code, exc.error, exc.fix) from exc
     finally:
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
 
@@ -1319,6 +1434,7 @@ def _identity_for_commit(
     timeout: int,
     require_gitleaks: bool,
     gitleaks: str | None,
+    approved_ids: Sequence[str] | None = None,
 ) -> dict[str, Any] | None:
     """Recompute the execution identity from the *committed* verified tree."""
 
@@ -1343,6 +1459,7 @@ def _identity_for_commit(
             timeout=timeout,
             require_gitleaks=require_gitleaks,
             gitleaks=gitleaks,
+            approved_ids=approved_ids,
         )
     finally:
         _run(["git", "worktree", "remove", "--force", str(scratch)], repo)
@@ -1366,6 +1483,7 @@ def _record_still_valid(
     timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     gitleaks: str | None = None,
     source_tree_sha256: str | None = None,
+    approved_ids: Sequence[str] | None = None,
 ) -> bool:
     """Reuse only a record whose *results* still apply to this exact artifact.
 
@@ -1424,6 +1542,7 @@ def _record_still_valid(
         timeout=timeout,
         require_gitleaks=require_gitleaks,
         gitleaks=gitleaks,
+        approved_ids=approved_ids,
     )
     if expected is None:
         return False

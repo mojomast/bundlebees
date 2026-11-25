@@ -59,6 +59,16 @@ _SKILL_TEMPLATE = (
 )
 
 _STATUS_OPS = {"health", "capacity", "attempts", "events", "containers", "projects"}
+_STATUS_ATTEMPTS_DEFAULT_LIMIT = 20
+_STATUS_ATTEMPTS_MAX_LIMIT = 200
+_STATUS_ATTEMPT_COMPACT_KEYS = (
+    "attempt_id",
+    "state",
+    "project",
+    "branch",
+    "model",
+    "updated_at",
+)
 _ATTEMPT_OPS = {"get", "events", "cancel", "review"}
 _OS_VALUES = {"linux", "macos", "windows"}
 _REACH_VALUES = {"same-machine", "lan", "vpn", "ssh"}
@@ -328,6 +338,96 @@ def _lease_overlap(attempts: Any, brief: Mapping[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _attempt_sort_key(attempt: Mapping[str, Any]) -> tuple[str, str]:
+    updated = attempt.get("updated_at") or attempt.get("created_at") or ""
+    created = attempt.get("created_at") or ""
+    return (str(updated), str(created))
+
+
+def _compact_attempt(attempt: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: attempt[key]
+        for key in _STATUS_ATTEMPT_COMPACT_KEYS
+        if key in attempt and attempt[key] is not None
+    }
+
+
+def _attempt_state(attempt: Mapping[str, Any]) -> str:
+    return str(attempt.get("state") or attempt.get("status") or "").strip().lower()
+
+
+def _attempts_limit(value: Any) -> tuple[int | None, str | None]:
+    """Return (limit, error) for the requested row count."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return None, _err(
+            "invalid_argument",
+            "limit must be a positive integer",
+            "Pass a small limit; the list is capped at "
+            f"{_STATUS_ATTEMPTS_MAX_LIMIT}.",
+        )
+    return min(value, _STATUS_ATTEMPTS_MAX_LIMIT), None
+
+
+def _attempts_state(value: Any) -> tuple[str | None, str | None]:
+    """Return (state, error); a missing value means no filter."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or not value.strip():
+        return None, _err(
+            "invalid_argument",
+            "state must be a non-empty string",
+            "Pass an attempt state such as running or succeeded, or omit it.",
+        )
+    return value.strip().lower(), None
+
+
+def _attempts_detail(value: Any) -> tuple[bool | None, str | None]:
+    """Return (detail, error) for the compact/full row switch."""
+    if not isinstance(value, bool):
+        return None, _err(
+            "invalid_argument",
+            "detail must be a boolean",
+            "Pass true for full public rows or false for compact rows.",
+        )
+    return value, None
+
+
+def _attempts_rows(raw: Any, state: str | None) -> list[Mapping[str, Any]]:
+    """Return the public attempt rows, filtered by state when one is given."""
+    if isinstance(raw, (list, tuple)):
+        attempts = [item for item in raw if isinstance(item, Mapping)]
+    else:
+        attempts = []
+    if state is None:
+        return attempts
+    return [item for item in attempts if _attempt_state(item) == state]
+
+
+def _status_attempts(client: Any, args: Mapping[str, Any]) -> str:
+    limit, error = _attempts_limit(args.get("limit", _STATUS_ATTEMPTS_DEFAULT_LIMIT))
+    if error is not None:
+        return error
+    state, error = _attempts_state(args.get("state"))
+    if error is not None:
+        return error
+    detail, error = _attempts_detail(args.get("detail", False))
+    if error is not None:
+        return error
+
+    attempts = _attempts_rows(client.attempts(), state)
+    attempts.sort(key=_attempt_sort_key, reverse=True)
+    total = len(attempts)
+    page = attempts[:limit]
+    rows = [dict(item) for item in page] if detail else [_compact_attempt(item) for item in page]
+    return _ok(
+        op="attempts",
+        attempts=rows,
+        total=total,
+        truncated=total > len(rows),
+        untrusted=True,
+    )
+
+
 def _status(client: Any, args: Mapping[str, Any]) -> str:
     op = args.get("op")
     if op not in _STATUS_OPS:
@@ -341,7 +441,7 @@ def _status(client: Any, args: Mapping[str, Any]) -> str:
     if op == "capacity":
         return _ok(op=op, capacity=client.health())
     if op == "attempts":
-        return _ok(op=op, attempts=client.attempts(), untrusted=True)
+        return _status_attempts(client, args)
     if op == "events":
         attempt_id = args.get("attempt_id")
         if not isinstance(attempt_id, str) or not attempt_id.strip():
@@ -680,20 +780,40 @@ def _dispatch(
                     _FIX_PROJECT,
                 )
 
-    try:
-        raw_attempts = (
-            client.attempts_raw()
-            if hasattr(client, "attempts_raw")
-            else client.attempts()
+    # A backend may expose attempts_raw (preferred) or attempts; a minimal
+    # WorkerBackend with only create + result exposes NEITHER. "Neither" means
+    # the adapter has no attempts capability at all, so there are no live
+    # attempts to overlap with and dispatch proceeds. Once the capability
+    # EXISTS, an unreadable or malformed read still fails closed below.
+    reader: Any = None
+    for capability in ("attempts_raw", "attempts"):
+        candidate = getattr(client, capability, None)
+        if callable(candidate):
+            reader = candidate
+            break
+    if reader is None:
+        raw_attempts: list[Any] = []
+    else:
+        try:
+            raw_attempts = reader()
+        except Exception:
+            return _err(
+                "launcher_unreadable",
+                "live attempts are unreadable, so the lease-overlap check cannot run",
+                "Restore launcher access and retry; nothing was dispatched.",
+            )
+    if not isinstance(raw_attempts, list):
+        return _err(
+            "launcher_unreadable",
+            "live attempts did not return a list, so the lease-overlap check cannot run",
+            "Fix the launcher response and retry; nothing was dispatched.",
         )
-    except Exception:
-        raw_attempts = []
     if _lease_overlap(raw_attempts, brief):
         return _err(
             "lease_overlap",
             "assigned_files overlap a running attempt on the same project and branch",
             "Wait for the running attempt or choose non-overlapping files. Lease "
-            "checks are best-effort against live attempts.",
+            "checks require a readable live attempt list.",
         )
 
     # No model means "the launcher decides": its default is the cheapest usable route on that host
@@ -1071,17 +1191,31 @@ def _schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str
 
 _STATUS_SCHEMA = _schema(
     "bundlebees_status",
-    "Check worker launcher health, capacity, attempts, events, containers, or authorized projects. Never returns tokens or hosts.",
+    "Launcher health, capacity, attempts, events, containers, or authorized projects. No tokens or hosts.",
     {
         "type": "object",
         "properties": {
             "op": {
                 "type": "string",
                 "enum": sorted(_STATUS_OPS),
-                "description": "Status view.",
+                "description": "View.",
             },
-            "attempt_id": {"type": "string", "description": "Attempt id (events)."},
+            "attempt_id": {"type": "string", "description": "Attempt id for events."},
             "cursor": {"type": "integer", "description": "Event cursor."},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _STATUS_ATTEMPTS_MAX_LIMIT,
+                "description": "Rows returned; default 20, max 200.",
+            },
+            "state": {
+                "type": "string",
+                "description": "Filter by attempt state.",
+            },
+            "detail": {
+                "type": "boolean",
+                "description": "Full rows, not compact.",
+            },
         },
         "required": ["op"],
         "additionalProperties": False,
@@ -1090,21 +1224,21 @@ _STATUS_SCHEMA = _schema(
 
 _DISPATCH_SCHEMA = _schema(
     "bundlebees_dispatch",
-    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. An optional acdd/1 contract is validated and enforced. Does not apply patches, run tests, or deploy.",
+    "Validate a strict bee brief (schema, full source_rev, file leases) and start a worker. Optional acdd/1 contract enforced. No patches, tests, or deploys.",
     {
         "type": "object",
         "properties": {
             "brief": {
                 "type": ["object", "string"],
-                "description": "Brief object or JSON object string; validated in code.",
+                "description": "Object or JSON string; validated in code.",
             },
             "model": {
                 "type": "string",
-                "description": "Launcher-allowed model id; omit to use the launcher's preferred route.",
+                "description": "Allowed model id; omit for the launcher default.",
             },
             "kanban_task_id": {
                 "type": "string",
-                "description": "Optional Hermes kanban task id to record and return.",
+                "description": "Kanban task id to record.",
             },
         },
         "required": ["brief"],
@@ -1114,23 +1248,23 @@ _DISPATCH_SCHEMA = _schema(
 
 _ATTEMPT_SCHEMA = _schema(
     "bundlebees_attempt",
-    "Get, stream events for, cancel, or review one bee attempt. cancel and review require confirm=true.",
+    "Get, stream events, cancel, or review an attempt. cancel and review need confirm=true.",
     {
         "type": "object",
         "properties": {
             "op": {
                 "type": "string",
                 "enum": sorted(_ATTEMPT_OPS),
-                "description": "Attempt operation.",
+                "description": "Action.",
             },
             "attempt_id": {"type": "string", "description": "Attempt id."},
             "cursor": {"type": "integer", "description": "Event cursor."},
             "confirm": {
                 "type": "boolean",
-                "description": "Must be true for cancel and review.",
+                "description": "Required true for cancel/review.",
             },
             "accepted": {"type": "boolean", "description": "Review decision."},
-            "note": {"type": "string", "description": "Optional review note; scrubbed."},
+            "note": {"type": "string", "description": "Optional note; scrubbed."},
         },
         "required": ["op", "attempt_id"],
         "additionalProperties": False,
@@ -1139,7 +1273,7 @@ _ATTEMPT_SCHEMA = _schema(
 
 _HOST_PROMPT_SCHEMA = _schema(
     "bundlebees_host_prompt",
-    "Generate a paste-ready setup prompt for an agent on a remote host. No secrets or host addresses in, no secrets or host addresses out.",
+    "Paste-ready setup prompt for a remote host agent. No secrets or addresses in or out.",
     {
         "type": "object",
         "properties": {
@@ -1170,16 +1304,16 @@ _HOST_PROMPT_SCHEMA = _schema(
 
 _ROUTE_PREVIEW_SCHEMA = _schema(
     "bundlebees_route_preview",
-    "Preview the model and credential route a brief would take. Starts no attempt.",
+    "Preview the model and credential route a brief would take. Starts nothing.",
     {
         "type": "object",
         "properties": {
             "kind": {"type": "string", "description": "Route kind."},
-            "model": {"type": "string", "description": "Model id to preview."},
+            "model": {"type": "string", "description": "Model id."},
             "tier": {"type": "string", "description": "Launcher tier."},
             "brief": {
                 "type": "object",
-                "description": "Only kind, priority and model are sent.",
+                "description": "Only kind, priority, model sent.",
             },
         },
         "additionalProperties": False,

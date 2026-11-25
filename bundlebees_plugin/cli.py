@@ -761,6 +761,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             argv = [str(args.brief)]
             if getattr(args, "state_dir", None):
                 argv.extend(["--state-dir", str(args.state_dir)])
+            if config_flag(_config(ctx).get("require_contract"), False):
+                argv.append("--require-contract")
             return _preflight.main(argv)
         if command == "contract":
             return acdd_cli.cmd_contract(ctx, args)
@@ -1078,6 +1080,7 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
     credential -- unless it is itself secret-shaped: then the scrubbed form
     always wins and the raw id is never re-inserted into the row.
     """
+    from . import route_sync as _route_sync
     from . import verify_local
 
     accepted = _accepted_waves(state_dir)
@@ -1120,11 +1123,18 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
         else:
             state = _ATTEMPT_DISPATCHED
         route, attributed_model = _attribution_route(state_dir, attempt_id)
+        # The launcher picks the model at claim time; ``route_sync`` records what
+        # it reports. A verified attribution intent outranks that report, and a
+        # reported model is never promoted to ``attributed_model``.
+        reported_route, reported_model = _route_sync.read_route(state_dir, attempt_id)
+        if route is None:
+            route = reported_route
         row = {
             "attempt_id": attempt_id,
             "state": state,
             "branch": _text_or_none(record.get("branch")),
-            "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model")),
+            "model": _text_or_none(brief.get("model")) or _text_or_none(evidence.get("model"))
+            or reported_model,
             "route": route,
             "attributed_model": attributed_model,
             "project": _text_or_none(brief.get("project")),
@@ -1134,6 +1144,11 @@ def _attempt_rows(state_dir: Path) -> list[dict[str, Any]]:
             # project label is not a repo slug, so it is never substituted.
             "job_id": _text_or_none(brief.get("job_id")) or _text_or_none(lease.get("job_id")),
             "repo": _text_or_none(brief.get("repo")) or _text_or_none(lease.get("repo")),
+            # The task the lease was bound to at dispatch (brief ``task_id``, else
+            # the coordinator's ``label``); older leases fall back to the brief.
+            "task_id": _text_or_none(lease.get("task_id"))
+            or leases._identity(brief.get("task_id"))
+            or leases._identity(brief.get("label")),
             "created_at": str(record.get("created_at") or ""),
             "updated_at": updated_at,
         }
@@ -3010,6 +3025,8 @@ def _cmd_verify_landed(ctx: Any, args: Any) -> int:
 
 
 def _cmd_verify(ctx: Any, args: Any) -> int:
+    from . import verify_local
+
     attempt_id = _safe_attempt_id(getattr(args, "attempt_id", None))
     state_dir = _state_dir(ctx, args)
     config = _config(ctx)
@@ -3071,6 +3088,10 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "the worker result has no patch yet",
                 "Wait for the worker to finish and collect a result with a patch.",
             )
+        try:
+            verify_local.check_patch_subversion(patch)
+        except verify_local.VerifyError as exc:
+            raise _as_cli_error(exc) from exc
 
         # ACDD: a contract in the lease makes approved tests read-only and
         # requires a valid RED before anything is applied. None = legacy.

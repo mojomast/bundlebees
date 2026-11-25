@@ -13,9 +13,8 @@ metadata:
 
 # bundlebees operator
 
-Skill id: `bundlebees:bundlebees-operator`. The plugin also registers the bare
-name `bundlebees-operator`; always refer to the qualified id in a session,
-never a `plugin:` prefix.
+Skill id: `bundlebees:bundlebees-operator` (also registered bare); use the
+qualified id in a session, never a `plugin:` prefix.
 
 ## When to Use
 
@@ -48,8 +47,8 @@ client against the launcher.
 | `bundlebees_host_prompt` | `os` (`linux`/`macos`/`windows`), `reach` (`same-machine`/`lan`/`vpn`/`ssh`), `provider`, `repos`, `max_concurrent` (1-10), optional `branch_rules` | Fill the host setup template. No addresses or secrets in or out. |
 | `bundlebees_route_preview` | optional `kind`, `model`, `tier`, `brief` | Preview the model route a dispatch would take; starts no attempt. |
 
-Default model: `deepseek-v4.1-flash`; pass another only when the user asks and
-the launcher allows it.
+Default model: `deepseek-v4.1-flash`. Complex slices get `k3.1-pro` from
+`python -m bundlebees_plugin.model_route <brief>`; others only on request.
 
 User-typed CLI (never a model tool):
 
@@ -64,7 +63,7 @@ Helper files:
 
 - `${HERMES_SKILL_DIR}/references/kanban.md` - Hermes board only.
 - `${HERMES_SKILL_DIR}/references/briefs-and-leases.md` - brief fields, leases, budgets.
-- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - exact commands the user types, including ACDD.
+- `${HERMES_SKILL_DIR}/references/verify-and-deploy.md` - step 7: exact user commands incl. ACDD.
 - `${HERMES_SKILL_DIR}/references/security.md` - secrets, hosts, untrusted text.
 - `${HERMES_SKILL_DIR}/templates/host-setup-prompt.md` - template used by `bundlebees_host_prompt`.
 
@@ -127,9 +126,9 @@ Helper files:
   `sandbox_unavailable`, `integration_required`, `unsupported_*` - see the
   code table in `references/verify-and-deploy.md`. Never edit lease files,
   hand-edit a patch, or suggest the unsafe local sandbox flag.
-- `lease_overlap` - the live-attempt check found shared `assigned_files` on the
-  same project and branch. Wait, or split the lease differently. The check is
-  best-effort.
+- `lease_overlap` - live attempts share `assigned_files` on this project and
+  branch. The check fails closed: unreadable attempts refuse dispatch.
+  Wait, or split the lease.
 - `model_not_allowed` - use `deepseek-v4.1-flash` or another allow-listed id.
 - `launcher_unavailable` - the configured adapter is down or unreachable.
   Report configured state and ask the user to check the host.
@@ -167,8 +166,8 @@ A dispatch is not success until all of these hold:
 6. The push target is the feature branch. If the user asks for `--dry-run`,
    no push happens. If anything is red, do not advance the card to review.
 
-The model never runs verify or deploy, a real SSH deploy, or a launcher
-restart, and never accepts a review without the user's explicit decision.
+The model never runs verify, deploy, or a launcher restart, and never
+accepts a review without the user's explicit decision.
 
 ## Hard Rules
 

@@ -8,7 +8,7 @@ process that is started, recorded and signalled exactly like the real driver.
 Safety belt
 -----------
 It refuses to run unless ``<state>/trial-rehearsal.marker`` exists, which only
-:func:`bundlebees_plugin.trial_harness.build_rehearsal_state` writes. It never
+:func:`contrib.trial.trial_harness.build_rehearsal_state` writes. It never
 contacts a launcher, never dispatches to a worker, never runs git and never
 touches a repository. Its "verification" and "integration" are simulated by
 writing the same durable record shapes the real modules write, so the harness's
@@ -39,11 +39,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import campaign as campaign_mod
-from . import job as jobs
-from . import queue as queue_mod
-from . import reconcile as reconcile_mod
-from . import revision
+from bundlebees_plugin import campaign as campaign_mod
+from bundlebees_plugin import job as jobs
+from bundlebees_plugin import queue as queue_mod
+from bundlebees_plugin import reconcile as reconcile_mod
+from bundlebees_plugin import revision
 
 MARKER = "trial-rehearsal.marker"
 SHA = "b" * 40
