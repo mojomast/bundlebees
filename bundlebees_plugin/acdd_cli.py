@@ -127,10 +127,10 @@ def _result(evidence: Mapping[str, Any]) -> dict[str, Any]:
     try:
         return {
             "exit_code": evidence.get("exit_code"),
-            "tests": verify_local._junit_counter(junit.get("tests") or len(cases), "tests"),
-            "failures": verify_local._junit_counter(junit.get("failures") or 0, "failures"),
-            "errors": verify_local._junit_counter(junit.get("errors") or 0, "errors"),
-            "skipped": verify_local._junit_counter(junit.get("skipped") or 0, "skipped"),
+            "tests": verify_local._junit_counter_or_default(junit, "tests", len(cases)),
+            "failures": verify_local._junit_counter_or_default(junit, "failures", 0),
+            "errors": verify_local._junit_counter_or_default(junit, "errors", 0),
+            "skipped": verify_local._junit_counter_or_default(junit, "skipped", 0),
             "timed_out": bool(evidence.get("timed_out")),
             "cases": cases,
         }
