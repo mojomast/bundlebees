@@ -42,6 +42,7 @@ from .security import contain_path, scrub
 
 EVIDENCE_VERSION = "tdd-evidence/1"
 COLLECTION_VERSION = "test-collection/1"
+STATIC_COLLECTION = "static"
 ATTESTATION_KINDS = ("coordinator_recorded_review", "human_authorization")
 
 CLASSIFICATIONS: tuple[str, ...] = (
@@ -1025,10 +1026,10 @@ def _frozen_collection_ids(
     return list(ids)
 
 
-def frozen_approved_ids(
+def frozen_approved_selection(
     state_dir: os.PathLike[str] | str, preflight: Any
-) -> list[str] | None:
-    """Load and validate the test ids selected by a frozen collection pin."""
+) -> tuple[list[str], list[str]] | None:
+    """Load the frozen ids and the subset collected statically by file."""
     found = _collection_pin(preflight)
     if found is None:
         return None
@@ -1037,13 +1038,29 @@ def frozen_approved_ids(
         if not isinstance(pin, Mapping):
             raise TddError("evidence_tampered", "frozen test-collection pin is invalid")
         manifest = _frozen_manifest(state_dir, contract, preflight)
-        return _frozen_collection_ids(contract, pin, manifest)
+        ids = _frozen_collection_ids(contract, pin, manifest)
+        methods = manifest.get("methods")
+        static_ids = [
+            test_id
+            for test_id in ids
+            if isinstance(methods, Mapping)
+            and methods.get(test_id.split("::", 1)[0]) == STATIC_COLLECTION
+        ]
+        return ids, static_ids
     except TddError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
         raise TddError(
             "evidence_tampered", "frozen test-collection evidence is invalid"
         ) from exc
+
+
+def frozen_approved_ids(
+    state_dir: os.PathLike[str] | str, preflight: Any
+) -> list[str] | None:
+    """Load and validate the test ids selected by a frozen collection pin."""
+    selection = frozen_approved_selection(state_dir, preflight)
+    return None if selection is None else selection[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1158,19 +1175,40 @@ def _id_mismatch_problems(
     observed: Mapping[str, int],
     unexecuted: set[str],
     malformed: bool,
+    static_ids: Sequence[str] = (),
 ) -> list[str]:
     """Describe every way the observed ids diverge from the approved ones."""
     approved_set = set(approved_counts)
     observed_set = set(observed)
-    missing = sorted(approved_set - observed_set)
-    extra = sorted(observed_set - approved_set)
+    static_counts, static_malformed = _approved_id_counts(static_ids)
+    static_set = set(static_counts) & approved_set
+    static_matches = {
+        test_id: resolve_test_ref(test_id, observed) for test_id in static_set
+    }
+    covered_observed = {
+        observed_id
+        for matches_for_id in static_matches.values()
+        for observed_id in matches_for_id
+    }
+    missing = sorted(
+        test_id
+        for test_id in approved_set
+        if test_id not in observed_set and not static_matches.get(test_id)
+    )
+    extra = sorted(observed_set - approved_set - covered_observed)
     duplicates = sorted(test_id for test_id, count in observed.items() if count != 1)
     duplicate_approved = sorted(test_id for test_id, count in approved_counts.items() if count != 1)
+    duplicate_static = sorted(test_id for test_id, count in static_counts.items() if count != 1)
+    unknown_static = sorted(set(static_counts) - approved_set)
     problems: list[str] = []
     if not approved_ids:
         problems.append("the approved test-id list is empty")
     if duplicate_approved:
         problems.append("duplicate approved ids: " + ", ".join(duplicate_approved[:20]))
+    if unknown_static:
+        problems.append("unknown static ids: " + ", ".join(unknown_static[:20]))
+    if duplicate_static:
+        problems.append("duplicate static ids: " + ", ".join(duplicate_static[:20]))
     if missing:
         problems.append("missing ids: " + ", ".join(missing[:20]))
     if extra:
@@ -1179,7 +1217,7 @@ def _id_mismatch_problems(
         problems.append("duplicate run ids: " + ", ".join(duplicates[:20]))
     if unexecuted:
         problems.append("cases were not passed call-stage executions: " + ", ".join(sorted(unexecuted)[:20]))
-    if malformed:
+    if malformed or static_malformed:
         problems.append("malformed cases without a string id")
     return problems
 
@@ -1187,9 +1225,12 @@ def _id_mismatch_problems(
 def check_collected_ids(
     approved: Sequence[str],
     cases: Iterable[Mapping[str, Any]],
+    *,
+    static_ids: Sequence[str] | None = None,
 ) -> None:
-    """Require exactly one executed case for every frozen collected-test id."""
+    """Require an executed case for every frozen id, expanding only static ids."""
     approved_ids = list(approved)
+    static_id_list = list(static_ids or [])
     approved_counts, approved_malformed = _approved_id_counts(approved_ids)
     observed, unexecuted, cases_malformed = _observed_id_counts(cases)
     problems = _id_mismatch_problems(
@@ -1198,6 +1239,7 @@ def check_collected_ids(
         observed,
         unexecuted,
         approved_malformed or cases_malformed,
+        static_id_list,
     )
     if problems:
         raise TddError(
@@ -1244,6 +1286,7 @@ def check_green(
     green: Mapping[str, Any],
     *,
     approved_ids: Sequence[str] | None = None,
+    static_ids: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     """Raise a named failure unless GREEN follows valid RED with identical tests."""
     _check_identity(contract, contract_sha256, green, "GREEN")
@@ -1258,7 +1301,11 @@ def check_green(
             "Make the implementation pass the approved tests without changing them.",
         )
     if approved_ids is not None:
-        check_collected_ids(approved_ids, (green.get("result") or {}).get("cases") or [])
+        check_collected_ids(
+            approved_ids,
+            (green.get("result") or {}).get("cases") or [],
+            static_ids=static_ids,
+        )
     return green
 
 
