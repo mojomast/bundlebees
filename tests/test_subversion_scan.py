@@ -338,3 +338,46 @@ def test_refusal_message_lists_findings_and_counts_them():
     assert "conftest@tests/conftest.py:1" in message
     assert message.count("@") == 5
     assert "+2 more" in message
+
+
+# --- PR #288 review minor 1: an INI comment is not a plugin option -------
+
+
+@pytest.mark.parametrize(
+    "path,lines",
+    [
+        ("setup.cfg", ["addopts =", "    -q", "    # prefer -p", "    -x"]),
+        ("pytest.ini", ["addopts =", "    ; prefer -p", "    -q"]),
+        ("tox.ini", ["addopts =", "    -q", "    # prefer -p"]),
+    ],
+    ids=["setup.cfg-hash", "pytest.ini-semicolon", "tox.ini-hash"],
+)
+def test_ini_comment_in_addopts_is_not_a_plugin_finding(path, lines):
+    assert "pytest_plugin" not in _kinds(_edit(path, lines))
+
+
+def test_ini_comment_mentioning_the_long_option_is_not_a_finding():
+    assert "pytest_plugin" not in _kinds(
+        _edit("tox.ini", ["addopts =", "    # prefer --plugin", "    -q"])
+    )
+
+
+def test_toml_hash_in_quoted_addopts_is_still_a_plugin_finding():
+    assert "pytest_plugin" in _kinds(
+        _edit("pyproject.toml", ['addopts = """', "-q", "# prefer -p", '"""'])
+    )
+
+
+# --- PR #288 review minor 3: --plugin at the end of an addopts line ------
+
+
+@pytest.mark.parametrize(
+    "path,lines",
+    [
+        ("pyproject.toml", ['addopts = """', "-q", "--plugin", "myplugin", '"""']),
+        ("setup.cfg", ["addopts =", "    -q", "    --plugin", "    myplugin"]),
+    ],
+    ids=["pyproject.toml-triple-quoted", "setup.cfg-indented"],
+)
+def test_plugin_long_option_at_end_of_line_is_a_finding(path, lines):
+    assert "pytest_plugin" in _kinds(_edit(path, lines))
