@@ -24,6 +24,28 @@ hermes bundlebees rails-import --source outbox --limit 100
 | `hermes` | The local `rails_hermes_db`, restricted to the explicit `rails_session_aliases` JSON mapping from enrolled IDs to public aliases. |
 | `launcher` | The existing `adapter: launcher`, configured `launcher_url`, `allow_private` policy and enrolled `rails_launcher_chain`. Configure `BUNDLEBEES_RAILS_READ_TOKEN` in the profile's existing Hermes secret store to match the worker's dedicated Rails read credential. No fallback to the launcher's administrative credential. |
 
+The `launcher` source's supported transport is a direct request to the peer's
+literal address. Plain `http` accepts only IPv4 loopback `127.0.0.0/8` and IPv6
+loopback `::1`. With `--allow-private` (or the equivalent `allow_private`
+setting), it also accepts exactly RFC 1918 `10.0.0.0/8`, `172.16.0.0/12` and
+`192.168.0.0/16`, plus RFC 6598 `100.64.0.0/10`. The request still carries the
+dedicated bearer token from `BUNDLEBEES_RAILS_READ_TOKEN`; `allow_private` never
+removes authentication. Every other plain-`http` peer is refused before the
+token is read or any network I/O occurs: TEST-NET-1/2/3 (`192.0.2.0/24`,
+`198.51.100.0/24`, `203.0.113.0/24`), benchmarking `198.18.0.0/15`, `240.0.0.0/4`,
+`0.0.0.0/8`, limited broadcast `255.255.255.255`, multicast, link-local, IPv6
+ULA, global/public IP literals and DNS hostnames. Use `https` for peers outside
+the plain-`http` set; the `https` transport arm is unchanged.
+
+The worker's Rails reader accepts exactly one `Host` header equal to the
+connection's own address and port and refuses any `Origin`; a direct literal
+request satisfies that without rewriting. The separately installed
+`rails_host_proxy.py` loopback forwarder
+(`rizzstack-rails-host-proxy.service`, `127.0.0.1:47923` to `127.0.0.1:47922`)
+rewrites `Host`. It is a temporary, unsupported workaround and is not part of
+the supported path; it is not needed for the direct literal transport and does
+not satisfy the peer's Host check.
+
 `has_more` means another page is available. Restart the same command with no cursor: local source pages commit their cursor, facts and checkpoint together; the remote source resumes at the ledger's committed origin sequence. A stale cursor or changed immutable prefix is an error, not permission to discard a checkpoint. Reads and doctor never perform an import. Do not put SQLite on a network share.
 
 ## Owner retry and crash recovery

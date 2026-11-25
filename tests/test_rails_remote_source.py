@@ -7,11 +7,13 @@ derived at run time; no literal digest or credential is stored here.
 """
 
 import hashlib
+import http.client
 import json
 import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from contextlib import closing
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -182,6 +184,140 @@ class RemoteSourceCase(unittest.TestCase):
 
 
 class EnrollmentTests(RemoteSourceCase):
+    def _launcher_transport(self, allow_private):
+        calls = []
+        value = "unit-" + "secret"
+
+        def token_provider():
+            calls.append("token")
+            return value
+
+        return remote.LauncherTransport(token_provider, 1024, allow_private), calls, value
+
+    def _assert_transport_reaches_pinned(self, url, allow_private):
+        transport, calls, value = self._launcher_transport(allow_private)
+        with patch.object(
+            remote.launcher_client,
+            "_pinned_request",
+            return_value=(200, {}, b"{}"),
+        ) as pinned:
+            response = transport.request(url)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(calls, ["token"])
+        pinned.assert_called_once()
+        request = pinned.call_args.args[0]
+        self.assertEqual(request.full_url, url)
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + value)
+        self.assertIs(pinned.call_args.kwargs["allow_private"], allow_private)
+
+    def _assert_plaintext_refused_before_io(self, url, allow_private):
+        transport, calls, _ = self._launcher_transport(allow_private)
+        with patch.object(
+            remote.launcher_client, "_pinned_request"
+        ) as pinned, self.assertRaises(remote.EnrollmentRefused):
+            transport.request(url)
+        self.assertEqual(calls, [])
+        pinned.assert_not_called()
+        hostname = urllib.parse.urlsplit(url).hostname
+        self.assertFalse(remote._plaintext_peer_allowed(hostname, allow_private))
+
+    def test_plain_http_cgnat_and_private_literals_allowed_only_with_allow_private(self):
+        port = 47821
+        path = "/v1/rails/events?after=0&limit=10"
+        private_urls = tuple(
+            "http://" + host + path
+            for host in (
+                "100.125.58.63:%d" % port,
+                "10.0.0.5:8080",
+                "172.16.2.3:8080",
+                "192.168.1.9:8080",
+            )
+        )
+        for url in private_urls + ("http://[::1]:%d%s" % (port, path),):
+            with self.subTest(url=url, allow_private=True):
+                self._assert_transport_reaches_pinned(url, True)
+        for url in private_urls:
+            with self.subTest(url=url, allow_private=False):
+                self._assert_plaintext_refused_before_io(url, False)
+        for url in (
+            "http://127.0.0.2:%d%s" % (port, path),
+            "http://[::1]:%d%s" % (port, path),
+            "https://10.0.0.5:8443" + path,
+        ):
+            with self.subTest(url=url, previous_outcome=True):
+                self._assert_transport_reaches_pinned(url, False)
+
+    def test_plain_http_public_literal_and_hostname_still_refuse(self):
+        path = "/v1/rails/events?after=0&limit=10"
+        for host in (
+            "203.0.113.9:8080",
+            "192.0.2.1:8080",
+            "198.51.100.1:8080",
+            "198.18.0.1:8080",
+            "240.0.0.1:8080",
+            "0.1.2.3:8080",
+            "255.255.255.255:8080",
+            "224.0.0.1:8080",
+            "169.254.169.254:8080",
+            "[fd00::1]:8080",
+            "[2606:4700::1111]:8080",
+            "8.8.8.8:8080",
+            "peer.example:8443",
+        ):
+            url = "http://" + host + path
+            with self.subTest(url=url, allow_private=True):
+                self._assert_plaintext_refused_before_io(url, True)
+
+    def test_transport_keeps_peer_host_header_without_shim(self):
+        observed = []
+
+        class Peer(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hosts = self.headers.get_all("Host") or []
+                expected = "%s:%d" % self.connection.getsockname()[:2]
+                origin = self.headers.get("Origin")
+                observed.append((hosts, origin))
+                ok = len(hosts) == 1 and hosts[0] == expected and origin is None
+                self.send_response(200 if ok else 403)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_):
+                pass
+
+        with HTTPServer(("127.0.0.1", 0), Peer) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                path = "/v1/rails/events?after=0&limit=1"
+                url = "http://127.0.0.1:%d%s" % (server.server_port, path)
+                transport = remote.LauncherTransport(lambda: "unit-secret", 1024, False)
+                self.assertEqual(transport.request(url).status, 200)
+                mismatched_port = (
+                    server.server_port + 1 if server.server_port < 65535 else server.server_port - 1
+                )
+                mismatched_host = "127.0.0.1:%d" % mismatched_port
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                try:
+                    connection.request("GET", path, headers={"Host": mismatched_host})
+                    reply = connection.getresponse()
+                    self.assertEqual(reply.status, 403)
+                    reply.read()
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertEqual(
+            observed,
+            [
+                (["127.0.0.1:%d" % server.server_port], None),
+                ([mismatched_host], None),
+            ],
+        )
+
     def test_real_pinned_read_sends_scoped_credential_without_exposing_it(self):
         import secrets
         secret = secrets.token_urlsafe(24)
