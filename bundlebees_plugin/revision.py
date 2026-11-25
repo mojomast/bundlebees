@@ -46,7 +46,7 @@ import re
 import secrets
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -875,6 +875,21 @@ def _message_names_attempt(message: str, attempt_id: str) -> bool:
     return re.search(pattern, message) is not None
 
 
+def _named_tests(value: Any) -> list[str] | None:
+    """A record's test targets as non-empty strings, or ``None`` when malformed."""
+    if not isinstance(value, list) or not value:
+        return None
+    named: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        text = item.strip()
+        if not text:
+            return None
+        named.append(text)
+    return named
+
+
 class _LandedVerifications:
     """Landed-commit verify records attributed to one attempt, lazily.
 
@@ -913,32 +928,32 @@ class _LandedVerifications:
         except OSError:
             return self._records
         for path in paths:
-            sha = path.stem[len(LANDED_VERIFY_PREFIX):].lower()
-            if _SHA40_RE.fullmatch(sha) is None:
-                continue
-            data = _read_json_object(path)
-            if data is None or data.get("schema") != LANDED_VERIFY_SCHEMA:
-                continue
-            body_sha = data.get("sha")
-            if not isinstance(body_sha, str) or body_sha.lower() != sha:
-                continue
-            tests = data.get("tests")
-            if not isinstance(tests, list) or not tests:
-                continue
-            named = [
-                str(item).strip()
-                for item in tests
-                if isinstance(item, str) and item.strip()
-            ]
-            if len(named) != len(tests):
-                continue
-            self._records[sha] = {
-                "sha": sha,
-                "ok": data.get("ok") is True,
-                "tests": named,
-                "record": f"verify-results/{LANDED_VERIFY_PREFIX}{sha}.json",
-            }
+            record = self._load_one(path)
+            if record is not None:
+                self._records[record["sha"]] = record
         return self._records
+
+    @staticmethod
+    def _load_one(path: Path) -> dict[str, Any] | None:
+        """One schema-valid landed record, or ``None`` when it cannot be used."""
+        sha = path.stem[len(LANDED_VERIFY_PREFIX):].lower()
+        if _SHA40_RE.fullmatch(sha) is None:
+            return None
+        data = _read_json_object(path)
+        if data is None or data.get("schema") != LANDED_VERIFY_SCHEMA:
+            return None
+        body_sha = data.get("sha")
+        if not isinstance(body_sha, str) or body_sha.lower() != sha:
+            return None
+        named = _named_tests(data.get("tests"))
+        if named is None:
+            return None
+        return {
+            "sha": sha,
+            "ok": data.get("ok") is True,
+            "tests": named,
+            "record": f"verify-results/{LANDED_VERIFY_PREFIX}{sha}.json",
+        }
 
     def _message(self, sha: str) -> str | None:
         if sha in self._messages:
@@ -960,41 +975,55 @@ class _LandedVerifications:
         self._ancestors[sha] = proc.returncode == 0
         return self._ancestors[sha]
 
+    def _mentions(self, sha: str, attempt_id: str) -> bool:
+        message = self._message(sha)
+        if message is None or not _message_names_attempt(message, attempt_id):
+            return False
+        return True
+
     def for_attempt(self, attempt_id: str) -> tuple[dict[str, Any] | None, str | None]:
         """The landed-tests proof for this attempt, or the most precise refusal."""
-        proof: dict[str, Any] | None = None
-        failed: str | None = None
+        accepted: list[dict[str, Any]] = []
+        failed: list[str] = []
         elsewhere: list[str] = []
         for sha, record in sorted(self._load().items()):
-            message = self._message(sha)
-            if message is None or not _message_names_attempt(message, attempt_id):
+            if not self._mentions(sha, attempt_id):
                 continue
             if not self._in_head(sha):
                 elsewhere.append(sha)
-                continue
-            if record["ok"]:
-                if proof is None:
-                    proof = {
+            elif record["ok"]:
+                accepted.append(
+                    {
                         "landed_sha": sha,
                         "tests": list(record["tests"]),
                         "record": record["record"],
                         "method": LANDED_VERIFY_METHOD,
                     }
-            elif failed is None:
-                failed = (
+                )
+            else:
+                failed.append(
                     f"{PROBLEM_LANDED_FAILED}: the landed verify record for {sha} ran the "
                     "named tests at that commit and did not pass"
                 )
-        if proof is not None:
-            return proof, None
-        if failed is not None:
-            return None, failed
-        if elsewhere:
-            return None, (
-                f"{PROBLEM_LANDED_NOT_IN_HEAD}: a landed verify record exists for "
-                f"{sorted(elsewhere)[0]}, but that commit is not in HEAD's history"
-            )
-        return None, None
+        return _landed_verdict(accepted, failed, elsewhere)
+
+
+def _landed_verdict(
+    accepted: Sequence[Mapping[str, Any]],
+    failed: Sequence[str],
+    elsewhere: Sequence[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """An accepted proof wins, then a failed run, then a commit outside HEAD."""
+    if accepted:
+        return dict(accepted[0]), None
+    if failed:
+        return None, str(failed[0])
+    if elsewhere:
+        return None, (
+            f"{PROBLEM_LANDED_NOT_IN_HEAD}: a landed verify record exists for "
+            f"{sorted(elsewhere)[0]}, but that commit is not in HEAD's history"
+        )
+    return None, None
 
 
 def _verified_sha(state_dir: Path, attempt_id: str) -> tuple[str | None, str | None]:
@@ -1042,6 +1071,26 @@ def _foreign_repository_problem(
     )
 
 
+def _landed_candidate(
+    verify: _LandedVerifications | None, attempt_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The landed proof/refusal for one attempt (none without that evidence class)."""
+    if verify is None:
+        return None, None
+    return verify.for_attempt(attempt_id)
+
+
+def _landed_or(
+    proof: dict[str, Any] | None,
+    problem: str | None,
+    fallback: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The landed proof when present, else the landed problem, else *fallback*."""
+    if proof is not None:
+        return None, proof
+    return problem or fallback, None
+
+
 def _attempt_evidence(
     state_dir: Path,
     attempt_id: str,
@@ -1080,16 +1129,13 @@ def _attempt_evidence(
         return None, None
 
     # The landed evidence class: the landing commit's exact tree was tested.
-    landed_proof: dict[str, Any] | None = None
-    landed_problem: str | None = None
-    if landed_verify is not None:
-        landed_proof, landed_problem = landed_verify.for_attempt(attempt_id)
+    landed_proof, landed_problem = _landed_candidate(landed_verify, attempt_id)
 
     present = run_git(["cat-file", "-e", f"{sha}^{{commit}}"], workdir, check=False)
     if present.returncode != 0:
-        if landed_proof is not None:
-            return None, landed_proof
-        return landed_problem or "verified sha is not an ancestor of HEAD", None
+        return _landed_or(
+            landed_proof, landed_problem, "verified sha is not an ancestor of HEAD"
+        )
 
     target = head.strip() if isinstance(head, str) else ""
     if _SHA40_RE.fullmatch(target) is None:
@@ -1112,9 +1158,7 @@ def _attempt_evidence(
             "verified_blobs": dict(blobs or {}),
             "method": REPLAY_METHOD_BLOB_EQUALITY,
         }
-    if landed_proof is not None:
-        return None, landed_proof
-    return landed_problem or problem, None
+    return _landed_or(landed_proof, landed_problem, problem)
 
 
 def _junit_regressions(junit: Any) -> int:
@@ -1226,14 +1270,12 @@ def _clean_replay(
 
 def _clean_landed_tests(value: Any) -> list[str] | None:
     """The landed record's test targets as storable audit text, or ``None``."""
-    if not isinstance(value, list) or not value or len(value) > 50:
+    named = _named_tests(value)
+    if named is None or len(named) > 50:
         return None
     clean: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            return None
-        text = item.strip()
-        if not text or len(text) > 300:
+    for text in named:
+        if len(text) > 300:
             return None
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
             return None
@@ -1266,6 +1308,14 @@ def _clean_landed(
             "method": LANDED_VERIFY_METHOD,
         }
     return clean
+
+
+def _landed_section(
+    landed: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """The optional landed-evidence section; empty when there is no proof."""
+    clean = _clean_landed(landed)
+    return {"landed_evidence": clean} if clean else {}
 
 
 def _clean_record(
@@ -1309,9 +1359,7 @@ def _clean_record(
         clean["replay_evidence"] = clean_replay
     # Landed-tests proof is a separate evidence class: the landing commit's own
     # tree was tested and passed, which says nothing about content equality.
-    clean_landed = _clean_landed(landed)
-    if clean_landed:
-        clean["landed_evidence"] = clean_landed
+    clean.update(_landed_section(landed))
     return clean
 
 

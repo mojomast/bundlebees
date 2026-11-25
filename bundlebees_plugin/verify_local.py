@@ -1660,32 +1660,22 @@ def _landed_evidence(
     }
 
 
-def verify_landed(
-    state_dir: Path,
-    workdir: Path,
-    sha: str,
-    tests: Sequence[str],
-    *,
-    runner: TestRunner | None = None,
-    backend: str = "auto",
-    allow_unsafe_local: bool = False,
-    allow_weak: bool = False,
-    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
-    now: str | None = None,
-) -> dict[str, Any]:
-    """Run *tests* on the exact tree of one landed commit; never commit or push.
 
-    The caller's checkout is a clean worktree whose ``HEAD`` must already
-    contain *sha*. Verification happens in a disposable detached worktree at
-    *sha* (so the checked-out revision is never moved) and through the same
-    sandbox policy as ``verify``. The result is written once as
-    ``verify-results/landed-<sha>.json`` with schema
-    :data:`LANDED_RECORD_SCHEMA`; a failing run is recorded with ``ok: false``
-    rather than raised, so integration can tell "refused before the run" from
-    "the landed tree failed".
-    """
+def _repository_root_ok(repo: Path) -> bool | None:
+    """True at the repository root, False in a subdirectory, None when not a repo."""
+    proc = _run(["git", "rev-parse", "--show-toplevel"], repo, timeout=120)
+    if proc.returncode != 0:
+        return None
+    try:
+        root = Path(str(proc.stdout or "").strip()).resolve()
+        resolved = repo.resolve()
+    except OSError:
+        return None
+    return root == resolved
 
-    repo = Path(workdir).expanduser()
+
+def _landed_target(sha: Any, tests: Sequence[str]) -> tuple[str, list[str]]:
+    """The validated commit id and the named test targets for a landed run."""
     value = sha.strip() if isinstance(sha, str) else ""
     if _LANDED_SHA_RE.fullmatch(value) is None:
         raise VerifyError(
@@ -1693,8 +1683,6 @@ def verify_landed(
             "the landed sha is not a full 40-hex commit id",
             "Pass the merge/landing commit id exactly as git reports it.",
         )
-    target = value.lower()
-
     named: list[str] = []
     for item in tests or []:
         text = str(item).strip()
@@ -1706,20 +1694,19 @@ def verify_landed(
             "verify-landed needs at least one test target",
             "Pass --tests with the targets the attempt was verified against.",
         )
+    return value.lower(), named
 
-    toplevel = _run(["git", "rev-parse", "--show-toplevel"], repo, timeout=120)
-    if toplevel.returncode != 0:
+
+def _landed_checkout(repo: Path, target: str) -> None:
+    """Refuse anything but a clean repository root whose HEAD contains *target*."""
+    root_ok = _repository_root_ok(repo)
+    if root_ok is None:
         raise VerifyError(
             "not_a_repository",
             "the workdir is not a git worktree",
             "Pass --workdir <clean checkout>.",
         )
-    try:
-        root = Path(str(toplevel.stdout or "").strip()).resolve()
-        resolved = repo.resolve()
-    except OSError:
-        root = resolved = None
-    if root is None or resolved is None or root != resolved:
+    if not root_ok:
         raise VerifyError(
             "workdir_not_root",
             "the workdir is not the repository root",
@@ -1754,8 +1741,20 @@ def verify_landed(
             "Check out the branch that contains the landing commit.",
         )
 
-    head_before = _rev(repo, "HEAD")
-    argv = sandbox.pytest_argv(named)
+
+def _landed_tree_evidence(
+    repo: Path,
+    target: str,
+    named: Sequence[str],
+    *,
+    runner: TestRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run the tests in one disposable detached worktree at *target*."""
+    argv = sandbox.pytest_argv(list(named))
     with tempfile.TemporaryDirectory(prefix="bundlebees-landed-") as scratch:
         tree = Path(scratch) / "tree"
         try:
@@ -1781,7 +1780,7 @@ def verify_landed(
                     f"the landed worktree is not at {target}",
                     "Inspect the repository's worktree state and retry.",
                 )
-            evidence = _landed_evidence(
+            return _landed_evidence(
                 tree,
                 argv,
                 runner=runner,
@@ -1794,23 +1793,28 @@ def verify_landed(
             _run(["git", "worktree", "remove", "--force", str(tree)], repo)
             _run(["git", "worktree", "prune"], repo)
 
-    if _rev(repo, "HEAD") != head_before:
-        raise VerifyError(
-            "head_moved",
-            "the checkout's HEAD moved while the landed tree was verified",
-            "Restore the checkout to its original revision; the record was not written.",
-        )
 
+def _landed_record(
+    target: str,
+    named: Sequence[str],
+    evidence: Mapping[str, Any],
+    *,
+    runner: TestRunner | None,
+    backend: str,
+    timeout: int,
+    now: str | None,
+) -> dict[str, Any]:
+    """The exact record a landed run writes: the seven schema fields only."""
     exit_code = int(evidence["exit_code"])
     timed_out = bool(evidence["timed_out"])
     try:
         duration = float(evidence.get("duration_s") or 0.0)
     except (TypeError, ValueError):
         duration = 0.0
-    record = {
+    return {
         "schema": LANDED_RECORD_SCHEMA,
         "sha": target,
-        "tests": named,
+        "tests": list(named),
         "ok": bool(exit_code == 0 and not timed_out),
         "counts": _landed_counts(evidence.get("junit"), len(named)),
         "sandbox": {
@@ -1826,5 +1830,62 @@ def verify_landed(
         },
         "created_at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def verify_landed(
+    state_dir: Path,
+    workdir: Path,
+    sha: str,
+    tests: Sequence[str],
+    *,
+    runner: TestRunner | None = None,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Run *tests* on the exact tree of one landed commit; never commit or push.
+
+    The caller's checkout is a clean worktree whose ``HEAD`` must already
+    contain *sha*. Verification happens in a disposable detached worktree at
+    *sha* (so the checked-out revision is never moved) and through the same
+    sandbox policy as ``verify``. The result is written once as
+    ``verify-results/landed-<sha>.json`` with schema
+    :data:`LANDED_RECORD_SCHEMA`; a failing run is recorded with ``ok: false``
+    rather than raised, so integration can tell "refused before the run" from
+    "the landed tree failed".
+    """
+
+    repo = Path(workdir).expanduser()
+    target, named = _landed_target(sha, tests)
+    _landed_checkout(repo, target)
+    head_before = _rev(repo, "HEAD")
+    evidence = _landed_tree_evidence(
+        repo,
+        target,
+        named,
+        runner=runner,
+        backend=backend,
+        allow_unsafe_local=allow_unsafe_local,
+        allow_weak=allow_weak,
+        timeout=timeout,
+    )
+    if _rev(repo, "HEAD") != head_before:
+        raise VerifyError(
+            "head_moved",
+            "the checkout's HEAD moved while the landed tree was verified",
+            "Restore the checkout to its original revision; the record was not written.",
+        )
+
+    record = _landed_record(
+        target,
+        named,
+        evidence,
+        runner=runner,
+        backend=backend,
+        timeout=timeout,
+        now=now,
+    )
     _write_landed_record(state_dir, target, record)
     return record

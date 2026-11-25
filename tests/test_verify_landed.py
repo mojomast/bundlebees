@@ -179,22 +179,8 @@ def test_verify_landed_refuses_a_dirty_worktree(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_verify_landed_writes_the_record_for_the_landed_tree(tmp_path: Path):
-    repo, _verified, landed = _repo_with_drifted_landing(tmp_path)
-    state = _state(tmp_path)
-    head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    calls: list[tuple[Path, list[str], str]] = []
-    tests = ["tests/test_sample.py", "tests/test_other.py"]
-
-    record = verify_local.verify_landed(
-        state,
-        repo,
-        landed.upper(),
-        tests,
-        runner=_runner(calls=calls),
-        now="2026-11-24T12:00:00Z",
-    )
-
+def _assert_landed_record(record, path, state, landed, tests) -> None:
+    """The record must be exactly the schema, on disk, and readable back."""
     assert set(record) == {"schema", "sha", "tests", "ok", "counts", "sandbox", "created_at"}
     assert record == {
         "schema": "rizzstack.verify-landed/1",
@@ -219,13 +205,13 @@ def test_verify_landed_writes_the_record_for_the_landed_tree(tmp_path: Path):
         },
         "created_at": "2026-11-24T12:00:00Z",
     }
-    path = state / "verify-results" / f"landed-{landed}.json"
     assert json.loads(path.read_text(encoding="utf-8")) == record
     assert verify_local.read_landed_record(state, landed.upper()) == record
     assert path.stat().st_mode & 0o777 == 0o600
 
-    # The run happened once, in a disposable worktree detached at the landed sha,
-    # not in the caller's checkout.
+
+def _assert_landed_worktree(calls, repo, landed, tests) -> None:
+    """The run happened once, at the landed sha, in a now-removed worktree."""
     assert len(calls) == 1
     worktree, argv, revision_seen = calls[0]
     assert revision_seen == landed
@@ -233,6 +219,27 @@ def test_verify_landed_writes_the_record_for_the_landed_tree(tmp_path: Path):
     assert all(target in argv for target in tests)
     assert argv[1:5] == ["-B", "-m", "pytest", "-p"]
     assert str(worktree) not in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_verify_landed_writes_the_record_for_the_landed_tree(tmp_path: Path):
+    repo, _verified, landed = _repo_with_drifted_landing(tmp_path)
+    state = _state(tmp_path)
+    head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    calls: list[tuple[Path, list[str], str]] = []
+    tests = ["tests/test_sample.py", "tests/test_other.py"]
+
+    record = verify_local.verify_landed(
+        state,
+        repo,
+        landed.upper(),
+        tests,
+        runner=_runner(calls=calls),
+        now="2026-11-24T12:00:00Z",
+    )
+
+    path = state / "verify-results" / f"landed-{landed}.json"
+    _assert_landed_record(record, path, state, landed, tests)
+    _assert_landed_worktree(calls, repo, landed, tests)
 
     # The checkout's revision and contents were never modified.
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head_before
