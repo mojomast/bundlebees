@@ -17,12 +17,14 @@ stored, or printed, and every error text is passed through
 :func:`bundlebees_plugin.security.scrub`.
 
 A wave is accepted only when every listed attempt has an ``ok`` verify result
-whose 40-hex sha descends from ``HEAD`` — or, when a merge queue landed the
-change as a different commit, whose change is exactly patch-identical
-(``git patch-id --stable``) to a commit ``HEAD`` carries — *and* a
-caller-supplied full test suite returns a non-timeout exit code of zero. An
-accepted wave record is final: later attempts to overwrite it raise
-``RevisionError("wave_already_accepted")``.
+whose 40-hex sha descends from ``HEAD`` — or, when a squash or replay landing
+put the change on ``HEAD`` as a different commit, every path the verified
+change touches resolves to exactly the same object at ``HEAD`` (per-file blob
+equality, so a landing that also carries other files still proves the files it
+shares) — or the change is exactly patch-identical (``git patch-id --stable``)
+to a commit ``HEAD`` carries — *and* a caller-supplied full test suite returns
+a non-timeout exit code of zero. An accepted wave record is final: later
+attempts to overwrite it raise ``RevisionError("wave_already_accepted")``.
 Records are published through a fsynced temporary file and a create-only link,
 so an accepted record is written once and never replaced, and a record that
 exists but cannot be read raises ``wave_unreadable``/``wave_malformed`` — it is
@@ -58,15 +60,28 @@ WAVE_MALFORMED = "wave_malformed"
 
 #: Distinct problem codes for the refusals that are not about missing
 #: evidence. ``verified_change_not_landed`` says the verified commit exists in
-#: this checkout but no commit HEAD carries introduces the identical change;
-#: ``attempt_repo_foreign`` says the attempt belongs to another repository, so
-#: an ancestry message about this worktree would be misleading.
+#: this checkout but HEAD does not carry its exact content, naming the first
+#: path that differs or is missing; ``attempt_repo_foreign`` says the attempt
+#: belongs to another repository, so an ancestry message about this worktree
+#: would be misleading.
 PROBLEM_CHANGE_NOT_LANDED = "verified_change_not_landed"
 PROBLEM_FOREIGN_REPO = "attempt_repo_foreign"
+
+#: How a non-ancestor landing was proven. ``blob-equality`` is the general
+#: rule: every path the verified change touches has the same object at HEAD.
+#: ``patch-id`` is only an extra acceptance path for a landing that is exactly
+#: the verified change and nothing else.
+REPLAY_METHOD_BLOB_EQUALITY = "blob-equality"
+REPLAY_METHOD_PATCH_ID = "patch-id"
 
 #: How far back HEAD's own history is scanned for a patch-identical landing.
 #: Ancestry is still the fast path; this bound keeps a refusal cheap.
 LANDED_EVIDENCE_SCAN_LIMIT = 200
+
+#: Upper bound on the paths a single blob-equality proof will record. A bee
+#: slice is file-leased and small; a change above this is refused rather than
+#: silently truncated, because the record must name every proven file.
+REPLAY_EVIDENCE_PATH_LIMIT = 512
 
 
 _WAVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -665,6 +680,104 @@ def _commit_patch_id(run_git: RunGit, workdir: Path, rev: str) -> str | None:
     return None
 
 
+def _changed_paths(run_git: RunGit, workdir: Path, sha: str) -> list[str] | None:
+    """The paths one commit changes against its first parent, sorted.
+
+    ``--no-renames`` keeps the set deterministic: a rename is a deleted path
+    plus an added path, and the deleted side must be reported as missing at
+    HEAD instead of being silently followed. A root commit has no parent, so
+    its whole tree is its change. ``-z`` keeps unusual names intact.
+    """
+    parent = run_git(["rev-parse", "--verify", "--quiet", f"{sha}^"], workdir, check=False)
+    if parent.returncode == 0:
+        proc = run_git(
+            ["diff", "--name-only", "--no-renames", "-z", f"{sha}^", sha],
+            workdir,
+            check=False,
+        )
+    else:
+        proc = run_git(["ls-tree", "-r", "--name-only", "-z", sha], workdir, check=False)
+    if proc.returncode != 0:
+        return None
+    return sorted({path for path in str(proc.stdout or "").split("\x00") if path})
+
+
+def _blob_at(run_git: RunGit, workdir: Path, rev: str, path: str) -> str | None:
+    """The object ``rev:path`` resolves to, or ``None`` when it is absent.
+
+    ``rev-parse`` looks the name up literally, so a file whose name looks like
+    a glob can never match some other path. A submodule entry resolves to its
+    commit and is compared the same way as a blob: the pointer must match.
+    """
+    proc = run_git(
+        ["rev-parse", "--verify", "--quiet", f"{rev}:{path}"],
+        workdir,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    lines = [line for line in str(proc.stdout or "").splitlines() if line]
+    if len(lines) != 1 or _SHA40_RE.fullmatch(lines[0]) is None:
+        return None
+    return lines[0].lower()
+
+
+def _blob_equality_proof(
+    run_git: RunGit,
+    workdir: Path,
+    sha: str,
+    head: str,
+) -> tuple[dict[str, str] | None, str | None]:
+    """Prove every path the verified change touches is byte-identical at HEAD.
+
+    Exactness is the point: object ids are compared, so a landing that carries
+    extra commits (a squash bundling the RED test commit, say) still passes
+    while one byte of difference in a shared file fails. The first failing path
+    in sorted order is named, and a path HEAD does not have is reported as
+    missing instead of raising.
+    """
+    paths = _changed_paths(run_git, workdir, sha)
+    if paths is None:
+        return None, (
+            f"{PROBLEM_CHANGE_NOT_LANDED}: the verified commit exists, but its change "
+            "cannot be read from this object store"
+        )
+    if not paths:
+        return None, (
+            f"{PROBLEM_CHANGE_NOT_LANDED}: the verified commit changes no paths, so it "
+            "proves nothing about HEAD"
+        )
+    if len(paths) > REPLAY_EVIDENCE_PATH_LIMIT:
+        return None, (
+            f"{PROBLEM_CHANGE_NOT_LANDED}: the verified commit touches {len(paths)} paths, "
+            f"above the {REPLAY_EVIDENCE_PATH_LIMIT}-path evidence limit"
+        )
+
+    verified: dict[str, str] = {}
+    for path in paths:
+        blob = _blob_at(run_git, workdir, sha, path)
+        if blob is None:
+            return None, (
+                f"{PROBLEM_CHANGE_NOT_LANDED}: path {path} has no object at the verified "
+                "commit"
+            )
+        verified[path] = blob
+
+    for path in paths:
+        landed = _blob_at(run_git, workdir, head, path)
+        if landed is None:
+            return None, (
+                f"{PROBLEM_CHANGE_NOT_LANDED}: path {path} is missing at HEAD, so the "
+                "verified change is not landed intact"
+            )
+        if landed != verified[path]:
+            return None, (
+                f"{PROBLEM_CHANGE_NOT_LANDED}: path {path} differs at HEAD "
+                f"(verified blob {verified[path]}, HEAD blob {landed})"
+            )
+    return verified, None
+
+
 class _LandedChanges:
     """Bounded, lazy patch-id index of the changes HEAD already carries.
 
@@ -773,14 +886,18 @@ def _attempt_evidence(
     *,
     workdir_repository: str | None = None,
     landed: _LandedChanges | None = None,
-) -> tuple[str | None, dict[str, str] | None]:
+    head: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
     """One attempt's refusal, plus the replay proof when equivalence passed.
 
     Order matters. A repository check refuses a cross-repo attempt by name
     before any ancestry message can mislead. Ancestry is then the fast path. A
     commit that is absent from this object store keeps the historical refusal.
-    Only then is patch-id equivalence computed, and only an exact match
-    accepts. ``None`` proof means the attempt passed on ancestry.
+    Only then is a landing proven: exact patch identity is an extra acceptance
+    path for a landing that is the verified change and nothing else, and
+    per-file blob equality is the general rule a squash landing bundling other
+    commits still satisfies. ``None`` proof means the attempt passed on
+    ancestry.
     """
     sha, reason = _verified_sha(state_dir, attempt_id)
     if reason is not None or sha is None:
@@ -798,16 +915,28 @@ def _attempt_evidence(
     if present.returncode != 0:
         return "verified sha is not an ancestor of HEAD", None
 
+    target = head.strip() if isinstance(head, str) else ""
+    if _SHA40_RE.fullmatch(target) is None:
+        target = "HEAD"
+
     patch_id = _commit_patch_id(run_git, workdir, sha)
     landed_sha = landed.find(patch_id) if landed is not None else None
-    if landed_sha is None:
-        return (
-            f"{PROBLEM_CHANGE_NOT_LANDED}: the verified commit exists, but no commit "
-            "in the scanned HEAD history introduces exactly its change; a landing that "
-            "also carries other changes is not equivalent evidence",
-            None,
-        )
-    return None, {"verified_sha": sha, "landed_sha": landed_sha, "patch_id": str(patch_id)}
+    if landed_sha is not None:
+        return None, {
+            "verified_sha": sha,
+            "landed_sha": landed_sha,
+            "patch_id": str(patch_id),
+            "method": REPLAY_METHOD_PATCH_ID,
+        }
+
+    blobs, problem = _blob_equality_proof(run_git, workdir, sha, target)
+    if problem is not None:
+        return problem, None
+    return None, {
+        "verified_sha": sha,
+        "verified_blobs": dict(blobs or {}),
+        "method": REPLAY_METHOD_BLOB_EQUALITY,
+    }
 
 
 def _junit_regressions(junit: Any) -> int:
@@ -828,23 +957,92 @@ def suite_passed(suite: Any) -> bool:
             and suite["exit_code"] == 0 and not suite.get("timed_out") and not suite.get("blocking"))
 
 
-def _clean_replay(replay: Mapping[str, Mapping[str, Any]] | None) -> dict[str, dict[str, str]]:
-    """The replay proof, restricted to the three fixed, hash-shaped fields.
+def _safe_replay_path(path: str) -> bool:
+    """Whether a diff path is storable audit text: relative, printable, short."""
+    if not path or len(path) > 400 or path.startswith("/"):
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return False
+    return not any(part in ("", ".", "..") for part in path.split("/"))
+
+
+def _clean_blob_entry(path: Any, blob: Any) -> tuple[str, str] | None:
+    """One stored proof row, or ``None`` when either side is not safe text."""
+    if not isinstance(path, str) or not _safe_replay_path(path):
+        return None
+    if not isinstance(blob, str) or _SHA40_RE.fullmatch(blob) is None:
+        return None
+    return str(scrub(path)), blob.lower()
+
+
+def _clean_blob_map(value: Any) -> dict[str, str] | None:
+    """The verified blob ids, keyed by path; ``None`` drops the whole proof."""
+    if not isinstance(value, Mapping) or not value:
+        return None
+    if len(value) > REPLAY_EVIDENCE_PATH_LIMIT:
+        return None
+    clean: dict[str, str] = {}
+    for path, blob in value.items():
+        entry = _clean_blob_entry(path, blob)
+        if entry is None:
+            return None
+        clean[entry[0]] = entry[1]
+    return clean
+
+
+def _clean_patch_id_fields(proof: Mapping[str, Any]) -> dict[str, str] | None:
+    """The landed commit and patch hash of a patch-id proof, or ``None``."""
+    landed_sha = proof.get("landed_sha")
+    patch_id = proof.get("patch_id")
+    if not isinstance(landed_sha, str) or _SHA40_RE.fullmatch(landed_sha) is None:
+        return None
+    if not isinstance(patch_id, str) or _PATCH_ID_RE.fullmatch(patch_id) is None:
+        return None
+    return {"landed_sha": landed_sha.lower(), "patch_id": patch_id.lower()}
+
+
+def _clean_replay_proof(proof: Any) -> dict[str, Any] | None:
+    """One attempt's proof, restricted to fixed, hash-shaped fields.
 
     Proof is audit evidence, never a substitute for the suite: it names exactly
-    which verified change a landed commit was proven equal to.
+    which verified change a landing was proven equal to. A blob-equality proof
+    carries the verified blob id for every path it proved; a patch-id proof
+    carries the landed commit and the patch hash. Anything else is dropped, so
+    a malformed proof can never make an accepted record look stronger than the
+    gate that produced it.
     """
-    clean: dict[str, dict[str, str]] = {}
+    if not isinstance(proof, Mapping):
+        return None
+    verified = proof.get("verified_sha")
+    method = proof.get("method")
+    if not isinstance(verified, str) or _SHA40_RE.fullmatch(verified) is None:
+        return None
+    entry: dict[str, Any] = {"verified_sha": verified.lower()}
+    if method == REPLAY_METHOD_BLOB_EQUALITY:
+        blobs = _clean_blob_map(proof.get("verified_blobs"))
+        if blobs is None:
+            return None
+        entry["verified_blobs"] = blobs
+    elif method == REPLAY_METHOD_PATCH_ID:
+        fields = _clean_patch_id_fields(proof)
+        if fields is None:
+            return None
+        entry.update(fields)
+    else:
+        return None
+    entry["method"] = str(method)
+    return entry
+
+
+def _clean_replay(
+    replay: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Every attempt's cleaned replay proof, keyed by attempt id."""
+    clean: dict[str, dict[str, Any]] = {}
     for attempt_id, proof in dict(replay or {}).items():
-        if not isinstance(proof, Mapping):
-            continue
-        fields = {
-            name: str(proof[name])
-            for name in ("verified_sha", "landed_sha", "patch_id")
-            if isinstance(proof.get(name), str) and proof.get(name)
-        }
-        if set(fields) == {"verified_sha", "landed_sha", "patch_id"}:
-            clean[str(attempt_id)] = fields
+        entry = _clean_replay_proof(proof)
+        if entry is not None:
+            clean[str(attempt_id)] = entry
     return clean
 
 
@@ -990,12 +1188,14 @@ def integrate_wave(
 
     Every attempt must have an ``ok`` verify result with a 40-hex sha that is
     either an ancestor of ``HEAD`` (the fast path) or, when the checkout does
-    not carry the verified commit itself, exactly patch-identical to a commit
-    ``HEAD`` does carry (a squash or replay landing). A foreign-repository
-    attempt is refused by name rather than with an ancestry message. Only when
-    every slice passes is ``run_suite(workdir)`` called; the wave is accepted
-    only if that full suite exits zero and does not time out. Problems are
-    collected per attempt instead of stopping at the first one.
+    not carry the verified commit itself, landed with every path the verified
+    change touches byte-identical at ``HEAD`` (a squash or replay landing,
+    proven per file so a landing that also carries other files still passes),
+    or exactly patch-identical to a commit ``HEAD`` carries. A
+    foreign-repository attempt is refused by name rather than with an ancestry
+    message. Only when every slice passes is ``run_suite(workdir)`` called; the
+    wave is accepted only if that full suite exits zero and does not time out.
+    Problems are collected per attempt instead of stopping at the first one.
     """
     if not _safe_wave_id(wave_id):
         raise RevisionError(
@@ -1047,7 +1247,7 @@ def integrate_wave(
     landed = _LandedChanges(run_git, repo, head)
 
     problems: dict[str, str] = {}
-    replay: dict[str, dict[str, str]] = {}
+    replay: dict[str, dict[str, Any]] = {}
     for attempt_id in ids:
         reason, proof = _attempt_evidence(
             state,
@@ -1056,6 +1256,7 @@ def integrate_wave(
             run_git,
             workdir_repository=workdir_repository,
             landed=landed,
+            head=head,
         )
         if reason:
             problems[attempt_id] = reason
