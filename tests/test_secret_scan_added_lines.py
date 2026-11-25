@@ -148,3 +148,38 @@ def test_real_credential_shaped_literal_still_trips():
     line = SECRET_NAMED_KEY + ": '" + credential + "'"
     assert security.looks_like_secret(line)
     assert security.first_secret_rule(line) == "assignment"
+
+
+def test_quoted_noncredential_fixture_does_not_trip():
+    from bundlebees_plugin import security
+
+    fixture = "-".join(("synthetic", "approval", "word"))
+    line = SECRET_NAMED_KEY + ": '" + fixture + "'"
+    assert not security.looks_like_secret(line)
+    assert security.first_secret_rule(line) is None
+
+
+def test_quoted_bearer_expression_does_not_trip():
+    from bundlebees_plugin import security
+
+    line = "Author" + "ization: 'Bear" + "er ' + " + "credential"
+    assert not security.looks_like_secret(line)
+    assert security.first_secret_rule(line) is None
+
+
+def test_quoted_credential_shaped_token_still_trips():
+    from bundlebees_plugin import security
+
+    credential = "a1" * 20
+    assert len(credential) == 40
+    assert any(char.isdigit() for char in credential)
+    assert any(char.isalpha() for char in credential)
+    line = SECRET_NAMED_KEY + ": '" + credential + "'"
+    assert security.looks_like_secret(line)
+    assert security.first_secret_rule(line) == "assignment"
+
+    short_credential = "hunter" + "2"
+    short_line = "pass" + "word = '" + short_credential + "'"
+    assert security.looks_like_secret(short_line)
+    assert security.first_secret_rule(short_line) == "assignment"
+    assert not security.looks_like_secret(SECRET_NAMED_KEY + ": ''")

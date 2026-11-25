@@ -12,9 +12,13 @@ passwd, pwd, authorization) but trips only on credential-shaped literal
 values. Code references and non-credential literals are exempt:
 
 - a quoted literal is credential-shaped when it is non-empty and is not one
-  angle-bracket placeholder. Empty strings and placeholder fixtures carry no
-  literal credential and stay exempt; other non-empty quoted literals retain
-  the conservative trip behavior;
+  angle-bracket placeholder, an expression, or an all-alphabetic multi-word
+  fixture. An expression contains ``+``, ``.``, or ``$`` inside the quotes,
+  or has one of those operator characters after optional whitespace following
+  the closing quote. A fixture has two or more alphabetic words joined by
+  hyphens or underscores and no other characters. Empty strings stay exempt.
+  Whitespace alone does not exempt a quoted literal, so multi-word passphrases
+  retain the conservative trip behavior;
 - an unquoted code reference is exempt: a bare identifier or dotted property
   chain, including one followed by an object-literal closing brace, or a value
   run containing a call parenthesis or an arrow. The credential enters at
@@ -31,9 +35,11 @@ values. Code references and non-credential literals are exempt:
 
 Thus naming a runtime secret without carrying one does not trip, while
 literal credential material remains covered by the assignment, prefix,
-bearer, and high-entropy arms. The accepted residual risk is a short unquoted
-identifier-shaped literal written with whitespace after the separator; its
-tight-separator form still trips.
+bearer, and high-entropy arms. The accepted residual false negatives are a
+short unquoted identifier-shaped literal written with whitespace after the
+separator (its tight-separator form still trips), and real credential text
+that itself has an exempt quoted expression or all-alphabetic joined-fixture
+shape. The scan cannot distinguish those values from runtime code or fixtures.
 """
 
 from __future__ import annotations
@@ -59,7 +65,8 @@ class UnsafeURLError(ValueError):
 # credential-shaped literal value. Code references and non-credential literals
 # are exempt. See the module docstring for the complete boundary. The value
 # alternatives:
-#   non-empty quoted strings, except one angle-bracket placeholder
+#   non-empty quoted strings, except one angle-bracket placeholder, quoted
+#   expressions, and all-alphabetic multi-word hyphen/underscore fixtures
 #   special-led runs: first char cannot start a code identifier or reference
 #   "="-led runs that are not the arrow "=>"
 #   identifier-led runs with literal punctuation other than an object-literal
@@ -78,8 +85,16 @@ _ASSIGNMENT_SECRET_RE = re.compile(
     r"(?i)\b([A-Za-z0-9_.-]*?"
     r"(?:api[_-]?key|token|secret|password|passwd|pwd|authorization))"
     r"(\s*[:=]\s*)"
-    r"(?:\"(?!<[^<>\n]*>\")[^\"\n]+\""
-    r"|'(?!<[^<>\n]*>')[^'\n]+'"
+    r"(?:\"(?!<[^<>\n]*>\")"
+    r"(?![^\"\n]*[.+$])"
+    r"(?![^\"\n]*\"\s*[.+$])"
+    r"(?![A-Za-z]+(?:[-_][A-Za-z]+)+\")"
+    r"[^\"\n]+\""
+    r"|'(?!<[^<>\n]*>')"
+    r"(?![^'\n]*[.+$])"
+    r"(?![^'\n]*'\s*[.+$])"
+    r"(?![A-Za-z]+(?:[-_][A-Za-z]+)+')"
+    r"[^'\n]+'"
     r"|[^\s,;\"'A-Za-z_$=(][^\s,;\"']*"
     r"|=(?!>)[^\s,;\"']*"
     r"|[A-Za-z_$]"
