@@ -289,6 +289,51 @@ def test_quoted_path_unicode_separators_cannot_spoof_the_refusal_message(escape)
     assert "\n" not in message and "\r" not in message
 
 
+# --- WA-A1A-FUP7: a raw separator must not split the diff header ---------
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"], ids=["u2028", "u2029"])
+def test_raw_unicode_separator_in_quoted_path_keeps_the_finding(separator):
+    patch = (
+        "diff --git a/src/evil.py b/src/evil.py\n"
+        "--- /dev/null\n"
+        f'+++ "b/tests/conftest{separator}.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+os._exit(0)\n"
+    )
+    findings = _scan()(patch)
+    assert {finding["kind"] for finding in findings} == {"conftest", "forced_exit"}
+    assert all(finding["path"] == "tests/conftest.py" for finding in findings)
+    with pytest.raises(verify_local.VerifyError) as caught:
+        verify_local.check_patch_subversion(patch)
+    message = caught.value.message
+    assert "\u2028" not in message and "\u2029" not in message
+    assert "\n" not in message and "\r" not in message
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\u000b", "\u000c", "\u001c", "\u001d", "\u001e", "\u0085"],
+    ids=["vt", "ff", "fs", "gs", "rs", "nel"],
+)
+def test_raw_control_separator_in_quoted_path_keeps_the_finding(separator):
+    patch = (
+        "diff --git a/src/evil.py b/src/evil.py\n"
+        "--- /dev/null\n"
+        f'+++ "b/tests/conftest{separator}.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+os._exit(0)\n"
+    )
+    findings = _scan()(patch)
+    assert {finding["kind"] for finding in findings} == {"conftest", "forced_exit"}
+    assert all(finding["path"] == "tests/conftest.py" for finding in findings)
+
+
+def test_crlf_terminated_patch_headers_still_parse():
+    patch = _new_file("tests/conftest.py", "import pytest").replace("\n", "\r\n")
+    assert "conftest" in _kinds(patch)
+
+
 # --- review minor 3: equivalent TOML for the pytest11 entry-point table ---
 
 
