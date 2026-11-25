@@ -401,3 +401,59 @@ def test_one_line_exit_helper_still_reports_forced_exit():
         ["def _exit(code): os._exit(code)", "ex = _exit", "ex(0)"],
     )
     assert ("forced_exit", 1) in {(f["kind"], f["line"]) for f in _scan()(patch)}
+# --- r3: git's mid-hunk no-newline marker ---------------------------------
+# When the pre-image's last line has no trailing newline, git emits
+# "\ No newline at end of file" between the removed and the added side. That
+# marker is not the end of the hunk: the added lines after it are added lines
+# and must still be scanned.
+
+_NO_NEWLINE_EXIT_PATCH = (
+    "diff --git a/tests/conftest.py b/tests/conftest.py\n"
+    "index 3d2b4b1..fe41b02 100644\n"
+    "--- a/tests/conftest.py\n"
+    "+++ b/tests/conftest.py\n"
+    "@@ -1 +1 @@\n"
+    "-x = 1\n"
+    "\\ No newline at end of file\n"
+    "+os._exit(0)\n"
+    "\\ No newline at end of file\n"
+)
+
+_NO_NEWLINE_APPEND_PATCH = (
+    "diff --git a/tests/conftest.py b/tests/conftest.py\n"
+    "index 3d2b4b1..0a1b2c3 100644\n"
+    "--- a/tests/conftest.py\n"
+    "+++ b/tests/conftest.py\n"
+    "@@ -1 +1,2 @@\n"
+    "-x = 1\n"
+    "\\ No newline at end of file\n"
+    "+x = 1\n"
+    "+os._exit(0)\n"
+)
+
+_NO_NEWLINE_SAFE_PATCH = (
+    "diff --git a/src/safe.py b/src/safe.py\n"
+    "index 3d2b4b1..fe41b02 100644\n"
+    "--- a/src/safe.py\n"
+    "+++ b/src/safe.py\n"
+    "@@ -1 +1 @@\n"
+    "-x = 1\n"
+    "\\ No newline at end of file\n"
+    "+os._exit(0)\n"
+    "\\ No newline at end of file\n"
+)
+
+
+def test_no_newline_marker_does_not_hide_an_added_exit_line():
+    found = {(finding["kind"], finding["line"]) for finding in _scan()(_NO_NEWLINE_EXIT_PATCH)}
+    assert ("conftest", 1) in found
+    assert ("forced_exit", 1) in found
+
+
+def test_no_newline_marker_before_an_appended_exit_line_is_a_finding():
+    found = {(finding["kind"], finding["line"]) for finding in _scan()(_NO_NEWLINE_APPEND_PATCH)}
+    assert ("forced_exit", 2) in found
+
+
+def test_no_newline_marker_on_a_safe_path_is_not_a_finding():
+    assert _scan()(_NO_NEWLINE_SAFE_PATCH) == []
