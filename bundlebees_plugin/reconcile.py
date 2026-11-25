@@ -1311,6 +1311,10 @@ def _dispatch_one(
         "fingerprint": fingerprint,
     }
     brief = _brief_for(job, task)
+    # go-max lane routing: a no-op unless the owner turned go-max on (docs/contracts/go-max.md).
+    from . import go_max as _go_max
+
+    brief = _go_max.route_brief(state_dir, brief, task)
     _write_json(path, intent)  # fsynced before the call
 
     if task.get("state") == "pending":

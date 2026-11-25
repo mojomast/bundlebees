@@ -173,6 +173,7 @@ def test_tool_names_match_provides_tools():
             "bundlebees_attempt",
             "bundlebees_host_prompt",
             "bundlebees_route_preview",
+            "bundlebees_go_max",
         ]
     )
     import yaml

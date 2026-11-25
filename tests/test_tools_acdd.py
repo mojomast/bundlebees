@@ -1,7 +1,7 @@
 """Approved acceptance tests for the ACDD dispatch gate in tools.py (contract BC1).
 
 Written by the coordinator before implementation. Do not edit.
-(The schema-budget test below was re-approved with the fifth tool: budget 700.
+(The schema-budget test below was re-approved with the sixth tool: budget 900.
 No hostile fixture strings live here; route-preview canaries are runtime-assembled
 in the other leased test files.)
 """
@@ -132,11 +132,11 @@ def test_require_contract_rejects_legacy_briefs(tools, tmp_path):
     assert client.created == []
 
 
-# AC-011: the tool schemas stay within budget (o200k; five tools, budget 700).
-# The four original schemas measured 583 tokens; the bundlebees_route_preview
-# schema could not fit in the remaining 17, so the combined budget was raised
-# from 600 to 700 for the fifth tool. Measured with tiktoken o200k_base over
-# the five registered schemas: 679 tokens.
+# AC-011: the tool schemas stay within budget (o200k; six tools, budget 900).
+# The five-tool registration measured 679 tokens; the bundlebees_go_max schema
+# could not fit in the remaining 21, so the owner re-approved raising the
+# combined budget from 700 to 900 for the sixth tool. Measured with tiktoken
+# o200k_base over the six registered schemas: 852 tokens.
 def test_tool_schema_budget():
     tiktoken = pytest.importorskip("tiktoken")
     plugin = load_plugin()
@@ -144,4 +144,4 @@ def test_tool_schema_budget():
     plugin.register(ctx)
     body = json.dumps([rec["schema"] for rec in ctx.tools.values()], separators=(",", ":"), ensure_ascii=False)
     measured = len(tiktoken.get_encoding("o200k_base").encode(body))
-    assert measured <= 700, (measured, body)
+    assert measured <= 900, (measured, body)

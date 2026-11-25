@@ -513,6 +513,8 @@ def _build_parser(parser: Any) -> Any:
     board_dispatch_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     board_dispatch_cmd.set_defaults(command="board-dispatch")
 
+    _add_go_max_parser(subparsers)
+
     preflight_cmd = subparsers.add_parser(
         "preflight",
         help="Run the dispatch gates without dispatching (side-effect free).",
@@ -560,6 +562,60 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
            f"blocked={len(result['blocked'])} errors={len(result['errors'])} "
            f"damaged={len(result['damaged'])}")
     return 0 if not result["errors"] and not result["damaged"] else 2
+
+
+def _add_go_max_parser(subparsers: Any) -> Any:
+    cmd = subparsers.add_parser(
+        "go-max",
+        help="Fill free bee slots safely (on/off/status); the factory does the filling.",
+    )
+    cmd.add_argument("action", choices=["on", "off", "status"])
+    cmd.add_argument("--ttl-minutes", type=int, default=None, help="How long go-max stays on (default 480, max 1440).")
+    cmd.add_argument("--json", action="store_true", help="Print the full status record as JSON.")
+    cmd.add_argument("--offline", action="store_true", help="Do not contact the launcher (status from local state only).")
+    cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    cmd.set_defaults(command="go-max")
+    return cmd
+
+
+def _cmd_go_max(ctx: Any, args: Any) -> int:
+    """go-max on/off/status. Never dispatches, cancels or approves anything itself."""
+    from . import go_max as _go_max
+
+    state_dir = _state_dir(ctx, args)
+    client = None
+    if not getattr(args, "offline", False):
+        try:
+            client = _client_for(ctx, args)
+        except CliError:
+            client = None
+    try:
+        policy = _go_max.Policy.from_settings(_config(ctx))
+    except Exception:  # noqa: BLE001 - settings are optional; defaults are the safe floor
+        policy = _go_max.Policy()
+    try:
+        out = _go_max.run_action(
+            state_dir, str(args.action), client=client,
+            ttl_minutes=getattr(args, "ttl_minutes", None), by="cli", policy=policy,
+        )
+    except _go_max.GoMaxError as exc:
+        raise CliError(exc.code, exc.message, exc.fix) from exc
+    if getattr(args, "json", False):
+        _print(json.dumps(out["status"], indent=2, sort_keys=True))
+    else:
+        _print(out["summary"])
+    return 0
+
+
+def go_max_main(argv: list[str] | None = None) -> int:
+    """Standalone entry: ``python -m bundlebees_plugin.cli go-max ...`` style, for scripts and Orbit."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="bundlebees go-max")
+    sub = parser.add_subparsers(dest="command", required=True)
+    _add_go_max_parser(sub)
+    args = parser.parse_args(["go-max", *(argv or [])])
+    return _dispatch(None, args)
 
 
 def _cmd_board_dispatch(ctx: Any, args: Any) -> int:
@@ -759,6 +815,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_board_sync(ctx, args)
         if command == "board-dispatch":
             return _cmd_board_dispatch(ctx, args)
+        if command == "go-max":
+            return _cmd_go_max(ctx, args)
         if command == "preflight":
             from . import preflight as _preflight
             argv = [str(args.brief)]
