@@ -572,6 +572,10 @@ one pull request.
 Tool count unchanged (4). Schemas: 571 -> 573 o200k (+2, dispatch
 description).
 
+### Fixed
+
+- **Retry findings reach the bee (WA-A5B):** `bundlebees_dispatch` now attaches the accepted research findings for a gated retry to `brief.findings` before `client.create`, so the launcher renders the research that `require_findings` already required; a findings block supplied by the caller is preserved, and a brief with no `failure_id` or `retry_of` is dispatched unchanged.
+
 ## [0.1.1] - 2026-11-12
 
 Fixes from the Hermes catalog review of 0.1.0 (NousResearch/hermes-agent#153888). Tested against real Hermes 0.23.0.
