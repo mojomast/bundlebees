@@ -35,6 +35,7 @@ Built as six file-leased DeepSeek bee slices (two waves) and integrated in
 one pull request.
 
 - `verify` records now carry a `test_argv` only when it is the argv this process executed: when the evidence text is the exact trusted template for these tests (pytest with the fixed flags, or `node --test`) and equals the executed argv, it is recorded verbatim — including a path component that the scrubber would redact, because that argv is the CLI-built evidence; when the evidence text is not that template, the executed argv is recorded in its scrubbed form; and the key is omitted when there is no executed argv (an empty argv sequence counts as none), or when the evidence text is that template but the executed argv is not (review-bb-pr232 F1 / pr233 F1 / pr234 F1+F2 as a class, plus review-bb-pr236 F1/F2 and review-bb-pr237 F1-F5 / pr238 F1).
+- **GREEN-adjacent hardening (WA-A1B-FUP3, review-bb-pr282 minors):** `tdd.frozen_approved_ids` now refuses an explicit null or non-mapping `test_collection` pin as `evidence_tampered` instead of treating it as absent, `tdd refactor` and `tdd review` pass the frozen approved ids into `tdd.check_green`, and `acdd_cli._result` maps a non-numeric JUnit counter on the verify lane to a named `evidence_invalid` refusal.
 
 ### Added (wave A, Nov 2026)
 
