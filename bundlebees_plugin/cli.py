@@ -3527,6 +3527,11 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
     _print(f"attempts: {', '.join(record.get('attempts') or [])}")
     for attempt, problem in sorted((record.get("problems") or {}).items()):
         _print(f"problem: {attempt}: {problem}")
+    for attempt, proof in sorted((record.get("replay_evidence") or {}).items()):
+        _print(
+            f"replay: {attempt}: verified {proof.get('verified_sha')} is patch-identical "
+            f"to landed {proof.get('landed_sha')} (patch-id {proof.get('patch_id')})"
+        )
     if suite:
         _print(f"suite: exit {suite.get('exit_code')} via {suite.get('backend')} junit={json.dumps(suite.get('junit'))}")
     for name, info in (suite.get("suites") or {}).items():

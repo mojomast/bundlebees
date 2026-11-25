@@ -17,9 +17,12 @@ stored, or printed, and every error text is passed through
 :func:`bundlebees_plugin.security.scrub`.
 
 A wave is accepted only when every listed attempt has an ``ok`` verify result
-whose 40-hex sha descends from ``HEAD`` *and* a caller-supplied full test suite
-returns a non-timeout exit code of zero. An accepted wave record is final:
-later attempts to overwrite it raise ``RevisionError("wave_already_accepted")``.
+whose 40-hex sha descends from ``HEAD`` — or, when a merge queue landed the
+change as a different commit, whose change is exactly patch-identical
+(``git patch-id --stable``) to a commit ``HEAD`` carries — *and* a
+caller-supplied full test suite returns a non-timeout exit code of zero. An
+accepted wave record is final: later attempts to overwrite it raise
+``RevisionError("wave_already_accepted")``.
 Records are published through a fsynced temporary file and a create-only link,
 so an accepted record is written once and never replaced, and a record that
 exists but cannot be read raises ``wave_unreadable``/``wave_malformed`` — it is
@@ -53,11 +56,25 @@ WAVE_MISSING = "wave_missing"
 WAVE_UNREADABLE = "wave_unreadable"
 WAVE_MALFORMED = "wave_malformed"
 
+#: Distinct problem codes for the refusals that are not about missing
+#: evidence. ``verified_change_not_landed`` says the verified commit exists in
+#: this checkout but no commit HEAD carries introduces the identical change;
+#: ``attempt_repo_foreign`` says the attempt belongs to another repository, so
+#: an ancestry message about this worktree would be misleading.
+PROBLEM_CHANGE_NOT_LANDED = "verified_change_not_landed"
+PROBLEM_FOREIGN_REPO = "attempt_repo_foreign"
+
+#: How far back HEAD's own history is scanned for a patch-identical landing.
+#: Ancestry is still the fast path; this bound keeps a refusal cheap.
+LANDED_EVIDENCE_SCAN_LIMIT = 200
+
 
 _WAVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FULL_HEX_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SHA40_RE = re.compile(r"[0-9a-fA-F]{40}")
+_PATCH_ID_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+_ZERO_OID_RE = re.compile(r"0{40}(?:0{24})?")
 _MAX_DETAIL = 800
 
 RunGit = Callable[..., subprocess.CompletedProcess]
@@ -507,36 +524,290 @@ def attempt_accepted(state_dir: Path, attempt_id: str) -> bool:
     return False
 
 
-def _attempt_problem(
-    state_dir: Path,
-    attempt_id: str,
-    workdir: Path,
-    run_git: RunGit,
-) -> str | None:
+def _strip_remote_origin(text: str) -> str:
+    """Drop a scheme or an scp-like ``user@host:`` prefix from a remote."""
+    if "://" in text:
+        return text.split("://", 1)[1]
+    if "@" in text and ":" in text and text.index("@") < text.index(":"):
+        return text.split(":", 1)[1]
+    return text
+
+
+def _repo_identity(value: Any) -> tuple[str, str] | None:
+    """Normalise a repository reference to ``(slug-or-name, final name)``.
+
+    Accepts ``owner/name``, an https or scp-like remote URL, or a local path.
+    ``None`` means "not a usable identity", and callers must not compare it: a
+    folder name alone is never evidence about which repository a lease named.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    if not text or "\x00" in text or any(ch.isspace() for ch in text):
+        return None
+    text = _strip_remote_origin(text.rstrip("/"))
+    if text.endswith(".git"):
+        text = text[:-4]
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        return None
+    name = parts[-1].lower()
+    if len(parts) == 1:
+        return name, name
+    return f"{parts[-2].lower()}/{name}", name
+
+
+def _same_repository(left: Any, right: Any) -> bool | None:
+    """Tri-state repository comparison: True same, False foreign, None unknown.
+
+    Final-name equality is treated as the same repository on purpose: a local
+    clone path has no owner component, and a fork that shares the name must
+    never be refused by a guess. Only two *different* normalised names are
+    proof of a foreign repository.
+    """
+    first = _repo_identity(left)
+    second = _repo_identity(right)
+    if first is None or second is None:
+        return None
+    return first[0] == second[0] or first[1] == second[1]
+
+
+def _workdir_repository(workdir: Path, run_git: RunGit) -> str | None:
+    """The worktree's declared ``origin`` remote, never its folder name.
+
+    A linked integration worktree shares the repository config, so it answers
+    exactly like its main checkout. No origin means the repository cannot be
+    compared, and the caller must not invent one from a path.
+    """
+    proc = run_git(["config", "--get", "remote.origin.url"], workdir, check=False)
+    if proc.returncode != 0:
+        return None
+    text = str(proc.stdout or "").strip()
+    return text or None
+
+
+def _attempt_repository(state_dir: Path, attempt_id: str) -> str | None:
+    """The repository an attempt was dispatched for, when a record names it.
+
+    The lease's brief is the dispatch-time statement; the job document's
+    ``goal.repo`` is the sealed authorization when the brief does not repeat
+    it. Anything unreadable or absent is simply "not named" — this evidence
+    only explains a refusal, it never authorizes one on its own.
+    """
+    try:
+        from . import leases  # noqa: PLC0415 - keep revision's import surface small
+
+        lease = leases.load_lease(state_dir, attempt_id)
+    except Exception:  # noqa: BLE001 - a missing or damaged lease is not this gate's refusal
+        return None
+    brief = lease.get("brief")
+    brief = brief if isinstance(brief, Mapping) else {}
+    for candidate in (brief.get("repo"), lease.get("repo")):
+        text = candidate.strip() if isinstance(candidate, str) else ""
+        if text:
+            return text
+    job_id = brief.get("job_id") or lease.get("job_id")
+    if not isinstance(job_id, str) or not job_id.strip():
+        return None
+    try:
+        from . import job as jobs  # noqa: PLC0415 - job imports revision lazily
+
+        job = jobs.load_job(state_dir, job_id.strip(), recover=False)
+    except Exception:  # noqa: BLE001 - the job record is optional evidence here
+        return None
+    goal = job.get("goal") if isinstance(job, Mapping) else None
+    repo = goal.get("repo") if isinstance(goal, Mapping) else None
+    text = repo.strip() if isinstance(repo, str) else ""
+    return text or None
+
+
+def _patch_id_index(output: str) -> dict[str, str]:
+    """Parse ``git patch-id`` lines into ``{patch_id: commit}`` (newest wins)."""
+    index: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not _PATCH_ID_RE.fullmatch(parts[0]):
+            continue
+        commit = parts[1].lower()
+        if not _PATCH_ID_RE.fullmatch(commit) or _ZERO_OID_RE.fullmatch(commit):
+            continue
+        index.setdefault(parts[0].lower(), commit)
+    return index
+
+
+def _commit_patch_id(run_git: RunGit, workdir: Path, rev: str) -> str | None:
+    """``git patch-id --stable`` of one commit's change over its first parent.
+
+    ``git log -p`` is used rather than ``git diff`` so the verified commit and
+    the commits HEAD carries are rendered through exactly the same code path.
+    A root or merge commit has no single change of its own and yields ``None``.
+    """
+    rendered = run_git(
+        [
+            "log", "-p", "-n", "1", "--no-merges", "--no-color", "--no-ext-diff",
+            "--no-show-signature", "--format=commit %H", rev,
+        ],
+        workdir,
+        check=False,
+    )
+    if rendered.returncode != 0 or not str(rendered.stdout or "").strip():
+        return None
+    hashed = run_git(
+        ["patch-id", "--stable"],
+        workdir,
+        input_text=str(rendered.stdout),
+        check=False,
+    )
+    if hashed.returncode != 0:
+        return None
+    for line in str(hashed.stdout or "").splitlines():
+        parts = line.split()
+        if parts and _PATCH_ID_RE.fullmatch(parts[0]):
+            return parts[0].lower()
+    return None
+
+
+class _LandedChanges:
+    """Bounded, lazy patch-id index of the changes HEAD already carries.
+
+    The fast path is ancestry. This index is read only when a verified commit
+    exists in the object store but is not an ancestor, because a merge queue
+    may squash- or replay-land the identical change as a different commit.
+    Only an exact ``git patch-id --stable`` match counts, so the proof is that
+    the merged change *is* the verified change — never that it resembles it.
+    """
+
+    def __init__(
+        self,
+        run_git: RunGit,
+        workdir: Path,
+        head: str,
+        limit: int = LANDED_EVIDENCE_SCAN_LIMIT,
+    ) -> None:
+        self._run_git = run_git
+        self._workdir = Path(workdir)
+        self._head = head
+        self._limit = max(1, int(limit))
+        self._changes: dict[str, str] | None = None
+
+    def _load(self) -> dict[str, str]:
+        if self._changes is not None:
+            return self._changes
+        self._changes = {}
+        rendered = self._run_git(
+            [
+                "log", "-p", "--no-merges", "--no-color", "--no-ext-diff",
+                "--no-show-signature", f"--max-count={self._limit}",
+                "--format=commit %H", self._head,
+            ],
+            self._workdir,
+            check=False,
+        )
+        if rendered.returncode != 0:
+            return self._changes
+        hashed = self._run_git(
+            ["patch-id", "--stable"],
+            self._workdir,
+            input_text=str(rendered.stdout or ""),
+            check=False,
+        )
+        if hashed.returncode == 0:
+            self._changes = _patch_id_index(str(hashed.stdout or ""))
+        return self._changes
+
+    def find(self, patch_id: str | None) -> str | None:
+        """The commit on HEAD whose change has exactly this patch identity."""
+        if not patch_id:
+            return None
+        return self._load().get(patch_id)
+
+
+def _verified_sha(state_dir: Path, attempt_id: str) -> tuple[str | None, str | None]:
+    """The verified 40-hex sha for one attempt, or the record's refusal reason."""
     target = state_dir / "verify-results" / f"{attempt_id}.json"
     try:
         text = target.read_text(encoding="utf-8")
     except (OSError, ValueError):
-        return "verify result is missing"
+        return None, "verify result is missing"
     try:
         data = json.loads(text)
     except (TypeError, ValueError):
-        return "verify result is not valid JSON"
+        return None, "verify result is not valid JSON"
     if not isinstance(data, Mapping):
-        return "verify result is not an object"
+        return None, "verify result is not an object"
     if data.get("ok") is not True:
-        return "verify result is not ok"
+        return None, "verify result is not ok"
     sha = data.get("sha")
     if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
-        return "verify result has no full 40-hex sha"
-    proc = run_git(
-        ["merge-base", "--is-ancestor", sha, "HEAD"],
-        workdir,
-        check=False,
+        return None, "verify result has no full 40-hex sha"
+    return sha, None
+
+
+def _foreign_repository_problem(
+    state_dir: Path,
+    attempt_id: str,
+    workdir_repository: str | None,
+) -> str | None:
+    """The refusal when the attempt names a repository that is not this one.
+
+    Reported identities are normalised, never the raw remote: an origin URL can
+    carry credentials and a brief is untrusted input. Anything the records do
+    not name, or cannot be compared, is not a refusal.
+    """
+    declared = _attempt_repository(state_dir, attempt_id)
+    declared_identity = _repo_identity(declared)
+    workdir_identity = _repo_identity(workdir_repository)
+    if declared_identity is None or workdir_identity is None:
+        return None
+    if _same_repository(declared, workdir_repository) is not False:
+        return None
+    return (
+        f"{PROBLEM_FOREIGN_REPO}: the attempt was dispatched for {declared_identity[0]}, "
+        f"but --workdir is {workdir_identity[0]}"
     )
-    if proc.returncode != 0:
-        return "verified sha is not an ancestor of HEAD"
-    return None
+
+
+def _attempt_evidence(
+    state_dir: Path,
+    attempt_id: str,
+    workdir: Path,
+    run_git: RunGit,
+    *,
+    workdir_repository: str | None = None,
+    landed: _LandedChanges | None = None,
+) -> tuple[str | None, dict[str, str] | None]:
+    """One attempt's refusal, plus the replay proof when equivalence passed.
+
+    Order matters. A repository check refuses a cross-repo attempt by name
+    before any ancestry message can mislead. Ancestry is then the fast path. A
+    commit that is absent from this object store keeps the historical refusal.
+    Only then is patch-id equivalence computed, and only an exact match
+    accepts. ``None`` proof means the attempt passed on ancestry.
+    """
+    sha, reason = _verified_sha(state_dir, attempt_id)
+    if reason is not None or sha is None:
+        return reason, None
+
+    foreign = _foreign_repository_problem(state_dir, attempt_id, workdir_repository)
+    if foreign is not None:
+        return foreign, None
+
+    ancestor = run_git(["merge-base", "--is-ancestor", sha, "HEAD"], workdir, check=False)
+    if ancestor.returncode == 0:
+        return None, None
+
+    present = run_git(["cat-file", "-e", f"{sha}^{{commit}}"], workdir, check=False)
+    if present.returncode != 0:
+        return "verified sha is not an ancestor of HEAD", None
+
+    patch_id = _commit_patch_id(run_git, workdir, sha)
+    landed_sha = landed.find(patch_id) if landed is not None else None
+    if landed_sha is None:
+        return (
+            f"{PROBLEM_CHANGE_NOT_LANDED}: the verified commit exists, but no commit "
+            "in the scanned HEAD history introduces exactly its change; a landing that "
+            "also carries other changes is not equivalent evidence",
+            None,
+        )
+    return None, {"verified_sha": sha, "landed_sha": landed_sha, "patch_id": str(patch_id)}
 
 
 def _junit_regressions(junit: Any) -> int:
@@ -557,7 +828,31 @@ def suite_passed(suite: Any) -> bool:
             and suite["exit_code"] == 0 and not suite.get("timed_out") and not suite.get("blocking"))
 
 
-def _clean_record(record: Mapping[str, Any], head: str) -> dict:
+def _clean_replay(replay: Mapping[str, Mapping[str, Any]] | None) -> dict[str, dict[str, str]]:
+    """The replay proof, restricted to the three fixed, hash-shaped fields.
+
+    Proof is audit evidence, never a substitute for the suite: it names exactly
+    which verified change a landed commit was proven equal to.
+    """
+    clean: dict[str, dict[str, str]] = {}
+    for attempt_id, proof in dict(replay or {}).items():
+        if not isinstance(proof, Mapping):
+            continue
+        fields = {
+            name: str(proof[name])
+            for name in ("verified_sha", "landed_sha", "patch_id")
+            if isinstance(proof.get(name), str) and proof.get(name)
+        }
+        if set(fields) == {"verified_sha", "landed_sha", "patch_id"}:
+            clean[str(attempt_id)] = fields
+    return clean
+
+
+def _clean_record(
+    record: Mapping[str, Any],
+    head: str,
+    replay: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict:
     problems = record.get("problems") or {}
     clean_problems = {
         str(attempt_id): str(scrub(reason))
@@ -575,7 +870,7 @@ def _clean_record(record: Mapping[str, Any], head: str) -> dict:
     raw_failures = (record.get("suite") or {}).get("failures") if isinstance(record.get("suite"), Mapping) else None
     if isinstance(suite, dict) and isinstance(raw_failures, Mapping):
         suite["failures"] = {k: (list(v) if isinstance(v, list) else bool(v)) for k, v in raw_failures.items()}
-    return {
+    clean = {
         "wave_id": record["wave_id"],
         "accepted": bool(record["accepted"]),
         "head_sha": head,
@@ -585,6 +880,13 @@ def _clean_record(record: Mapping[str, Any], head: str) -> dict:
         "regressions": int(record["regressions"]),
         "at": record["at"],
     }
+    # Replay proof is audit evidence, never a substitute for the suite: it
+    # records exactly which verified change a landed commit was proven equal
+    # to. Only the three fixed, hash-shaped fields are stored.
+    clean_replay = _clean_replay(replay)
+    if clean_replay:
+        clean["replay_evidence"] = clean_replay
+    return clean
 
 
 def _lost_race(state_dir: Path, wave_id: str) -> RevisionError:
@@ -687,10 +989,13 @@ def integrate_wave(
     """Integrate verified attempt slices into one wave record.
 
     Every attempt must have an ``ok`` verify result with a 40-hex sha that is
-    an ancestor of ``HEAD``. Only when all slices pass is ``run_suite(workdir)``
-    called; the wave is accepted only if that full suite exits zero and does
-    not time out. Problems are collected per attempt instead of stopping at the
-    first one.
+    either an ancestor of ``HEAD`` (the fast path) or, when the checkout does
+    not carry the verified commit itself, exactly patch-identical to a commit
+    ``HEAD`` does carry (a squash or replay landing). A foreign-repository
+    attempt is refused by name rather than with an ancestry message. Only when
+    every slice passes is ``run_suite(workdir)`` called; the wave is accepted
+    only if that full suite exits zero and does not time out. Problems are
+    collected per attempt instead of stopping at the first one.
     """
     if not _safe_wave_id(wave_id):
         raise RevisionError(
@@ -738,12 +1043,24 @@ def integrate_wave(
         )
 
     head = head_sha(repo, run_git)
+    workdir_repository = _workdir_repository(repo, run_git)
+    landed = _LandedChanges(run_git, repo, head)
 
     problems: dict[str, str] = {}
+    replay: dict[str, dict[str, str]] = {}
     for attempt_id in ids:
-        reason = _attempt_problem(state, attempt_id, repo, run_git)
+        reason, proof = _attempt_evidence(
+            state,
+            attempt_id,
+            repo,
+            run_git,
+            workdir_repository=workdir_repository,
+            landed=landed,
+        )
         if reason:
             problems[attempt_id] = reason
+        elif proof:
+            replay[attempt_id] = proof
 
     suite: dict | None = None
     accepted = False
@@ -769,6 +1086,7 @@ def integrate_wave(
             "at": now or _now(),
         },
         head,
+        replay,
     )
     _write_wave(state, wave_id, record)
     return record

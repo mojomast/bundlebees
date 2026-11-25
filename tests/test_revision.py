@@ -7,6 +7,7 @@ network, no tokens) and uses ``security.child_env`` for child processes.
 from __future__ import annotations
 
 import json
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Mapping
 
 import pytest
 
-from bundlebees_plugin import revision, security
+from bundlebees_plugin import leases, revision, security
 
 
 def _git(
@@ -66,6 +67,63 @@ def _orphan_commit(repo: Path) -> str:
     side = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _git(repo, "checkout", "--quiet", "main")
     return side
+
+
+def _squash_repo(tmp_path: Path, name: str = "repo") -> tuple[Path, str, str]:
+    """A verified commit on its own branch, squash-landed on ``main``.
+
+    The verified commit survives in the object store on ``feat`` but is not an
+    ancestor of ``main``: exactly what a merge queue produces when it squash-
+    lands the verified work as a new commit.
+    """
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Revision Test")
+    _git(repo, "config", "user.email", "revision@example.invalid")
+
+    (repo / "src").mkdir()
+    (repo / "src" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+
+    _git(repo, "checkout", "--quiet", "-b", "feat")
+    (repo / "src" / "a.py").write_text("value = 10\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "verified change")
+    verified = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "--quiet", "main")
+    _git(repo, "merge", "--squash", "feat")
+    _git(repo, "commit", "-m", "squash landing")
+    landed = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    return repo, verified, landed
+
+
+def _plain_repo(tmp_path: Path, name: str, origin: str) -> Path:
+    """A one-commit repository whose origin names the repository it is."""
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Revision Test")
+    _git(repo, "config", "user.email", "revision@example.invalid")
+    _git(repo, "remote", "add", "origin", origin)
+    (repo / "a.py").write_text(f"repo = {name!r}\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    return repo
+
+
+def _lease_with_repo(state: Path, attempt_id: str, sha: str, repo: str) -> None:
+    leases.record_lease(
+        state,
+        attempt_id,
+        {
+            "source_rev": sha,
+            "assigned_files": ["src/a.py"],
+            "acceptance": {"tests": ["tests/test_sample.py"]},
+            "repo": repo,
+        },
+    )
 
 
 def _write_verify(
@@ -277,21 +335,113 @@ def test_integrate_wave_missing_and_failed_verify_results_are_collected(
     assert revision.attempt_accepted(state, "att-missing") is False
 
 
-def test_integrate_wave_rejects_a_verified_sha_that_is_not_an_ancestor(
-    tmp_path: Path,
+def test_integrate_wave_ancestor_fast_path_never_computes_patch_ids(
+    tmp_path: Path, monkeypatch
 ):
-    repo, _base, _later = _repo(tmp_path)
+    repo, _base, later = _repo(tmp_path)
     state = _state(tmp_path)
-    side = _orphan_commit(repo)
-    _write_verify(state, "att-side", side)
+    _write_verify(state, "att-tip", later)
+    calls: list[Path] = []
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("an ancestor must pass without patch-id evidence")
+
+    monkeypatch.setattr(revision, "_commit_patch_id", refuse)
+    monkeypatch.setattr(revision._LandedChanges, "_load", refuse)
+
+    record = revision.integrate_wave(
+        state, "wave-fast", repo, ["att-tip"], _runner(_suite(), calls)
+    )
+
+    assert record["accepted"] is True
+    assert record["problems"] == {}
+    assert "replay_evidence" not in record
+    assert calls == [repo]
+
+
+def test_integrate_wave_accepts_a_squash_landed_change_by_patch_id(tmp_path: Path):
+    repo, verified, landed = _squash_repo(tmp_path)
+    state = _state(tmp_path)
+    _write_verify(state, "att-squash", verified)
     calls: list[Path] = []
 
     record = revision.integrate_wave(
-        state, "wave-side", repo, ["att-side"], _runner(_suite(), calls)
+        state, "wave-squash", repo, ["att-squash"], _runner(_suite(), calls)
+    )
+
+    assert record["accepted"] is True
+    assert record["problems"] == {}
+    assert calls == [repo]
+    proof = record["replay_evidence"]["att-squash"]
+    assert proof["verified_sha"] == verified
+    assert proof["landed_sha"] == landed
+    assert re.fullmatch(r"[0-9a-f]{40}", proof["patch_id"])
+    assert revision.load_wave(state, "wave-squash") == record
+
+
+def test_integrate_wave_rejects_a_squash_landing_with_a_different_patch_id(
+    tmp_path: Path,
+):
+    repo, verified, _landed = _squash_repo(tmp_path)
+    # The landing keeps the file but changes it differently, so no commit on
+    # HEAD introduces the verified change.
+    (repo / "src" / "a.py").write_text("value = 11\n", encoding="utf-8")
+    _git(repo, "commit", "--amend", "-am", "squash landing, adjusted")
+    state = _state(tmp_path)
+    _write_verify(state, "att-differs", verified)
+    calls: list[Path] = []
+
+    record = revision.integrate_wave(
+        state, "wave-differs", repo, ["att-differs"], _runner(_suite(), calls)
     )
 
     assert record["accepted"] is False
-    assert "att-side" in record["problems"]
+    problem = record["problems"]["att-differs"]
+    assert problem.startswith(revision.PROBLEM_CHANGE_NOT_LANDED)
+    assert "not an ancestor" not in problem
+    assert calls == []
+    assert "replay_evidence" not in record
+
+
+def test_integrate_wave_keeps_the_ancestry_refusal_for_an_absent_sha(tmp_path: Path):
+    repo, _base, _later = _repo(tmp_path)
+    state = _state(tmp_path)
+    _write_verify(state, "att-gone", "f" * 40)
+    calls: list[Path] = []
+
+    record = revision.integrate_wave(
+        state, "wave-gone", repo, ["att-gone"], _runner(_suite(), calls)
+    )
+
+    assert record["accepted"] is False
+    assert record["problems"]["att-gone"] == "verified sha is not an ancestor of HEAD"
+    assert calls == []
+
+
+def test_integrate_wave_names_a_foreign_repository_instead_of_ancestry(
+    tmp_path: Path,
+):
+    alpha = _plain_repo(tmp_path, "alpha", "https://example.invalid/acme/alpha.git")
+    beta = _plain_repo(tmp_path, "beta", "https://example.invalid/acme/beta.git")
+    state = _state(tmp_path)
+    alpha_sha = _git(alpha, "rev-parse", "HEAD").stdout.strip()
+    beta_sha = _git(beta, "rev-parse", "HEAD").stdout.strip()
+    _write_verify(state, "att-alpha", alpha_sha)
+    _write_verify(state, "att-beta", beta_sha)
+    _lease_with_repo(state, "att-alpha", alpha_sha, "acme/alpha")
+    _lease_with_repo(state, "att-beta", beta_sha, "acme/beta")
+    calls: list[Path] = []
+
+    record = revision.integrate_wave(
+        state, "wave-mixed", alpha, ["att-alpha", "att-beta"], _runner(_suite(), calls)
+    )
+
+    assert record["accepted"] is False
+    assert "att-alpha" not in record["problems"]
+    problem = record["problems"]["att-beta"]
+    assert problem.startswith(revision.PROBLEM_FOREIGN_REPO)
+    assert "acme/beta" in problem
+    assert "not an ancestor" not in problem
     assert calls == []
 
 
