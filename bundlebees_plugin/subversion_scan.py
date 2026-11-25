@@ -15,11 +15,14 @@ _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _DIFF_GIT_RE = re.compile(
     r'^diff --git ("(?:\\.|[^"\\])*"|\S+) ("(?:\\.|[^"\\])*"|\S+)$'
 )
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _PYTEST_PLUGINS_RE = re.compile(r"\bpytest_plugins\s*(?::[^=\n]+)?=")
 _ADDOPTS_RE = re.compile(r"\baddopts\s*=")
-_PLUGIN_OPTION_RE = re.compile(r"(?:^|[\s\"'])(?:-p(?:\s|=|[A-Za-z_])|--plugin(?:\s|=))")
-_PYTEST11_SECTION_RE = re.compile(r"^\s*\[\s*project\.entry-points\.pytest11\s*\]\s*(?:#.*)?$")
+_PLUGIN_OPTION_RE = re.compile(r"(?:^|[\s\"'])(?:-p(?:\s|=|[A-Za-z_]|$)|--plugin(?:\s|=))")
+_PYTEST11_SECTION_RE = re.compile(
+    r"^\s*\[\s*project\s*\.\s*entry-points\s*\.\s*"
+    r"(?:pytest11|\"pytest11\"|'pytest11')\s*\]\s*(?:#.*)?$"
+)
 _PYTEST11_ENTRY_RE = re.compile(r"^\s*pytest11\s*=")
 _CONTENT_PATTERNS = (
     ("forced_exit", re.compile(r"(?:\bfrom\s+os\s+import\s+[^#\n]*\b_exit\b|\b_exit\s*\()")),
@@ -231,6 +234,12 @@ def _scan_context_line(state: _ScanState, path: str, context: str) -> None:
 
 
 def scan_patch(patch: str) -> list[Finding]:
+    """Scan added lines for test subversion.
+
+    Addopts continuation state resets at every hunk. An addopts opener outside
+    the hunk therefore leaves a long triple-quoted addopts block inside the
+    hunk undetectable; a patch-only scan cannot see the opener.
+    """
     state = _new_scan_state()
     for diff_line in patch.splitlines():
         if diff_line.startswith("diff --git "):
