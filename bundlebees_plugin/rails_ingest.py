@@ -91,21 +91,73 @@ def _code(exc: BaseException) -> str:
     return code if isinstance(code, str) and _CODE_RE.fullmatch(code) else "source_unavailable"
 
 
+def _last_identity(led, adapter: str, instance: str):
+    """The dedupe identity of the newest record this ledger consumed from a source."""
+    rows = led.query(
+        "select envelope_json from event_rows"
+        " where json_extract(envelope_json,'$.source.adapter')=?"
+        " and json_extract(envelope_json,'$.source.instance')=? order by seq desc limit 1",
+        (adapter, instance))
+    if not rows:
+        return None
+    try:
+        key = json.loads(rows[0]["envelope_json"]).get("dedupe_key")
+    except (TypeError, ValueError):
+        return None
+    return "r1." + key if isinstance(key, str) and key else None
+
+
+def _rebase_legacy_cursor(led, importer, source, exc) -> bool:
+    """Move a stale positional cursor onto the last record the ledger consumed.
+
+    A directory snapshot is ordered by file mtime, so rewriting one record moves
+    it and invalidates every positional hash after it for good -- the retry can
+    never validate that cursor again. The ledger still knows which record it
+    consumed last: while that identity survives in the snapshot, one empty
+    checkpoint moves the cursor onto it (no rewind, no skipped row, no second
+    dedupe layer). A genuinely lost record keeps raising ``source_gap``.
+    """
+    if _code(exc) != "source_gap" or not getattr(source, "_identity_cursors", False):
+        return False
+    position = importer.position(source.adapter_id, source.instance)
+    cursor = position["cursor"]
+    if not cursor or cursor.startswith("r1."):
+        return False
+    identity = _last_identity(led, source.adapter_id, source.instance)
+    if identity is not None:
+        try:
+            source.read_batch(identity, 1, 1 << 20)
+        except Exception:  # noqa: BLE001 - the identity is gone: a real gap
+            return False
+    importer.commit_batch(source.adapter_id, source.instance, [], expected_cursor=cursor,
+                          next_cursor=identity, expected_page=position["page"])
+    return True
+
+
 def _local_pages(name: str, ledger: str, state: str, page_limit: int, max_pages: int) -> dict:
     from rizzstack_rails import RailsLedger
     from rizzstack_rails.importer import Importer
 
     source, authorities = _source(name, state)
-    imported, has_more = 0, False
+    imported, has_more, rebased = 0, False, False
     with closing(RailsLedger(ledger, allowed_authorities=authorities)) as led:
         importer = Importer(led, authorities=authorities)
         for _ in range(max_pages):
-            result = importer.import_once(source, limit=page_limit)
+            try:
+                result = importer.import_once(source, limit=page_limit)
+            except Exception as exc:  # noqa: BLE001 - only a stale legacy cursor is recoverable
+                if not _rebase_legacy_cursor(led, importer, source, exc):
+                    raise
+                rebased = True
+                result = importer.import_once(source, limit=page_limit)
             imported += int(result["imported"])
             has_more = bool(result["has_more"])
             if not has_more:
                 break
-    return {"ok": True, "imported": imported, "has_more": has_more}
+    report = {"ok": True, "imported": imported, "has_more": has_more}
+    if rebased:
+        report["rebased"] = True
+    return report
 
 
 def _launcher_page(led, importer, source, chain: str, page_limit: int) -> tuple[int, bool]:

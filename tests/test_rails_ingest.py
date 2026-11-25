@@ -13,6 +13,7 @@ these tests so no socket is opened.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -327,6 +328,95 @@ def test_a_symlinked_contract_directory_is_still_refused(tmp_path: Path):
     with pytest.raises(source.SourceError) as err:
         source.collect_snapshot(str(state))
     assert err.value.code == "source_unsafe"
+
+
+def _verify(state: Path, attempt: str, order: int) -> Path:
+    path = state / "verify-results" / f"{attempt}.json"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_text(json.dumps({
+        "attempt_id": attempt, "ok": True, "at": "2026-01-02T03:04:05Z",
+        "sha": hashlib.sha1(attempt.encode()).hexdigest(),
+    }), encoding="utf-8")
+    os.utime(path, (order, order))
+    return path
+
+
+def test_a_stale_legacy_cursor_is_rebased_onto_the_last_committed_record(tmp_path: Path, capsys):
+    """A rewritten record reorders the mtime-sorted snapshot and kills the
+    positional cursor; the ledger still knows the last record it consumed."""
+    from bundlebees_plugin import rails_bundlebees_source as bb_source
+    from rizzstack_rails.importer import Importer
+
+    class Legacy(bb_source.BundlebeesSource):
+        _identity_cursors = False
+
+    state = _state(tmp_path)
+    _verify(state, "att-a", 10)
+    _verify(state, "att-b", 20)
+    db = tmp_path / "ledger.sqlite3"
+
+    # The pre-identity-cursor runner committed the whole snapshot positionally.
+    source = Legacy(state)
+    page = source.read_batch(None, 500, 1 << 20)
+    assert not page["next_cursor"].startswith("r1.")
+    led = rails_ledger.RailsLedger(str(db))
+    try:
+        Importer(led).commit_batch(source.adapter_id, source.instance, page["records"],
+                                   expected_cursor=None, next_cursor=page["next_cursor"])
+    finally:
+        led.close()
+
+    # A rewrite bumps the mtime, moving the record after the checkpoint: the
+    # stored positional prefix can never validate again.
+    _verify(state, "att-a", 30)
+    _verify(state, "att-c", 40)
+
+    code, out = _run(["--ledger", str(db), "--state-dir", str(state),
+                      "--source", "bundlebees", "--page-limit", "10"], capsys)
+    assert code == 0
+    assert out["sources"]["bundlebees"] == {"ok": True, "imported": 1, "has_more": False,
+                                            "rebased": True}
+
+    led = rails_ledger.RailsLedger(str(db), read_only=True)
+    try:
+        cursor = led.query("select cursor from source_pages order by page desc limit 1")[0]["cursor"]
+    finally:
+        led.close()
+    assert cursor.startswith("r1.")
+
+    code, out = _run(["--ledger", str(db), "--state-dir", str(state),
+                      "--source", "bundlebees", "--page-limit", "10"], capsys)
+    assert code == 0 and out["sources"]["bundlebees"]["imported"] == 0
+
+
+def test_a_lost_record_is_still_a_source_gap(tmp_path: Path, capsys):
+    """The rebase never invents a resume point for a record the snapshot lost."""
+    from bundlebees_plugin import rails_bundlebees_source as bb_source
+    from rizzstack_rails.importer import Importer
+
+    class Legacy(bb_source.BundlebeesSource):
+        _identity_cursors = False
+
+    state = _state(tmp_path)
+    _verify(state, "att-a", 10)
+    committed = _verify(state, "att-b", 20)
+    db = tmp_path / "ledger.sqlite3"
+
+    source = Legacy(state)
+    page = source.read_batch(None, 500, 1 << 20)
+    led = rails_ledger.RailsLedger(str(db))
+    try:
+        Importer(led).commit_batch(source.adapter_id, source.instance, page["records"],
+                                   expected_cursor=None, next_cursor=page["next_cursor"])
+    finally:
+        led.close()
+
+    Path(committed).unlink()
+
+    code, out = _run(["--ledger", str(db), "--state-dir", str(state),
+                      "--source", "bundlebees", "--page-limit", "10"], capsys)
+    assert code == 3
+    assert out["sources"]["bundlebees"] == {"ok": False, "error": {"code": "source_gap"}}
 
 
 def _usage_pages(count: int, chain: str = "c1") -> list[str]:
