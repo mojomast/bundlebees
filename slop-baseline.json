@@ -90,9 +90,6 @@
     "complexity": 16,
     "swallowed-exception": 1
   },
-  "bundlebees_plugin/hive_docket.py": {
-    "complexity": 3
-  },
   "bundlebees_plugin/integrate_job.py": {
     "complexity": 4
   },
@@ -135,9 +132,6 @@
   "bundlebees_plugin/rails_outbox_source.py": {
     "complexity": 2
   },
-  "bundlebees_plugin/rails_owner_bridge.py": {
-    "complexity": 2
-  },
   "bundlebees_plugin/rails_queue_source.py": {
     "complexity": 1
   },
@@ -167,9 +161,6 @@
   "bundlebees_plugin/revision.py": {
     "complexity": 3
   },
-  "bundlebees_plugin/rework_metrics.py": {
-    "complexity": 3
-  },
   "bundlebees_plugin/risk.py": {
     "complexity": 2
   },
@@ -192,12 +183,6 @@
   "bundlebees_plugin/transport.py": {
     "complexity": 2
   },
-  "bundlebees_plugin/trial_harness.py": {
-    "complexity": 12
-  },
-  "bundlebees_plugin/trial_simulated_driver.py": {
-    "complexity": 1
-  },
   "bundlebees_plugin/verify_local.py": {
     "complexity": 3,
     "swallowed-exception": 1
@@ -205,9 +190,6 @@
   "bundlebees_plugin/verify_workers.py": {
     "complexity": 8,
     "swallowed-exception": 2
-  },
-  "bundlebees_plugin/wave_compat.py": {
-    "complexity": 2
   },
   "bundlebees_plugin/work_scheduler.py": {
     "complexity": 4
@@ -239,6 +221,24 @@
   },
   "contrib/rizzstack_rails/source.py": {
     "complexity": 1
+  },
+  "contrib/trial/trial_harness.py": {
+    "complexity": 12
+  },
+  "contrib/trial/trial_simulated_driver.py": {
+    "complexity": 1
+  },
+  "contrib/unwired/hive_docket.py": {
+    "complexity": 3
+  },
+  "contrib/unwired/rails_owner_bridge.py": {
+    "complexity": 2
+  },
+  "contrib/unwired/rework_metrics.py": {
+    "complexity": 3
+  },
+  "contrib/unwired/wave_compat.py": {
+    "complexity": 2
   },
   "contrib/vibeline/sessions.py": {
     "complexity": 2
