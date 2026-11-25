@@ -100,21 +100,16 @@ def _base64url(value):
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-def issue_ticket(
-    brief,
-    *,
-    private_key,
-    kid,
-    audience,
-    now=None,
-    jti=None,
-    ledger=None,
-    ttl_seconds=TICKET_TTL_SECONDS,
-):
+def _issue_identity(kid, audience):
+    """Refuse an empty kid or audience before anything is signed."""
     if not isinstance(kid, str) or not kid:
         raise TicketError("kid must be a non-empty string")
     if not isinstance(audience, str) or not audience:
         raise TicketError("audience must be a non-empty string")
+
+
+def _issue_risk_tier(brief):
+    """Refuse a brief that cannot name its risk tier; return the validated tier."""
     if not isinstance(brief, dict):
         raise TicketError("brief must be an object")
     if "source_rev" not in brief or "assigned_files" not in brief:
@@ -125,28 +120,52 @@ def issue_ticket(
         raise TicketError("brief risk tier must be low, medium, or high") from None
     if not isinstance(risk_tier, str) or risk_tier not in {"low", "medium", "high"}:
         raise TicketError("brief risk tier must be low, medium, or high")
+    return risk_tier
+
+
+def _issue_ttl(ttl_seconds):
+    """Refuse a ttl outside 1..TICKET_TTL_SECONDS; return it unchanged."""
     if (
         isinstance(ttl_seconds, bool)
         or not isinstance(ttl_seconds, int)
         or not 1 <= ttl_seconds <= TICKET_TTL_SECONDS
     ):
         raise TicketError("ttl_seconds must be between 1 and 600")
+    return ttl_seconds
+
+
+def _issue_iat(now):
+    """Resolve the issued-at stamp, refusing anything that is not an int."""
     iat = int(time.time()) if now is None else now
     if isinstance(iat, bool) or not isinstance(iat, int):
         raise TicketError("now must be an integer Unix timestamp")
+    return iat
+
+
+def _issue_jti(jti):
+    """Mint a jti when none was supplied; refuse a shape outside 32 lower-case hex."""
     if jti is None:
         jti = uuid.uuid4().hex
     if not isinstance(jti, str) or _JTI_RE.fullmatch(jti) is None:
         raise TicketError("jti must be 32 lower-case hexadecimal characters")
+    return jti
+
+
+def _issue_key_bytes(private_key):
+    """Refuse a private key that is not a 32-byte Ed25519 seed; return its bytes."""
     try:
         key_bytes = memoryview(private_key).tobytes()
     except TypeError:
         raise TicketError("private_key must be a 32-byte Ed25519 seed") from None
     if len(key_bytes) != 32:
         raise TicketError("private_key must be a 32-byte Ed25519 seed")
+    return key_bytes
 
+
+def _issue_claims(brief, *, risk_tier, audience, iat, ttl_seconds, jti, kid):
+    """Build the twelve claims the ticket binds to this brief."""
     contract = brief.get("contract")
-    claims = {
+    return {
         "brief_sha256": brief_digest(brief),
         "project": brief["project"],
         "source_rev": brief["source_rev"],
@@ -160,16 +179,50 @@ def issue_ticket(
         "jti": jti,
         "kid": kid,
     }
-    header_segment = _base64url(jcs({"alg": "EdDSA", "kid": kid}))
-    payload_segment = _base64url(jcs(claims))
-    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
 
+
+def _issue_signer(key_bytes):
+    """Return an Ed25519 signer, loading cryptography lazily so the module works without it."""
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     except ImportError as exc:
         raise TicketCryptoUnavailable(_CRYPTO_UNAVAILABLE) from exc
+    return Ed25519PrivateKey.from_private_bytes(key_bytes)
 
+
+def issue_ticket(
+    brief,
+    *,
+    private_key,
+    kid,
+    audience,
+    now=None,
+    jti=None,
+    ledger=None,
+    ttl_seconds=TICKET_TTL_SECONDS,
+):
+    _issue_identity(kid, audience)
+    risk_tier = _issue_risk_tier(brief)
+    _issue_ttl(ttl_seconds)
+    iat = _issue_iat(now)
+    jti = _issue_jti(jti)
+    key_bytes = _issue_key_bytes(private_key)
+
+    claims = _issue_claims(
+        brief,
+        risk_tier=risk_tier,
+        audience=audience,
+        iat=iat,
+        ttl_seconds=ttl_seconds,
+        jti=jti,
+        kid=kid,
+    )
+    header_segment = _base64url(jcs({"alg": "EdDSA", "kid": kid}))
+    payload_segment = _base64url(jcs(claims))
+    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+
+    signer = _issue_signer(key_bytes)
     if ledger is not None:
         ledger.claim(jti, claims["exp"])
-    signature = Ed25519PrivateKey.from_private_bytes(key_bytes).sign(signing_input)
+    signature = signer.sign(signing_input)
     return f"{header_segment}.{payload_segment}.{_base64url(signature)}"
