@@ -19,14 +19,25 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from . import leases, sandbox, test_receipts as receipts
+from .security import scrub
 
 RECORD_DIR = "verify-results"
+
+#: The evidence class a landed verification writes. It is distinct from the
+#: per-attempt verify record on purpose: it names one landed commit and the
+#: tests that ran on that commit's exact tree, so integration can consume it
+#: without pretending the verified attempt commit is an ancestor.
+LANDED_RECORD_SCHEMA = "rizzstack.verify-landed/1"
+LANDED_RECORD_PREFIX = "landed-"
+_LANDED_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
+
 DEFAULT_SANDBOX_TIMEOUT_S = 600
 _MAX_SANDBOX_TIMEOUT_S = 7200
 _COORDINATOR_ENV_PREFIXES = ("BUNDLEBEES_", "HERMES_")
@@ -780,6 +791,36 @@ def _write_record(state_dir: Path, attempt_id: str, record: Mapping[str, Any]) -
     return payload
 
 
+def landed_record_path(state_dir: Path, sha: str) -> Path:
+    """The landed-verify record for one commit id (``landed-<sha>.json``)."""
+    return Path(state_dir) / RECORD_DIR / f"{LANDED_RECORD_PREFIX}{str(sha).lower()}.json"
+
+
+def read_landed_record(state_dir: Path, sha: str) -> dict[str, Any] | None:
+    """The stored landed-verify record, or ``None`` when absent/unreadable."""
+    try:
+        data = json.loads(landed_record_path(state_dir, sha).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_landed_record(state_dir: Path, sha: str, record: Mapping[str, Any]) -> Path:
+    """Write one landed-verify record atomically (0600, fsynced, replaced)."""
+    path = landed_record_path(state_dir, sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(dict(record), sort_keys=True, indent=2).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return path
+
+
 def _branch(attempt_id: str) -> str:
     return f"bb-verify/{attempt_id}"
 
@@ -1514,3 +1555,276 @@ def reprove_commit(repo: Path, record: Mapping[str, Any]) -> dict[str, Any]:
     elif not base_rev or not _commit_matches(repo, sha, base_rev, files):
         problems.append("commit_mismatch")
     return {"ok": not problems, "problems": problems}
+
+
+# ---------------------------------------------------------------------------
+# Landed verification
+# ---------------------------------------------------------------------------
+
+
+def _landed_counts(junit: Any, targets: int) -> dict[str, int | None]:
+    """Case counts straight from the sandbox's JUnit evidence, or nulls.
+
+    ``targets`` is always known; every other count comes from the runner's
+    JUnit summary and stays ``None`` when the runner produced none, so a record
+    can never claim cases it did not observe.
+    """
+
+    if not isinstance(junit, Mapping):
+        return {
+            "targets": targets,
+            "tests": None,
+            "failures": None,
+            "errors": None,
+            "skipped": None,
+            "passed": None,
+        }
+
+    def _count(name: str) -> int:
+        try:
+            return max(0, int(junit.get(name) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    tests = _count("tests")
+    failures = _count("failures")
+    errors = _count("errors")
+    skipped = _count("skipped")
+    return {
+        "targets": targets,
+        "tests": tests,
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+        "passed": max(0, tests - failures - errors - skipped),
+    }
+
+
+def _landed_evidence(
+    tree: Path,
+    argv: Sequence[str],
+    *,
+    runner: TestRunner | None,
+    backend: str,
+    allow_unsafe_local: bool,
+    allow_weak: bool,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run the verify test command once and keep the sandbox evidence intact.
+
+    This is the same execution path ``verify`` uses (:func:`sandbox_runner`, or
+    an injected runner in tests); unlike :func:`_execute_test_command` it keeps
+    ``backend``/``junit``/``duration_s`` so the landed record can report them.
+    """
+
+    try:
+        if runner is not None:
+            raw = runner(Path(tree), list(argv))
+        else:
+            raw = sandbox_runner(
+                Path(tree),
+                list(argv),
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=timeout,
+            )
+    except sandbox.SandboxUnavailable as exc:
+        raise VerifyError(exc.code, exc.error, exc.fix) from exc
+    except ValueError as exc:
+        raise VerifyError(
+            "invalid_argument",
+            f"unknown verify_isolation backend: {exc}",
+            "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise VerifyError(
+            "sandbox_evidence",
+            "the test runner returned no evidence",
+            "Check the sandbox runner and retry.",
+        )
+    try:
+        exit_code = int(raw.get("exit_code"))
+    except (TypeError, ValueError):
+        exit_code = 1
+    tail = raw.get("output_tail")
+    if tail is None:
+        tail = raw.get("tail", "")
+    return {
+        "backend": raw.get("backend"),
+        "exit_code": exit_code,
+        "timed_out": bool(raw.get("timed_out")),
+        "duration_s": raw.get("duration_s"),
+        "junit": raw.get("junit") if isinstance(raw.get("junit"), Mapping) else None,
+        "output_tail": str(tail or ""),
+    }
+
+
+def verify_landed(
+    state_dir: Path,
+    workdir: Path,
+    sha: str,
+    tests: Sequence[str],
+    *,
+    runner: TestRunner | None = None,
+    backend: str = "auto",
+    allow_unsafe_local: bool = False,
+    allow_weak: bool = False,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Run *tests* on the exact tree of one landed commit; never commit or push.
+
+    The caller's checkout is a clean worktree whose ``HEAD`` must already
+    contain *sha*. Verification happens in a disposable detached worktree at
+    *sha* (so the checked-out revision is never moved) and through the same
+    sandbox policy as ``verify``. The result is written once as
+    ``verify-results/landed-<sha>.json`` with schema
+    :data:`LANDED_RECORD_SCHEMA`; a failing run is recorded with ``ok: false``
+    rather than raised, so integration can tell "refused before the run" from
+    "the landed tree failed".
+    """
+
+    repo = Path(workdir).expanduser()
+    value = sha.strip() if isinstance(sha, str) else ""
+    if _LANDED_SHA_RE.fullmatch(value) is None:
+        raise VerifyError(
+            "invalid_landed_sha",
+            "the landed sha is not a full 40-hex commit id",
+            "Pass the merge/landing commit id exactly as git reports it.",
+        )
+    target = value.lower()
+
+    named: list[str] = []
+    for item in tests or []:
+        text = str(item).strip()
+        if text and text not in named:
+            named.append(text)
+    if not named:
+        raise VerifyError(
+            "no_tests_named",
+            "verify-landed needs at least one test target",
+            "Pass --tests with the targets the attempt was verified against.",
+        )
+
+    toplevel = _run(["git", "rev-parse", "--show-toplevel"], repo, timeout=120)
+    if toplevel.returncode != 0:
+        raise VerifyError(
+            "not_a_repository",
+            "the workdir is not a git worktree",
+            "Pass --workdir <clean checkout>.",
+        )
+    try:
+        root = Path(str(toplevel.stdout or "").strip()).resolve()
+        resolved = repo.resolve()
+    except OSError:
+        root = resolved = None
+    if root is None or resolved is None or root != resolved:
+        raise VerifyError(
+            "workdir_not_root",
+            "the workdir is not the repository root",
+            "Pass --workdir <clean checkout> at the repository root.",
+        )
+
+    status = _run(["git", "status", "--porcelain"], repo, timeout=120)
+    if status.returncode != 0:
+        raise VerifyError(
+            "git_error",
+            "cannot read the worktree status",
+            "Inspect the repository and retry.",
+        )
+    if str(status.stdout or "").strip():
+        raise VerifyError(
+            "workdir_dirty",
+            "the checkout has uncommitted changes",
+            "Commit or stash them; verify-landed runs only on a clean checkout.",
+        )
+
+    if not _commit_exists(repo, target):
+        raise VerifyError(
+            "landed_sha_missing",
+            f"commit {target} does not exist in this checkout",
+            "Fetch the landing commit first; verify-landed never fetches or pushes.",
+        )
+    ancestor = _run(["git", "merge-base", "--is-ancestor", target, "HEAD"], repo, timeout=120)
+    if ancestor.returncode != 0:
+        raise VerifyError(
+            "landed_sha_not_in_head",
+            f"commit {target} is not an ancestor of HEAD",
+            "Check out the branch that contains the landing commit.",
+        )
+
+    head_before = _rev(repo, "HEAD")
+    argv = sandbox.pytest_argv(named)
+    with tempfile.TemporaryDirectory(prefix="bundlebees-landed-") as scratch:
+        tree = Path(scratch) / "tree"
+        try:
+            added = _run(
+                ["git", "worktree", "add", "--detach", "--quiet", str(tree), target],
+                repo,
+            )
+            if added.returncode != 0:
+                raise VerifyError(
+                    "worktree_failed",
+                    f"cannot create a worktree at {target}: {str(added.stderr or '').strip()[:200]}",
+                    "Inspect the repository's worktree state and retry.",
+                )
+            if not _ensure_full_worktree(tree, repo, target):
+                raise VerifyError(
+                    "worktree_incomplete",
+                    "the landed worktree is missing tracked files (sparse checkout?)",
+                    "Disable sparse checkout in the checkout and retry.",
+                )
+            if _rev(tree, "HEAD") != target:
+                raise VerifyError(
+                    "worktree_mismatch",
+                    f"the landed worktree is not at {target}",
+                    "Inspect the repository's worktree state and retry.",
+                )
+            evidence = _landed_evidence(
+                tree,
+                argv,
+                runner=runner,
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=timeout,
+            )
+        finally:
+            _run(["git", "worktree", "remove", "--force", str(tree)], repo)
+            _run(["git", "worktree", "prune"], repo)
+
+    if _rev(repo, "HEAD") != head_before:
+        raise VerifyError(
+            "head_moved",
+            "the checkout's HEAD moved while the landed tree was verified",
+            "Restore the checkout to its original revision; the record was not written.",
+        )
+
+    exit_code = int(evidence["exit_code"])
+    timed_out = bool(evidence["timed_out"])
+    try:
+        duration = float(evidence.get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    record = {
+        "schema": LANDED_RECORD_SCHEMA,
+        "sha": target,
+        "tests": named,
+        "ok": bool(exit_code == 0 and not timed_out),
+        "counts": _landed_counts(evidence.get("junit"), len(named)),
+        "sandbox": {
+            "backend": str(
+                evidence.get("backend")
+                or ("injected" if runner is not None else backend)
+            ),
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "duration_s": max(0.0, duration),
+            "timeout_s": int(timeout),
+            "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
+        },
+        "created_at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _write_landed_record(state_dir, target, record)
+    return record
