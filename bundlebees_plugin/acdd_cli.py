@@ -267,7 +267,7 @@ def _collect_manifest(ctx: Any, contract: Mapping[str, Any], sha: str, workdir: 
                 raise _error("tests_uncollectable", f"approved test file {path} is unreadable",
                              "Commit the approved test file at source_rev.") from exc
             ids.extend(_static_ids(path, source))
-            methods[path] = "static"
+            methods[path] = tdd.STATIC_COLLECTION
         ids = sorted(set(_bounded_ids(ids)))
 
     resolved: dict[str, dict[str, list[str]]] = {}
@@ -418,7 +418,10 @@ def cmd_contract(ctx: Any, args: Any) -> int:
         print(f"contract: {scrub(str(frozen.get('id')))} approved")
         _print_hex("contract_sha256", frozen["review"]["contract_sha256"])
         if manifest is not None:
-            static = sorted(path for path, how in manifest["methods"].items() if how == "static")
+            static = sorted(
+                path for path, how in manifest["methods"].items()
+                if how == tdd.STATIC_COLLECTION
+            )
             print(f"tests collected: {len(manifest['collected_ids'])} ids at source_rev, every AC reference resolved")
             if static:
                 print("read statically (import-type collection error at source_rev): " + scrub(", ".join(static)))
@@ -799,9 +802,15 @@ def record_green(state_dir: Path, acdd_state: Mapping[str, Any], workdir: Path, 
         environment=_environment(evidence), notes=note,
     )
     try:
-        approved_ids = tdd.frozen_approved_ids(state_dir, acdd_state)
+        selection = tdd.frozen_approved_selection(state_dir, acdd_state)
+        approved_ids, static_ids = selection if selection is not None else (None, None)
         tdd.check_green(
-            contract, sha, acdd_state["red"], record, approved_ids=approved_ids
+            contract,
+            sha,
+            acdd_state["red"],
+            record,
+            approved_ids=approved_ids,
+            static_ids=static_ids,
         )
         tdd.write_record(state_dir, record, acdd_state["key"])
     except tdd.TddError as exc:
@@ -867,8 +876,16 @@ def integrate_preflight(state_dir: Path, attempt_ids: list[str]) -> list[dict[st
                          "Verify the attempt with `hermes bundlebees verify` before integrating.")
         try:
             preflight = {"contract": contract, "sha": sha, "key": key}
-            approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
-            tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
+            selection = tdd.frozen_approved_selection(state_dir, preflight)
+            approved_ids, static_ids = selection if selection is not None else (None, None)
+            tdd.check_green(
+                contract,
+                sha,
+                red,
+                green,
+                approved_ids=approved_ids,
+                static_ids=static_ids,
+            )
         except tdd.TddError as exc:
             raise _as_error(exc) from exc
         if "refactor" in [str(phase) for phase in contract.get("evidence_required") or []]:
