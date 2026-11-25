@@ -21,6 +21,7 @@ _ADDOPTS_RE = re.compile(r"\baddopts\s*=")
 _PLUGIN_OPTION_RE = re.compile(r"(?:^|[\s\"'])(?:-p(?:\s|=|[A-Za-z_])|--plugin(?:\s|=))")
 _PYTEST11_SECTION_RE = re.compile(r"^\s*\[\s*project\.entry-points\.pytest11\s*\]\s*(?:#.*)?$")
 _PYTEST11_ENTRY_RE = re.compile(r"^\s*pytest11\s*=")
+_EXIT_DEFINITION_RE = re.compile(r"^\s*(?:async\s+)?def\s+_exit\s*\(")
 _CONTENT_PATTERNS = (
     ("forced_exit", re.compile(r"(?:\bfrom\s+os\s+import\s+[^#\n]*\b_exit\b|\b_exit\s*\()")),
     ("atexit", re.compile(r"(?:\batexit\s*\.\s*register\s*\(|\bimport\s+atexit\s+as\s+[A-Za-z_]\w*\b)")),
@@ -179,6 +180,8 @@ def _added_line_findings(
     if _loads_pytest_plugin(path, content, addopts_continuation):
         findings.append(Finding(kind="pytest_plugin", path=path, line=line))
     for kind, pattern in _CONTENT_PATTERNS:
+        if kind == "forced_exit" and _EXIT_DEFINITION_RE.search(content):
+            continue
         if pattern.search(content):
             findings.append(Finding(kind=kind, path=path, line=line))
     return findings
@@ -198,6 +201,7 @@ def _new_scan_state() -> _ScanState:
         "new_line": 0,
         "in_hunk": False,
         "path_reported": False,
+        "file_level": False,
         "addopts": None,
     }
 
@@ -205,9 +209,10 @@ def _new_scan_state() -> _ScanState:
 def _flush_file(state: _ScanState) -> None:
     """Emit the file-level kinds for the file that just ended, if any."""
     path = state["path"]
-    if path is not None and not state["path_reported"]:
+    if path is not None and state["file_level"] and not state["path_reported"]:
         state["findings"].extend(_file_level_findings(path))
     state["path_reported"] = False
+    state["file_level"] = False
     state["addopts"] = None
 
 
@@ -235,6 +240,15 @@ def scan_patch(patch: str) -> list[Finding]:
     for diff_line in patch.splitlines():
         if diff_line.startswith("diff --git "):
             _flush_file(state)
+        if not state["in_hunk"]:
+            if diff_line.startswith("new file mode "):
+                state["file_level"] = True
+            elif diff_line.startswith("deleted file mode "):
+                state["path"] = None
+            elif diff_line.startswith("--- ") and _path_value(diff_line[4:]) is None:
+                state["file_level"] = True
+            elif diff_line.startswith("rename to "):
+                state["file_level"] = True
         if _hunk_start(diff_line) is not None:
             state["addopts"] = None
         handled, state["path"], state["in_hunk"], state["new_line"] = _header_state(
