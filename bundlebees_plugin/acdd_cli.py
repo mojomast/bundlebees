@@ -120,17 +120,22 @@ def _test_first(contract: Mapping[str, Any]) -> bool:
 
 
 def _result(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    from . import verify_local
+
     junit = evidence.get("junit") if isinstance(evidence.get("junit"), Mapping) else {}
     cases = [case for case in evidence.get("cases") or [] if isinstance(case, Mapping)]
-    return {
-        "exit_code": evidence.get("exit_code"),
-        "tests": int(junit.get("tests") or len(cases)),
-        "failures": int(junit.get("failures") or 0),
-        "errors": int(junit.get("errors") or 0),
-        "skipped": int(junit.get("skipped") or 0),
-        "timed_out": bool(evidence.get("timed_out")),
-        "cases": cases,
-    }
+    try:
+        return {
+            "exit_code": evidence.get("exit_code"),
+            "tests": verify_local._junit_counter(junit.get("tests") or len(cases), "tests"),
+            "failures": verify_local._junit_counter(junit.get("failures") or 0, "failures"),
+            "errors": verify_local._junit_counter(junit.get("errors") or 0, "errors"),
+            "skipped": verify_local._junit_counter(junit.get("skipped") or 0, "skipped"),
+            "timed_out": bool(evidence.get("timed_out")),
+            "cases": cases,
+        }
+    except verify_local.VerifyError as exc:
+        raise _error("evidence_invalid", exc.message, exc.fix) from exc
 
 
 def _environment(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -493,7 +498,9 @@ def _cmd_refactor(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
         raise _error("green_failed", "no GREEN evidence for this contract",
                      "Run `hermes bundlebees verify` on the implementation revision first.")
     try:
-        tdd.check_green(contract, sha, red, green)
+        preflight = {"contract": contract, "sha": sha, "key": key}
+        approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
+        tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
 
@@ -571,7 +578,9 @@ def _cmd_review(ctx: Any, args: Any, contract: Mapping[str, Any], sha: str,
         raise _error("green_failed", "no GREEN evidence for this contract",
                      "Run `hermes bundlebees verify` on the implementation revision first.")
     try:
-        tdd.check_green(contract, sha, red, green)
+        preflight = {"contract": contract, "sha": sha, "key": key}
+        approved_ids = tdd.frozen_approved_ids(state_dir, preflight)
+        tdd.check_green(contract, sha, red, green, approved_ids=approved_ids)
     except tdd.TddError as exc:
         raise _as_error(exc) from exc
 

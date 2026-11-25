@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Wave E adapters ADR (`docs/adr/0001-adapters.md`): harness, model, sandbox, forge and coordinator seams; second harness recommendation is Claude Code over ACP.
 - **Preflight honours `require_contract`:** `bundlebees_plugin/preflight.py` takes a keyword-only `require_contract=` and gains a `--require-contract` flag, both threaded into the same `tools._gate` the dispatcher uses, and the registered `preflight` command reads the `require_contract` setting through `config_flag(settings_from_ctx(ctx))` exactly like `tools._require_contract`, so preflight and dispatch return the same verdict when the setting is on.
+- **GREEN-adjacent hardening (WA-A1B-FUP3, review-bb-pr282 minors):** `tdd.frozen_approved_ids` now refuses an explicit null or non-mapping `test_collection` pin as `evidence_tampered` instead of treating it as absent, `tdd refactor` and `tdd review` pass the frozen approved ids into `tdd.check_green`, and `acdd_cli._result` maps a non-numeric JUnit counter on the verify lane to a named `evidence_invalid` refusal.
 
 ## [0.2.0] - 2026-11-24
 
