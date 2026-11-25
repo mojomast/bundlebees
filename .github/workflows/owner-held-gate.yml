@@ -1,0 +1,30 @@
+name: owner-held gate
+
+# Enforces the owner-held hold at merge time: any pull request that carries the
+# `owner-held` label fails this check. The label is only removed by the owner,
+# with a typed yes. Read-only: uses the default token and no secrets.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  owner-held:
+    name: owner-held
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report labels and enforce the owner-held hold
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '|') }}
+        run: |
+          set -euo pipefail
+          echo "PR labels: ${PR_LABELS:-<none>}"
+          case "|${PR_LABELS}|" in
+            *"|owner-held|"*)
+              echo "::error::owner-held: this PR must not be merged or modified without a typed owner yes."
+              exit 1
+              ;;
+          esac
+          echo "owner-held gate: pass (no owner-held label)"
