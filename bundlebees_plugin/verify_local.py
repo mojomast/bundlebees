@@ -169,23 +169,31 @@ class VerifyError(Exception):
         self.fix = fix
 
 
-def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
-    findings = subversion_scan.scan_patch(patch)
+def _subversion_message(findings: Sequence[subversion_scan.Finding]) -> str:
+    listed = ", ".join(
+        f"{finding['kind']}@{subversion_scan.safe_path(finding['path'])}:{finding['line']}"
+        for finding in findings[:5]
+    )
+    message = f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
+    if len(findings) > 5:
+        message += f" (+{len(findings) - 5} more)"
+    return message
+
+
+def check_patch_subversion(
+    patch: str,
+    repo_root: Path | None = None,
+    source_rev: str | None = None,
+) -> list[subversion_scan.Finding]:
+    findings = subversion_scan.scan_for_verify(patch, repo_root, source_rev)
     if findings:
-        listed = ", ".join(
-            f"{finding['kind']}@{finding['path']}:{finding['line']}"
-            for finding in findings[:5]
-        )
-        message = (
-            f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
-        )
-        if len(findings) > 5:
-            message += f" (+{len(findings) - 5} more)"
-        raise VerifyError(
+        error = VerifyError(
             "test_subversion",
-            message,
+            _subversion_message(findings),
             "Remove test-runner subversion from the patch.",
         )
+        error.subversion_differential = getattr(findings, "differential", None)
+        raise error
     return findings
 
 
@@ -1072,9 +1080,10 @@ def _verify_and_commit_locked(
     on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    check_patch_subversion(patch)
     state_dir = Path(state_dir)
     repo = Path(repo)
+    subversion = check_patch_subversion(patch, repo_root=repo, source_rev=base_rev)
+    subversion_differential = getattr(subversion, "differential", None)
     stats = stats if stats is not None else _test_cache_stats()
 
     # Fail closed on missing evidence rather than recording a hollow pass.
@@ -1387,6 +1396,7 @@ def _verify_and_commit_locked(
         patch_sha256=patch_sha256,
         test_cache=stats,
         execution_identity=execution_identity,
+        subversion_differential=subversion_differential,
     )
     written = _write_record(state_dir, attempt_id, record)
     if on_receipt_written is not None and scope is not None:
@@ -1395,8 +1405,23 @@ def _verify_and_commit_locked(
     return record
 
 
-def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, patch_sha256=None, resumed=False, test_cache=None, execution_identity=None) -> dict[str, Any]:
-    return {
+def _record(
+    attempt_id,
+    sha,
+    base_rev,
+    files,
+    tests,
+    *,
+    red,
+    suite,
+    gitleaks,
+    patch_sha256=None,
+    resumed=False,
+    test_cache=None,
+    execution_identity=None,
+    subversion_differential=None,
+) -> dict[str, Any]:
+    record = {
         "attempt_id": attempt_id,
         "ok": True,
         "sha": sha,
@@ -1416,6 +1441,9 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, pa
         "test_cache": dict(test_cache or _test_cache_stats()),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if subversion_differential is not None:
+        record["subversion_differential"] = subversion_differential
+    return record
 
 
 def _identity_for_commit(
