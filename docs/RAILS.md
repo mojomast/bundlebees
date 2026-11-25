@@ -40,12 +40,41 @@ The source emits `intervention.requested` for intake and `intervention.result` w
 ## Scheduled ingest outside a Hermes session
 
 `python -m bundlebees_plugin.rails_ingest --ledger /abs/ledger.sqlite3 --state-dir /abs/state --source bundlebees --source outbox`
-imports each named local source a bounded page at a time until it reports no
-more pages. Sources and the authorities each may write are exactly those
-`rails-import` grants (`bundlebees`, `outbox`, `queue`); the remote `launcher`
-and `hermes` sources stay with `rails-import`. The state is read only; only the
+imports each named source a bounded page at a time until it reports no more
+pages. Sources and the authorities each may write are exactly those
+`rails-import` grants (`bundlebees`, `outbox`, `queue`, `launcher`); the remote
+`hermes` source stays with `rails-import`. The state is read only; only the
 ledger is written; one run holds an exclusive lock beside the ledger. Output is
 one JSON line with per-source counts or generic error codes, never a path.
+
+The runner may add `--source launcher` to admit the worker launcher's
+read-only `rizzstack.rails-export/1` pages. Because it can start outside a
+Hermes session it cannot read plugin settings or the secret store, so the
+launcher source takes explicit arguments:
+
+```sh
+python -m bundlebees_plugin.rails_ingest --ledger /abs/ledger.sqlite3 \
+  --state-dir /abs/state --source bundlebees --source launcher \
+  --launcher-url https://worker.example:8443 --launcher-chain <origin-chain> \
+  --rails-token-file /abs/worker-rails-read.txt [--allow-private]
+```
+
+`--launcher-url`, `--launcher-chain` and `--rails-token-file` are required as a
+set when `launcher` is named, and influence no other source. Configuration is
+validated before any ledger write, even when `launcher` is listed after another
+source: the URL must be an absolute `http`/`https` URL with a host and no
+userinfo, query or fragment; the chain must be a valid origin identity; and the
+credential file must be a regular readable file whose value is 32..512 printable
+non-space ASCII characters. Any failure prints `{"ok": false, "error": {"code":
+"not_configured"}}` and exits `2` without creating the ledger. The launcher keeps
+a per-origin-chain cursor in the ledger and refuses a halted chain with
+`source_fork`. A page error leaves earlier committed pages committed and reports
+`ok: false` with a generic code.
+
+The shipped `contrib/systemd/bundlebees-rails-ingest.{service,timer}` units stay
+local-only (`PrivateNetwork=yes`) and are not changed by this slice. A unit that
+grants the launcher source needs network access and is a separate deployment
+decision.
 
 The bundlebees and outbox sources refuse a state root that a group or other
 user can write or traverse (`source_unsafe`). Keep the plugin data directory
