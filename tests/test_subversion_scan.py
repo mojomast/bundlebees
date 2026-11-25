@@ -338,3 +338,60 @@ def test_refusal_message_lists_findings_and_counts_them():
     assert "conftest@tests/conftest.py:1" in message
     assert message.count("@") == 5
     assert "+2 more" in message
+
+
+# --- review minor 2 (FUP6): quoted and escaped TOML key segments ---------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[project."entry-points".pytest11]',
+        '["project"."entry-points"."pytest11"]',
+        "[project.'entry-points'.'pytest11']",
+        "[project.\"entry-points\".'pytest11']",
+        '[ project . "entry-points" . pytest11 ]',
+        '[project.entry-points."pytest\\u0031\\u0031"]',
+        '[project.entry-points."pytest\\U00000031\\U00000031"]',
+        '["pro\\u006Aect".entry-points.pytest11]',
+        '["project"."entry-points"."pytest11"]  # entry point group',
+    ],
+    ids=[
+        "quoted-entry-points",
+        "all-quoted",
+        "single-quoted",
+        "mixed-quotes",
+        "spaced-and-quoted",
+        "escaped-u",
+        "escaped-U",
+        "escaped-project",
+        "quoted-with-comment",
+    ],
+)
+def test_quoted_or_escaped_toml_key_segments_are_a_finding(line):
+    assert "pytest_plugin" in _kinds(_edit("pyproject.toml", [line]))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[project.entry-points.pytest11x]",
+        '[project."entry-points"."pytest11x"]',
+        "[project.entry-points.pytest11.foo]",
+        '["project.entry-points".pytest11]',
+        '[project."entry-points.pytest11"]',
+        '[project.entry-points."pytest1\\u0031x"]',
+        '["project"."entry-points"."pytest12"]',
+    ],
+    ids=[
+        "suffix-x",
+        "quoted-suffix-x",
+        "child-table",
+        "dot-inside-first-key",
+        "dot-inside-second-key",
+        "escape-then-x",
+        "quoted-other-group",
+    ],
+)
+def test_quoted_or_escaped_key_segments_do_not_over_match(line):
+    assert _scan()(_edit("pyproject.toml", [line])) == []
