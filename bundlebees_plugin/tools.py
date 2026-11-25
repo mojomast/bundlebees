@@ -744,6 +744,67 @@ def _gate(
     return brief, acdd, assessed
 
 
+def _gated_failure_id(brief: Mapping[str, Any], state_dir: Path | None) -> str | None:
+    """The failure id the research gate gated: explicit first, else retry_of."""
+
+    explicit = brief.get("failure_id")
+    if explicit:
+        return explicit.strip() if isinstance(explicit, str) else ""
+    retry_of = brief.get("retry_of")
+    if state_dir is None or not isinstance(retry_of, str) or not retry_of.strip():
+        return None
+    from . import research_gate as rg
+
+    failure = rg._read_json(rg.failure_path(state_dir, retry_of.strip()))
+    if failure is None:
+        return None
+    return str(failure.get("failure_id") or "")
+
+
+def _attach_accepted_findings(
+    brief: dict[str, Any], state_dir: Path | None
+) -> dict[str, Any] | str:
+    """Return the gated brief with its accepted findings, or an error envelope.
+
+    The research gate has already proven an accepted artifact exists. The
+    launcher renders ``brief.findings`` into the worker prompt, so the dispatch
+    must carry the same artifact the gate validated. A findings block supplied
+    by the caller stays authoritative and is never replaced by the state copy.
+    """
+    if isinstance(brief.get("findings"), Mapping):
+        return brief
+    if not brief.get("failure_id"):
+        if not brief.get("retry_of"):
+            return brief
+    from . import research_gate as rg
+
+    try:
+        fid = _gated_failure_id(brief, state_dir)
+    except rg.ResearchGateError as exc:
+        return _err(exc.code, exc.message, exc.fix)
+    if not fid:
+        return brief
+    if state_dir is None:
+        return _err(
+            "not_configured",
+            "the plugin data directory is unavailable, so the accepted findings cannot be attached",
+            "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
+        )
+    try:
+        artifact = rg._read_json(rg.findings_path(state_dir, fid))
+    except rg.ResearchGateError as exc:
+        return _err(exc.code, exc.message, exc.fix)
+    if artifact is None:
+        return _err(
+            "research_required",
+            f"no accepted findings artifact for failure {fid}",
+            "Record accepted findings before retrying; nothing was dispatched.",
+        )
+    attached = dict(brief)
+    attached["findings"] = artifact
+    return attached
+
+
 def _dispatch(
     client: Any,
     args: Mapping[str, Any],
@@ -762,6 +823,11 @@ def _dispatch(
             "the plugin data directory is unavailable, so the coordinator lease cannot be recorded",
             "Run bundlebees inside Hermes so plugin_data_dir is available; nothing was dispatched.",
         )
+
+    attached = _attach_accepted_findings(brief, state_dir)
+    if isinstance(attached, str):
+        return attached
+    brief = attached
 
     _record_gate_findings(state_dir, brief, acdd)
 
