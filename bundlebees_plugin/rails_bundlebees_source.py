@@ -5,10 +5,11 @@ directory, *not* a filename in a JSON snapshot. TDD records have a separate
 seal. As in tdd.review_identity(), that seal authenticates a coordinator's
 recording of a review, not an owner's identity or independent execution.
 
-Directory snapshots have no native sequence. Each checkpoint binds the source
-instance, position and digest of the observed prefix. New suffixes can be read
-after restart; a changed/missing prefix requires explicit reconciliation.
-Only the importer persists a checkpoint. Reads have hard scan and output caps.
+Directory snapshots have no native sequence. Each new checkpoint names the
+last consumed record's dedupe identity. Resume locates that identity in the
+current snapshot; a missing identity requires explicit reconciliation. Stored
+positional checkpoints retain legacy prefix validation. Only the importer
+persists a checkpoint. Reads have hard scan and output caps.
 """
 
 from __future__ import annotations
@@ -532,7 +533,9 @@ class _PagedSource:
                                         row.get('duration_ms'), row.get('timing_quality', 'unknown'),
                                         row.get('redaction_policy'))
             rows.append(dict(body, schema='rizzstack.rails-candidate/1', dedupe_key=row['dedupe_key']))
-        # Pin the observed head while paging, including not-yet-read records.
+        identity = (getattr(self, '_identity_cursors', False) and
+                    (cursor is None or cursor.startswith('r1.')))
+        # Legacy positions pin the observed head, including not-yet-read records.
         # The chain seed binds cursors to an adapter and its configured source.
         hashes = [_hash([self.adapter_id, self.instance])]
         for row in rows:
@@ -540,16 +543,27 @@ class _PagedSource:
         stop = len(rows)
         start = 0
         if cursor is not None:
-            parts = cursor.split(':')
-            if len(parts) != 4 or not all(re.fullmatch(r'[0-9]{1,8}', p) for p in parts[:2]):
-                raise SourceError('invalid_cursor')
-            start, end = map(int, parts[:2])
-            if (not 0 <= start <= end <= stop or hashes[start] != parts[2] or hashes[end] != parts[3]):
-                raise SourceError('source_gap', 'snapshot no longer contains the checkpointed prefix')
-            if start < end:
-                stop = end
+            if identity:
+                if not re.fullmatch(r'r1\.[A-Za-z0-9._:=+~-]+', cursor):
+                    raise SourceError('invalid_cursor')
+                checkpoint = cursor[3:]
+                start = next((n + 1 for n, row in enumerate(rows)
+                              if row['dedupe_key'] == checkpoint), None)
+                if start is None:
+                    raise SourceError('source_gap', 'snapshot no longer contains the checkpointed identity')
+            else:
+                parts = cursor.split(':')
+                if len(parts) != 4 or not all(re.fullmatch(r'[0-9]{1,8}', p) for p in parts[:2]):
+                    raise SourceError('invalid_cursor')
+                start, end = map(int, parts[:2])
+                if (not 0 <= start <= end <= stop or hashes[start] != parts[2] or hashes[end] != parts[3]):
+                    raise SourceError('source_gap', 'snapshot no longer contains the checkpointed prefix')
+                if start < end:
+                    stop = end
 
         def position(n):
+            if identity:
+                return 'r1.' + rows[n - 1]['dedupe_key'] if n else cursor
             return f'{n}:{stop}:{hashes[n]}:{hashes[stop]}'
 
         def page(n):
@@ -580,6 +594,7 @@ class _PagedSource:
 
 class BundlebeesSource(_PagedSource):
     adapter_id = ADAPTER_ID
+    _identity_cursors = True
 
     @classmethod
     def from_existing_state(cls, state_dir):
