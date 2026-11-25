@@ -285,6 +285,31 @@ def lane_of(model: Any) -> str:
     return "other"
 
 
+def _refuse_temperature_zero(brief: Mapping[str, Any]) -> None:
+    """Refuse a brief that asks for temperature 0; ignore unreadable values."""
+
+    temperature = brief.get("temperature")
+    if temperature is None or isinstance(temperature, bool):
+        return
+    try:
+        zero = float(temperature) == 0.0
+    except (TypeError, ValueError):
+        return
+    if zero:
+        raise GoMaxError("temperature_zero", "the brief asks for temperature 0",
+                         "Remove the temperature; these models must not run at 0.")
+
+
+def _select_model(brief: Mapping[str, Any], failed_attempts: int | None,
+                  allowed_models: Iterable[str] | None) -> Mapping[str, Any]:
+    try:
+        return model_route.select_worker_model(
+            brief, failed_attempts=failed_attempts, allowed_models=allowed_models
+        )
+    except ValueError as exc:
+        raise GoMaxError("brief_unreadable", str(exc)) from exc
+
+
 def route(
     brief: Mapping[str, Any],
     *,
@@ -295,23 +320,11 @@ def route(
 
     if not isinstance(brief, Mapping):
         raise GoMaxError("brief_unreadable", "the brief is not an object")
-    temperature = brief.get("temperature")
-    if temperature is not None and not isinstance(temperature, bool):
-        try:
-            if float(temperature) == 0.0:
-                raise GoMaxError("temperature_zero", "the brief asks for temperature 0",
-                                 "Remove the temperature; these models must not run at 0.")
-        except (TypeError, ValueError):
-            pass
+    _refuse_temperature_zero(brief)
     pinned = brief.get("model")
     if isinstance(pinned, str) and pinned.strip():
         return {"model": pinned.strip(), "lane": lane_of(pinned), "reasons": ["pinned"], "source": "pinned"}
-    try:
-        picked = model_route.select_worker_model(
-            brief, failed_attempts=failed_attempts, allowed_models=allowed_models
-        )
-    except ValueError as exc:
-        raise GoMaxError("brief_unreadable", str(exc)) from exc
+    picked = _select_model(brief, failed_attempts, allowed_models)
     model = str(picked.get("model") or "")
     return {"model": model, "lane": lane_of(model), "reasons": list(picked.get("reasons") or []),
             "source": str(picked.get("source") or "rule")}
@@ -352,6 +365,19 @@ def _lane_counts(value: Any) -> dict[str, int]:
     return {lane: max(0, _int(data.get(lane)) or 0) for lane in LANES}
 
 
+def _public_lane_rate(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"count": 0, "last_at": None}
+    return {"count": max(0, _int(value.get("count")) or 0), "last_at": _num(value.get("last_at"))}
+
+
+def _public_rate_limits(limits: Mapping[str, Any]) -> dict[str, Any]:
+    raw = limits.get("by_lane")
+    by_lane: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    return {"window_s": _int(limits.get("window_s")),
+            "by_lane": {lane: _public_lane_rate(by_lane.get(lane)) for lane in LANES}}
+
+
 def public_capacity(payload: Any) -> dict[str, Any] | None:
     """Keep only the documented ``hyvv.capacity/1`` fields (drops anything else)."""
 
@@ -359,8 +385,8 @@ def public_capacity(payload: Any) -> dict[str, Any] | None:
         return None
     host = payload.get("host") if isinstance(payload.get("host"), Mapping) else {}
     docker = payload.get("docker") if isinstance(payload.get("docker"), Mapping) else {}
-    limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), Mapping) else {}
-    by_lane = limits.get("by_lane") if isinstance(limits.get("by_lane"), Mapping) else {}
+    raw_limits = payload.get("rate_limits")
+    limits: Mapping[str, Any] = raw_limits if isinstance(raw_limits, Mapping) else {}
     ok = docker.get("ok")
     return {
         "schema": CAPACITY_SCHEMA,
@@ -385,18 +411,7 @@ def public_capacity(payload: Any) -> dict[str, Any] | None:
             "containers_running": _int(docker.get("containers_running")),
             "detail": "".join(ch for ch in str(docker.get("detail") or "")[:32] if ch.isalnum() or ch in "_-"),
         },
-        "rate_limits": {
-            "window_s": _int(limits.get("window_s")),
-            "by_lane": {
-                lane: {
-                    "count": max(0, _int((by_lane.get(lane) or {}).get("count")) or 0)
-                    if isinstance(by_lane.get(lane), Mapping) else 0,
-                    "last_at": _num((by_lane.get(lane) or {}).get("last_at"))
-                    if isinstance(by_lane.get(lane), Mapping) else None,
-                }
-                for lane in LANES
-            },
-        },
+        "rate_limits": _public_rate_limits(limits),
     }
 
 
@@ -410,6 +425,125 @@ def _closed(reasons: list[str], policy: Policy, lanes: dict[str, Any] | None = N
                                   "reason": "admission_closed"} for lane in LANES},
         "policy": policy.public(),
     }
+
+
+def _capacity_reasons(cap_doc: Mapping[str, Any], at: float, policy: Policy) -> list[str]:
+    """Every reason the launcher's own gauges give for staying closed."""
+
+    reasons: list[str] = []
+    if abs(at - cap_doc["observed_at"]) > policy.capacity_max_age_s:
+        reasons.append("capacity_stale")
+    docker = cap_doc["docker"]
+    if docker["ok"] is False:
+        reasons.append("docker_unhealthy")
+    elif docker["ok"] is not True:
+        reasons.append("docker_unknown")
+    if cap_doc["split_brain"] is not False:
+        reasons.append("launcher_split_brain")
+    if cap_doc["queued"] > 0:
+        reasons.append("launcher_queue_backlog")
+    return reasons
+
+
+def _ram_slots(host: Mapping[str, Any], policy: Policy, reasons: list[str]) -> int:
+    avail = host["mem_available_mb"]
+    if avail is None:
+        reasons.append("host_memory_unknown")
+        return 0
+    slots = (avail - policy.host_ram_reserve_mb) // policy.per_bee_ram_mb
+    if slots <= 0:
+        reasons.append("ram_pressure")
+    return slots
+
+
+def _vm_slots(docker: Mapping[str, Any], policy: Policy, active: int, reasons: list[str]) -> int | None:
+    if docker["ok"] is not True:
+        return None
+    mem = docker["mem_total_mb"]
+    if mem is None:
+        reasons.append("docker_memory_unknown")
+        return 0
+    slots = mem // policy.per_bee_ram_mb - active
+    if slots <= 0:
+        reasons.append("docker_memory_full")
+    return slots
+
+
+def _cpu_slots(host: Mapping[str, Any], docker: Mapping[str, Any], policy: Policy, active: int,
+               reasons: list[str]) -> int:
+    busy = host["cpu_busy_pct"]
+    cpus = host["cpu_count"] or docker["ncpu"]
+    if busy is None or not cpus:
+        reasons.append("host_cpu_unknown")
+        return 0
+    if busy >= policy.cpu_busy_max_pct:
+        reasons.append("cpu_pressure")
+    slots = cpus // policy.per_bee_cpus - active
+    if slots <= 0:
+        reasons.append("cpu_full")
+    return slots
+
+
+def _budget_slots(spent: int | None, policy: Policy, reasons: list[str]) -> int:
+    if spent is None:
+        reasons.append("budget_unreadable")
+        return 0
+    left = policy.daily_attempt_budget - int(spent)
+    if left <= 0:
+        reasons.append("budget_exhausted")
+    return left
+
+
+def _slot_limits(cap_doc: Mapping[str, Any], policy: Policy, active: int, queued: int, max_c: int,
+                 spent: int | None, reasons: list[str]) -> dict[str, Any]:
+    """One slot count per constraint, plus the reason each closed one contributes."""
+
+    in_flight = active + queued
+    limits: dict[str, Any] = {"shared": policy.cap - in_flight}
+    if limits["shared"] <= 0:
+        reasons.append("shared_cap_reached")
+    limits["launcher"] = max_c - in_flight
+    if limits["launcher"] <= 0:
+        reasons.append("launcher_full")
+    docker, host = cap_doc["docker"], cap_doc["host"]
+    limits["ram"] = _ram_slots(host, policy, reasons)
+    vm = _vm_slots(docker, policy, active, reasons)
+    if vm is not None:
+        limits["vm"] = vm
+    limits["cpu"] = _cpu_slots(host, docker, policy, active, reasons)
+    limits["budget"] = _budget_slots(spent, policy, reasons)
+    return limits
+
+
+def _lane_view(policy: Policy, cap_doc: Mapping[str, Any]) -> dict[str, Any]:
+    act_l, q_l = cap_doc["active_by_lane"], cap_doc["queued_by_lane"]
+    rl = cap_doc["rate_limits"]["by_lane"]
+    lanes: dict[str, Any] = {}
+    for lane in LANES:
+        room = max(0, int(policy.lane_max.get(lane, 0)) - act_l[lane] - q_l[lane])
+        paused = rl[lane]["count"] > 0
+        reason = "lane_rate_limited" if paused else ("lane_full" if room <= 0 else "open")
+        lanes[lane] = {"active": act_l[lane], "queued": q_l[lane], "room": 0 if paused else room,
+                       "paused": paused, "reason": reason, "rate_limits": rl[lane]["count"]}
+    return lanes
+
+
+def _gauges(cap_doc: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    active, queued, max_c = cap_doc["active"], cap_doc["queued"], cap_doc["max_concurrent"]
+    if active is None or queued is None or max_c is None or cap_doc["observed_at"] is None:
+        return None
+    return int(active), int(queued), int(max_c)
+
+
+def _open_admission(reasons: list[str], limits: dict[str, Any], lanes: dict[str, Any],
+                    policy: Policy) -> dict[str, Any]:
+    free = min(int(v) for v in limits.values())
+    if free > policy.step_max:
+        free = policy.step_max
+        reasons.append("ramp_step")
+    limits["step"] = policy.step_max
+    return {"free_slots": max(0, free), "reasons": reasons, "limits": limits, "lanes": lanes,
+            "policy": policy.public()}
 
 
 def admit(
@@ -426,121 +560,63 @@ def admit(
     cap_doc = public_capacity(capacity)
     if cap_doc is None:
         return _closed(["capacity_unreadable"], policy)
-    reasons: list[str] = []
-    active, queued, max_c = cap_doc["active"], cap_doc["queued"], cap_doc["max_concurrent"]
-    if active is None or queued is None or max_c is None or cap_doc["observed_at"] is None:
+    gauges = _gauges(cap_doc)
+    if gauges is None:
         return _closed(["capacity_unreadable"], policy)
-    if abs(at - cap_doc["observed_at"]) > policy.capacity_max_age_s:
-        reasons.append("capacity_stale")
-    docker, host = cap_doc["docker"], cap_doc["host"]
-    if docker["ok"] is False:
-        reasons.append("docker_unhealthy")
-    elif docker["ok"] is not True:
-        reasons.append("docker_unknown")
-    if cap_doc["split_brain"] is not False:
-        reasons.append("launcher_split_brain")
-    if queued > 0:
-        reasons.append("launcher_queue_backlog")
-
-    in_flight = active + queued
-    limits: dict[str, Any] = {}
-    limits["shared"] = policy.cap - in_flight
-    if limits["shared"] <= 0:
-        reasons.append("shared_cap_reached")
-    limits["launcher"] = max_c - in_flight
-    if limits["launcher"] <= 0:
-        reasons.append("launcher_full")
-
-    avail = host["mem_available_mb"]
-    if avail is None:
-        reasons.append("host_memory_unknown")
-        limits["ram"] = 0
-    else:
-        limits["ram"] = (avail - policy.host_ram_reserve_mb) // policy.per_bee_ram_mb
-        if limits["ram"] <= 0:
-            reasons.append("ram_pressure")
-    vm_mem = docker["mem_total_mb"]
-    if docker["ok"] is True:
-        if vm_mem is None:
-            reasons.append("docker_memory_unknown")
-            limits["vm"] = 0
-        else:
-            limits["vm"] = vm_mem // policy.per_bee_ram_mb - active
-            if limits["vm"] <= 0:
-                reasons.append("docker_memory_full")
-
-    busy = host["cpu_busy_pct"]
-    cpus = host["cpu_count"] or docker["ncpu"]
-    if busy is None or not cpus:
-        reasons.append("host_cpu_unknown")
-        limits["cpu"] = 0
-    else:
-        if busy >= policy.cpu_busy_max_pct:
-            reasons.append("cpu_pressure")
-        limits["cpu"] = cpus // policy.per_bee_cpus - active
-        if limits["cpu"] <= 0:
-            reasons.append("cpu_full")
-
-    if dispatched_today is None:
-        reasons.append("budget_unreadable")
-        limits["budget"] = 0
-    else:
-        limits["budget"] = policy.daily_attempt_budget - int(dispatched_today)
-        if limits["budget"] <= 0:
-            reasons.append("budget_exhausted")
-
+    active, queued, max_c = gauges
+    reasons = _capacity_reasons(cap_doc, at, policy)
+    limits = _slot_limits(cap_doc, policy, active, queued, max_c, dispatched_today, reasons)
     if last_pressure_at is not None and 0 <= at - float(last_pressure_at) < PRESSURE_COOLDOWN_S:
         reasons.append("pressure_cooldown")
-
-    act_l, q_l = cap_doc["active_by_lane"], cap_doc["queued_by_lane"]
-    rl = cap_doc["rate_limits"]["by_lane"]
-    lanes: dict[str, Any] = {}
-    for lane in LANES:
-        room = max(0, int(policy.lane_max.get(lane, 0)) - act_l[lane] - q_l[lane])
-        paused = rl[lane]["count"] > 0
-        reason = "lane_rate_limited" if paused else ("lane_full" if room <= 0 else "open")
-        lanes[lane] = {"active": act_l[lane], "queued": q_l[lane], "room": 0 if paused else room,
-                       "paused": paused, "reason": reason, "rate_limits": rl[lane]["count"]}
-
+    lanes = _lane_view(policy, cap_doc)
     if reasons:
         return _closed(reasons, policy, lanes=lanes, limits=limits)
-    free = min(int(v) for v in limits.values())
-    if free > policy.step_max:
-        free = policy.step_max
-        reasons.append("ramp_step")
-    limits["step"] = policy.step_max
-    return {"free_slots": max(0, free), "reasons": reasons, "limits": limits, "lanes": lanes,
-            "policy": policy.public()}
+    return _open_admission(reasons, limits, lanes, policy)
+
+
+def _lane_limits(admission: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, bool]]:
+    """Per-lane remaining room and rate-limit pause, straight from an admission."""
+
+    lanes = admission.get("lanes") or {}
+    rooms = {lane: int((lanes.get(lane) or {}).get("room") or 0) for lane in LANES}
+    paused = {lane: bool((lanes.get(lane) or {}).get("paused")) for lane in LANES}
+    return rooms, paused
+
+
+def _hold_reason(cand: Mapping[str, Any], lane: str, rooms: Mapping[str, int],
+                 paused: Mapping[str, bool], free: int) -> str | None:
+    """Why one candidate cannot start now; ``None`` means it may."""
+
+    if cand.get("reason") and not cand.get("lane"):
+        return str(cand["reason"])
+    if cand.get("approved") is not True:
+        return "not_approved"
+    if cand.get("needs_owner") is not False:
+        return "needs_owner_yes"
+    if lane not in LANES:
+        return "lane_unknown"
+    if paused[lane]:
+        return "lane_rate_limited"
+    if rooms[lane] <= 0:
+        return "lane_full"
+    if free <= 0:
+        return "no_free_slots"
+    return None
 
 
 def plan(admission: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Choose candidates in order within free slots and lane room. Pure."""
 
     free = int(admission.get("free_slots") or 0)
-    rooms = {lane: int((admission.get("lanes") or {}).get(lane, {}).get("room") or 0) for lane in LANES}
-    paused = {lane: bool((admission.get("lanes") or {}).get(lane, {}).get("paused")) for lane in LANES}
+    rooms, paused = _lane_limits(admission)
     admitted: list[dict[str, Any]] = []
     held: list[dict[str, Any]] = []
     for cand in candidates:
         work_id = str(cand.get("work_id") or "")
         lane = str(cand.get("lane") or "")
-        hold = None
-        if cand.get("reason") and not cand.get("lane"):
-            hold = str(cand["reason"])
-        elif cand.get("approved") is not True:
-            hold = "not_approved"
-        elif cand.get("needs_owner") is not False:
-            hold = "needs_owner_yes"
-        elif lane not in LANES:
-            hold = "lane_unknown"
-        elif paused[lane]:
-            hold = "lane_rate_limited"
-        elif rooms[lane] <= 0:
-            hold = "lane_full"
-        elif free <= 0:
-            hold = "no_free_slots"
-        if hold:
-            held.append({"work_id": work_id, "lane": lane or None, "reason": hold})
+        reason = _hold_reason(cand, lane, rooms, paused, free)
+        if reason:
+            held.append({"work_id": work_id, "lane": lane or None, "reason": reason})
             continue
         free -= 1
         rooms[lane] -= 1
@@ -614,6 +690,69 @@ def summary_text(record: Mapping[str, Any]) -> str:
     return head + (f" Slots stay empty because: {', '.join(empty)}." if empty else "")
 
 
+def _lane_entry(info: Mapping[str, Any], ready: int, admitted: int) -> dict[str, Any]:
+    return {
+        "active": int(info.get("active") or 0),
+        "queued": int(info.get("queued") or 0),
+        "room": int(info.get("room") or 0),
+        "paused": bool(info.get("paused")),
+        "reason": str(info.get("reason") or ""),
+        "ready": ready,
+        "admitted": admitted,
+    }
+
+
+def _lane_status(adm: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
+                 result: Mapping[str, Any]) -> dict[str, Any]:
+    """Per-lane counts as the status card shows them."""
+
+    views = adm.get("lanes") or {}
+    admitted = result.get("admit") or ()
+    lanes: dict[str, Any] = {}
+    for lane in LANES:
+        info = dict(views.get(lane) or {})
+        ready = sum(1 for c in candidates if c.get("lane") == lane)
+        started = sum(1 for a in admitted if a.get("lane") == lane)
+        lanes[lane] = _lane_entry(info, ready, started)
+    return lanes
+
+
+def _held_counts(result: Mapping[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in result.get("held") or ():
+        key = str(item.get("reason") or "held")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _empty_reasons(mode: Mapping[str, Any], adm: Mapping[str, Any],
+                   candidates: Sequence[Mapping[str, Any]], held: Mapping[str, int]) -> list[str]:
+    """Why slots stay empty, in the order the status card explains them."""
+
+    empty: list[str] = []
+    if not mode.get("enabled"):
+        empty.append("mode_off" if mode.get("reason") in ("off", None) else f"mode_{mode.get('reason')}")
+    if int(adm.get("free_slots") or 0) <= 0:
+        empty.extend(r for r in adm.get("reasons") or () if r not in INFO_REASONS)
+    if not candidates:
+        empty.append("no_ready_approved_work")
+    empty.extend(f"held:{key}" for key in sorted(held) if key != "no_free_slots")
+    return empty
+
+
+def _launcher_view(adm: Mapping[str, Any], cap_doc: Mapping[str, Any]) -> dict[str, Any]:
+    """The launcher/host/docker/admission part of a status record."""
+
+    return {
+        "launcher": {"active": cap_doc.get("active"), "queued": cap_doc.get("queued"),
+                     "max_concurrent": cap_doc.get("max_concurrent")},
+        "host": cap_doc.get("host"),
+        "docker": cap_doc.get("docker"),
+        "admission": {"free_slots": int(adm.get("free_slots") or 0), "reasons": list(adm.get("reasons") or ()),
+                      "limits": dict(adm.get("limits") or {})},
+    }
+
+
 def build_status(
     state_dir: Any,
     capacity: Any,
@@ -636,46 +775,18 @@ def build_status(
     )
     result = dict(plan_result) if plan_result is not None else plan(adm, candidates)
     cap_doc = public_capacity(capacity) or {}
-    lanes: dict[str, Any] = {}
-    for lane in LANES:
-        info = dict((adm.get("lanes") or {}).get(lane) or {})
-        lanes[lane] = {
-            "active": int(info.get("active") or 0),
-            "queued": int(info.get("queued") or 0),
-            "room": int(info.get("room") or 0),
-            "paused": bool(info.get("paused")),
-            "reason": str(info.get("reason") or ""),
-            "ready": sum(1 for c in candidates if c.get("lane") == lane),
-            "admitted": sum(1 for a in result.get("admit") or () if a.get("lane") == lane),
-        }
-    held_counts: dict[str, int] = {}
-    for item in result.get("held") or ():
-        key = str(item.get("reason") or "held")
-        held_counts[key] = held_counts.get(key, 0) + 1
-    empty: list[str] = []
-    if not mode.get("enabled"):
-        empty.append("mode_off" if mode.get("reason") in ("off", None) else f"mode_{mode.get('reason')}")
-    if int(adm.get("free_slots") or 0) <= 0:
-        empty.extend(r for r in adm.get("reasons") or () if r not in INFO_REASONS)
-    if not candidates:
-        empty.append("no_ready_approved_work")
-    empty.extend(f"held:{key}" for key in sorted(held_counts) if key != "no_free_slots")
+    held = _held_counts(result)
     record = {
         "schema": STATUS_SCHEMA,
         "observed_at": at,
         "observed_at_iso": _iso(at),
         "mode": mode,
         "policy": pol.public(),
-        "launcher": {"active": cap_doc.get("active"), "queued": cap_doc.get("queued"),
-                     "max_concurrent": cap_doc.get("max_concurrent")},
-        "host": cap_doc.get("host"),
-        "docker": cap_doc.get("docker"),
-        "admission": {"free_slots": int(adm.get("free_slots") or 0), "reasons": list(adm.get("reasons") or ()),
-                      "limits": dict(adm.get("limits") or {})},
-        "lanes": lanes,
+        **_launcher_view(adm, cap_doc),
+        "lanes": _lane_status(adm, candidates, result),
         "admitted": list(result.get("admit") or ()),
-        "held": held_counts,
-        "empty_reasons": list(dict.fromkeys(empty)),
+        "held": held,
+        "empty_reasons": list(dict.fromkeys(_empty_reasons(mode, adm, candidates, held))),
         "allowed_models": [m for m in (allowed_models or ()) if isinstance(m, str)][:64],
         "last_pressure_at": last_pressure_at,
     }
@@ -714,6 +825,27 @@ def _board_brief(state: Path, work_id: str) -> tuple[dict[str, Any] | None, dict
     return (dict(brief) if isinstance(brief, Mapping) else None), (dict(body) if isinstance(body, Mapping) else None)
 
 
+def _pick_task(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The task a dispatch would take next: the first pending one, else the first."""
+
+    tasks = [t for t in job.get("tasks") or () if isinstance(t, Mapping)]
+    pending = [t for t in tasks if str(t.get("state") or "pending") in ("pending", "dispatching", "retry")]
+    return (pending or tasks or [None])[0]
+
+
+def _job_brief(item: Mapping[str, Any], job_id: str, state: Path) -> tuple[dict[str, Any], int]:
+    """Brief-shaped view of one job task, plus how many attempts it already had."""
+
+    from . import job as job_mod
+
+    task = _pick_task(job_mod.load_job(state, job_id))
+    if task is None:
+        raise GoMaxError("brief_unreadable", f"job {job_id!r} has no task")
+    brief = {"assigned_files": list(task.get("lease") or item.get("lease_files") or ()),
+             "project": str(task.get("project") or ""), "objective": str(task.get("objective") or "")}
+    return brief, len(task.get("attempts") or ())
+
+
 def default_lane_reader(state_dir: Any) -> Callable[[Mapping[str, Any], str], dict[str, Any]]:
     """Predict the lane a factory item would dispatch on (fails closed to brief_unreadable)."""
 
@@ -724,17 +856,7 @@ def default_lane_reader(state_dir: Any) -> Callable[[Mapping[str, Any], str], di
         brief, approval = _board_brief(state, work_id)
         failed = 0
         if brief is None:
-            from . import job as job_mod
-
-            job = job_mod.load_job(state, job_id)
-            tasks = [t for t in job.get("tasks") or () if isinstance(t, Mapping)]
-            pending = [t for t in tasks if str(t.get("state") or "pending") in ("pending", "dispatching", "retry")]
-            task = (pending or tasks or [None])[0]
-            if task is None:
-                raise GoMaxError("brief_unreadable", f"job {job_id!r} has no task")
-            brief = {"assigned_files": list(task.get("lease") or item.get("lease_files") or ()),
-                     "project": str(task.get("project") or ""), "objective": str(task.get("objective") or "")}
-            failed = len(task.get("attempts") or ())
+            brief, failed = _job_brief(item, job_id, state)
         picked = route(brief, failed_attempts=failed)
         return {"lane": picked["lane"], "model": picked["model"], "needs_owner": _needs_owner(brief, approval)}
 
@@ -796,19 +918,27 @@ class FactoryGate:
             self.stock = {"status": "error", "code": str(getattr(exc, "code", type(exc).__name__))[:64]}
         return self.stock
 
-    def begin_pass(self) -> dict[str, Any]:
-        at = _clock(self._now)
+    def _read_capacity(self) -> Any:
         try:
-            self.capacity = self._capacity_reader()
+            return self._capacity_reader()
         except Exception:  # noqa: BLE001 - unreadable capacity admits nothing
-            self.capacity = None
+            return None
+
+    def _read_allowed(self) -> list[str]:
+        if not self._allowed_reader:
+            return []
         try:
-            allowed = self._allowed_reader() if self._allowed_reader else []
+            allowed = self._allowed_reader()
             if isinstance(allowed, Mapping):
                 allowed = allowed.get("models") or []
-            self.allowed_models = [m for m in allowed or () if isinstance(m, str)]
+            return [m for m in allowed or () if isinstance(m, str)]
         except Exception:  # noqa: BLE001 - no allow-list means no model routing
-            self.allowed_models = []
+            return []
+
+    def begin_pass(self) -> dict[str, Any]:
+        at = _clock(self._now)
+        self.capacity = self._read_capacity()
+        self.allowed_models = self._read_allowed()
         previous = read_status(self.state).get("last_pressure_at")
         self.last_pressure_at = float(previous) if isinstance(previous, (int, float)) else None
         self.admission = admit(
@@ -820,9 +950,7 @@ class FactoryGate:
         if pressure:
             self.last_pressure_at = at
         self._free = int(self.admission.get("free_slots") or 0)
-        lanes = self.admission.get("lanes") or {}
-        self._rooms = {lane: int((lanes.get(lane) or {}).get("room") or 0) for lane in LANES}
-        self._paused = {lane: bool((lanes.get(lane) or {}).get("paused")) for lane in LANES}
+        self._rooms, self._paused = _lane_limits(self.admission)
         self.admitted, self.held = [], []
         if pressure:
             self.finish_pass()  # persist the cooldown start even if the pass ends early
@@ -882,6 +1010,19 @@ class FactoryGate:
 # ---------------------------------------------------------------------------
 
 
+def _routed_model(out: Mapping[str, Any], task: Mapping[str, Any], state_dir: Any) -> str | None:
+    """The allow-listed lane model for an unpinned brief, or ``None`` to keep the default."""
+
+    allowed = [m for m in read_status(state_dir).get("allowed_models") or () if isinstance(m, str)]
+    if not allowed:
+        return None
+    failed = len((task or {}).get("attempts") or ())
+    picked = route(out, failed_attempts=failed, allowed_models=allowed)
+    if picked["model"] in allowed and lane_of(picked["model"]) != "other":
+        return picked["model"]
+    return None
+
+
 def route_brief(state_dir: Any, brief: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any]:
     """While go-max is on, give an unpinned dispatch brief its lane's model.
 
@@ -896,13 +1037,9 @@ def route_brief(state_dir: Any, brief: Mapping[str, Any], task: Mapping[str, Any
             return out
         if state_dir is None or not read_mode(state_dir).get("enabled"):
             return out
-        allowed = [m for m in read_status(state_dir).get("allowed_models") or () if isinstance(m, str)]
-        if not allowed:
-            return out
-        failed = len((task or {}).get("attempts") or ())
-        picked = route(out, failed_attempts=failed, allowed_models=allowed)
-        if picked["model"] in allowed and lane_of(picked["model"]) != "other":
-            out["model"] = picked["model"]
+        model = _routed_model(out, task, state_dir)
+        if model:
+            out["model"] = model
     except Exception:  # noqa: BLE001 - routing is an optimisation; unrouted is the default lane
         return dict(brief)
     return out
@@ -947,6 +1084,29 @@ def ready_candidates(state_dir: Any, *, lane_reader: Callable[..., Mapping[str, 
     return out
 
 
+def _live_inputs(client: Any) -> tuple[Any, list[str], list[str]]:
+    """Capacity document, allow-list and any offline reasons from a live client."""
+
+    extra: list[str] = []
+    allowed: list[str] = []
+    if client is None:
+        return None, allowed, ["capacity_offline"]
+    if not hasattr(client, "host_capacity"):
+        return None, allowed, ["capacity_api_unavailable"]
+    try:
+        capacity = client.host_capacity()
+    except Exception:  # noqa: BLE001
+        capacity = None
+    if capacity is None:
+        extra.append("capacity_unreadable")
+    try:
+        health = client.health() if hasattr(client, "health") else {}
+        allowed = [m for m in (health or {}).get("models") or () if isinstance(m, str)]
+    except Exception:  # noqa: BLE001
+        allowed = []
+    return capacity, allowed, extra
+
+
 def snapshot_status(
     state_dir: Any,
     *,
@@ -957,25 +1117,7 @@ def snapshot_status(
 ) -> dict[str, Any]:
     """Build (and by default persist) the status record from live inputs."""
 
-    extra: list[str] = []
-    capacity = None
-    allowed: list[str] = []
-    if client is None:
-        extra.append("capacity_offline")
-    elif not hasattr(client, "host_capacity"):
-        extra.append("capacity_api_unavailable")
-    else:
-        try:
-            capacity = client.host_capacity()
-        except Exception:  # noqa: BLE001
-            capacity = None
-        if capacity is None:
-            extra.append("capacity_unreadable")
-        try:
-            health = client.health() if hasattr(client, "health") else {}
-            allowed = [m for m in (health or {}).get("models") or () if isinstance(m, str)]
-        except Exception:  # noqa: BLE001
-            allowed = []
+    capacity, allowed, extra = _live_inputs(client)
     previous = read_status(state_dir).get("last_pressure_at")
     record = build_status(
         state_dir, capacity, ready_candidates(state_dir), policy=policy, now=now,
