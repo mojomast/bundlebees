@@ -1,0 +1,303 @@
+# WAVE-C-C3 RED evidence
+repo: bundlebees
+branch: red/wave-c-c3
+base_rev: 23fb810
+test_file: tests/test_ticket_issue.py
+command: python -m unittest tests.test_ticket_issue -v
+result: Ran 18 tests: FAILED (failures=18)
+keys: generated at test time in memory (os.urandom); no key material is written or committed
+note: bundlebees_plugin/ticket.py is absent on the base revision; every test fails at setUp with that reason.
+
+test_a_brief_without_a_risk_tier_is_refused (tests.test_ticket_issue.InputValidation.test_a_brief_without_a_risk_tier_is_refused) ... FAIL
+test_empty_audience_and_kid_are_refused (tests.test_ticket_issue.InputValidation.test_empty_audience_and_kid_are_refused) ... FAIL
+test_a_brief_without_a_contract_gets_a_null_contract_digest (tests.test_ticket_issue.IssuedTicketClaims.test_a_brief_without_a_contract_gets_a_null_contract_digest) ... FAIL
+test_brief_digest_is_rfc8785_over_the_brief_without_its_ticket (tests.test_ticket_issue.IssuedTicketClaims.test_brief_digest_is_rfc8785_over_the_brief_without_its_ticket) ... FAIL
+test_exp_is_exactly_ten_minutes_and_ttl_cannot_be_extended (tests.test_ticket_issue.IssuedTicketClaims.test_exp_is_exactly_ten_minutes_and_ttl_cannot_be_extended) ... FAIL
+test_header_is_eddsa_and_payload_is_the_twelve_claims (tests.test_ticket_issue.IssuedTicketClaims.test_header_is_eddsa_and_payload_is_the_twelve_claims) ... FAIL
+test_issue_is_deterministic_for_a_fixed_key_jti_and_iat (tests.test_ticket_issue.IssuedTicketClaims.test_issue_is_deterministic_for_a_fixed_key_jti_and_iat) ... FAIL
+test_payload_is_the_rfc8785_canonical_json_of_the_claims (tests.test_ticket_issue.IssuedTicketClaims.test_payload_is_the_rfc8785_canonical_json_of_the_claims) ... FAIL
+test_remaining_claims_come_from_the_brief (tests.test_ticket_issue.IssuedTicketClaims.test_remaining_claims_come_from_the_brief) ... FAIL
+test_module_never_consults_environment_or_home_for_a_key (tests.test_ticket_issue.KeyHandling.test_module_never_consults_environment_or_home_for_a_key) ... FAIL
+test_no_key_material_is_committed_with_the_module_or_test (tests.test_ticket_issue.KeyHandling.test_no_key_material_is_committed_with_the_module_or_test) ... FAIL
+test_no_production_key_path_is_opened (tests.test_ticket_issue.KeyHandling.test_no_production_key_path_is_opened) ... FAIL
+test_private_key_is_a_required_injected_argument (tests.test_ticket_issue.KeyHandling.test_private_key_is_a_required_injected_argument) ... FAIL
+test_cryptography_stays_an_optional_extra (tests.test_ticket_issue.OptionalCryptography.test_cryptography_stays_an_optional_extra) ... FAIL
+test_missing_cryptography_fails_closed_with_a_named_error (tests.test_ticket_issue.OptionalCryptography.test_missing_cryptography_fails_closed_with_a_named_error) ... FAIL
+test_a_replayed_jti_is_refused_by_the_ledger (tests.test_ticket_issue.SingleUseJti.test_a_replayed_jti_is_refused_by_the_ledger) ... FAIL
+test_default_jti_is_random_32_hex_and_unique_per_issue (tests.test_ticket_issue.SingleUseJti.test_default_jti_is_random_32_hex_and_unique_per_issue) ... FAIL
+test_ledger_refuses_the_same_jti_twice_even_without_a_ticket (tests.test_ticket_issue.SingleUseJti.test_ledger_refuses_the_same_jti_twice_even_without_a_ticket) ... FAIL
+
+======================================================================
+FAIL: test_a_brief_without_a_risk_tier_is_refused (tests.test_ticket_issue.InputValidation.test_a_brief_without_a_risk_tier_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_empty_audience_and_kid_are_refused (tests.test_ticket_issue.InputValidation.test_empty_audience_and_kid_are_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_a_brief_without_a_contract_gets_a_null_contract_digest (tests.test_ticket_issue.IssuedTicketClaims.test_a_brief_without_a_contract_gets_a_null_contract_digest)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_brief_digest_is_rfc8785_over_the_brief_without_its_ticket (tests.test_ticket_issue.IssuedTicketClaims.test_brief_digest_is_rfc8785_over_the_brief_without_its_ticket)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_exp_is_exactly_ten_minutes_and_ttl_cannot_be_extended (tests.test_ticket_issue.IssuedTicketClaims.test_exp_is_exactly_ten_minutes_and_ttl_cannot_be_extended)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_header_is_eddsa_and_payload_is_the_twelve_claims (tests.test_ticket_issue.IssuedTicketClaims.test_header_is_eddsa_and_payload_is_the_twelve_claims)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_issue_is_deterministic_for_a_fixed_key_jti_and_iat (tests.test_ticket_issue.IssuedTicketClaims.test_issue_is_deterministic_for_a_fixed_key_jti_and_iat)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_payload_is_the_rfc8785_canonical_json_of_the_claims (tests.test_ticket_issue.IssuedTicketClaims.test_payload_is_the_rfc8785_canonical_json_of_the_claims)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_remaining_claims_come_from_the_brief (tests.test_ticket_issue.IssuedTicketClaims.test_remaining_claims_come_from_the_brief)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_module_never_consults_environment_or_home_for_a_key (tests.test_ticket_issue.KeyHandling.test_module_never_consults_environment_or_home_for_a_key)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_no_key_material_is_committed_with_the_module_or_test (tests.test_ticket_issue.KeyHandling.test_no_key_material_is_committed_with_the_module_or_test)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_no_production_key_path_is_opened (tests.test_ticket_issue.KeyHandling.test_no_production_key_path_is_opened)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_private_key_is_a_required_injected_argument (tests.test_ticket_issue.KeyHandling.test_private_key_is_a_required_injected_argument)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_cryptography_stays_an_optional_extra (tests.test_ticket_issue.OptionalCryptography.test_cryptography_stays_an_optional_extra)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_missing_cryptography_fails_closed_with_a_named_error (tests.test_ticket_issue.OptionalCryptography.test_missing_cryptography_fails_closed_with_a_named_error)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_a_replayed_jti_is_refused_by_the_ledger (tests.test_ticket_issue.SingleUseJti.test_a_replayed_jti_is_refused_by_the_ledger)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_default_jti_is_random_32_hex_and_unique_per_issue (tests.test_ticket_issue.SingleUseJti.test_default_jti_is_random_32_hex_and_unique_per_issue)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+======================================================================
+FAIL: test_ledger_refuses_the_same_jti_twice_even_without_a_ticket (tests.test_ticket_issue.SingleUseJti.test_ledger_refuses_the_same_jti_twice_even_without_a_ticket)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_issue.py", line 273, in setUp
+    self.fail(
+    ~~~~~~~~~^
+        "bundlebees_plugin/ticket.py is missing or does not import"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        + (f": {IMPORT_ERROR!r}" if IMPORT_ERROR else "")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: bundlebees_plugin/ticket.py is missing or does not import
+
+----------------------------------------------------------------------
+Ran 18 tests in 0.005s
+
+FAILED (failures=18)
