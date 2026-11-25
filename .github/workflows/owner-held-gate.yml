@@ -2,7 +2,7 @@ name: owner-held gate
 
 # Enforces the owner-held hold at merge time: any pull request that carries the
 # `owner-held` label fails this check. The label is only removed by the owner,
-# with a typed yes. Read-only: uses the default token and no secrets.
+# with a typed yes. Read-only: the default token only, no secret values.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
