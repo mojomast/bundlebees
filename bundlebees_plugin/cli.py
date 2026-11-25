@@ -302,6 +302,34 @@ def _build_parser(parser: Any) -> Any:
     )
     verify.set_defaults(command="verify")
 
+    verify_landed = subparsers.add_parser(
+        "verify-landed",
+        help="Run the named tests on a landed commit's exact tree; never commit or push.",
+    )
+    verify_landed.add_argument(
+        "--workdir",
+        default=None,
+        help="Clean git checkout whose HEAD contains the landed sha.",
+    )
+    verify_landed.add_argument(
+        "--sha",
+        required=True,
+        help="Full 40-hex merge/landing commit id.",
+    )
+    verify_landed.add_argument(
+        "--tests",
+        nargs="+",
+        action="extend",
+        required=True,
+        help="Test targets to run at the landed commit.",
+    )
+    verify_landed.add_argument(
+        "--state-dir",
+        default=None,
+        help="Plugin data directory for verify-results (defaults to Hermes plugin data).",
+    )
+    verify_landed.set_defaults(command="verify-landed")
+
     coverage_cmd = subparsers.add_parser("coverage", help="Classify queued backlog tasks against open/merged PRs (read-only).")
     coverage_cmd.add_argument("--backlog", required=True)
     coverage_cmd.add_argument("--candidates", required=True)
@@ -704,6 +732,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             if getattr(args, "commit_local", False):
                 return _cmd_verify_commit_local(ctx, args)
             return _cmd_verify(ctx, args)
+        if command == "verify-landed":
+            return _cmd_verify_landed(ctx, args)
         if command == "deliver":
             return _cmd_deliver(ctx, args)
         if command == "deploy":
@@ -759,7 +789,7 @@ def _dispatch(ctx: Any, args: Any) -> int:
         raise CliError(
             "invalid_argument",
             "unknown bundlebees command",
-            "Use one of: verify, integrate, lease, metrics, deploy, doctor, "
+            "Use one of: verify, verify-landed, integrate, lease, metrics, deploy, doctor, "
             "contract, tdd, job, repo, campaign, attempts, status, factory-hook.",
         )
     except CliError as exc:
@@ -2947,6 +2977,53 @@ def _cmd_verify_commit_local(ctx: Any, args: Any) -> int:
     return 0
 
 
+def _cmd_verify_landed(ctx: Any, args: Any) -> int:
+    """`verify-landed`: run the named tests on one landed commit's exact tree."""
+
+    from . import verify_local
+    from .execution import SandboxRunner
+
+    state_dir = _state_dir(ctx, args)
+    config = _config(ctx)
+    workdir = Path(getattr(args, "workdir", None) or config.get("worktree") or os.getcwd())
+    tests = list(getattr(args, "tests", None) or [])
+    try:
+        runner = SandboxRunner(config)
+    except dispatch.PayloadError as exc:
+        raise _as_cli_error(exc) from exc
+    options = dict(runner.options)
+
+    try:
+        record = verify_local.verify_landed(
+            state_dir,
+            workdir,
+            str(args.sha),
+            tests,
+            runner=runner,
+            backend=str(options.get("backend") or "auto"),
+            allow_unsafe_local=bool(options.get("allow_unsafe_local")),
+            allow_weak=bool(options.get("allow_weak")),
+            timeout=int(options.get("timeout") or verify_local.DEFAULT_SANDBOX_TIMEOUT_S),
+        )
+    except verify_local.VerifyError as exc:
+        raise CliError(exc.code, exc.message, exc.fix) from exc
+
+    sandbox = record.get("sandbox") if isinstance(record.get("sandbox"), Mapping) else {}
+    _print("bundlebees verify-landed")
+    _print_sha(record["sha"])
+    _print(f"tests: {', '.join(record['tests'])}")
+    # The sha is a validated 40-hex id and the name is derived from it, so the
+    # record path is echoed literally instead of through scrub()'s hash redaction.
+    print(f"record: verify-results/landed-{record['sha']}.json")
+    _print(
+        f"ok: {record['ok']} (exit {sandbox.get('exit_code')} via {sandbox.get('backend')})"
+    )
+    if not record["ok"]:
+        _print(f"output: {sandbox.get('output_tail')}")
+        return 1
+    return 0
+
+
 def _cmd_verify(ctx: Any, args: Any) -> int:
     from . import verify_local
 
@@ -3560,6 +3637,17 @@ def _cmd_integrate(ctx: Any, args: Any) -> int:
                 f"replay: {attempt}: verified {proof.get('verified_sha')} is patch-identical "
                 f"to landed {proof.get('landed_sha')} (patch-id {proof.get('patch_id')})"
             )
+    for attempt, proof in sorted((record.get("landed_evidence") or {}).items()):
+        landed_sha = str(proof.get("landed_sha") or "")
+        if re.fullmatch(r"[0-9a-f]{40}", landed_sha) is None:
+            continue
+        # Cleaned evidence always carries a full sha; echoing it literally keeps
+        # the commit visible instead of letting scrub() redact it as a secret.
+        print(
+            f"landed: {attempt}: {landed_sha} passed "
+            f"{', '.join(proof.get('tests') or [])} at that commit "
+            f"({proof.get('record')})"
+        )
     if suite:
         _print(f"suite: exit {suite.get('exit_code')} via {suite.get('backend')} junit={json.dumps(suite.get('junit'))}")
     for name, info in (suite.get("suites") or {}).items():

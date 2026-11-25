@@ -22,9 +22,12 @@ put the change on ``HEAD`` as a different commit, every path the verified
 change touches resolves to exactly the same object at ``HEAD`` (per-file blob
 equality, so a landing that also carries other files still proves the files it
 shares) — or the change is exactly patch-identical (``git patch-id --stable``)
-to a commit ``HEAD`` carries — *and* a caller-supplied full test suite returns
-a non-timeout exit code of zero. An accepted wave record is final: later
-attempts to overwrite it raise ``RevisionError("wave_already_accepted")``.
+to a commit ``HEAD`` carries — or, when a landing also changed the content, a
+landed-verify record proves the named tests ran green on that exact landing
+commit's tree and the commit's message names this attempt — *and* a
+caller-supplied full test suite returns a non-timeout exit code of zero. An
+accepted wave record is final: later attempts to overwrite it raise
+``RevisionError("wave_already_accepted")``.
 Records are published through a fsynced temporary file and a create-only link,
 so an accepted record is written once and never replaced, and a record that
 exists but cannot be read raises ``wave_unreadable``/``wave_malformed`` — it is
@@ -43,7 +46,7 @@ import re
 import secrets
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +69,23 @@ WAVE_MALFORMED = "wave_malformed"
 #: would be misleading.
 PROBLEM_CHANGE_NOT_LANDED = "verified_change_not_landed"
 PROBLEM_FOREIGN_REPO = "attempt_repo_foreign"
+
+#: The landed-verification evidence class. ``landed_verify_not_in_head`` says a
+#: record for this attempt's landing commit exists but that commit is not in
+#: HEAD's history; ``landed_verify_failed`` says the landed tree's own test run
+#: did not pass, which is stronger and more honest than "not landed".
+PROBLEM_LANDED_NOT_IN_HEAD = "landed_verify_not_in_head"
+PROBLEM_LANDED_FAILED = "landed_verify_failed"
+
+#: Schema written by ``verify-landed`` (mirrors
+#: ``verify_local.LANDED_RECORD_SCHEMA``; a test pins the two together).
+LANDED_VERIFY_SCHEMA = "rizzstack.verify-landed/1"
+LANDED_VERIFY_PREFIX = "landed-"
+LANDED_VERIFY_METHOD = "landed-tests"
+
+#: Upper bound on landed records read for one integrate call. Records are
+#: operator-produced, one per landed commit; the bound keeps a refusal cheap.
+LANDED_VERIFY_RECORD_LIMIT = 200
 
 #: How a non-ancestor landing was proven. ``blob-equality`` is the general
 #: rule: every path the verified change touches has the same object at HEAD.
@@ -833,6 +853,179 @@ class _LandedChanges:
         return self._load().get(patch_id)
 
 
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    """Read one JSON object from disk; anything unreadable or non-object is None."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return dict(data) if isinstance(data, Mapping) else None
+
+
+def _message_names_attempt(message: str, attempt_id: str) -> bool:
+    """Whether a commit message names this attempt id as a whole token.
+
+    The landing convention (``bundlebees: apply verified attempt <id>``) is the
+    only link a landed-verify record has to an attempt. A substring match would
+    let ``att_ab`` claim ``att_abc``'s landing, so the id must stand alone.
+    """
+    if not message or not attempt_id:
+        return False
+    pattern = rf"(?<![A-Za-z0-9._-]){re.escape(attempt_id)}(?![A-Za-z0-9._-])"
+    return re.search(pattern, message) is not None
+
+
+def _named_tests(value: Any) -> list[str] | None:
+    """A record's test targets as non-empty strings, or ``None`` when malformed."""
+    if not isinstance(value, list) or not value:
+        return None
+    named: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        text = item.strip()
+        if not text:
+            return None
+        named.append(text)
+    return named
+
+
+class _LandedVerifications:
+    """Landed-commit verify records attributed to one attempt, lazily.
+
+    ``verify-landed`` runs the named tests on the exact tree of a landed commit
+    and writes ``verify-results/landed-<sha>.json``. The record names no
+    attempt, so attribution uses the landing convention this repository already
+    writes: the landing commit's message carries the attempt id. A record is
+    consumable only when its filename and body name the same full sha, the
+    schema is exact, the run passed, and that sha is in HEAD's history. A
+    record for a commit outside HEAD is reported as its own problem; a failed
+    run at an in-HEAD commit is reported as a failed landed verification.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path,
+        run_git: RunGit,
+        workdir: Path,
+        limit: int = LANDED_VERIFY_RECORD_LIMIT,
+    ) -> None:
+        self._state = Path(state_dir)
+        self._run_git = run_git
+        self._workdir = Path(workdir)
+        self._limit = max(1, int(limit))
+        self._records: dict[str, dict[str, Any]] | None = None
+        self._messages: dict[str, str | None] = {}
+        self._ancestors: dict[str, bool] = {}
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        if self._records is not None:
+            return self._records
+        self._records = {}
+        directory = self._state / "verify-results"
+        try:
+            paths = sorted(directory.glob(f"{LANDED_VERIFY_PREFIX}*.json"))[: self._limit]
+        except OSError:
+            return self._records
+        for path in paths:
+            record = self._load_one(path)
+            if record is not None:
+                self._records[record["sha"]] = record
+        return self._records
+
+    @staticmethod
+    def _load_one(path: Path) -> dict[str, Any] | None:
+        """One schema-valid landed record, or ``None`` when it cannot be used."""
+        sha = path.stem[len(LANDED_VERIFY_PREFIX):].lower()
+        if _SHA40_RE.fullmatch(sha) is None:
+            return None
+        data = _read_json_object(path)
+        if data is None or data.get("schema") != LANDED_VERIFY_SCHEMA:
+            return None
+        body_sha = data.get("sha")
+        if not isinstance(body_sha, str) or body_sha.lower() != sha:
+            return None
+        named = _named_tests(data.get("tests"))
+        if named is None:
+            return None
+        return {
+            "sha": sha,
+            "ok": data.get("ok") is True,
+            "tests": named,
+            "record": f"verify-results/{LANDED_VERIFY_PREFIX}{sha}.json",
+        }
+
+    def _message(self, sha: str) -> str | None:
+        if sha in self._messages:
+            return self._messages[sha]
+        proc = self._run_git(
+            ["log", "-1", "--no-color", "--no-show-signature", "--format=%B", sha],
+            self._workdir,
+            check=False,
+        )
+        self._messages[sha] = str(proc.stdout or "")[:20_000] if proc.returncode == 0 else None
+        return self._messages[sha]
+
+    def _in_head(self, sha: str) -> bool:
+        if sha in self._ancestors:
+            return self._ancestors[sha]
+        proc = self._run_git(
+            ["merge-base", "--is-ancestor", sha, "HEAD"], self._workdir, check=False
+        )
+        self._ancestors[sha] = proc.returncode == 0
+        return self._ancestors[sha]
+
+    def _mentions(self, sha: str, attempt_id: str) -> bool:
+        message = self._message(sha)
+        if message is None or not _message_names_attempt(message, attempt_id):
+            return False
+        return True
+
+    def for_attempt(self, attempt_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        """The landed-tests proof for this attempt, or the most precise refusal."""
+        accepted: list[dict[str, Any]] = []
+        failed: list[str] = []
+        elsewhere: list[str] = []
+        for sha, record in sorted(self._load().items()):
+            if not self._mentions(sha, attempt_id):
+                continue
+            if not self._in_head(sha):
+                elsewhere.append(sha)
+            elif record["ok"]:
+                accepted.append(
+                    {
+                        "landed_sha": sha,
+                        "tests": list(record["tests"]),
+                        "record": record["record"],
+                        "method": LANDED_VERIFY_METHOD,
+                    }
+                )
+            else:
+                failed.append(
+                    f"{PROBLEM_LANDED_FAILED}: the landed verify record for {sha} ran the "
+                    "named tests at that commit and did not pass"
+                )
+        return _landed_verdict(accepted, failed, elsewhere)
+
+
+def _landed_verdict(
+    accepted: Sequence[Mapping[str, Any]],
+    failed: Sequence[str],
+    elsewhere: Sequence[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """An accepted proof wins, then a failed run, then a commit outside HEAD."""
+    if accepted:
+        return dict(accepted[0]), None
+    if failed:
+        return None, str(failed[0])
+    if elsewhere:
+        return None, (
+            f"{PROBLEM_LANDED_NOT_IN_HEAD}: a landed verify record exists for "
+            f"{sorted(elsewhere)[0]}, but that commit is not in HEAD's history"
+        )
+    return None, None
+
+
 def _verified_sha(state_dir: Path, attempt_id: str) -> tuple[str | None, str | None]:
     """The verified 40-hex sha for one attempt, or the record's refusal reason."""
     target = state_dir / "verify-results" / f"{attempt_id}.json"
@@ -878,6 +1071,26 @@ def _foreign_repository_problem(
     )
 
 
+def _landed_candidate(
+    verify: _LandedVerifications | None, attempt_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The landed proof/refusal for one attempt (none without that evidence class)."""
+    if verify is None:
+        return None, None
+    return verify.for_attempt(attempt_id)
+
+
+def _landed_or(
+    proof: dict[str, Any] | None,
+    problem: str | None,
+    fallback: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The landed proof when present, else the landed problem, else *fallback*."""
+    if proof is not None:
+        return None, proof
+    return problem or fallback, None
+
+
 def _attempt_evidence(
     state_dir: Path,
     attempt_id: str,
@@ -886,18 +1099,22 @@ def _attempt_evidence(
     *,
     workdir_repository: str | None = None,
     landed: _LandedChanges | None = None,
+    landed_verify: _LandedVerifications | None = None,
     head: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """One attempt's refusal, plus the replay proof when equivalence passed.
 
     Order matters. A repository check refuses a cross-repo attempt by name
     before any ancestry message can mislead. Ancestry is then the fast path. A
-    commit that is absent from this object store keeps the historical refusal.
-    Only then is a landing proven: exact patch identity is an extra acceptance
-    path for a landing that is the verified change and nothing else, and
-    per-file blob equality is the general rule a squash landing bundling other
-    commits still satisfies. ``None`` proof means the attempt passed on
-    ancestry.
+    commit that is absent from this object store keeps the historical refusal
+    unless a landed-verify record covers this attempt's landing commit. Only
+    then is a landing proven: exact patch identity is an extra acceptance path
+    for a landing that is the verified change and nothing else, and per-file
+    blob equality is the general rule a squash landing bundling other commits
+    still satisfies. A landing whose content drifted (so no equality proof can
+    pass) may still be accepted by that commit's own landed test run, which is
+    a different evidence class, never an equivalence claim. ``None`` proof
+    means the attempt passed on ancestry.
     """
     sha, reason = _verified_sha(state_dir, attempt_id)
     if reason is not None or sha is None:
@@ -911,9 +1128,14 @@ def _attempt_evidence(
     if ancestor.returncode == 0:
         return None, None
 
+    # The landed evidence class: the landing commit's exact tree was tested.
+    landed_proof, landed_problem = _landed_candidate(landed_verify, attempt_id)
+
     present = run_git(["cat-file", "-e", f"{sha}^{{commit}}"], workdir, check=False)
     if present.returncode != 0:
-        return "verified sha is not an ancestor of HEAD", None
+        return _landed_or(
+            landed_proof, landed_problem, "verified sha is not an ancestor of HEAD"
+        )
 
     target = head.strip() if isinstance(head, str) else ""
     if _SHA40_RE.fullmatch(target) is None:
@@ -930,13 +1152,13 @@ def _attempt_evidence(
         }
 
     blobs, problem = _blob_equality_proof(run_git, workdir, sha, target)
-    if problem is not None:
-        return problem, None
-    return None, {
-        "verified_sha": sha,
-        "verified_blobs": dict(blobs or {}),
-        "method": REPLAY_METHOD_BLOB_EQUALITY,
-    }
+    if problem is None:
+        return None, {
+            "verified_sha": sha,
+            "verified_blobs": dict(blobs or {}),
+            "method": REPLAY_METHOD_BLOB_EQUALITY,
+        }
+    return _landed_or(landed_proof, landed_problem, problem)
 
 
 def _junit_regressions(junit: Any) -> int:
@@ -1046,10 +1268,61 @@ def _clean_replay(
     return clean
 
 
+def _clean_landed_tests(value: Any) -> list[str] | None:
+    """The landed record's test targets as storable audit text, or ``None``."""
+    named = _named_tests(value)
+    if named is None or len(named) > 50:
+        return None
+    clean: list[str] = []
+    for text in named:
+        if len(text) > 300:
+            return None
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return None
+        clean.append(str(scrub(text)))
+    return clean
+
+
+def _clean_landed(
+    landed: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Every attempt's landed-tests proof, restricted to fixed safe fields.
+
+    The record name is reconstructed from the validated sha rather than copied
+    from the record, so a stored path can never be attacker-chosen.
+    """
+    clean: dict[str, dict[str, Any]] = {}
+    for attempt_id, proof in dict(landed or {}).items():
+        if not isinstance(proof, Mapping):
+            continue
+        sha = proof.get("landed_sha")
+        if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
+            continue
+        tests = _clean_landed_tests(proof.get("tests"))
+        if tests is None:
+            continue
+        clean[str(attempt_id)] = {
+            "landed_sha": sha.lower(),
+            "record": f"verify-results/{LANDED_VERIFY_PREFIX}{sha.lower()}.json",
+            "tests": tests,
+            "method": LANDED_VERIFY_METHOD,
+        }
+    return clean
+
+
+def _landed_section(
+    landed: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """The optional landed-evidence section; empty when there is no proof."""
+    clean = _clean_landed(landed)
+    return {"landed_evidence": clean} if clean else {}
+
+
 def _clean_record(
     record: Mapping[str, Any],
     head: str,
     replay: Mapping[str, Mapping[str, Any]] | None = None,
+    landed: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict:
     problems = record.get("problems") or {}
     clean_problems = {
@@ -1084,6 +1357,9 @@ def _clean_record(
     clean_replay = _clean_replay(replay)
     if clean_replay:
         clean["replay_evidence"] = clean_replay
+    # Landed-tests proof is a separate evidence class: the landing commit's own
+    # tree was tested and passed, which says nothing about content equality.
+    clean.update(_landed_section(landed))
     return clean
 
 
@@ -1191,11 +1467,14 @@ def integrate_wave(
     not carry the verified commit itself, landed with every path the verified
     change touches byte-identical at ``HEAD`` (a squash or replay landing,
     proven per file so a landing that also carries other files still passes),
-    or exactly patch-identical to a commit ``HEAD`` carries. A
-    foreign-repository attempt is refused by name rather than with an ancestry
-    message. Only when every slice passes is ``run_suite(workdir)`` called; the
-    wave is accepted only if that full suite exits zero and does not time out.
-    Problems are collected per attempt instead of stopping at the first one.
+    or exactly patch-identical to a commit ``HEAD`` carries, or covered by a
+    landed-verify record for the landing commit that names this attempt (a
+    landing whose content drifted but whose own tree passed the named tests).
+    A foreign-repository attempt is refused by name rather than with an
+    ancestry message. Only when every slice passes is ``run_suite(workdir)``
+    called; the wave is accepted only if that full suite exits zero and does
+    not time out. Problems are collected per attempt instead of stopping at the
+    first one.
     """
     if not _safe_wave_id(wave_id):
         raise RevisionError(
@@ -1245,9 +1524,11 @@ def integrate_wave(
     head = head_sha(repo, run_git)
     workdir_repository = _workdir_repository(repo, run_git)
     landed = _LandedChanges(run_git, repo, head)
+    landed_verify = _LandedVerifications(state, run_git, repo)
 
     problems: dict[str, str] = {}
     replay: dict[str, dict[str, Any]] = {}
+    landed_evidence: dict[str, dict[str, Any]] = {}
     for attempt_id in ids:
         reason, proof = _attempt_evidence(
             state,
@@ -1256,12 +1537,16 @@ def integrate_wave(
             run_git,
             workdir_repository=workdir_repository,
             landed=landed,
+            landed_verify=landed_verify,
             head=head,
         )
         if reason:
             problems[attempt_id] = reason
         elif proof:
-            replay[attempt_id] = proof
+            if proof.get("method") == LANDED_VERIFY_METHOD:
+                landed_evidence[attempt_id] = proof
+            else:
+                replay[attempt_id] = proof
 
     suite: dict | None = None
     accepted = False
@@ -1288,6 +1573,7 @@ def integrate_wave(
         },
         head,
         replay,
+        landed_evidence,
     )
     _write_wave(state, wave_id, record)
     return record
