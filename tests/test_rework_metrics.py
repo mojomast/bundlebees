@@ -1,4 +1,4 @@
-"""Approved acceptance tests for bundlebees_plugin.rework_metrics. Coordinator-written; do not edit.
+"""Approved acceptance tests for contrib.unwired.rework_metrics. Coordinator-written; do not edit.
 The metrics are advisory: nothing here may make a verification fail."""
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import rework_metrics as rm
+from contrib.unwired import rework_metrics as rm
 
 
 def C(sha, date, **files):

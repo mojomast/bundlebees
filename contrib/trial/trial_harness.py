@@ -92,11 +92,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
-from . import campaign as campaign_mod
-from . import job as jobs
-from . import reconcile as reconcile_mod
-from . import return_report
-from . import verify_local
+from bundlebees_plugin import campaign as campaign_mod
+from bundlebees_plugin import job as jobs
+from bundlebees_plugin import reconcile as reconcile_mod
+from bundlebees_plugin import return_report
+from bundlebees_plugin import verify_local
 
 SCHEMA = "bundlebees.trial-report/1"
 INTENT_SCHEMA = "bundlebees.dispatch-intent/1"
@@ -735,7 +735,7 @@ def default_contexts(*, rehearsal: bool, coordinator_python: str | None = None,
 
 
 FACTORY_DRIVER_MODULE = "bundlebees_plugin.factory_driver"
-SIMULATED_DRIVER_MODULE = "bundlebees_plugin.trial_simulated_driver"
+SIMULATED_DRIVER_MODULE = "contrib.trial.trial_simulated_driver"
 SIMULATED_DRIVER_SCRIPT = "trial_simulated_driver.py"
 SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd.exe", "powershell"})
 PIPELINE_TOKENS = frozenset({"|", "||", "&&", ";", ">", ">>", "<", "tee", "xargs"})
@@ -752,7 +752,7 @@ def validate_driver_argv(
     ``allowed_modules`` is the set of ``-m`` modules that may be the driver. The
     default is the real coordinator. With ``rehearsal=True`` the allowlist is
     not widened: the argv must name exactly the simulated driver
-    (``bundlebees_plugin.trial_simulated_driver``) via ``-m`` — any other module
+    (``contrib.trial.trial_simulated_driver``) via ``-m`` — any other module
     is refused, and any ``.py`` script must be exactly
     ``trial_simulated_driver.py``. A rehearsal never starts the real factory
     driver.
@@ -2834,7 +2834,7 @@ def rehearsal_driver_argv(
     return (
         str(python or sys.executable),
         "-m",
-        "bundlebees_plugin.trial_simulated_driver",
+        "contrib.trial.trial_simulated_driver",
         "--state",
         str(Path(state_dir)),
         "--trial-dir",
@@ -2867,7 +2867,7 @@ def run_rehearsal(
     interpreter, never the coordinator venv.
     """
 
-    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[1]
+    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[2]
     created = state_dir is None
     state = Path(tempfile.mkdtemp(prefix="bundlebees-trial-rehearsal-")) if created else Path(state_dir)
     if (state / jobs.JOBS_DIR / "trial-job.json").exists() or (state / REHEARSAL_MARKER).exists():
@@ -2970,7 +2970,7 @@ def prepare_request(
     """
 
     try:
-        from . import approval  # noqa: PLC0415 - approval lane may not be installed
+        from bundlebees_plugin import approval  # noqa: PLC0415 - approval lane may not be installed
     except Exception as exc:  # pragma: no cover - deployment fault
         raise TrialRefused(
             "approval_unavailable",
@@ -2986,7 +2986,7 @@ def prepare_request(
             f"unexpected trial plan schema {schema!r}",
             "Use a trial/restart-trial-*.json plan.",
         )
-    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[1]
+    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[2]
     revision = str(code_rev or plan.get("code_rev") or approval.code_revision(root)).strip().lower()
     if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
         raise TrialRefused(
@@ -3181,7 +3181,7 @@ def main(argv: list[str] | None = None) -> int:
     checkout = Checkout(root=Path(args.source_root), contexts=contexts)
     launcher = None
     if args.launcher_url:
-        from .client import LauncherClient, get_launcher_token  # noqa: PLC0415 - only a live trial needs the transport
+        from bundlebees_plugin.client import LauncherClient, get_launcher_token  # noqa: PLC0415 - only a live trial needs the transport
 
         token = get_launcher_token()
         if not token:

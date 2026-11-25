@@ -1,9 +1,9 @@
-"""Approved acceptance tests for bundlebees_plugin.risk_policy. Coordinator-written; do not edit."""
+"""Approved acceptance tests for contrib.unwired.risk_policy. Coordinator-written; do not edit."""
 from __future__ import annotations
 
 import pytest
 
-from bundlebees_plugin import risk_policy
+from contrib.unwired import risk_policy
 
 PHASES = {"red", "green", "refactor", "integration", "review", "security"}
 

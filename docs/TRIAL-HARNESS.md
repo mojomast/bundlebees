@@ -1,6 +1,6 @@
 # Disposable restart trial harness
 
-`bundlebees_plugin.trial_harness` coordinates the host-side half of a coordinator
+`contrib.trial.trial_harness` coordinates the host-side half of a coordinator
 restart trial. It exists to answer one question with durable evidence:
 
 > After the coordinator is stopped mid-flight and started again, did the
@@ -131,17 +131,17 @@ are consumed before run 1: one receipt admits one trial.
 
 ```bash
 # Offline rehearsal: simulated worker and driver, no launcher, no worker.
-python -m bundlebees_plugin.trial_harness rehearse \
+python -m contrib.trial.trial_harness rehearse \
   --source-root "$PWD" --deadline-seconds 60
 
 # Create the inert one-time owner approval request from the plan. The owner
 # then reviews the card in the Bundlebees pane; no terminal authorization.
-python -m bundlebees_plugin.trial_harness prepare \
+python -m contrib.trial.trial_harness prepare \
   --state "$BUNDLEBEES_STATE" --plan trial/restart-trial-20261115.json \
   --source-root "$PWD" --code-rev "$MERGED_BUNDLEBEES_REV"
 
 # A live trial (only after the owner approved it and the job is queued).
-BUNDLEBEES_TRIAL_LIVE=1 python -m bundlebees_plugin.trial_harness run \
+BUNDLEBEES_TRIAL_LIVE=1 python -m contrib.trial.trial_harness run \
   --state "$BUNDLEBEES_STATE" --job job_x --campaign camp_x \
   --source-root "$PWD" --deadline-seconds 900 \
   --ready-on dispatch --restart-on job-complete \
