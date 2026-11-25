@@ -366,3 +366,38 @@ def test_edit_that_adds_a_line_to_conftest_is_still_a_finding():
 def test_user_defined_exit_helper_is_not_a_forced_exit():
     patch = _edit("src/pkg/core.py", ["def _exit(code):", "    raise SystemExit(code)"])
     assert "forced_exit" not in _kinds(patch)
+
+
+# --- r2: binary-marked blocks and a one-line _exit helper ----------------
+# A GIT binary patch block carries no ---/+++ header and no hunk, so a
+# binary-marked MODIFICATION of an existing risky path has no added line and
+# no creation marker; it must still be a file-level finding.
+
+
+def _binary_modification(path: str, payload: str = "Scc@XpScc@XpScc@Xp") -> str:
+    """What git emits when a path is marked binary: no header pair, no hunk."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "index 587be6b..b2e9a4e 100644\n"
+        "GIT binary patch\n"
+        f"literal {len(payload)}\n"
+        f"{payload}\n"
+        "\n"
+    )
+
+
+def test_binary_marked_modification_of_conftest_is_still_a_finding():
+    patch = _binary_modification("tests/conftest.py")
+    assert [(f["kind"], f["line"]) for f in _scan()(patch)] == [("conftest", 1)]
+
+
+def test_binary_marked_modification_of_a_risky_pth_is_still_a_finding():
+    assert "pth_file" in _kinds(_binary_modification("src/evil.pth"))
+
+
+def test_one_line_exit_helper_still_reports_forced_exit():
+    patch = _edit(
+        "src/pkg/core.py",
+        ["def _exit(code): os._exit(code)", "ex = _exit", "ex(0)"],
+    )
+    assert ("forced_exit", 1) in {(f["kind"], f["line"]) for f in _scan()(patch)}
