@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from . import leases, sandbox, subversion_scan, tdd, test_receipts as receipts
-from .security import scrub
+from .security import contain_path, scrub
 
 RECORD_DIR = "verify-results"
 
@@ -1723,6 +1723,7 @@ def _landed_evidence(
     tree: Path,
     argv: Sequence[str],
     *,
+    runner_name: str,
     runner: TestRunner | None,
     backend: str,
     allow_unsafe_local: bool,
@@ -1771,6 +1772,7 @@ def _landed_evidence(
         tail = raw.get("tail", "")
     return {
         "backend": raw.get("backend"),
+        "runner": runner_name,
         "exit_code": exit_code,
         "timed_out": bool(raw.get("timed_out")),
         "duration_s": raw.get("duration_s"),
@@ -1861,6 +1863,74 @@ def _landed_checkout(repo: Path, target: str) -> None:
         )
 
 
+_NODE_TEST_SUFFIXES = (".mjs", ".cjs", ".js")
+
+
+def _landed_target_kind(text: str, tree: Path) -> tuple[str, str | None]:
+    """Classify one landed test target as ``python``/``node`` or a problem."""
+    if "::" in text:
+        return "python", None
+    try:
+        candidate = Path(contain_path(text.split("::", 1)[0] or ".", str(tree)))
+    except ValueError:
+        return "", f"{text} (outside the landed tree)"
+    if text == "." or text.endswith(".py") or candidate.is_dir():
+        return "python", None
+    if text.lower().endswith(_NODE_TEST_SUFFIXES):
+        if candidate.is_file():
+            return "node", None
+        return "", f"{text} (file does not exist at the landed commit)"
+    return "", f"{text} (unknown extension)"
+
+
+def _landed_runner(targets: Sequence[str], tree: Path) -> tuple[str, list[str]]:
+    """Choose exactly one runner for the landed targets, as ``verify`` does.
+
+    Python targets keep pytest's selection rules (``.py``, a ``::`` node id,
+    ``.`` or an existing directory). Node targets must be existing
+    ``.mjs``/``.cjs``/``.js`` files in the landed tree and run under
+    ``node --test``. A mixed list is refused instead of guessed: handing a
+    Node suite to pytest reports "no tests ran" and would look like a pass.
+    """
+
+    python_targets: list[str] = []
+    node_targets: list[str] = []
+    problems: list[str] = []
+    for target in targets:
+        text = str(target).strip()
+        if not text:
+            continue
+        kind, problem = _landed_target_kind(text, tree)
+        if problem:
+            problems.append(problem)
+        elif kind == "node":
+            node_targets.append(text)
+        else:
+            python_targets.append(text)
+    if problems:
+        raise VerifyError(
+            "invalid_test_target",
+            "test targets cannot be run: " + ", ".join(problems),
+            "Pass Python test files/node ids or Node .mjs/.cjs/.js files that exist at the landed commit.",
+        )
+    if python_targets and node_targets:
+        raise VerifyError(
+            "mixed_test_runners",
+            "test targets mix Python and Node suites: "
+            + ", ".join([*python_targets, *node_targets]),
+            "Pass one runner's targets per run; a mixed list cannot be run exactly.",
+        )
+    if node_targets:
+        return "node-test", node_targets
+    if python_targets:
+        return "pytest", python_targets
+    raise VerifyError(
+        "no_tests_named",
+        "none of the named targets is an existing Python or Node test",
+        "Reference a test file that exists at the landed commit.",
+    )
+
+
 def _landed_tree_evidence(
     repo: Path,
     target: str,
@@ -1873,7 +1943,6 @@ def _landed_tree_evidence(
     timeout: int,
 ) -> dict[str, Any]:
     """Run the tests in one disposable detached worktree at *target*."""
-    argv = sandbox.pytest_argv(list(named))
     with tempfile.TemporaryDirectory(prefix="bundlebees-landed-") as scratch:
         tree = Path(scratch) / "tree"
         try:
@@ -1899,9 +1968,16 @@ def _landed_tree_evidence(
                     f"the landed worktree is not at {target}",
                     "Inspect the repository's worktree state and retry.",
                 )
+            runner_name, selected = _landed_runner(named, tree)
+            argv = (
+                ["node", "--test", *selected]
+                if runner_name == "node-test"
+                else sandbox.pytest_argv(selected)
+            )
             return _landed_evidence(
                 tree,
                 argv,
+                runner_name=runner_name,
                 runner=runner,
                 backend=backend,
                 allow_unsafe_local=allow_unsafe_local,
@@ -1923,7 +1999,12 @@ def _landed_record(
     timeout: int,
     now: str | None,
 ) -> dict[str, Any]:
-    """The exact record a landed run writes: the seven schema fields only."""
+    """The exact record a landed run writes: the seven schema fields only.
+
+    ``sandbox`` keeps the evidence block it always had and now names the runner
+    that produced it (``pytest`` or ``node-test``); the top-level schema and
+    every field integration consumes are unchanged.
+    """
     exit_code = int(evidence["exit_code"])
     timed_out = bool(evidence["timed_out"])
     try:
@@ -1941,6 +2022,7 @@ def _landed_record(
                 evidence.get("backend")
                 or ("injected" if runner is not None else backend)
             ),
+            "runner": str(evidence.get("runner") or "pytest"),
             "exit_code": exit_code,
             "timed_out": timed_out,
             "duration_s": max(0.0, duration),
