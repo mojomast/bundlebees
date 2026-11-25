@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -27,6 +28,8 @@ from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from . import leases, sandbox, subversion_scan, tdd, test_receipts as receipts
 from .security import scrub
+
+_LOGGER = logging.getLogger(__name__)
 
 RECORD_DIR = "verify-results"
 
@@ -180,20 +183,41 @@ def _subversion_message(findings: Sequence[subversion_scan.Finding]) -> str:
     return message
 
 
+def _log_subversion_differential(differential: Mapping[str, Any] | None) -> None:
+    """Log the V1/V2 scanner differential instead of recording it.
+
+    Report-only week: the differential is evidence about the scanner cutover,
+    not part of the verify record, whose field set is a closed contract
+    (``verify_workers.RECORD_FIELDS``). It goes to this module's log only.
+    """
+
+    if not differential:
+        return
+    delta = differential.get("delta") or {}
+    _LOGGER.warning(
+        "subversion differential (report-only, not in the verify record): "
+        "v1=%d v2=%d v1_only=%d v2_only=%d match=%s",
+        len(differential.get("v1") or ()),
+        len(differential.get("v2") or ()),
+        len(delta.get("v1_only") or ()),
+        len(delta.get("v2_only") or ()),
+        bool(differential.get("match")),
+    )
+
+
 def check_patch_subversion(
     patch: str,
     repo_root: Path | None = None,
     source_rev: str | None = None,
 ) -> list[subversion_scan.Finding]:
     findings = subversion_scan.scan_for_verify(patch, repo_root, source_rev)
+    _log_subversion_differential(getattr(findings, "differential", None))
     if findings:
-        error = VerifyError(
+        raise VerifyError(
             "test_subversion",
             _subversion_message(findings),
             "Remove test-runner subversion from the patch.",
         )
-        error.subversion_differential = getattr(findings, "differential", None)
-        raise error
     return findings
 
 
@@ -1082,8 +1106,9 @@ def _verify_and_commit_locked(
 ) -> dict[str, Any]:
     state_dir = Path(state_dir)
     repo = Path(repo)
-    subversion = check_patch_subversion(patch, repo_root=repo, source_rev=base_rev)
-    subversion_differential = getattr(subversion, "differential", None)
+    # Refuses a subverting patch; the scanner's V1/V2 differential is logged by
+    # check_patch_subversion and is deliberately not part of the verify record.
+    check_patch_subversion(patch, repo_root=repo, source_rev=base_rev)
     stats = stats if stats is not None else _test_cache_stats()
 
     # Fail closed on missing evidence rather than recording a hollow pass.
@@ -1396,7 +1421,6 @@ def _verify_and_commit_locked(
         patch_sha256=patch_sha256,
         test_cache=stats,
         execution_identity=execution_identity,
-        subversion_differential=subversion_differential,
     )
     written = _write_record(state_dir, attempt_id, record)
     if on_receipt_written is not None and scope is not None:
@@ -1419,7 +1443,6 @@ def _record(
     resumed=False,
     test_cache=None,
     execution_identity=None,
-    subversion_differential=None,
 ) -> dict[str, Any]:
     record = {
         "attempt_id": attempt_id,
@@ -1441,8 +1464,6 @@ def _record(
         "test_cache": dict(test_cache or _test_cache_stats()),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    if subversion_differential is not None:
-        record["subversion_differential"] = subversion_differential
     return record
 
 
