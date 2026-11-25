@@ -71,6 +71,11 @@ def hold_findings(labels):
     return sorted({name for name in labels if (name or "").strip().lower() == HOLD_LABEL})
 
 
+def describe(kind, pull_request):
+    """Return a log-friendly '<kind> #<number>' label for a pull request."""
+    return f"{kind} #{pull_request.get('number') or '?'}"
+
+
 def http_get_json(url, token):
     """GET ``url`` and return ``(payload, link_header)``.
 
@@ -127,35 +132,42 @@ def queue_ref_number(head_ref):
     return match.group(1) if match else ""
 
 
+def pull_request_labels(payload):
+    """Labels for a pull_request event, straight from the payload."""
+    pull_request = payload.get("pull_request") or {}
+    return [(describe("pull_request", pull_request), label_names(pull_request))]
+
+
+def queued_pull_request(merge_group, repo, sha, token, api_url, http):
+    """Resolve the queued pull request from the queue ref when the commit has none."""
+    number = queue_ref_number(str(merge_group.get("head_ref") or ""))
+    if not number:
+        raise LookupError(f"no pull request is associated with merge group head {sha}")
+    return pull_request_by_number(repo, number, token, api_url, http)
+
+
+def merge_group_labels(payload, repo, token, api_url, http):
+    """Labels for a merge_group event, resolved from the merge group head SHA."""
+    merge_group = payload.get("merge_group") or {}
+    sha = str(merge_group.get("head_sha") or "").strip()
+    if not sha:
+        raise LookupError("merge_group payload has no head_sha")
+    if not repo:
+        raise LookupError("GITHUB_REPOSITORY is not set; cannot resolve the queued pull request")
+    if not token:
+        raise LookupError("GITHUB_TOKEN is not set; cannot resolve the queued pull request")
+    queued = pull_requests_for_commit(repo, sha, token, api_url, http)
+    if not queued:
+        queued = [queued_pull_request(merge_group, repo, sha, token, api_url, http)]
+    return [(describe("merge_group", pull_request), label_names(pull_request)) for pull_request in queued]
+
+
 def resolved_labels(payload, event_name, repo, token, api_url, http):
     """Return ``[(where, labels)]`` for the event, or ``[]`` when not applicable."""
     if event_name == "pull_request":
-        pull_request = payload.get("pull_request") or {}
-        number = pull_request.get("number") or payload.get("number")
-        where = f"pull_request #{number}" if number else "pull_request"
-        return [(where, label_names(pull_request))]
-
+        return pull_request_labels(payload)
     if event_name == "merge_group":
-        merge_group = payload.get("merge_group") or {}
-        sha = str(merge_group.get("head_sha") or "").strip()
-        if not sha:
-            raise LookupError("merge_group payload has no head_sha")
-        if not repo:
-            raise LookupError("GITHUB_REPOSITORY is not set; cannot resolve the queued pull request")
-        if not token:
-            raise LookupError("GITHUB_TOKEN is not set; cannot resolve the queued pull request")
-        queued = pull_requests_for_commit(repo, sha, token, api_url, http)
-        if not queued:
-            number = queue_ref_number(str(merge_group.get("head_ref") or ""))
-            if not number:
-                raise LookupError(f"no pull request is associated with merge group head {sha}")
-            queued = [pull_request_by_number(repo, number, token, api_url, http)]
-        resolved = []
-        for pull_request in queued:
-            number = pull_request.get("number") or "?"
-            resolved.append((f"merge_group #{number}", label_names(pull_request)))
-        return resolved
-
+        return merge_group_labels(payload, repo, token, api_url, http)
     return []
 
 
@@ -166,6 +178,54 @@ def infer_event_name(payload):
     if "pull_request" in payload:
         return "pull_request"
     return ""
+
+
+def read_payload(path):
+    """Load the event JSON payload, raising LookupError for the caller to report."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as error:
+        raise LookupError(f"cannot read event payload {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise LookupError(f"event payload {path} is not JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise LookupError(f"event payload {path} is not a JSON object")
+    return payload
+
+
+def report(resolved, event_name):
+    """Print every label set and return the exit status for the gate."""
+    if not resolved:
+        print(f"owner-held: no pull request to hold for event={event_name or '<unknown>'}; pass")
+        return 0
+    held = []
+    for where, labels in resolved:
+        print(f"owner-held: {where} labels: {', '.join(sorted(labels)) or '<none>'}")
+        held.extend(hold_findings(labels))
+    if held:
+        print(
+            f"::error::owner-held: {HOLD_LABEL} is present; this pull request must not be merged "
+            "or modified without a typed owner yes."
+        )
+        return 1
+    print(f"owner-held: pass; no {HOLD_LABEL} label")
+    return 0
+
+
+def evaluate(payload, env, http):
+    """Resolve the event's labels and return the exit status."""
+    event_name = env.get("GITHUB_EVENT_NAME") or infer_event_name(payload)
+    repo = (env.get("GITHUB_REPOSITORY") or "").strip()
+    token = (env.get("GITHUB_TOKEN") or env.get("GH_TOKEN") or "").strip()
+    api_url = (env.get("GITHUB_API_URL") or DEFAULT_API_URL).rstrip("/")
+    print(f"owner-held: event={event_name or '<unknown>'} repository={repo or '<unset>'}")
+    try:
+        resolved = resolved_labels(payload, event_name, repo, token, api_url, http)
+    except (LookupError, OSError, ValueError) as error:
+        # OSError covers urllib.error.URLError/HTTPError; ValueError covers bad JSON.
+        print(f"::error::owner-held: fail closed: {error}", file=sys.stderr)
+        return 1
+    return report(resolved, event_name)
 
 
 def main(argv=None, env=None, http=None):
@@ -182,49 +242,11 @@ def main(argv=None, env=None, http=None):
         print("owner-held: no event payload; pass a path or set GITHUB_EVENT_PATH", file=sys.stderr)
         return 1
     try:
-        payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
-    except OSError as error:
-        print(f"owner-held: cannot read event payload {event_path}: {error}", file=sys.stderr)
+        payload = read_payload(event_path)
+    except LookupError as error:
+        print(f"owner-held: {error}", file=sys.stderr)
         return 1
-    except json.JSONDecodeError as error:
-        print(f"owner-held: event payload {event_path} is not JSON: {error}", file=sys.stderr)
-        return 1
-    if not isinstance(payload, dict):
-        print(f"owner-held: event payload {event_path} is not a JSON object", file=sys.stderr)
-        return 1
-
-    event_name = env.get("GITHUB_EVENT_NAME") or infer_event_name(payload)
-    repo = env.get("GITHUB_REPOSITORY", "").strip()
-    token = (env.get("GITHUB_TOKEN") or env.get("GH_TOKEN") or "").strip()
-    api_url = (env.get("GITHUB_API_URL") or DEFAULT_API_URL).rstrip("/")
-
-    print(f"owner-held: event={event_name or '<unknown>'} repository={repo or '<unset>'}")
-
-    try:
-        resolved = resolved_labels(payload, event_name, repo, token, api_url, http)
-    except (LookupError, OSError, ValueError) as error:
-        # OSError covers urllib.error.URLError/HTTPError; ValueError covers bad JSON.
-        print(f"::error::owner-held: fail closed: {error}", file=sys.stderr)
-        return 1
-
-    if not resolved:
-        print(f"owner-held: no pull request to hold for event={event_name or '<unknown>'}; pass")
-        return 0
-
-    held = []
-    for where, labels in resolved:
-        held.extend(hold_findings(labels))
-        print(f"owner-held: {where} labels: {', '.join(sorted(labels)) or '<none>'}")
-
-    if held:
-        print(
-            f"::error::owner-held: {HOLD_LABEL} is present; this pull request must not be merged "
-            "or modified without a typed owner yes."
-        )
-        return 1
-
-    print(f"owner-held: pass; no {HOLD_LABEL} label")
-    return 0
+    return evaluate(payload, env, http)
 
 
 if __name__ == "__main__":
