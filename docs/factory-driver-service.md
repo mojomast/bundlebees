@@ -142,6 +142,27 @@ gitleaks value is unset it exits nonzero with the missing names instead of
 silently degrading to observation-only. The `EnvironmentFile` directive has no
 `-` prefix, so a missing file is also a startup failure.
 
+## Feature flags
+
+`MEMORY_ENABLED` and `BUNDLEBEES_BOARD_STOCK` are not read from the unit
+environment alone. `bundlebees_plugin/flags.py` resolves each one from the
+process environment first, then from the shared file
+`~/.config/bundlebees/flags.env` (`BUNDLEBEES_FLAGS_FILE` overrides the path) —
+the same file the Hermes gateway's plugin load reads, so a switch means one
+thing in both processes. That file holds flag names only; the launcher token
+and every other credential stay in `factory-driver.env`.
+
+At startup the driver prints one line, before any refusal:
+
+```text
+bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=0 flags_file=/home/<user>/.config/bundlebees/flags.env (present)
+```
+
+It names the effective 0/1 values and the file it consulted, never a value from
+it. `tests/test_flags.py` covers the loader, the precedence and both startup
+lines. Recall stays dark: `MEMORY_ENABLED` is absent from the shared file until
+the owner turns it on.
+
 ## Running from the CLI
 
 ```bash

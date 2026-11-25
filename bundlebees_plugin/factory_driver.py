@@ -47,6 +47,7 @@ from . import launcher_adapter
 from . import bee_events
 from . import board_stock
 from . import campaign as campaign_mod
+from . import flags
 from . import job_cli
 from . import hermes_adapter
 from . import event_consumer
@@ -3025,6 +3026,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # One line naming the effective flags, before any refusal. The gateway
+    # reads the same file through the same loader, so this line is what both
+    # processes actually run with.
+    flags.log_startup()
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
     tick = load_tick(args.tick)
