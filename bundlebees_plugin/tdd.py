@@ -34,7 +34,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 import jsonschema
 
@@ -1169,6 +1169,76 @@ def _observed_id_counts(
     return observed, unexecuted, malformed
 
 
+class _StaticCoverage(NamedTuple):
+    """What the statically collected approved ids cover in the observed run."""
+
+    covered_approved: set[str]
+    covered_observed: set[str]
+    unknown: list[str]
+    duplicate: list[str]
+    malformed: bool
+
+
+def _static_coverage(
+    approved_set: set[str],
+    observed: Mapping[str, int],
+    static_ids: Sequence[str],
+) -> _StaticCoverage:
+    """Resolve the statically collected approved ids against the run's ids."""
+    static_counts, malformed = _approved_id_counts(static_ids)
+    known = set(static_counts) & approved_set
+    matches = {test_id: resolve_test_ref(test_id, observed) for test_id in known}
+    return _StaticCoverage(
+        covered_approved={test_id for test_id, found in matches.items() if found},
+        covered_observed={item for found in matches.values() for item in found},
+        unknown=sorted(set(static_counts) - approved_set),
+        duplicate=sorted(test_id for test_id, count in static_counts.items() if count != 1),
+        malformed=malformed,
+    )
+
+
+def _approved_id_problems(
+    approved_ids: Sequence[str],
+    approved_counts: Mapping[str, int],
+    coverage: _StaticCoverage,
+) -> list[str]:
+    """Problems that come from the approved list or its static selection."""
+    problems: list[str] = []
+    if not approved_ids:
+        problems.append("the approved test-id list is empty")
+    duplicate_approved = sorted(test_id for test_id, count in approved_counts.items() if count != 1)
+    if duplicate_approved:
+        problems.append("duplicate approved ids: " + ", ".join(duplicate_approved[:20]))
+    if coverage.unknown:
+        problems.append("unknown static ids: " + ", ".join(coverage.unknown[:20]))
+    if coverage.duplicate:
+        problems.append("duplicate static ids: " + ", ".join(coverage.duplicate[:20]))
+    return problems
+
+
+def _observed_id_problems(
+    approved_set: set[str],
+    observed: Mapping[str, int],
+    unexecuted: set[str],
+    coverage: _StaticCoverage,
+) -> list[str]:
+    """Problems that come from the ids the run actually executed."""
+    observed_set = set(observed)
+    missing = sorted(approved_set - observed_set - coverage.covered_approved)
+    extra = sorted(observed_set - approved_set - coverage.covered_observed)
+    duplicates = sorted(test_id for test_id, count in observed.items() if count != 1)
+    problems: list[str] = []
+    if missing:
+        problems.append("missing ids: " + ", ".join(missing[:20]))
+    if extra:
+        problems.append("extra ids: " + ", ".join(extra[:20]))
+    if duplicates:
+        problems.append("duplicate run ids: " + ", ".join(duplicates[:20]))
+    if unexecuted:
+        problems.append("cases were not passed call-stage executions: " + ", ".join(sorted(unexecuted)[:20]))
+    return problems
+
+
 def _id_mismatch_problems(
     approved_ids: Sequence[str],
     approved_counts: Mapping[str, int],
@@ -1178,46 +1248,10 @@ def _id_mismatch_problems(
     static_ids: Sequence[str] = (),
 ) -> list[str]:
     """Describe every way the observed ids diverge from the approved ones."""
-    approved_set = set(approved_counts)
-    observed_set = set(observed)
-    static_counts, static_malformed = _approved_id_counts(static_ids)
-    static_set = set(static_counts) & approved_set
-    static_matches = {
-        test_id: resolve_test_ref(test_id, observed) for test_id in static_set
-    }
-    covered_observed = {
-        observed_id
-        for matches_for_id in static_matches.values()
-        for observed_id in matches_for_id
-    }
-    missing = sorted(
-        test_id
-        for test_id in approved_set
-        if test_id not in observed_set and not static_matches.get(test_id)
-    )
-    extra = sorted(observed_set - approved_set - covered_observed)
-    duplicates = sorted(test_id for test_id, count in observed.items() if count != 1)
-    duplicate_approved = sorted(test_id for test_id, count in approved_counts.items() if count != 1)
-    duplicate_static = sorted(test_id for test_id, count in static_counts.items() if count != 1)
-    unknown_static = sorted(set(static_counts) - approved_set)
-    problems: list[str] = []
-    if not approved_ids:
-        problems.append("the approved test-id list is empty")
-    if duplicate_approved:
-        problems.append("duplicate approved ids: " + ", ".join(duplicate_approved[:20]))
-    if unknown_static:
-        problems.append("unknown static ids: " + ", ".join(unknown_static[:20]))
-    if duplicate_static:
-        problems.append("duplicate static ids: " + ", ".join(duplicate_static[:20]))
-    if missing:
-        problems.append("missing ids: " + ", ".join(missing[:20]))
-    if extra:
-        problems.append("extra ids: " + ", ".join(extra[:20]))
-    if duplicates:
-        problems.append("duplicate run ids: " + ", ".join(duplicates[:20]))
-    if unexecuted:
-        problems.append("cases were not passed call-stage executions: " + ", ".join(sorted(unexecuted)[:20]))
-    if malformed or static_malformed:
+    coverage = _static_coverage(set(approved_counts), observed, static_ids)
+    problems = _approved_id_problems(approved_ids, approved_counts, coverage)
+    problems += _observed_id_problems(set(approved_counts), observed, unexecuted, coverage)
+    if malformed or coverage.malformed:
         problems.append("malformed cases without a string id")
     return problems
 
