@@ -101,6 +101,11 @@ def _junit_counter(value: Any, name: str) -> int:
         ) from exc
 
 
+def _junit_counter_or_default(junit: Mapping[str, Any], name: str, default: int) -> int:
+    value = junit.get(name)
+    return _junit_counter(default if value is None else value, name)
+
+
 def _check_frozen_green(
     preflight: Mapping[str, Any],
     approved_ids: Sequence[str],
@@ -117,10 +122,10 @@ def _check_frozen_green(
     cases = list(evidence.get("cases") or [])
     result = {
         "exit_code": evidence.get("exit_code"),
-        "tests": _junit_counter(junit.get("tests") or len(cases), "tests"),
-        "failures": _junit_counter(junit.get("failures") or 0, "failures"),
-        "errors": _junit_counter(junit.get("errors") or 0, "errors"),
-        "skipped": _junit_counter(junit.get("skipped") or 0, "skipped"),
+        "tests": _junit_counter_or_default(junit, "tests", len(cases)),
+        "failures": _junit_counter_or_default(junit, "failures", 0),
+        "errors": _junit_counter_or_default(junit, "errors", 0),
+        "skipped": _junit_counter_or_default(junit, "skipped", 0),
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
     }
