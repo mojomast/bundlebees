@@ -828,7 +828,7 @@ def resolve_contract(
 
     # 1. A named path is read at the base tip, then at the merge-base.  A path
     #    the branch adds or edits is never read unless this PR bootstraps the gate.
-    if path and not wanted:
+    if path:
         for revision, label in base_revisions:
             doc = _read_contract_object(repo, revision, path)
             if doc is not None:
