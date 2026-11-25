@@ -439,7 +439,7 @@ _NO_NEWLINE_SAFE_PATCH = (
     "@@ -1 +1 @@\n"
     "-x = 1\n"
     "\\ No newline at end of file\n"
-    "+os._exit(0)\n"
+    "+y = 2\n"
     "\\ No newline at end of file\n"
 )
 
