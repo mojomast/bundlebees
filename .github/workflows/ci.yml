@@ -237,6 +237,34 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python3 .github/scripts/owner_held.py "$GITHUB_EVENT_PATH"
 
+  lease-tamper:
+    name: lease-tamper
+    # Required through ci-gate. Every pull request must resolve a slice
+    # contract; after the verify boundary only scope.assigned_files may change
+    # and scope.test_files/scope.prohibited are frozen. Applies to every
+    # author, including the coordinator and triage lanes. Canonical script and
+    # docs: mojomast/workflow .github/scripts/lease_tamper.py and
+    # docs/32-lease-tamper-gate.md.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Enforce the slice lease and frozen tests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 .github/scripts/lease_tamper.py "$GITHUB_EVENT_PATH"
+
   ci-gate:
     name: ci-gate
     # The main ruleset requires this one check. It passes only when every job
@@ -248,6 +276,7 @@ jobs:
       - plugin-doctor
       - secret-scan
       - owner-held
+      - lease-tamper
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

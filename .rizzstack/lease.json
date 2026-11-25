@@ -1,0 +1,14 @@
+{
+  "id": "bundlebees-lease-tamper-gate",
+  "lease_version": "rizzstack.lease/1",
+  "source_rev": "6cfc272fd43f7b86cc4fa3830dc0b4f99b1f4faf",
+  "scope": {
+    "assigned_files": [
+      ".github/scripts/lease_tamper.py",
+      ".github/workflows/ci.yml",
+      ".rizzstack/lease.json"
+    ],
+    "test_files": [],
+    "prohibited": []
+  }
+}
