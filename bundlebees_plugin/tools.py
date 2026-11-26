@@ -754,13 +754,20 @@ def _gate(
 def _gated_failure_id(brief: Mapping[str, Any], state_dir: Path | None) -> str | None:
     """The failure id the research gate gated: explicit first, else retry_of."""
 
+    from . import research_gate as rg
+
     explicit = brief.get("failure_id")
     if explicit:
-        return explicit.strip() if isinstance(explicit, str) else ""
+        if not isinstance(explicit, str):
+            raise rg.ResearchGateError(
+                "research_required",
+                "failure_id must be a non-empty string",
+                "Name the recorded failure this retry is for.",
+            )
+        return explicit.strip()
     retry_of = brief.get("retry_of")
     if state_dir is None or not isinstance(retry_of, str) or not retry_of.strip():
         return None
-    from . import research_gate as rg
 
     failure = rg._read_json(rg.failure_path(state_dir, retry_of.strip()))
     if failure is None:

@@ -634,6 +634,18 @@ def _artifact_label(state: Path | None, fid: str) -> str:
         return "research/findings/<invalid-id>.json"
 
 
+def _conflicting_id_refusal(explicit_fid: str, retry_fid: str) -> dict[str, Any]:
+    """Refuse a brief whose explicit id and retry_of name different failures."""
+
+    return _refusal(
+        "research_required",
+        f"failure_id {explicit_fid} and retry_of name different failures ({retry_fid})",
+        "Send one failure id: either failure_id or a retry_of whose failure matches it.",
+        failure_id=explicit_fid,
+        artifact="",
+    )
+
+
 def require_findings(state_dir: Any, brief: Mapping[str, Any]) -> dict[str, Any] | None:
     """Fail closed unless accepted findings exist for every gated failure id.
 
@@ -652,6 +664,8 @@ def require_findings(state_dir: Any, brief: Mapping[str, Any]) -> dict[str, Any]
     state = Path(state_dir) if state_dir is not None else None
     failure_ids: list[str] = []
     failure_records: list[dict[str, Any]] = []
+    explicit_fid: str | None = None
+    retry_fid: str | None = None
     if explicit:
         if not isinstance(explicit, str) or not explicit.strip():
             return _refusal(
@@ -661,7 +675,8 @@ def require_findings(state_dir: Any, brief: Mapping[str, Any]) -> dict[str, Any]
                 failure_id=str(explicit),
                 artifact="",
             )
-        failure_ids.append(explicit.strip())
+        explicit_fid = explicit.strip()
+        failure_ids.append(explicit_fid)
     if retry_of:
         if state is None:
             return _refusal(
@@ -692,8 +707,12 @@ def require_findings(state_dir: Any, brief: Mapping[str, Any]) -> dict[str, Any]
         if failure is not None:
             fid = str(failure.get("failure_id") or "")
             if fid:
+                retry_fid = fid
                 failure_ids.append(fid)
                 failure_records.append(failure)
+
+    if explicit_fid is not None and retry_fid is not None and explicit_fid != retry_fid:
+        return _conflicting_id_refusal(explicit_fid, retry_fid)
 
     for fid in dict.fromkeys(failure_ids):
         for prior in failure_records:
