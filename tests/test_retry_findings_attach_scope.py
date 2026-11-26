@@ -7,7 +7,9 @@ artifact, ignores a supplied block whose ``failure_id`` differs, and the
 mismatched block is then forwarded to the launcher. These tests pin the attach
 step's own decisions (which id wins, what a supplied block has to match) and the
 fail-closed branches the end-to-end suite cannot reach because
-``research_gate.require_findings`` refuses before the helper runs.
+``research_gate.require_findings`` refuses before the helper runs. The attach is
+dark by default, so these pin the enabled path and set ``ATTACH_FINDINGS``
+explicitly; ``tests/test_attach_findings_flag.py`` pins the dark default.
 """
 
 from __future__ import annotations
@@ -15,11 +17,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from bundlebees_plugin import flags
 from bundlebees_plugin import research_gate as rg
 from bundlebees_plugin import tools
 
 WF = "c" * 40
 REV = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _attach_enabled(monkeypatch):
+    """These pin the enabled path; the dark default lives in its own module."""
+
+    monkeypatch.setenv(flags.FLAG_ATTACH_FINDINGS, "1")
 
 
 def failure(**over):
