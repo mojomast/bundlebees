@@ -12,6 +12,13 @@ Event handling (``GITHUB_EVENT_NAME``, else inferred from the payload):
     Labels come straight from ``github.event.pull_request.labels``. No API call,
     so fork pull requests (read-only token) are covered too.
 
+``pull_request_review``
+    A submitted review re-runs the required checks, so it must re-evaluate the
+    hold too: the payload carries the same ``pull_request`` object and the
+    labels are read from it exactly as for ``pull_request``. Treating a review
+    as "no pull request to hold" would let an ``owner-held`` pull request turn
+    ``ci-gate`` green by submitting a review.
+
 ``merge_group``
     A queued merge commit has no labels in the payload, so the pull requests
     associated with ``github.event.merge_group.head_sha`` are resolved through
@@ -164,7 +171,7 @@ def merge_group_labels(payload, repo, token, api_url, http):
 
 def resolved_labels(payload, event_name, repo, token, api_url, http):
     """Return ``[(where, labels)]`` for the event, or ``[]`` when not applicable."""
-    if event_name == "pull_request":
+    if event_name in ("pull_request", "pull_request_review"):
         return pull_request_labels(payload)
     if event_name == "merge_group":
         return merge_group_labels(payload, repo, token, api_url, http)
@@ -175,6 +182,9 @@ def infer_event_name(payload):
     """Best-effort event name when GITHUB_EVENT_NAME is not set."""
     if "merge_group" in payload:
         return "merge_group"
+    # A pull_request_review payload carries both the review and the pull request.
+    if "review" in payload and "pull_request" in payload:
+        return "pull_request_review"
     if "pull_request" in payload:
         return "pull_request"
     return ""
