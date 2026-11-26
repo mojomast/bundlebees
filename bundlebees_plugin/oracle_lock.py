@@ -252,7 +252,11 @@ def _ini_text(options: Mapping[str, Any]) -> str:
             value = " ".join(cleaned) if isinstance(value, str) else cleaned
         text = _ini_value(value)
         if isinstance(value, str) and "\n" in text:
-            text = " ".join(part.strip() for part in text.splitlines() if part.strip())
+            # Keep ini multiline values (markers, filterwarnings) as continuation
+            # lines instead of joining them into one ambiguous value.
+            text = "\n" + "\n".join(
+                f"    {part}" for part in text.splitlines() if part.strip()
+            )
         lines.append(f"{name} = {text}" if text else f"{name} =")
     return "\n".join(lines) + "\n"
 

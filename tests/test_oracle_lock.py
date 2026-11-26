@@ -166,11 +166,15 @@ def test_main_pytest_ini_section_and_plugin_allowlist_are_extracted(tmp_path: Pa
                 "testpaths = tests\n"
                 "addopts = -q -p allowed_plugin\n"
                 "pytest_plugins = allowed_hooks\n"
+                "markers =\n"
+                "    slow: slow tests\n"
+                "    net: network tests\n"
             )
         },
     )
     text, plugins = oracle.main_config(repo, sha)
     assert "addopts = -q" in text
+    assert "markers = \n    slow: slow tests\n    net: network tests" in text
     assert "allowed_plugin" not in text  # re-added explicitly as -p
     assert "allowed_hooks" not in text  # re-added explicitly as -p
     assert plugins == ("allowed_plugin", "allowed_hooks")
