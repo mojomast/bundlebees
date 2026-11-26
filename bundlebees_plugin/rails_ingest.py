@@ -45,6 +45,8 @@ import urllib.parse
 from contextlib import closing
 from pathlib import Path
 
+from .rails_bundlebees_source import _PagedSource
+
 SOURCES = ("bundlebees", "outbox", "queue", "launcher", "launcher-rails")
 _LAUNCHER_SOURCES = ("launcher", "launcher-rails")
 _CODE_RE = re.compile(r"^[a-z_]{1,48}$")
@@ -91,21 +93,147 @@ def _code(exc: BaseException) -> str:
     return code if isinstance(code, str) and _CODE_RE.fullmatch(code) else "source_unavailable"
 
 
+def _last_identity(led, adapter: str, instance: str):
+    """The dedupe key of the newest record this ledger consumed, or None."""
+    rows = led.query(
+        "select envelope_json from event_rows"
+        " where json_extract(envelope_json,'$.source.adapter')=?"
+        " and json_extract(envelope_json,'$.source.instance')=? order by seq desc limit 1",
+        (adapter, instance))
+    if not rows:
+        return None
+    try:
+        key = json.loads(rows[0]["envelope_json"]).get("dedupe_key")
+    except (TypeError, ValueError):
+        return None
+    return key if isinstance(key, str) and key else None
+
+
+def _consumed_keys(led, adapter: str, instance: str) -> set[str]:
+    """Every dedupe key this ledger already holds for one adapter instance."""
+    rows = led.query(
+        "select json_extract(envelope_json,'$.dedupe_key') as dedupe_key from event_rows"
+        " where json_extract(envelope_json,'$.source.adapter')=?"
+        " and json_extract(envelope_json,'$.source.instance')=?",
+        (adapter, instance))
+    return {row["dedupe_key"] for row in rows
+            if isinstance(row["dedupe_key"], str) and row["dedupe_key"]}
+
+
+def _resume_identity(led, source):
+    """The identity cursor that resumes without skipping an unconsumed record.
+
+    A rewrite moves a record in the mtime-ordered snapshot, so the newest
+    consumed record can end up *after* a record the ledger never saw. Resuming
+    from the newest consumed identity would then silently strand that record.
+    The safe resume point is the consumed record immediately before the first
+    unconsumed record in snapshot order. Returns ``(cursor, rows)`` where
+    ``rows`` is the exact snapshot the anchor was chosen from, so the retry
+    pages the same snapshot instead of a concurrently rewritten one. Returns
+    None when no such point exists (a lost newest identity, a pruned ledger,
+    or an unconsumed record at the very front), which the caller treats as a
+    hard ``source_gap``.
+    """
+    try:
+        rows = list(source.events())
+    except Exception:  # noqa: BLE001 - an unreadable snapshot is not recoverable
+        return None
+    keys = [row.get("dedupe_key") for row in rows]
+    if any(not isinstance(key, str) or not key for key in keys):
+        return None
+    newest = _last_identity(led, source.adapter_id, source.instance)
+    if newest is None or newest not in keys:
+        return None
+    consumed = _consumed_keys(led, source.adapter_id, source.instance)
+    first = next((n for n, key in enumerate(keys) if key not in consumed), None)
+    if first == 0:
+        return None
+    anchor = len(keys) - 1 if first is None else first - 1
+    return "r1." + keys[anchor], rows
+
+
+class _PinnedSnapshot(_PagedSource):
+    """Page exactly the rows an anchor was derived from.
+
+    A directory snapshot can change between the anchor enumeration and the
+    retry (a verify-writer rewrites a record, moving it in mtime order). The
+    anchor is only safe against the snapshot it was computed from, so the retry
+    pages that same list; it carries the same disk provenance the rows already
+    had, because they came from ``collect_events``.
+    """
+
+    def __init__(self, source, rows) -> None:
+        self._source = source
+        self._rows_pinned = tuple(rows)
+        self.adapter_id = source.adapter_id
+        self.instance = source.instance
+        self._identity_cursors = getattr(source, "_identity_cursors", False)
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+    def _rows(self):
+        return list(self._rows_pinned)
+
+    def events(self):
+        return self._rows()
+
+
+def _rebase_legacy_cursor(led, importer, source, exc):
+    """Move a stale positional cursor to a point the ledger can prove safe.
+
+    A directory snapshot is ordered by file mtime, so rewriting one record moves
+    it and invalidates every positional hash after it for good -- the retry can
+    never validate that cursor again. One empty checkpoint moves the cursor onto
+    the consumed record immediately before the first unconsumed one, so the
+    retry imports every record the ledger has not seen (no rewind, no skipped
+    row, no second dedupe layer). The retry is returned a source pinned to the
+    anchor's snapshot, so a rewrite between the two enumerations cannot move an
+    unconsumed record behind the new checkpoint. A lost identity or an
+    unprovable resume point keeps raising ``source_gap``; this never writes a
+    null cursor.
+    """
+    if _code(exc) != "source_gap" or not getattr(source, "_identity_cursors", False):
+        return None
+    position = importer.position(source.adapter_id, source.instance)
+    cursor = position["cursor"]
+    if not cursor or cursor.startswith("r1."):
+        return None
+    resolved = _resume_identity(led, source)
+    if resolved is None:
+        return None
+    identity, rows = resolved
+    importer.commit_batch(source.adapter_id, source.instance, [], expected_cursor=cursor,
+                          next_cursor=identity, expected_page=position["page"])
+    return _PinnedSnapshot(source, rows)
+
+
 def _local_pages(name: str, ledger: str, state: str, page_limit: int, max_pages: int) -> dict:
     from rizzstack_rails import RailsLedger
     from rizzstack_rails.importer import Importer
 
     source, authorities = _source(name, state)
-    imported, has_more = 0, False
+    imported, has_more, rebased = 0, False, False
     with closing(RailsLedger(ledger, allowed_authorities=authorities)) as led:
         importer = Importer(led, authorities=authorities)
         for _ in range(max_pages):
-            result = importer.import_once(source, limit=page_limit)
+            try:
+                result = importer.import_once(source, limit=page_limit)
+            except Exception as exc:  # noqa: BLE001 - only a stale legacy cursor is recoverable
+                pinned = _rebase_legacy_cursor(led, importer, source, exc)
+                if pinned is None:
+                    raise
+                rebased = True
+                source = pinned
+                result = importer.import_once(source, limit=page_limit)
             imported += int(result["imported"])
             has_more = bool(result["has_more"])
             if not has_more:
                 break
-    return {"ok": True, "imported": imported, "has_more": has_more}
+    report = {"ok": True, "imported": imported, "has_more": has_more}
+    if rebased:
+        report["rebased"] = True
+    return report
 
 
 def _launcher_page(led, importer, source, chain: str, page_limit: int) -> tuple[int, bool]:

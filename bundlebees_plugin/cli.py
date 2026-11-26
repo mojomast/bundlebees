@@ -541,7 +541,7 @@ def _build_parser(parser: Any) -> Any:
 
 def _cmd_deliver(ctx: Any, args: Any) -> int:
     """Reconcile pending deliveries (open missing PRs). Idempotent; safe on a timer."""
-    state_dir = Path(getattr(args, "state_dir", None) or settings.state_dir(ctx))
+    state_dir = _state_dir(ctx, args)
     scanned = _delivery.scan(state_dir)
     rows = scanned["pending"]
     damaged = scanned["damaged"]
