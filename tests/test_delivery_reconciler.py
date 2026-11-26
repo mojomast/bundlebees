@@ -331,6 +331,29 @@ class DeliveryDamagedRecords(unittest.TestCase):
             self.assertEqual(record["state"], delivery.STATE_PR_OPEN)
 
 
+def test_cli_deliver_defaults_to_plugin_state_dir_on_a_dry_run(tmp_path, capsys, monkeypatch):
+    state = tmp_path / "state"
+    delivery.record_intent(state, attempt_id="att_del000000001", repo="mojomast/bundlebees",
+                           branch="rails/r99-x", base_sha="0" * 40, title="t", body="b")
+    delivery.record_pushed(state, "att_del000000001", "a" * 40)
+    calls = {}
+
+    def fake_sweep(path, dry_run=False):
+        calls["path"] = Path(path)
+        calls["dry_run"] = dry_run
+        return {"opened": [], "existing": [], "blocked": [], "errors": [], "damaged": []}
+
+    monkeypatch.setattr(cli, "plugin_state_dir", lambda: state)
+    monkeypatch.setattr(delivery, "sweep", fake_sweep)
+
+    rc = cli._cmd_deliver(FakeCtx(), argparse.Namespace(state_dir=None, dry_run=True))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == {"path": state, "dry_run": True}
+    assert "deliver: opened=0" in out
+
+
 def test_cli_only_damaged_record_is_not_an_all_clear(tmp_path, capsys, monkeypatch):
     state = tmp_path / "state"
     deliveries = state / "deliveries"
