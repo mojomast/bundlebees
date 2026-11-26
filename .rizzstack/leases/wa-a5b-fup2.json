@@ -1,0 +1,43 @@
+{
+ "id": "wa-a5b-fup2",
+ "lease_version": "rizzstack.lease/1",
+ "slice": "wa-a5b-fup2",
+ "branch": "feat/wa-a5b-fup2",
+ "contract_id": "wa-a5b-fup2",
+ "contract_sha256": "e96bc6133aef048a4d10ae543ed070a5ecbfb0462b371d569e5538b3a93764b5",
+ "source_rev": "9289a861a968f198c535d9e75335ef51aee8173b",
+ "scope": {
+  "assigned_files": [
+   "bundlebees_plugin/tools.py",
+   "bundlebees_plugin/research_gate.py"
+  ],
+  "test_files": [
+   "tests/test_retry_findings_paths.py"
+  ],
+  "prohibited": [
+   "tests/test_retry_findings_paths.py",
+   "tests/test_retry_findings_attach_scope.py",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "evidence/**"
+  ],
+  "read_only": [
+   "bundlebees_plugin/brief.py",
+   "bundlebees_plugin/leases.py",
+   "bundlebees_plugin/dispatch.py"
+  ]
+ },
+ "derived_from": {
+  "contract": "WA-A5B-FUP2",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26: approved: e96bc613 (A5B-FUP2)",
+  "approved_at": "2026-11-26T22:40:19Z"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26: approved: e96bc613 (A5B-FUP2)",
+  "approved_at": "2026-11-26T22:40:19Z",
+  "contract_sha256": "e96bc6133aef048a4d10ae543ed070a5ecbfb0462b371d569e5538b3a93764b5"
+ }
+}
