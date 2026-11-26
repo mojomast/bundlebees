@@ -7,6 +7,11 @@ on:
     # `labeled`/`unlabeled` re-evaluate the owner-held hold: adding the label
     # fails the required ci-gate check, removing it lets the pull request pass.
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # A submitted review can flip the gate's answer (an approval or a rejection is
+  # judged at the head), so the same required checks re-run on it. The gate reads
+  # the head from pull_request.head.sha, never from the review commit_id.
+  pull_request_review:
+    types: [submitted]
   # Merge-queue candidates run the same required checks; the owner-held job
   # resolves the queued pull request from the merge group head SHA.
   merge_group:

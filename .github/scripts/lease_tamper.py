@@ -113,6 +113,16 @@ conclusion: GitHub counts a neutral required check as passing, so a neutral
 result would be a way around the gate.  A resolved pull request whose reviewed
 head did not pass the gate also fails.
 
+A ``pull_request_review`` event is a **pull request re-check**, not a review
+verdict: the gate reads the pull request and its head out of
+``pull_request.head.sha`` exactly as it does for ``pull_request`` and applies the
+same slice and non-slice rules to that head.  The review's own ``commit_id`` is
+the commit the review was submitted against and may be older than the head; it
+is **never** substituted for the head, and a review payload with no
+``pull_request.head.sha`` fails closed instead of falling back to it.  Which
+reviews decide a non-slice pull request is still read from the API under the
+normal exact-head and carry-forward rules.
+
 Usage:
     python3 .github/scripts/lease_tamper.py [EVENT_JSON_PATH]
 
@@ -155,6 +165,12 @@ MAX_GROUP_ENTRIES = 100
 DEFAULT_API_URL = "https://api.github.com"
 LEASE_JOB_NAME = "lease-tamper"
 MERGE_GROUP_REASON = "merge_group_pr_unresolved"
+
+#: Events whose payload carries the pull request itself.  A review submission is
+#: re-checked against ``pull_request.head.sha`` for the same reason a push is:
+#: an approval or a rejection can change a non-slice pull request's answer, so
+#: the gate must judge the head the review is carried to, not the reviewed commit.
+PULL_REQUEST_EVENTS = ("pull_request", "pull_request_review")
 
 # --- BEGIN SHARED GATE POLICY (vendored; keep byte-identical) ---------------
 # One implementation of the rules the lease/tamper gate and the merge lane both
@@ -1222,9 +1238,40 @@ def infer_event_name(payload):
     """Best-effort event name when GITHUB_EVENT_NAME is not set."""
     if "merge_group" in payload:
         return "merge_group"
+    # A pull_request_review payload carries BOTH the review and the pull request
+    # it was submitted on, so it must be recognised before pull_request.
+    if "review" in payload and "pull_request" in payload:
+        return "pull_request_review"
     if "pull_request" in payload:
         return "pull_request"
     return "other"
+
+
+def target_from_pull_request(payload, event_name):
+    """The Target for a pull_request-shaped object, from any pull-request event.
+
+    Both ``pull_request`` and ``pull_request_review`` payloads carry the pull
+    request itself, so the base, the head, the labels and the number come from
+    the same place.  The head is ALWAYS ``pull_request.head.sha``: a review
+    payload also carries ``review.commit_id`` (the commit the review was
+    submitted against, which may be older than the head) and reading it here
+    would let a review move the gate's head backwards.  It is never read, and a
+    payload without a head fails closed rather than borrowing it.
+    """
+    pull = payload.get("pull_request") or {}
+    base = ((pull.get("base") or {}).get("sha") or "").strip()
+    head = ((pull.get("head") or {}).get("sha") or "").strip()
+    if not base or not head:
+        raise GateError(
+            "the %s payload has no base/head sha in pull_request; the head is read only "
+            "from pull_request.head.sha and a review's commit_id is never substituted "
+            "for it." % event_name,
+            reason="review_event_head_missing" if event_name == "pull_request_review" else None,
+        )
+    branch = ((pull.get("head") or {}).get("ref") or "").strip() or None
+    return Target(
+        base, head, _labels_of(pull), pull.get("body") or "", pull.get("number"), branch
+    )
 
 
 def target_from_event(payload, event_name, environ, http=None):
@@ -1235,16 +1282,8 @@ def target_from_event(payload, event_name, environ, http=None):
         # Routed to check_merge_group() by main(); reaching here is a bug.
         raise merge_group_error("internal", "merge_group must be handled by check_merge_group()")
 
-    if name == "pull_request":
-        pull = payload.get("pull_request") or {}
-        base = ((pull.get("base") or {}).get("sha") or "").strip()
-        head = ((pull.get("head") or {}).get("sha") or "").strip()
-        if not base or not head:
-            raise GateError("the pull_request payload has no base/head sha")
-        branch = ((pull.get("head") or {}).get("ref") or "").strip() or None
-        return Target(
-            base, head, _labels_of(pull), pull.get("body") or "", pull.get("number"), branch
-        )
+    if name in PULL_REQUEST_EVENTS:
+        return target_from_pull_request(payload, name)
 
     return None
 
@@ -1834,6 +1873,7 @@ def main(argv=None, environ=None):
     try:
         labels = [item for item in (args.labels or "").split(",") if item.strip()]
         body = args.body or ""
+        event_name = ""
         if args.base and args.head:
             target = Target(
                 args.base.strip(),
@@ -1868,6 +1908,12 @@ def main(argv=None, environ=None):
 
         target.base = _resolve_rev(args.repo, target.base)
         target.head = _resolve_rev(args.repo, target.head)
+        if event_name == "pull_request_review" and not args.quiet:
+            print(
+                "lease-tamper: event=pull_request_review; head read from "
+                "pull_request.head.sha %s; applying the same rules as a pull_request."
+                % target.head
+            )
 
         changes = metadata_changes(args.repo, target)
         if changes and not args.contract:
