@@ -1,0 +1,37 @@
+{
+ "id": "pr-triage",
+ "lease_version": "rizzstack.lease/1",
+ "slice": "pr-triage",
+ "branch": "feat/pr-triage",
+ "contract_id": "pr-triage",
+ "contract_sha256": "58560a1db87bf7e5cdf8690e31301a3bfbb9bf28fb41cb302d42d034730ad9af",
+ "source_rev": "855e6549159d5ae6e43d1d14f370abc80c2f8689",
+ "scope": {
+  "assigned_files": [
+   "bundlebees_plugin/pr_audit.py"
+  ],
+  "test_files": [
+   "tests/test_pr_audit.py"
+  ],
+  "prohibited": [
+   "tests/test_pr_audit.py",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "evidence/**",
+   "bundlebees_plugin/cli.py"
+  ],
+  "read_only": [
+   "bundlebees_plugin/brief.py",
+   "bundlebees_plugin/leases.py",
+   "bundlebees_plugin/delivery.py",
+   "bundlebees_plugin/coverage.py"
+  ]
+ },
+ "derived_from": {
+  "contract": "rizzstack-t1634/contracts/PR-TRIAGE.contract.json",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-25",
+  "approved_at": "2026-11-25T23:50:00Z"
+ }
+}
