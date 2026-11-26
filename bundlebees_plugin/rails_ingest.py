@@ -20,6 +20,15 @@ file explicitly (``--launcher-url``, ``--launcher-chain``,
 malformed launcher configuration is refused before any ledger is created.
 The launcher's committed cursor is per origin chain.
 
+``launcher-rails`` reads that same export bind-mount strictly: it stages every
+page of the pending range first and admits the range only after the last page
+has been read and the ledger's own validator has accepted every record. A page
+error, malformed record or schema mismatch therefore aborts the run with a
+non-zero exit and leaves the ledger and its cursor exactly as they were. Use
+it for bounded admission (worker ``usage.observed`` receipts); use ``launcher``
+for a large backfill, whose committed pages survive a later page failure and
+resume from the per-chain cursor.
+
 Exit codes: 0 every source imported, 2 configuration refused, 3 a source failed.
 """
 
@@ -36,7 +45,8 @@ import urllib.parse
 from contextlib import closing
 from pathlib import Path
 
-SOURCES = ("bundlebees", "outbox", "queue", "launcher")
+SOURCES = ("bundlebees", "outbox", "queue", "launcher", "launcher-rails")
+_LAUNCHER_SOURCES = ("launcher", "launcher-rails")
 _CODE_RE = re.compile(r"^[a-z_]{1,48}$")
 _MAX_ACCESS_BYTES = 514
 
@@ -45,6 +55,15 @@ class _Refused(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _PageFailure(Exception):
+    """A staged page could not be read; keep where it failed and why."""
+
+    def __init__(self, cursor: int, cause: BaseException) -> None:
+        super().__init__("page read failed")
+        self.cursor = int(cursor)
+        self.cause = cause
 
 
 def _source(name: str, state: str):
@@ -113,17 +132,135 @@ def _launcher_pages(ledger: str, source, chain: str, page_limit: int, max_pages:
     return {"ok": True, "imported": imported, "has_more": has_more}
 
 
+def _transport_detail(exc: BaseException) -> str:
+    """A scrubbed one-line transport label; never a path or raw record."""
+    from rizzstack_rails import privacy
+
+    code = getattr(exc, "code", None)
+    label = code if isinstance(code, str) and code else type(exc).__name__
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        label += " " + str(status)
+    message = privacy.scrub_text(str(exc))[:160]
+    return label + (": " + message if message and message != label else "")
+
+
+def _next_cursor(report, cursor: int) -> int:
+    following = report.get("next_cursor")
+    if isinstance(following, bool) or not isinstance(following, int) or following <= cursor:
+        raise _PageFailure(cursor, _Refused("peer_protocol"))
+    return following
+
+
+def _stage_launcher_pages(source, chain: str, cursor: int, page_limit: int,
+                          max_pages: int) -> list[list[str]]:
+    """Read every pending page without touching the ledger."""
+    staged: list[list[str]] = []
+    for _ in range(max_pages):
+        try:
+            report = source.fetch(chain, after=cursor, limit=page_limit)
+        except Exception as exc:  # noqa: BLE001 - re-raised with the failing cursor
+            raise _PageFailure(cursor, exc) from None
+        gaps = report.get("gaps") or []
+        if gaps:
+            from .rails_remote_source import ExportGapDetected
+
+            raise _PageFailure(
+                cursor, ExportGapDetected("peer export has a cursor gap", gaps, report=report)
+            )
+        records = list(report.get("events") or [])
+        if records:
+            staged.append(records)
+        if not report.get("has_more"):
+            return staged
+        cursor = _next_cursor(report, cursor)
+    raise _PageFailure(cursor, _Refused("max_pages_exceeded"))
+
+
+def _refuse_uncommittable_stage(staged: list[list[str]]) -> None:
+    """Refuse before the first write if a page cannot be committed as one page."""
+    from rizzstack_rails import contracts
+
+    for page in staged:
+        if not 1 <= len(page) <= contracts.MAX_RECORDS:
+            raise _Refused("page_size")
+        total = 0
+        for text in page:
+            if not isinstance(text, str) or not text.isascii() or len(text) > contracts.MAX_RECORD:
+                raise _Refused("origin_bytes")
+            total += len(text)
+        if total > contracts.MAX_PAGE:
+            raise _Refused("page_size")
+
+
+def _preflight_origin_page(led, chain: str, records: list[str]) -> None:
+    """Prove the whole staged range admissible with the ledger's own validator.
+
+    ``import_origin_page`` commits one page atomically, so a rejection on a
+    later page cannot be undone. Running the same validator over the whole
+    range first is what makes the strict source all-or-nothing; without it the
+    run refuses rather than writing a partial range.
+    """
+    validator = getattr(led, "_validate_origin_pages", None)
+    connection = getattr(led, "_conn", None)
+    if not callable(validator) or connection is None:
+        raise _Refused("ledger_validation_unavailable")
+    outcome = validator(connection, chain, records)
+    if not isinstance(outcome, tuple):
+        raise _Refused("source_fork")
+
+
+def _launcher_rails_pages(ledger: str, source, chain: str, page_limit: int,
+                          max_pages: int) -> dict:
+    """Stage the pending range, validate it, then admit it as one run."""
+    from rizzstack_rails import RailsLedger
+
+    authorities = {"imported_observation", "worker_report"}
+    with closing(RailsLedger(ledger, allowed_authorities=authorities)) as led:
+        position = led.import_cursor(chain)
+        if position["state"] != "active":
+            raise _Refused("source_fork")
+        staged = _stage_launcher_pages(
+            source, chain, position["next_seq"] - 1, page_limit, max_pages
+        )
+        records = [text for page in staged for text in page]
+        if not records:
+            return {"ok": True, "imported": 0, "has_more": False}
+        _refuse_uncommittable_stage(staged)
+        _preflight_origin_page(led, chain, records)
+        imported = 0
+        for page in staged:
+            imported += int(led.import_origin_page(chain, page).get("imported", 0))
+    return {"ok": True, "imported": imported, "has_more": False}
+
+
 def ingest(ledger: str, state: str, sources, *, page_limit: int = 200, max_pages: int = 50,
            launcher_source=None, launcher_chain: str | None = None) -> dict:
     report: dict = {}
     for name in sources:
         try:
-            if name == "launcher":
+            if name in _LAUNCHER_SOURCES:
                 if launcher_source is None or launcher_chain is None:
                     raise _Refused("not_configured")
-                report[name] = _launcher_pages(ledger, launcher_source, launcher_chain, page_limit, max_pages)
+                if name == "launcher-rails":
+                    report[name] = _launcher_rails_pages(
+                        ledger, launcher_source, launcher_chain, page_limit, max_pages
+                    )
+                else:
+                    report[name] = _launcher_pages(
+                        ledger, launcher_source, launcher_chain, page_limit, max_pages
+                    )
             else:
                 report[name] = _local_pages(name, ledger, state, page_limit, max_pages)
+        except _PageFailure as failure:
+            report[name] = {
+                "ok": False,
+                "error": {
+                    "code": _code(failure.cause),
+                    "cursor": failure.cursor,
+                    "transport": _transport_detail(failure.cause),
+                },
+            }
         except Exception as exc:  # noqa: BLE001 - reported as a generic code only
             report[name] = {"ok": False, "error": {"code": _code(exc)}}
     return report
@@ -256,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "contrib"))
     launcher_source = launcher_chain = None
-    if "launcher" in names:
+    if any(name in _LAUNCHER_SOURCES for name in names):
         try:
             launcher_source, launcher_chain = _launcher_settings(args)
         except Exception:

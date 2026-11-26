@@ -983,7 +983,11 @@ def _collection_pin(preflight: Any) -> tuple[Mapping[str, Any], Any] | None:
     if not isinstance(preflight, Mapping) or not isinstance(preflight.get("contract"), Mapping):
         return None
     contract = preflight["contract"]
-    review = contract.get("review") if isinstance(contract.get("review"), Mapping) else {}
+    if "review" not in contract:
+        return None
+    review = contract["review"]
+    if not isinstance(review, Mapping):
+        raise TddError("evidence_tampered", "frozen review block is invalid")
     if "test_collection" not in review:
         return None
     pin = review["test_collection"]

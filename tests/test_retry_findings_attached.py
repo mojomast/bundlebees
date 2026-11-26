@@ -3,7 +3,9 @@
 The research gate proves accepted findings exist before a retry is allowed,
 but the launcher renders ``brief.findings`` into the worker prompt. Without an
 attach step the proof stays in the state directory and the bee retries blind.
-These tests pin the brief that ``client.create`` actually receives.
+These tests pin the brief that ``client.create`` actually receives when the
+``ATTACH_FINDINGS`` flag is on; ``tests/test_attach_findings_flag.py`` pins the
+dark default and the size cap.
 """
 
 from __future__ import annotations
@@ -11,11 +13,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from bundlebees_plugin import flags
 from bundlebees_plugin import research_gate as rg
 from bundlebees_plugin import tools
 
 WF = "c" * 40
 REV = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _attach_enabled(monkeypatch):
+    """These pin the enabled path; the dark default lives in its own module."""
+
+    monkeypatch.setenv(flags.FLAG_ATTACH_FINDINGS, "1")
 
 
 def failure(**over):

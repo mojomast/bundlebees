@@ -93,6 +93,20 @@ a per-origin-chain cursor in the ledger and refuses a halted chain with
 `source_fork`. A page error leaves earlier committed pages committed and reports
 `ok: false` with a generic code.
 
+`--source launcher-rails` reads the same export strictly, for bounded admission
+of worker `usage.observed` receipts. It stages every page of the pending range
+without writing, then runs the ledger's own origin validator over the whole
+range, and only then commits the pages. A page error, malformed record, schema
+mismatch, fork or gap therefore exits `3` with the ledger and the per-chain
+cursor untouched; the source's error object adds the failing `cursor` and a
+scrubbed `transport` label (for example `peer_unavailable 503: peer returned
+status 503`) so the timer log shows where the export stopped. It refuses rather
+than truncates when the pending range exceeds `--max-pages`, and it refuses
+`ledger_validation_unavailable` instead of writing an unproven range. A hard
+kill between per-page commits can leave a contiguous committed prefix; the
+cursor matches that prefix, so the next run resumes and never double-counts.
+Use `launcher`, not this source, for a large first backfill.
+
 The shipped `contrib/systemd/bundlebees-rails-ingest.{service,timer}` units stay
 local-only (`PrivateNetwork=yes`) and are not changed by this slice. A unit that
 grants the launcher source needs network access and is a separate deployment

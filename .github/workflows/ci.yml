@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled`/`unlabeled` re-evaluate the owner-held hold: adding the label
+    # fails the required ci-gate check, removing it lets the pull request pass.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  # Merge-queue candidates run the same required checks; the owner-held job
+  # resolves the queued pull request from the merge group head SHA.
+  merge_group:
 
 permissions:
   contents: read
@@ -169,7 +175,7 @@ jobs:
         # EXPECTED_TOOLS tools registered.
         env:
           HERMES_HOME: ${{ runner.temp }}/hermes-home
-          EXPECTED_TOOLS: "5"
+          EXPECTED_TOOLS: "6"
         run: |
           mkdir -p "$HERMES_HOME"
           HERMES_BIN="$RUNNER_TEMP/hermes-agent/.venv/bin/hermes"
@@ -210,6 +216,67 @@ jobs:
       - name: Scan history
         run: ./gitleaks detect --source . --redact --no-banner
 
+  owner-held:
+    name: owner-held
+    # Enforced through ci-gate, the single required check, so no ruleset change
+    # is needed: a pull request labelled `owner-held` fails this job and ci-gate
+    # (which needs it) cannot pass.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report labels and enforce the owner-held hold
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 .github/scripts/owner_held.py "$GITHUB_EVENT_PATH"
+
+  lease-tamper:
+    name: lease-tamper
+    # Required through ci-gate. Every pull request must resolve a slice
+    # contract; after the verify boundary only scope.assigned_files may change
+    # and scope.test_files/scope.prohibited are frozen. Applies to every
+    # author, including the coordinator and triage lanes. Canonical script and
+    # docs: mojomast/workflow .github/scripts/lease_tamper.py and
+    # docs/32-lease-tamper-gate.md (vendored from workflow 1ea44beaaea41ce2a5a249a1ce27c77d78ed98d6, carrying the
+    # slice/non-slice classification and the base-merge review carry-forward).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      # merge_group: prove each queued PR's head already passed this job by
+      # reading its check runs (GET /commits/{sha}/check-runs).
+      checks: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Lease/tamper gate unit tests
+        run: python3 -m unittest tests.test_lease_tamper -v
+      - name: Lease/tamper bypass regression (all five cases must fail closed)
+        run: python3 .github/scripts/lease_tamper_poc.py --expect fail-closed
+      - name: Lease/tamper adversarial reproduction v2 (13 cases must fail closed)
+        run: |
+          bash .github/scripts/lease_tamper_poc_v2.sh .github/scripts/lease_tamper.py | tee "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+          grep -q '^13 cases, 0 unexpected$' "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+      - name: Enforce the slice lease and frozen tests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 .github/scripts/lease_tamper.py "$GITHUB_EVENT_PATH"
+
   ci-gate:
     name: ci-gate
     # The main ruleset requires this one check. It passes only when every job
@@ -220,6 +287,8 @@ jobs:
       - orbit-roundtrip
       - plugin-doctor
       - secret-scan
+      - owner-held
+      - lease-tamper
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

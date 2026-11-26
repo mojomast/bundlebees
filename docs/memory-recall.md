@@ -17,6 +17,20 @@ subprocess, no file, no miss log. A lease recorded with the flag off has no
 | `MEMORY_ENABLED` | Exactly `1` enables recall. Every other value keeps it dark. |
 | `BUNDLEBEES_MEMORY_QUERY` | Program, and optional arguments, that answers one query. |
 
+Both flags are read through one loader, `bundlebees_plugin/flags.py`: the
+process environment first, then the shared file
+`~/.config/bundlebees/flags.env` (override `BUNDLEBEES_FLAGS_FILE`). The
+factory driver and the Hermes gateway that loads this plugin consult the same
+file, so recall is on or off for both instead of depending on which unit
+happened to export what. The file carries flag names only — never a credential
+— and each process logs one line at startup:
+
+```text
+bundlebees flags: MEMORY_ENABLED=0 BUNDLEBEES_BOARD_STOCK=0 flags_file=/home/<user>/.config/bundlebees/flags.env (present)
+```
+
+The line carries the 0/1 outcome and the file path, never a stored value.
+
 `BUNDLEBEES_MEMORY_QUERY` is split like a shell word list and is **not** run
 through a shell. The query text is appended as one argument, and the request
 JSON is written to stdin. The child gets the minimal exact-name environment

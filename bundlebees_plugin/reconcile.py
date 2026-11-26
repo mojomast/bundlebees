@@ -482,6 +482,47 @@ def _state_of(entry: Mapping[str, Any]) -> str:
     return str(entry.get("state") or entry.get("status") or "").strip().lower()
 
 
+def reconcile_tool_attempts(state_dir: Path, backend: Any) -> dict[str, Any]:
+    """Reconcile launcher-terminal attempts that have local coordinator leases."""
+
+    from . import agent_consumer
+
+    state_path = Path(state_dir)
+    attempts_by_id: dict[str, Mapping[str, Any]] = {}
+    for entry in backend.attempts_raw():
+        if not isinstance(entry, Mapping):
+            continue
+        attempt_id = _attempt_id(entry)
+        if attempt_id:
+            attempts_by_id[attempt_id] = entry
+
+    reconciled: list[str] = []
+    unchanged: list[str] = []
+    lease_paths = sorted((state_path / "leases").glob("*.json"))
+    for lease_path in lease_paths:
+        attempt_id = lease_path.stem
+        entry = attempts_by_id.get(attempt_id)
+        launcher_state = _state_of(entry) if entry is not None else ""
+        if launcher_state not in {"succeeded", "failed", "cancelled"}:
+            unchanged.append(attempt_id)
+            continue
+        outcome = agent_consumer.record_tool_completion(
+            state_path,
+            attempt_id,
+            state=launcher_state,
+        )
+        if outcome.get("emitted") is True:
+            reconciled.append(attempt_id)
+        else:
+            unchanged.append(attempt_id)
+
+    return {
+        "checked": len(lease_paths),
+        "reconciled": reconciled,
+        "unchanged": unchanged,
+    }
+
+
 # ---------------------------------------------------------------------------
 # The tick
 # ---------------------------------------------------------------------------
@@ -1370,6 +1411,10 @@ def _dispatch_one(
         "fingerprint": fingerprint,
     }
     brief = _brief_for(job, task)
+    # go-max lane routing: a no-op unless the owner turned go-max on (docs/contracts/go-max.md).
+    from . import go_max as _go_max
+
+    brief = _go_max.route_brief(state_dir, brief, task)
     _write_json(path, intent)  # fsynced before the call
 
     if task.get("state") == "pending":

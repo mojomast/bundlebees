@@ -291,6 +291,12 @@ def _build_parser(parser: Any) -> Any:
         help="Test targets to run. Defaults to the brief's named tests.",
     )
     verify.add_argument(
+        "--pull-request",
+        type=int,
+        default=None,
+        help="Pull request the verified head belongs to (stamped on the verify record).",
+    )
+    verify.add_argument(
         "--kanban-comment",
         action="store_true",
         help="Also post a comment through the public hermes kanban CLI.",
@@ -513,6 +519,8 @@ def _build_parser(parser: Any) -> Any:
     board_dispatch_cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
     board_dispatch_cmd.set_defaults(command="board-dispatch")
 
+    _add_go_max_parser(subparsers)
+
     preflight_cmd = subparsers.add_parser(
         "preflight",
         help="Run the dispatch gates without dispatching (side-effect free).",
@@ -560,6 +568,60 @@ def _cmd_deliver(ctx: Any, args: Any) -> int:
            f"blocked={len(result['blocked'])} errors={len(result['errors'])} "
            f"damaged={len(result['damaged'])}")
     return 0 if not result["errors"] and not result["damaged"] else 2
+
+
+def _add_go_max_parser(subparsers: Any) -> Any:
+    cmd = subparsers.add_parser(
+        "go-max",
+        help="Fill free bee slots safely (on/off/status); the factory does the filling.",
+    )
+    cmd.add_argument("action", choices=["on", "off", "status"])
+    cmd.add_argument("--ttl-minutes", type=int, default=None, help="How long go-max stays on (default 480, max 1440).")
+    cmd.add_argument("--json", action="store_true", help="Print the full status record as JSON.")
+    cmd.add_argument("--offline", action="store_true", help="Do not contact the launcher (status from local state only).")
+    cmd.add_argument("--state-dir", default=None, help="Plugin data directory override.")
+    cmd.set_defaults(command="go-max")
+    return cmd
+
+
+def _cmd_go_max(ctx: Any, args: Any) -> int:
+    """go-max on/off/status. Never dispatches, cancels or approves anything itself."""
+    from . import go_max as _go_max
+
+    state_dir = _state_dir(ctx, args)
+    client = None
+    if not getattr(args, "offline", False):
+        try:
+            client = _client_for(ctx, args)
+        except CliError:
+            client = None
+    try:
+        policy = _go_max.Policy.from_settings(_config(ctx))
+    except Exception:  # noqa: BLE001 - settings are optional; defaults are the safe floor
+        policy = _go_max.Policy()
+    try:
+        out = _go_max.run_action(
+            state_dir, str(args.action), client=client,
+            ttl_minutes=getattr(args, "ttl_minutes", None), by="cli", policy=policy,
+        )
+    except _go_max.GoMaxError as exc:
+        raise CliError(exc.code, exc.message, exc.fix) from exc
+    if getattr(args, "json", False):
+        _print(json.dumps(out["status"], indent=2, sort_keys=True))
+    else:
+        _print(out["summary"])
+    return 0
+
+
+def go_max_main(argv: list[str] | None = None) -> int:
+    """Standalone entry: ``python -m bundlebees_plugin.cli go-max ...`` style, for scripts and Orbit."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="bundlebees go-max")
+    sub = parser.add_subparsers(dest="command", required=True)
+    _add_go_max_parser(sub)
+    args = parser.parse_args(["go-max", *(argv or [])])
+    return _dispatch(None, args)
 
 
 def _cmd_board_dispatch(ctx: Any, args: Any) -> int:
@@ -759,6 +821,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_board_sync(ctx, args)
         if command == "board-dispatch":
             return _cmd_board_dispatch(ctx, args)
+        if command == "go-max":
+            return _cmd_go_max(ctx, args)
         if command == "preflight":
             from . import preflight as _preflight
             argv = [str(args.brief)]
@@ -2739,6 +2803,82 @@ def _verify_refusal_reason(
     return _clip_verify_reason(text)
 
 
+def _delivery_document(state_dir: Path, attempt_id: str) -> Mapping[str, Any] | None:
+    """The attempt's delivery record (its PR, when one was opened), or None."""
+    path = Path(state_dir) / "deliveries" / f"{attempt_id}.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, Mapping) else None
+
+
+def _verify_record_binding(record: Mapping[str, Any], workdir: Path) -> dict[str, Any]:
+    """repo/slice/contract_sha256 for a contracted attempt, or a named refusal."""
+    from . import verify_provenance as _provenance  # noqa: PLC0415 - only needed here
+
+    brief_value = record.get("brief")
+    brief = brief_value if isinstance(brief_value, Mapping) else {}
+    repo_value = brief.get("repo")
+    repo = repo_value if isinstance(repo_value, str) else None
+    try:
+        if not repo:
+            repo = _origin_repo(Path(workdir))
+        return _provenance.from_lease(record, repo=repo)
+    except _provenance.ProvenanceError as exc:
+        raise CliError(exc.code, exc.error, exc.fix) from exc
+
+
+def _pull_request_number(
+    record: Mapping[str, Any],
+    *,
+    pr: Any = None,
+    delivery: Mapping[str, Any] | None = None,
+    opened: Any = None,
+) -> int | None:
+    """The PR a verify record belongs to, from dispatch-time state only."""
+    from . import verify_provenance as _provenance  # noqa: PLC0415
+
+    if pr is not None:
+        return _provenance.pull_number(pr)
+    number = _provenance.pr_from_delivery(delivery)
+    if number is None:
+        number = _provenance.pr_from_url(opened)
+    if number is None:
+        brief_value = record.get("brief")
+        brief = brief_value if isinstance(brief_value, Mapping) else {}
+        for key in ("pull_request", "pull_requests", "pr", "prs", "number"):
+            value = brief.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                number = value
+                break
+            if isinstance(value, str) and value.strip().lstrip("#").isdigit():
+                number = int(value.strip().lstrip("#"))
+                break
+    return number
+
+
+def _verify_record_provenance(
+    record: Mapping[str, Any],
+    workdir: Path,
+    *,
+    pr: Any = None,
+    delivery: Mapping[str, Any] | None = None,
+    opened: Any = None,
+) -> dict[str, Any]:
+    """All four provenance fields for a slice record, or a named refusal."""
+    from . import verify_provenance as _provenance  # noqa: PLC0415
+
+    binding = _verify_record_binding(record, workdir)
+    try:
+        number = _pull_request_number(record, pr=pr, delivery=delivery, opened=opened)
+        return _provenance.with_pr(binding, number)
+    except _provenance.ProvenanceError as exc:
+        raise CliError(exc.code, exc.error, exc.fix) from exc
+
+
 def _write_verify_result(
     state_dir: Path,
     attempt_id: str,
@@ -2753,7 +2893,19 @@ def _write_verify_result(
     code: str | None = None,
     error: str | None = None,
     dry_run: bool = False,
+    provenance: Mapping[str, Any] | None = None,
+    require_provenance: bool = False,
 ) -> Path:
+    """Write one verify record; a slice record must carry its provenance.
+
+    ``require_provenance`` is set for an attempt dispatched with a frozen
+    contract (a slice).  Such a record is the merge lane's evidence, so the
+    writer refuses to produce one it cannot attribute: every one of ``repo``,
+    ``slice``, ``pr`` and ``contract_sha256`` is validated, and a missing or
+    invalid field is a named refusal rather than a record that reads as
+    evidence while belonging to nothing.  Uncontracted (legacy) attempts keep
+    the historical shape and are written without provenance.
+    """
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     relative = (
         f"verify-results/dry-run/{attempt_id}.json"
@@ -2786,6 +2938,13 @@ def _write_verify_result(
         payload["error"] = _clip_verify_reason(str(error))
     if dry_run:
         payload["dry_run"] = True
+    if require_provenance or provenance is not None:
+        from . import verify_provenance as _provenance  # noqa: PLC0415 - small, only needed here
+
+        try:
+            payload = _provenance.stamp(payload, provenance)
+        except _provenance.ProvenanceError as exc:
+            raise CliError(exc.code, exc.error, exc.fix) from exc
     source_rev = (evidence or {}).get("source_rev")
     clean = scrub(payload)
     clean["branch"] = _display_branch(branch, collapse=True)
@@ -2795,6 +2954,12 @@ def _write_verify_result(
         digest = (evidence or {}).get(key)
         if isinstance(digest, str) and _HEX64_RE.fullmatch(digest):
             clean["evidence"][key] = digest
+    # A contract digest is provenance, not a secret; scrub() cannot distinguish
+    # a 64-char hex digest from a key-shaped string, so restore the validated one.
+    contract_digest = payload.get("contract_sha256")
+    if isinstance(contract_digest, str) and _HEX64_RE.fullmatch(contract_digest):
+        clean["contract_sha256"] = contract_digest
+
     usage = (evidence or {}).get("usage")
     if isinstance(usage, Mapping):
         # Validated numeric counts; scrub() would redact the *Tokens key names.
@@ -3046,6 +3211,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
     run_id = "default"
     evidence: dict[str, Any] = {}
     test_evidence: dict[str, Any] | None = None
+    record_binding: dict[str, Any] | None = None
     repo_value = config.get("repo_path")
     if repo_value:
         try:
@@ -3119,6 +3285,13 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             or config.get("repo_path")
         )
         workdir = _prepare_worktree(workdir_value, branch)
+
+        # Provenance is dispatch-time truth, resolved before any test runs: a
+        # slice record that cannot name its repo, slice and contract is not
+        # evidence, so verify refuses before doing the work rather than after.
+        if acdd_state is not None:
+            record_binding = _verify_record_binding(record, workdir)
+
         files = _assigned_files(leases.lease_files(record), workdir)
 
         requested_tests = getattr(args, "tests", None)
@@ -3257,10 +3430,47 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
             except Exception as exc:  # noqa: BLE001
                 _print(f"delivery: pushed-sha not recorded: {exc}")
 
+        # Eager relay: the PR is opened as part of the same verify run, so
+        # "verified" is never a resting state and the record can name the PR it
+        # proves.  Failure is non-fatal: the delivery record stays pending for
+        # the `deliver` sweep, and a slice record still needs a PR named by
+        # --pull-request, the delivery record or the lease brief.
+        pr_url: str | None = None
+        pr_created = False
+        if delivery_record is not None:
+            try:
+                pr_url, pr_created = _delivery.open_pr_idempotent(
+                    delivery_record["repo"], branch, delivery_record["title"], delivery_record["body"])
+                _delivery.record_pr(state_dir, attempt_id, pr_url)
+            except Exception as exc:  # noqa: BLE001
+                _print(f"pr: pending - the platform refused or lacked access ({exc}); "
+                       "run `hermes bundlebees deliver` to converge")
+                pr_url, pr_created = None, False
+
+        record_provenance = None
+        if record_binding is not None:
+            try:
+                record_provenance = _verify_record_provenance(
+                    record,
+                    workdir,
+                    pr=getattr(args, "pull_request", None),
+                    delivery=_delivery_document(state_dir, attempt_id),
+                    opened=pr_url,
+                )
+            except CliError as exc:
+                raise CliError(
+                    exc.code,
+                    f"{exc.error}; the verified commit {sha} was pushed but no record was "
+                    "written, because an unattributed slice record is not evidence",
+                    exc.fix,
+                ) from exc
+
         target = _write_verify_result(
             state_dir, attempt_id, ok=True, sha=sha, branch=branch,
             files=files, tests=tests, evidence=evidence,
             executed_argv=getattr(test_evidence, "argv", None),
+            provenance=record_provenance,
+            require_provenance=acdd_state is not None,
         )
         _record_verify(state_dir, run_id, attempt_id, record, worker, ok=True, code="verified", sha=sha)
 
@@ -3274,18 +3484,8 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         _print_digest("patch_sha256", evidence.get("patch_sha256"))
         acdd_cli.print_mode(acdd_state, green)
         _print(f"pushed: feature branch only ({BRANCH_BUDGET_NOTE})")
-        if delivery_record is not None:
-            # Eager relay: the PR is opened as part of the same verify run, so "verified" is
-            # never a resting state. Failure is non-fatal - the record stays pending for the
-            # `deliver` sweep (the level-triggered backstop).
-            try:
-                url, created = _delivery.open_pr_idempotent(
-                    delivery_record["repo"], branch, delivery_record["title"], delivery_record["body"])
-                _delivery.record_pr(state_dir, attempt_id, url)
-                _print(f"pr: {url}" + ("" if created else " (existing)"))
-            except Exception as exc:  # noqa: BLE001
-                _print(f"pr: pending - the platform refused or lacked access ({exc}); "
-                       "run `hermes bundlebees deliver` to converge")
+        if pr_url is not None:
+            _print(f"pr: {pr_url}" + ("" if pr_created else " (existing)"))
         _print_state_path("verify result", target, state_dir)
         _print("wave: not accepted until `hermes bundlebees integrate` passes the full suite")
         suggested = (
@@ -3312,6 +3512,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 files=files, tests=tests, evidence=evidence,
                 code=str(exc.code), error=reason, dry_run=dry_run,
                 executed_argv=getattr(test_evidence, "argv", None),
+                provenance=record_binding,
             )
         except CliError as record_exc:
             if record_exc.code == "state_dir_uncontained":

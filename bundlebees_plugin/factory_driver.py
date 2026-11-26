@@ -47,6 +47,7 @@ from . import launcher_adapter
 from . import bee_events
 from . import board_stock
 from . import campaign as campaign_mod
+from . import flags
 from . import job_cli
 from . import hermes_adapter
 from . import event_consumer
@@ -2389,8 +2390,11 @@ class FactoryService:
         session: str | None = None,
         cap_reader: Any = None,
         limits_reader: Any = None,
+        go_max_gate: Any = None,
     ) -> None:
         self.driver = driver
+        # go-max (docs/contracts/go-max.md): inert unless the owner turned it on.
+        self.go_max = go_max_gate
         self.subscribers = list(subscribers) if subscribers is not None else None
         self.completion_subscribers = (
             list(completion_subscribers)
@@ -2596,9 +2600,10 @@ class FactoryService:
         blocked: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         wake: dict[str, Any] | None = None
+        gate = self.go_max if self.go_max is not None and self._go_max_enabled() else None
         try:
             if not work_scheduler.ready_items(self.state):
-                return {
+                out = {
                     "dispatched": 0,
                     "dispatched_items": dispatched,
                     "blocked": blocked,
@@ -2607,6 +2612,10 @@ class FactoryService:
                     "cap": None,
                     "limits": {},
                 }
+                if gate is not None:
+                    gate.begin_pass()
+                    out["go_max"] = self._go_max_report(gate)
+                return out
         except Exception as exc:  # noqa: BLE001 - a broken queue needs a human
             wake = self.request_judgment_wake(
                 reason="scheduler_unreadable",
@@ -2653,6 +2662,23 @@ class FactoryService:
                 "errors": errors,
             }
 
+        go_max_held: set[str] = set()
+        if gate is not None:
+            admission = gate.begin_pass()
+            if int(admission.get("free_slots") or 0) <= 0:
+                # Fail closed without a judgment wake: the status names the reasons.
+                blocked.append({"reason": "go_max_hold", "detail": ",".join(admission.get("reasons") or ())})
+                return {
+                    "dispatched": 0,
+                    "dispatched_items": dispatched,
+                    "blocked": blocked,
+                    "wake": None,
+                    "errors": errors,
+                    "cap": cap,
+                    "limits": dict(limits),
+                    "go_max": self._go_max_report(gate),
+                }
+
         # A generous bound: every successful claim removes one ready item, so
         # this only prevents a pathological loop, never caps normal work.
         for _ in range(1000):
@@ -2675,6 +2701,7 @@ class FactoryService:
                 item
                 for item in ready
                 if str(item.get("work_id") or "") not in self.driver._driven_this_pass
+                and str(item.get("work_id") or "") not in go_max_held
             ]
             if not candidates:
                 break
@@ -2700,9 +2727,23 @@ class FactoryService:
                     reason="job_unreadable", item=item, detail=exc.message
                 )
                 break
+            go_verdict: Mapping[str, Any] | None = None
+            if gate is not None:
+                go_verdict = gate.check(item, job_id)
+                if not go_verdict.get("allowed"):
+                    reason = str(go_verdict.get("reason") or "held")
+                    blocked.append({"work_id": work_id, "reason": f"go_max_{reason}"})
+                    if reason == "no_free_slots":
+                        break
+                    go_max_held.add(work_id)
+                    continue
             outcome = self.driver._drive_work(  # noqa: SLF001 - the driver owns the tick
                 work_id, job_id, max_active=cap
             )
+            if gate is not None and go_verdict is not None and str(outcome.get("work_state") or "") in {
+                "claimed", "done", "retryable", "failed"
+            }:
+                gate.note(work_id, go_verdict)
             state_name = str(outcome.get("work_state") or "")
             failure = outcome.get("failure") if isinstance(outcome.get("failure"), Mapping) else {}
             if state_name == "skipped" and str(failure.get("code") or "") == "capacity_exhausted":
@@ -2729,7 +2770,7 @@ class FactoryService:
                 }
             )
             break
-        return {
+        result = {
             "dispatched": len(dispatched),
             "dispatched_items": dispatched,
             "blocked": blocked,
@@ -2737,6 +2778,27 @@ class FactoryService:
             "errors": errors,
             "cap": cap,
             "limits": dict(limits),
+        }
+        if gate is not None:
+            result["go_max"] = self._go_max_report(gate)
+        return result
+
+    # -- go-max --------------------------------------------------------------
+
+    def _go_max_enabled(self) -> bool:
+        try:
+            return bool(self.go_max.enabled())
+        except Exception:  # noqa: BLE001 - an unreadable mode is off
+            return False
+
+    @staticmethod
+    def _go_max_report(gate: Any) -> dict[str, Any]:
+        record = gate.finish_pass()
+        return {
+            "admission": record.get("admission"),
+            "lanes": record.get("lanes"),
+            "empty_reasons": record.get("empty_reasons"),
+            "summary": record.get("summary"),
         }
 
     # -- loop ----------------------------------------------------------------
@@ -2772,6 +2834,9 @@ class FactoryService:
         except Exception as exc:  # noqa: BLE001
             driven = {"events": [], "errors": [{"stage": "driver", "error": type(exc).__name__}]}
             errors.append({"stage": "driver", "error": type(exc).__name__})
+        stock = None
+        if self.go_max is not None and self._go_max_enabled():
+            stock = self.go_max.stock_board()
         dispatch = self.dispatch_eligible()
         result = {
             "passes": self.passes,
@@ -2786,6 +2851,8 @@ class FactoryService:
         # byte-for-byte what it was before this duty existed.
         if board_stock.enabled():
             result["stock"] = self.stock_ready_column()
+        if stock is not None:
+            result["go_max_stock"] = stock
         self.last_result = result
         return result
 
@@ -2959,6 +3026,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # One line naming the effective flags, before any refusal. The gateway
+    # reads the same file through the same loader, so this line is what both
+    # processes actually run with.
+    flags.log_startup()
     state = Path(args.state)
     queue_path = Path(args.queue) if args.queue else state / "queue.json"
     tick = load_tick(args.tick)
@@ -3058,10 +3129,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.service:
+        gate = None
+        if client is not None and hasattr(client, "host_capacity"):
+            from . import go_max as go_max_mod
+
+            gate = go_max_mod.FactoryGate(
+                state,
+                capacity_reader=client.host_capacity,
+                allowed_reader=lambda: (client.health() or {}).get("models") or [],
+            )
         service = FactoryService(
             driver,
             subscribers=subscribers,
             interval_s=max(0.01, float(args.service_interval)),
+            go_max_gate=gate,
         )
         try:
             result = service.serve(max_passes=args.max_passes)

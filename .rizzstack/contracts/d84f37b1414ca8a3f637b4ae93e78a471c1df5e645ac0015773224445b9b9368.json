@@ -1,0 +1,157 @@
+{
+ "contract_version": "acdd/1",
+ "id": "wave-bc-toolpath-integrity",
+ "title": "Refuse glob leases, reconcile terminal tool-path attempts, and preflight the feature branch at dispatch",
+ "outcome": {
+  "summary": "Three tool-path integrity gaps are closed without touching the durable job path. Dispatch refuses a lease that contains glob syntax with the named code lease_glob_unsupported before any launcher call or lease record, using the same validator the landing write-back uses. A new reconcile_tool_attempts sweep maps a launcher-terminal attempt (succeeded, failed, cancelled) onto the local attempt store even when the local row is still dispatched, and leaves a genuinely running attempt untouched; it never creates an attempt. Dispatch also preflights the local feature branch when a worktree is configured: it REFUSES a missing branch with branch_not_found and a branch that does not descend from source_rev with branch_diverged, and it never creates or moves a branch. The existing job-path reconcile tick is unchanged.",
+  "observable_behavior": [
+   "a dispatch whose assigned_files contains '*', '?' or '[' returns ok:false, code lease_glob_unsupported, client.create is not called and no leases/<attempt>.json is written",
+   "bee_events.validate_lease_files accepts ordinary repository-relative paths including dots, plus signs, at-signs and subdirectories, and dispatch still creates exactly one attempt for them",
+   "reconcile.reconcile_tool_attempts(state_dir, backend) returns checked/reconciled/unchanged, writes succeeded as unverified, failed and cancelled as failed, leaves a running attempt dispatched, and calls backend.create zero times",
+   "dispatch with a configured worktree refuses a missing feature branch with branch_not_found and a non-descendant branch with branch_diverged before client.create; a branch equal to source_rev still dispatches",
+   "reconcile.tick on a durable job still performs exactly one dispatch, no verify, and no second post"
+  ]
+ },
+ "assumptions": [
+  "The local attempt store is the existing lease + tool-completion + verify evidence read by bundlebees_plugin.cli._attempt_rows; the sweep writes the same tool-completion record the polled write-back already writes, so no new store format is introduced.",
+  "The launcher backend exposes attempts_raw() (already used by tools._dispatch) and create(); the sweep reads attempts_raw() only and must never call create().",
+  "The feature branch is a local branch in the configured worktree (plugin setting worktree); dispatch does not fetch, create, move or push any branch, and skips the preflight when no worktree is configured.",
+  "bee_events is the single lease-path authority for both dispatch and landing events; the new public validate_lease_files is the shared entry point and _canonical_assigned_files delegates to it.",
+  "The RED base is origin/main a74287b44f0709dde7a8f298740813cfbbce8df6 and the frozen tests are exactly tests/test_toolpath_integrity.py."
+ ],
+ "interfaces": [
+  {
+   "name": "bundlebees_plugin/bee_events.py",
+   "kind": "file",
+   "change": "modify",
+   "notes": "Add public validate_lease_files(value) -> list[str]. It keeps every existing repository-relative rule and adds a glob refusal: any '*', '?' or '[' raises EventError('lease_glob_unsupported', ...). _canonical_assigned_files delegates to it so dispatch and the landing write-back share one decision."
+  },
+  {
+   "name": "bundlebees_plugin/tools.py",
+   "kind": "file",
+   "change": "modify",
+   "notes": "_gate calls bee_events.validate_lease_files after brief validation and before the risk/contract gates, returning the named lease_glob_unsupported envelope. _dispatch preflights the local feature branch from args['_settings']['worktree'] before client.create: missing -> branch_not_found, not a descendant of source_rev -> branch_diverged; no git mutation."
+  },
+  {
+   "name": "bundlebees_plugin/reconcile.py",
+   "kind": "file",
+   "change": "modify",
+   "notes": "Add reconcile_tool_attempts(state_dir, backend) -> dict with checked/reconciled/unchanged. It reads the local leases, matches each by attempt_id in backend.attempts_raw(), and for terminal states writes agent_consumer.record_tool_completion; non-terminal or absent launcher rows are unchanged. It never calls backend.create()."
+  }
+ ],
+ "acceptance_criteria": [
+  {
+   "id": "AC-001",
+   "statement": "Dispatching a brief whose assigned_files contains any glob character (*, ? or [) is refused with the named code lease_glob_unsupported and nothing is recorded or dispatched: the launcher create is never called and no lease file exists.",
+   "verification": "test",
+   "tests": [
+    "tests/test_toolpath_integrity.py::test_dispatch_refuses_a_glob_lease_with_a_named_error"
+   ]
+  },
+  {
+   "id": "AC-002",
+   "statement": "The same lease validator (bee_events.validate_lease_files) still accepts an ordinary repository-relative path list, including paths with dots, plus signs, at-signs and subdirectories, and dispatch still creates exactly one attempt for that list.",
+   "verification": "test",
+   "tests": [
+    "tests/test_toolpath_integrity.py::test_dispatch_still_accepts_normal_repository_relative_paths"
+   ]
+  },
+  {
+   "id": "AC-003",
+   "statement": "reconcile.reconcile_tool_attempts(state_dir, backend) maps a launcher-terminal attempt (succeeded/failed/cancelled) onto the local attempt store even when the local row is still dispatched, leaves a genuinely running attempt untouched, and never calls backend.create(). The observed local states are unverified for succeeded, failed for failed and cancelled, and dispatched for running.",
+   "verification": "test",
+   "tests": [
+    "tests/test_toolpath_integrity.py::test_reconcile_maps_terminal_launcher_attempts_and_leaves_running_ones"
+   ]
+  },
+  {
+   "id": "AC-004",
+   "statement": "CHOSEN BEHAVIOUR: dispatch refuses, it never creates a branch. With a worktree configured, a feature branch that does not exist is refused with branch_not_found before any launcher call, and a feature branch that exists but does not descend from source_rev is refused with branch_diverged. A branch equal to or descending from source_rev still dispatches. Dispatch never creates, moves or pushes a branch.",
+   "verification": "test",
+   "tests": [
+    "tests/test_toolpath_integrity.py::test_dispatch_refuses_a_missing_or_diverged_feature_branch"
+   ]
+  },
+  {
+   "id": "AC-005",
+   "statement": "The durable job path is unchanged: the existing reconcile.tick scenario still performs exactly one dispatch, never verifies on the dispatch tick, and never posts a second attempt.",
+   "verification": "test",
+   "tests": [
+    "tests/test_toolpath_integrity.py::test_job_path_reconcile_tick_is_unchanged"
+   ],
+   "regression": true
+  }
+ ],
+ "scope": {
+  "assigned_files": [
+   "bundlebees_plugin/tools.py",
+   "bundlebees_plugin/bee_events.py",
+   "bundlebees_plugin/reconcile.py"
+  ],
+  "test_files": [
+   "tests/test_toolpath_integrity.py"
+  ],
+  "read_only": [
+   "bundlebees_plugin/brief.py",
+   "bundlebees_plugin/leases.py",
+   "bundlebees_plugin/cli.py",
+   "bundlebees_plugin/agent_consumer.py"
+  ],
+  "prohibited": [
+   "tests/test_toolpath_integrity.py",
+   "CHANGELOG.md"
+  ]
+ },
+ "source_rev": "c419823208e6e441802e5c11d4a66323394cc6c5",
+ "tdd": {
+  "applicable": true
+ },
+ "verification": {
+  "independent": true,
+  "commands": [
+   "env -u PYTHONPATH nice -n 10 timeout 300 /var/tmp/m14-venv/bin/python -m pytest -q -p no:cacheprovider tests/test_toolpath_integrity.py",
+   "env -u PYTHONPATH nice -n 10 timeout 300 /var/tmp/m14-venv/bin/python -m pytest -q -p no:cacheprovider tests/test_tools.py tests/test_reconcile.py tests/test_bee_events.py"
+  ],
+  "integration": false
+ },
+ "evidence_required": [
+  "red",
+  "green",
+  "review"
+ ],
+ "authorization": {
+  "human_gates": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish"
+  ],
+  "not_authorized": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish",
+   "restart",
+   "force-push",
+   "branch deletion"
+  ]
+ },
+ "risk": {
+  "tier": "high",
+  "reasons": [
+   "bundlebees_plugin/tools.py is the dispatch gate every bee passes through",
+   "bundlebees_plugin/bee_events.py is the landing-event schema authority shared by the write-back and the outbox",
+   "bundlebees_plugin/reconcile.py is the crash-safety reconciler for durable jobs and the new tool-path sweep",
+   "a false accept here silently strands a dispatched attempt forever, which is the failure this slice closes"
+  ],
+  "blast_radius": "every bundlebees dispatch, every tool-path terminal write-back, and the local attempt store view used by bundlebees status/attempts"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner) typed: make sure this doesn't happen again, 2026-11-25",
+  "approved_at": "2026-11-25T14:25:00Z",
+  "contract_sha256": "d84f37b1414ca8a3f637b4ae93e78a471c1df5e645ac0015773224445b9b9368"
+ }
+}
