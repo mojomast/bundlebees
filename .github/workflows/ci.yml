@@ -36,6 +36,10 @@ jobs:
         shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The oracle lock reads main's pytest configuration, so origin/main
+          # must be a real ref for pull_request and merge_group checkouts too.
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -93,13 +97,20 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/hyvv-contract" rev-parse HEAD)" = "ae8680a4c0289ce91dab52169eff1433cb694533"
           echo "HYVV_SRC=$RUNNER_TEMP/hyvv-contract" >> "$GITHUB_ENV"
           echo "REQUIRE_HYVV=1" >> "$GITHUB_ENV"
-      - name: Run test suite (shard ${{ matrix.shard }} of 4)
+      - name: Run test suite (shard ${{ matrix.shard }} of 4, main's pytest config)
+        # ORACLE LOCK: the suite is judged with MAIN's pytest configuration and
+        # plugin allowlist, never the PR's pyproject.toml/pytest.ini/setup.cfg.
+        # A PR cannot add `addopts = -p ...`, `pytest_plugins`, an inline table,
+        # a dotted key or a project.entry-points.pytest11 entry that changes the
+        # tests judging it. Plugin autoload is disabled; only main's `-p`
+        # plugins are named explicitly.
         run: |
           set -euo pipefail
-          python .github/scripts/shard_tests.py --check 4 --against-pytest
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          python .github/scripts/shard_tests.py --check 4 --against-pytest --main-ref origin/main
           mapfile -t files < <(python3 .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
           test "${#files[@]}" -gt 0
-          python -m pytest -rs "${files[@]}"
+          python -m bundlebees_plugin.oracle_lock --main-ref origin/main --rootdir . -- -rs "${files[@]}"
       - name: Measure tool-schema tokens
         if: ${{ matrix.shard == 1 }}
         run: python scripts/measure_schemas.py

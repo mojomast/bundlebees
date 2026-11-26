@@ -1058,6 +1058,7 @@ def run_in_sandbox(
     collect_file: str | None = None,
     python: str | None = None,
     payload: Mapping[str, Path | str] | None = None,
+    env_extra: Mapping[str, str] | None = None,
 ) -> dict:
     """Copy *workdir*, run *argv* in isolation, and return only evidence.
 
@@ -1206,6 +1207,10 @@ def run_in_sandbox(
 
         if payload:
             env.update(stage_payload(copy_dir, payload))
+        if env_extra:
+            # Deliberate, caller-owned constants only (e.g. the oracle lock's
+            # PYTEST_DISABLE_PLUGIN_AUTOLOAD), never worker-controlled text.
+            env.update({str(key): str(value) for key, value in env_extra.items()})
 
         command_argv = _replace_evidence(argv, evidence_inside)
         if command_argv and _is_coordinator_interpreter(command_argv[0]):

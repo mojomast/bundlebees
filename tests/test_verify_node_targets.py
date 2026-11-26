@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin import cli, sandbox
+from bundlebees_plugin import cli, oracle_lock, sandbox
 from tests.test_cli import (
     ATTEMPT_ID,
     BRANCH,
@@ -107,7 +107,15 @@ def test_a_py_target_still_selects_pytest(tmp_path: Path, monkeypatch: pytest.Mo
     )
 
     assert rc == 0
-    assert seen == [sandbox.pytest_argv(["tests/test_sample.py"])]
+    # Verify's oracle runs with main's pytest configuration, never the PR's.
+    lock = oracle_lock.from_git(repo, base_sha)
+    try:
+        expected = oracle_lock.locked_argv(
+            lock, sandbox.pytest_argv(["tests/test_sample.py"]), rootdir=repo
+        )
+    finally:
+        lock.cleanup()
+    assert seen == [expected]
     record = _record(state)
     assert record["evidence"]["runner"] == "pytest"
 

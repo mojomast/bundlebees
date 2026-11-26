@@ -255,3 +255,4 @@ def test_verify_named_tests_run_with_the_main_config(tmp_path: Path, monkeypatch
     assert argv[-1] == "tests/test_ok.py"
     assert "-p" in argv  # at least the disable-cache provider argument
     assert not any("pyproject.toml" in argument for argument in argv)
+    lock.cleanup()

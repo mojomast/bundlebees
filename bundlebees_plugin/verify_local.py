@@ -26,7 +26,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
-from . import leases, sandbox, subversion_scan, tdd, test_receipts as receipts
+from . import leases, oracle_lock, sandbox, subversion_scan, tdd, test_receipts as receipts
 from .security import contain_path, scrub
 
 _LOGGER = logging.getLogger(__name__)
@@ -319,6 +319,7 @@ def sandbox_runner(
     timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     which: Any = None,
     probe: Any = None,
+    env_extra: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run *argv* in the enforced sandbox and return its evidence.
 
@@ -340,6 +341,8 @@ def sandbox_runner(
         options["which"] = which
     if probe is not None:
         options["probe"] = probe
+    if env_extra:
+        options["env_extra"] = dict(env_extra)
     return sandbox.run_in_sandbox(Path(workdir), list(argv), **options)
 
 
@@ -788,6 +791,7 @@ def _execute_test_command(
     allow_unsafe_local: bool,
     allow_weak: bool,
     timeout: int,
+    env_extra: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
         if runner is not None:
@@ -800,6 +804,7 @@ def _execute_test_command(
                 allow_unsafe_local=allow_unsafe_local,
                 allow_weak=allow_weak,
                 timeout=timeout,
+                env_extra=env_extra,
             )
     except sandbox.SandboxUnavailable as exc:
         raise VerifyError(exc.code, exc.error, exc.fix) from exc
@@ -822,15 +827,25 @@ def _run_test_command(
     allow_weak: bool,
     timeout: int,
     receipt_context: Mapping[str, Any] | None = None,
+    oracle: oracle_lock.OracleLock | None = None,
 ) -> dict[str, Any]:
+    # The oracle lock is applied here, at the single funnel every pytest
+    # command crosses: named RED/GREEN tests and the regression suite alike.
+    command = (
+        oracle_lock.locked_argv(oracle, argv, rootdir=workdir)
+        if oracle is not None
+        else [str(argument) for argument in argv]
+    )
+    env_extra = oracle.env() if oracle is not None else None
     execute = lambda: _execute_test_command(  # noqa: E731 - local closure keeps the call site small
         workdir,
-        argv,
+        command,
         runner=runner,
         backend=backend,
         allow_unsafe_local=allow_unsafe_local,
         allow_weak=allow_weak,
         timeout=timeout,
+        env_extra=env_extra,
     )
     if receipt_context is None:
         return execute()
@@ -841,7 +856,7 @@ def _run_test_command(
     cacheable = bool(context.get("cacheable", True))
     key_inputs = _receipt_key_inputs(
         workdir,
-        command=argv,
+        command=command,
         stage=str(context["stage"]),
         source_tree_sha256=str(context["source_tree_sha256"]),
         patch_sha256=str(context["patch_sha256"]),
@@ -1272,7 +1287,22 @@ def _verify_and_commit_locked(
             f"the prepared worktree is missing {WORKTREE_PROBE_RELATIVE} even after forcing a full checkout",
             "Inspect the repository's sparse-checkout state; verify refuses an incomplete worktree.",
         )
+    oracle: oracle_lock.OracleLock | None = None
     try:
+        # The oracle is main's pytest configuration, extracted from the pinned
+        # base commit before the patch is applied. The PR's own pyproject.toml /
+        # pytest.ini / setup.cfg is never allowed to configure the tests that
+        # judge it; the scanner remains a tripwire, not the boundary.
+        try:
+            oracle = oracle_lock.from_git(worktree, base_rev)
+        except oracle_lock.OracleLockError as exc:
+            raise VerifyError(
+                "oracle_lock_unavailable",
+                str(exc),
+                "Ensure the pinned base revision carries main's pytest configuration; "
+                "verify refuses to run the PR's configuration.",
+            ) from exc
+
         # 4. RED before the patch, when tests are named.
         red: dict[str, Any] | None = None
         if tests:
@@ -1286,6 +1316,7 @@ def _verify_and_commit_locked(
                 allow_weak=sandbox_allow_weak,
                 timeout=sandbox_timeout,
                 receipt_context=receipt_context("verify.red"),
+                oracle=oracle,
             )
             if red["timed_out"]:
                 raise VerifyError(
@@ -1314,6 +1345,9 @@ def _verify_and_commit_locked(
         # Test runs create bytecode/caches; they are not part of the worker's patch.
         touched = [path for path in touched
                    if not (path.endswith(".pyc") or "__pycache__" in path.split("/") or ".pytest_cache" in path.split("/"))]
+        # The oracle lock config is harness state written into the worktree, not
+        # worker content; it is never committed or treated as a patch file.
+        touched = [path for path in touched if path != oracle.config_name]
         touched = sorted({path.split(" -> ")[-1] for path in touched if path})
         if touched != declared:
             raise VerifyError(
@@ -1350,6 +1384,7 @@ def _verify_and_commit_locked(
             allow_weak=sandbox_allow_weak,
             timeout=sandbox_timeout,
             receipt_context=receipt_context("verify.green"),
+            oracle=oracle,
         )
         if green["timed_out"]:
             raise VerifyError(
@@ -1382,6 +1417,7 @@ def _verify_and_commit_locked(
                 allow_weak=sandbox_allow_weak,
                 timeout=sandbox_timeout,
                 receipt_context=receipt_context("verify.suite"),
+                oracle=oracle,
             )
             if suite["timed_out"]:
                 raise VerifyError(
@@ -1424,6 +1460,8 @@ def _verify_and_commit_locked(
             except tdd.TddError as exc:
                 raise VerifyError(exc.code, exc.error, exc.fix) from exc
     finally:
+        if oracle is not None:
+            oracle.cleanup()
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
 
     # 8. Prove the commit is what we say it is.
@@ -1658,6 +1696,7 @@ def _run_tests(
     allow_weak: bool = False,
     timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     receipt_context: Mapping[str, Any] | None = None,
+    oracle: oracle_lock.OracleLock | None = None,
 ) -> dict[str, Any]:
     if suite_command:
         base = list(suite_command)
@@ -1673,6 +1712,7 @@ def _run_tests(
         allow_weak=allow_weak,
         timeout=timeout,
         receipt_context=receipt_context,
+        oracle=oracle,
     )
 
 
@@ -1686,6 +1726,7 @@ def _run_suite(
     allow_weak: bool = False,
     timeout: int = DEFAULT_SANDBOX_TIMEOUT_S,
     receipt_context: Mapping[str, Any] | None = None,
+    oracle: oracle_lock.OracleLock | None = None,
 ) -> dict[str, Any]:
     return _run_test_command(
         worktree,
@@ -1696,6 +1737,7 @@ def _run_suite(
         allow_weak=allow_weak,
         timeout=timeout,
         receipt_context=receipt_context,
+        oracle=oracle,
     )
 
 
