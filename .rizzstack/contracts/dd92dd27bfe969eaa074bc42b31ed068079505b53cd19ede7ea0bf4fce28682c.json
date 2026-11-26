@@ -1,0 +1,211 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wave-c-C3",
+  "title": "Issue the Ed25519 rizzstack.ticket/1 JWS from the coordinator",
+  "outcome": {
+    "summary": "bundlebees_plugin/ticket.py mints the compact JWS that hyvv ADR 0002 puts at the dispatch boundary. Given a validated brief, an injected 32-byte Ed25519 seed, a kid and an audience, issue_ticket returns base64url(header).base64url(payload).base64url(signature) with header exactly {alg: EdDSA, kid}; the signed payload is the RFC 8785 (JCS) form of the twelve rizzstack.ticket/1 claims. brief_sha256 hashes the JCS form of the brief with its ticket key removed, assigned_files_sha256 hashes the JCS form of assigned_files, contract_sha256 hashes the embedded contract object or is null. exp is exactly iat + 600 and no caller can mint a longer ticket. jti is 32 lower-case hex, fresh per issue and single-use through an in-memory JtiLedger. The private key is a required caller argument: the module never reads the environment, the home directory or a key file, so the coordinator's secret store stays outside the library. cryptography is an optional 'tickets' extra; importing the module without it succeeds and issuing fails closed with the named TicketCryptoUnavailable.",
+    "observable_behavior": [
+      "issue_ticket(brief, *, private_key, kid, audience, now=None, jti=None, ledger=None, ttl_seconds=600) returns a three-part compact JWS whose header is exactly {\"alg\": \"EdDSA\", \"kid\": kid}.",
+      "The payload decodes to exactly the twelve ADR claims and its bytes are the JCS canonical JSON of those claims; the signature verifies over header.payload with the matching public key.",
+      "brief_sha256 is SHA-256 of the JCS form of the brief without its ticket key: key order and a stale ticket on the input cannot change it, and a changed brief does.",
+      "assigned_files_sha256 and contract_sha256 are SHA-256 of the JCS forms of assigned_files and the embedded contract object; a brief without a contract records null.",
+      "iat is the supplied now (or wall clock), exp is iat + 600, TICKET_TTL_SECONDS is 600 and ttl_seconds above 600 raises TicketError.",
+      "jti is 32 lower-case hex, differs across issues, and a JtiLedger refuses a second claim of the same jti with TicketReuseError.",
+      "issue_ticket requires private_key as a keyword-only argument with no default; the module source has no os.environ/getenv/Path.home/expanduser access and opens no key path even when candidate BUNDLEBEES_*/RIZZSTACK_*/COORDINATOR_* key variables point at one.",
+      "cryptography is not a core dependency: pyproject declares it under the optional 'tickets' extra; with the import blocked the module still loads and issue_ticket raises TicketCryptoUnavailable naming cryptography, never a bare ImportError."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "bundlebees_plugin.ticket.issue_ticket",
+      "kind": "function",
+      "change": "add",
+      "notes": "issue_ticket(brief: Mapping, *, private_key: bytes, kid: str, audience: str, now: int | None = None, jti: str | None = None, ledger: JtiLedger | None = None, ttl_seconds: int = TICKET_TTL_SECONDS) -> str. Builds the twelve claims, JCS-canonicalises them and signs header.payload with Ed25519. No I/O beyond the caller-supplied values."
+    },
+    {
+      "name": "bundlebees_plugin.ticket.JtiLedger",
+      "kind": "class",
+      "change": "add",
+      "notes": "In-memory single-use jti ledger: claim(jti, exp) raises TicketReuseError on a second claim; the issuer consults it when one is supplied."
+    },
+    {
+      "name": "bundlebees_plugin.ticket.brief_digest",
+      "kind": "function",
+      "change": "add",
+      "notes": "SHA-256 hex of the RFC 8785 canonical JSON of the brief without its ticket key."
+    },
+    {
+      "name": "bundlebees_plugin.ticket.TicketError",
+      "kind": "class",
+      "change": "add",
+      "notes": "Base refusal type; TicketReuseError and TicketCryptoUnavailable derive from it and are importable without cryptography."
+    },
+    {
+      "name": "pyproject.toml",
+      "kind": "file",
+      "change": "modify",
+      "notes": "Add optional-dependencies.tickets carrying cryptography; the core dependencies list stays free of it."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "the issued JWS has the EdDSA header, decodes to exactly the twelve ADR claims and verifies with the test public key",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_header_is_eddsa_and_payload_is_the_twelve_claims",
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_remaining_claims_come_from_the_brief",
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_a_brief_without_a_contract_gets_a_null_contract_digest"
+      ]
+    },
+    {
+      "id": "AC-002",
+      "statement": "brief_sha256 is the RFC 8785 digest of the brief minus ticket, stable under key order and a stale ticket",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_payload_is_the_rfc8785_canonical_json_of_the_claims",
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_brief_digest_is_rfc8785_over_the_brief_without_its_ticket"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "exp is exactly iat + 600 seconds and a longer requested lifetime is refused",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_exp_is_exactly_ten_minutes_and_ttl_cannot_be_extended"
+      ]
+    },
+    {
+      "id": "AC-004",
+      "statement": "jti is random 32-hex and single use: a second claim of the same jti is refused",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::SingleUseJti::test_default_jti_is_random_32_hex_and_unique_per_issue",
+        "tests/test_ticket_issue.py::SingleUseJti::test_a_replayed_jti_is_refused_by_the_ledger",
+        "tests/test_ticket_issue.py::SingleUseJti::test_ledger_refuses_the_same_jti_twice_even_without_a_ticket"
+      ]
+    },
+    {
+      "id": "AC-005",
+      "statement": "the private key is injected, the module never consults env/home/key paths, and no key material is committed",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::KeyHandling::test_private_key_is_a_required_injected_argument",
+        "tests/test_ticket_issue.py::KeyHandling::test_module_never_consults_environment_or_home_for_a_key",
+        "tests/test_ticket_issue.py::KeyHandling::test_no_production_key_path_is_opened",
+        "tests/test_ticket_issue.py::KeyHandling::test_no_key_material_is_committed_with_the_module_or_test"
+      ]
+    },
+    {
+      "id": "AC-006",
+      "statement": "cryptography is an optional extra and a missing import fails closed with the named TicketCryptoUnavailable",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::OptionalCryptography::test_cryptography_stays_an_optional_extra",
+        "tests/test_ticket_issue.py::OptionalCryptography::test_missing_cryptography_fails_closed_with_a_named_error"
+      ]
+    },
+    {
+      "id": "AC-007",
+      "statement": "empty audience/kid and a brief without a risk tier are refused, and a fixed key/jti/iat issues byte-identical JWS",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_issue.py::InputValidation::test_empty_audience_and_kid_are_refused",
+        "tests/test_ticket_issue.py::InputValidation::test_a_brief_without_a_risk_tier_is_refused",
+        "tests/test_ticket_issue.py::IssuedTicketClaims::test_issue_is_deterministic_for_a_fixed_key_jti_and_iat"
+      ]
+    }
+  ],
+  "dependencies": [
+    "wave-c-C1: the twelve claims and their types are the rizzstack.ticket/1 schema frozen in workflow",
+    "owner answer 2026-11-25: signing is an optional extra, the private key lives in the coordinator's secret store and production key generation waits for the owner"
+  ],
+  "assumptions": [
+    "private_key is the coordinator's raw 32-byte Ed25519 seed from its secret store; loading that secret is the caller's job and is not implemented in this slice",
+    "the tests carry their own Ed25519 verifier and RFC 8785 canonicalizer so the issuer is checked independently; wave D may land a shared JCS core later without changing these behaviours",
+    "only throwaway keys generated at test time are used; no production key, key file or key material enters the repository",
+    "JtiLedger is an in-process guard against double issuance within one coordinator; the cross-process, cross-restart single-use guarantee is C4's on-disk ReplayCache.",
+    "r1 diagnosis (att_ee69117be8ad4992, green_failed): 10 of the 18 approved cases raised TicketCryptoUnavailable because the verification interpreter (verify_python /var/tmp/bundlebees-py, CPython 3.12) has no cryptography, and the Hermes CPython 3.14 venv carries cryptography 50.0.2 whose Ed25519 binding raises ModuleNotFoundError: _cffi_backend. The r1 patch is behaviourally correct: the identical diff passes 18/18 wherever the tickets extra imports (proven with uv run --with cryptography).",
+    "GREEN requires the tickets extra pre-provisioned in the verification interpreter: the verify sandbox runs offline (--net=none) and no test may install anything at run time, so cryptography is installed into verify_python on the host before tdd red and verify."
+  ],
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/ticket.py",
+      "pyproject.toml"
+    ],
+    "test_files": [
+      "tests/test_ticket_issue.py"
+    ],
+    "read_only": [
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/leases.py",
+      "bundlebees_plugin/__init__.py"
+    ],
+    "prohibited": [
+      "tests/test_ticket_issue.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "uv.lock",
+      "evidence/**"
+    ]
+  },
+  "source_rev": "73ef014511132e4bb860729db0c7f9d228912a5d",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "python -m unittest tests.test_ticket_issue -v"
+    ],
+    "integration": false
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "deploy",
+      "restart",
+      "tag",
+      "release",
+      "publish",
+      "production key generation",
+      "key storage",
+      "key rotation",
+      "branch deletion",
+      "live canary"
+    ]
+  },
+  "risk": {
+    "tier": "high",
+    "reasons": [
+      "the issuer is the only component that touches the coordinator signing key; a leak or an implicit key discovery would let anyone mint tickets",
+      "the ticket becomes the admission credential for every hyvv create in wave C",
+      "introduces the first cryptography dependency path in bundlebees, even as an optional extra"
+    ],
+    "blast_radius": "wave C tickets, preflight and every dispatch that later presents a ticket"
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C3 v2 dd92dd27 under option (a) - cryptography provisioned into the sandbox verify interpreter, pinned version+hash",
+    "approved_at": "2026-11-25T20:59:24Z",
+    "contract_sha256": "dd92dd27bfe969eaa074bc42b31ed068079505b53cd19ede7ea0bf4fce28682c",
+    "test_collection": {
+      "manifest_sha256": "b3f07ee196385e48b11cdd0a3eafa8e761b5b26d98de175b777b0a579ab7d8e0",
+      "source_rev": "73ef014511132e4bb860729db0c7f9d228912a5d",
+      "collected": 18
+    }
+  }
+}

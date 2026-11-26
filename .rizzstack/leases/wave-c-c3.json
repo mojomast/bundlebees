@@ -32,5 +32,11 @@
     "contract": "rizzstack-t1634/contracts/wave-bc/C3.contract.json",
     "approved_by": "owner answers 2026-11-25: approve WAVE-C C3 v2 dd92dd27 under option (a) - cryptography provisioned into the sandbox verify interpreter, pinned version+hash",
     "approved_at": "2026-11-25T20:59:24Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C3 v2 dd92dd27 under option (a) - cryptography provisioned into the sandbox verify interpreter, pinned version+hash",
+    "approved_at": "2026-11-25T20:59:24Z",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope"
   }
 }
