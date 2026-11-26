@@ -535,6 +535,24 @@ def test_project_metadata_lines_are_not_findings():
     assert _pyproject_patch(before, after) == []
 
 
+def test_build_line_is_clean_when_pytest_config_already_exists():
+    before = (
+        _PYPROJECT_BASE
+        + '\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "-p preexisting"\n'
+    )
+    after = before.replace('  "README.md",\n', '  "README.md",\n  "schemas/**",\n')
+    assert _pyproject_patch(before, after) == []
+
+
+def test_build_line_is_clean_when_a_pytest11_entry_point_already_exists():
+    before = (
+        _PYPROJECT_BASE
+        + '\n[project.entry-points.pytest11]\npreexisting = "preexisting.plugin"\n'
+    )
+    after = before.replace('  "README.md",\n', '  "README.md",\n  "schemas/**",\n')
+    assert _pyproject_patch(before, after) == []
+
+
 @pytest.mark.parametrize(
     "option,value",
     [

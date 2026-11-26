@@ -678,20 +678,50 @@ def _starts_with(address: tuple[str, ...], prefix: tuple[str, ...]) -> bool:
     return address[: len(prefix)] == prefix
 
 
+def _plugin_option_addresses(document: Any) -> frozenset[tuple[str, ...]]:
+    """Key addresses whose parsed value loads a pytest plugin."""
+    options = _mapping_path(document, ("tool", "pytest", "ini_options"))
+    candidates = (
+        (("tool", "pytest", "ini_options", "addopts"), options, "addopts"),
+        (("tool", "pytest", "ini_options", "pytest_plugins"), options, "pytest_plugins"),
+        (("addopts",), document, "addopts"),
+        (("pytest_plugins",), document, "pytest_plugins"),
+    )
+    addresses = set()
+    for address, table, key in candidates:
+        if not isinstance(table, Mapping) or key not in table:
+            continue
+        if key == "pytest_plugins":
+            addresses.add(address)
+            continue
+        try:
+            if _addopts_plugin(table[key]):
+                addresses.add(address)
+        except (ValueError, TypeError):
+            addresses.add(address)
+    return frozenset(addresses)
+
+
 def _pyproject_line_kinds(
-    address: tuple[str, ...], line: str, modules: frozenset[str]
+    address: tuple[str, ...],
+    line: str,
+    modules: frozenset[str],
+    plugin_addresses: frozenset[tuple[str, ...]] = frozenset(),
 ) -> tuple[str, ...]:
     """Classify one pyproject line by the real TOML table that contains it."""
+    kinds = []
     if _starts_with(address, _PYTEST_TABLE):
-        return ("pytest_config",)
+        kinds.append("pytest_config")
+    if address in plugin_addresses:
+        kinds.append("pytest_plugin")
     if _starts_with(address, _COVERAGE_TABLE):
-        return ("coverage_config",)
+        kinds.append("coverage_config")
     if any(_starts_with(address, prefix) for prefix in _PYTEST11_TABLES):
-        return ("pytest_plugin",)
+        kinds.append("pytest_plugin")
     if any(_starts_with(address, prefix) for prefix in _DEPENDENCY_TABLES):
         if _dependency_is_pytest_plugin(line, modules):
-            return ("pytest_plugin",)
-    return ()
+            kinds.append("pytest_plugin")
+    return tuple(dict.fromkeys(kinds))
 
 
 def _pyproject_findings(
@@ -718,6 +748,9 @@ def _pyproject_findings(
     except (tomllib.TOMLDecodeError, ValueError):
         document = None
     modules = _entry_point_modules(document) if document is not None else frozenset()
+    plugin_addresses = (
+        _plugin_option_addresses(document) if document is not None else frozenset()
+    )
     findings = []
     for line in added:
         if not 1 <= line <= len(lines):
@@ -725,7 +758,9 @@ def _pyproject_findings(
         address = addresses.get(line)
         if address is None:
             continue
-        for kind in _pyproject_line_kinds(address, lines[line - 1], modules):
+        for kind in _pyproject_line_kinds(
+            address, lines[line - 1], modules, plugin_addresses
+        ):
             findings.append(_finding(kind, path, line))
     return findings
 
@@ -825,18 +860,12 @@ def _dedupe(findings: Iterable[Finding]) -> list[Finding]:
 
 
 def _toml_findings(path: str, text: str, *, recover: bool = False) -> list[Finding]:
+    """Validate a pyproject document; line semantics live in ``_path_findings``."""
     try:
-        document = tomllib.loads(text)
+        tomllib.loads(text)
     except (tomllib.TOMLDecodeError, ValueError):
         return [] if recover else _config_error(path)
-    options = _mapping_path(document, ("tool", "pytest", "ini_options"))
-    root_options = {key: document[key] for key in ("addopts", "pytest_plugins", *_DISCOVERY_OPTIONS) if key in document}
-    findings = _option_findings(path, {**root_options, **options})
-    entry_points = _mapping_path(document, ("project", "entry-points"))
-    poetry_plugins = _mapping_path(document, ("tool", "poetry", "plugins"))
-    if "pytest11" in entry_points or "pytest11" in poetry_plugins:
-        findings.append(_finding("pytest_plugin", path))
-    return _dedupe(findings)
+    return []
 
 
 def _ini_parser() -> configparser.ConfigParser:
