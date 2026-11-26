@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import flags
 from .security import child_env, scrub
 
 __all__ = [
@@ -37,8 +38,8 @@ __all__ = [
 
 #: Contract name and version for the vault query result.
 MEMORY_CONTRACT = "rizzstack.memory/1"
-#: The feature is dark unless this is exactly ``1``.
-FLAG_ENV = "MEMORY_ENABLED"
+#: The feature is dark unless the shared flag source resolves this to ``1``.
+FLAG_ENV = flags.FLAG_MEMORY
 #: Program (optionally with arguments) that answers a vault query.
 QUERY_ENV = "BUNDLEBEES_MEMORY_QUERY"
 
@@ -82,9 +83,14 @@ def _env(environ: Mapping[str, str] | None) -> Mapping[str, str]:
 
 
 def enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """True only when the operator set ``MEMORY_ENABLED`` to exactly ``1``."""
+    """True only when the shared flag source resolves ``MEMORY_ENABLED`` to ``1``.
 
-    return str(_env(environ).get(FLAG_ENV, "")).strip() == "1"
+    The factory driver and the Hermes gateway read the same file, so recall is
+    on or off for both. An explicit mapping is a hermetic caller view and the
+    shared file is not consulted.
+    """
+
+    return flags.enabled(flags.FLAG_MEMORY, environ=environ)
 
 
 def miss_path(state_dir: Any) -> Path:
