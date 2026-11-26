@@ -92,7 +92,7 @@ def _code(exc: BaseException) -> str:
 
 
 def _last_identity(led, adapter: str, instance: str):
-    """The dedupe identity of the newest record this ledger consumed from a source."""
+    """The dedupe key of the newest record this ledger consumed, or None."""
     rows = led.query(
         "select envelope_json from event_rows"
         " where json_extract(envelope_json,'$.source.adapter')=?"
@@ -104,18 +104,59 @@ def _last_identity(led, adapter: str, instance: str):
         key = json.loads(rows[0]["envelope_json"]).get("dedupe_key")
     except (TypeError, ValueError):
         return None
-    return "r1." + key if isinstance(key, str) and key else None
+    return key if isinstance(key, str) and key else None
+
+
+def _consumed_keys(led, adapter: str, instance: str) -> set[str]:
+    """Every dedupe key this ledger already holds for one adapter instance."""
+    rows = led.query(
+        "select json_extract(envelope_json,'$.dedupe_key') as dedupe_key from event_rows"
+        " where json_extract(envelope_json,'$.source.adapter')=?"
+        " and json_extract(envelope_json,'$.source.instance')=?",
+        (adapter, instance))
+    return {row["dedupe_key"] for row in rows
+            if isinstance(row["dedupe_key"], str) and row["dedupe_key"]}
+
+
+def _resume_identity(led, source):
+    """The identity cursor that resumes without skipping an unconsumed record.
+
+    A rewrite moves a record in the mtime-ordered snapshot, so the newest
+    consumed record can end up *after* a record the ledger never saw. Resuming
+    from the newest consumed identity would then silently strand that record.
+    The safe resume point is the consumed record immediately before the first
+    unconsumed record in snapshot order. Returns None when no such point exists
+    (a lost newest identity, a pruned ledger, or an unconsumed record at the
+    very front), which the caller treats as a hard ``source_gap``.
+    """
+    try:
+        rows = list(source.events())
+    except Exception:  # noqa: BLE001 - an unreadable snapshot is not recoverable
+        return None
+    keys = [row.get("dedupe_key") for row in rows]
+    if any(not isinstance(key, str) or not key for key in keys):
+        return None
+    newest = _last_identity(led, source.adapter_id, source.instance)
+    if newest is None or newest not in keys:
+        return None
+    consumed = _consumed_keys(led, source.adapter_id, source.instance)
+    first = next((n for n, key in enumerate(keys) if key not in consumed), None)
+    if first == 0:
+        return None
+    anchor = len(keys) - 1 if first is None else first - 1
+    return "r1." + keys[anchor]
 
 
 def _rebase_legacy_cursor(led, importer, source, exc) -> bool:
-    """Move a stale positional cursor onto the last record the ledger consumed.
+    """Move a stale positional cursor to a point the ledger can prove safe.
 
     A directory snapshot is ordered by file mtime, so rewriting one record moves
     it and invalidates every positional hash after it for good -- the retry can
-    never validate that cursor again. The ledger still knows which record it
-    consumed last: while that identity survives in the snapshot, one empty
-    checkpoint moves the cursor onto it (no rewind, no skipped row, no second
-    dedupe layer). A genuinely lost record keeps raising ``source_gap``.
+    never validate that cursor again. One empty checkpoint moves the cursor onto
+    the consumed record immediately before the first unconsumed one, so the
+    retry imports every record the ledger has not seen (no rewind, no skipped
+    row, no second dedupe layer). A lost identity or an unprovable resume point
+    keeps raising ``source_gap``; this never writes a null cursor.
     """
     if _code(exc) != "source_gap" or not getattr(source, "_identity_cursors", False):
         return False
@@ -123,12 +164,9 @@ def _rebase_legacy_cursor(led, importer, source, exc) -> bool:
     cursor = position["cursor"]
     if not cursor or cursor.startswith("r1."):
         return False
-    identity = _last_identity(led, source.adapter_id, source.instance)
-    if identity is not None:
-        try:
-            source.read_batch(identity, 1, 1 << 20)
-        except Exception:  # noqa: BLE001 - the identity is gone: a real gap
-            return False
+    identity = _resume_identity(led, source)
+    if identity is None:
+        return False
     importer.commit_batch(source.adapter_id, source.instance, [], expected_cursor=cursor,
                           next_cursor=identity, expected_page=position["page"])
     return True
