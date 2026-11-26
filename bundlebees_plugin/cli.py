@@ -3259,8 +3259,24 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "the worker result has no patch yet",
                 "Wait for the worker to finish and collect a result with a patch.",
             )
+        # The subversion scan reads the applied tree when it can: a patch hunk
+        # is a file fragment, and a patch-only scan reports parse_error on
+        # files that are valid after the patch applies. The lease's source_rev
+        # and the repository/worktree being verified are the tree inputs.
+        scan_repo = repo
+        if scan_repo is None:
+            candidate = getattr(args, "workdir", None) or config.get("worktree")
+            if candidate:
+                try:
+                    scan_repo = Path(str(candidate)).expanduser().resolve()
+                except (OSError, RuntimeError):
+                    scan_repo = None
         try:
-            verify_local.check_patch_subversion(patch)
+            verify_local.check_patch_subversion(
+                patch,
+                repo_root=scan_repo if source_rev else None,
+                source_rev=source_rev or None,
+            )
         except verify_local.VerifyError as exc:
             raise _as_cli_error(exc) from exc
 

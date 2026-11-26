@@ -50,6 +50,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Iterator
 
@@ -58,6 +59,7 @@ import pytest
 from bundlebees_plugin import cli, subversion_scan, verify_local
 from tests.test_cli import (
     ATTEMPT_ID,
+    IN_LEASE_PATCH,
     FakeClient,
     _ctx,
     _git as _cli_git,
@@ -651,6 +653,36 @@ def test_pytest_header_after_a_build_table_is_a_finding():
     findings = _pyproject_patch(before, after)
     assert [(f["kind"], f["path"]) for f in findings if f["kind"] == "pytest_config"] == [
         ("pytest_config", "pyproject.toml")
+    ]
+
+
+def test_multiline_close_sharing_the_array_bracket_keeps_later_tables_visible():
+    """A multiline close sharing its line with ``]`` must still close the array.
+
+    Dropping the remainder of a multiline-close line left the array depth above
+    zero, so every later line was addressed as the array's pending key and the
+    pytest table below it was never a finding (a gate weakening).
+    """
+    before = _PYPROJECT_BASE + "\n[tool.hatch.build.targets.sdist.extra]\ninclude = [\n"
+    after = (
+        before
+        + '  """multi\n[tool.pytest.ini_options]\n"""]\n'
+        + '[tool.pytest.ini_options]\naddopts = "-p evil"\n'
+    )
+    tomllib.loads(after)  # the shape must be valid TOML for the case to be real
+    findings = _pyproject_patch(before, after)
+    lines = after.splitlines()
+    addopts_line = lines.index('addopts = "-p evil"') + 1
+    occurrences = [
+        index + 1
+        for index, line in enumerate(lines)
+        if line == "[tool.pytest.ini_options]"
+    ]
+    assert len(occurrences) == 2, "one header inside the string, one real table"
+    _string_header, header_line = occurrences
+    assert [(f["kind"], f["line"]) for f in findings if f["kind"] == "pytest_config"] == [
+        ("pytest_config", header_line),
+        ("pytest_config", addopts_line),
     ]
 
 
@@ -1289,3 +1321,64 @@ def test_the_scan_alone_refuses_the_patch(tmp_path: Path, monkeypatch: pytest.Mo
     record = _record(state)
     assert record["ok"] is True
     assert "code" not in record
+
+
+# --- tree inputs: a partial hunk is a fragment, not a parse error ---------
+
+_PALETTE = """\
+COLORS = [
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "indigo",
+]
+"""
+
+
+def _palette_patch() -> str:
+    after = _PALETTE.replace('    "green",\n', '    "green2",\n')
+    return _text_patch("src/palette.py", _PALETTE, after)
+
+
+def test_partial_hunk_is_a_fragment_for_a_patch_only_scan():
+    """The patch alone rebuilds only the hunk, so ``ast`` refuses the fragment."""
+    kinds = {finding["kind"] for finding in subversion_scan.scan_patch(_palette_patch())}
+    assert kinds == {"parse_error"}
+
+
+def test_scan_patch_reads_the_applied_tree_when_given_repo_and_source_rev():
+    """repo_root + source_rev scan the whole post-image, so the fragment class is gone."""
+    patch = _palette_patch()
+    with _case(patch, {"src/palette.py": _PALETTE}) as (repo, sha):
+        assert subversion_scan.scan_patch(patch, repo, sha) == []
+        assert subversion_scan.scan_for_verify(patch, repo, sha) == []
+
+
+def test_scan_patch_with_only_one_tree_input_fails_closed():
+    patch = _palette_patch()
+    with _case(patch, {"src/palette.py": _PALETTE}) as (repo, _sha):
+        findings = subversion_scan.scan_patch(patch, repo_root=repo)
+    assert [finding["kind"] for finding in findings] == ["unreadable_input"]
+
+
+def test_cli_verify_passes_the_worktree_and_source_rev_to_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo, state, base_sha = _setup(tmp_path)
+    seen: dict[str, object] = {}
+    real = verify_local.check_patch_subversion
+
+    def spy(patch, repo_root=None, source_rev=None):
+        seen["repo_root"] = repo_root
+        seen["source_rev"] = source_rev
+        return real(patch, repo_root, source_rev)
+
+    monkeypatch.setattr(verify_local, "check_patch_subversion", spy)
+
+    rc, error, _doubles = _drive(repo, state, CLEAN_PATCH, base_sha, monkeypatch)
+
+    assert rc == 0, f"a clean patch was refused: {_code(error, rc, state)}"
+    assert Path(seen["repo_root"]).resolve() == repo.resolve()
+    assert seen["source_rev"] == base_sha

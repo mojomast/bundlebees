@@ -166,8 +166,8 @@ def test_the_scan_alone_refuses_the_patch(
     case fails if a future change starts refusing unrelated patches.
     """
     repo, state, base_sha = _setup(tmp_path)
-    monkeypatch.setattr(verify_local, "check_patch_subversion", lambda patch: [])
-    monkeypatch.setattr(cli, "check_patch_subversion", lambda patch: [], raising=False)
+    monkeypatch.setattr(verify_local, "check_patch_subversion", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "check_patch_subversion", lambda *a, **k: [], raising=False)
 
     rc, error, _doubles = _drive(repo, state, SUBVERSION_PATCH, base_sha, monkeypatch)
 

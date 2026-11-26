@@ -565,16 +565,17 @@ def _toml_value_state(value: str, depth: int = 0) -> tuple[str | None, int]:
     return None, depth
 
 
-def _toml_multiline_closed(line: str, delimiter: str) -> bool:
+def _toml_multiline_close_end(line: str, delimiter: str) -> int | None:
+    """Index just past this line's closing *delimiter*, or None if it stays open."""
     index = 0
     while index < len(line):
         if line.startswith(delimiter, index):
-            return True
+            return index + len(delimiter)
         if delimiter == '"""' and line[index] == "\\":
             index += 2
         else:
             index += 1
-    return False
+    return None
 
 
 def _split_toml_assignment(line: str) -> tuple[str, str] | None:
@@ -630,8 +631,15 @@ def _toml_line_addresses(text: str) -> dict[int, tuple[str, ...]]:
     for number, raw in enumerate(text.splitlines(), 1):
         if multiline is not None:
             addresses[number] = pending
-            if _toml_multiline_closed(raw, multiline):
-                multiline = None
+            close = _toml_multiline_close_end(raw, multiline)
+            if close is None:
+                continue
+            # The remainder of the line still counts: ``"""]`` closes the
+            # multiline string and its array on one line, and dropping that
+            # bracket left ``depth`` above zero, so every later line was
+            # addressed as the array's pending key and real pytest tables
+            # became invisible.
+            multiline, depth = _toml_value_state(raw[close:], depth)
             continue
         if depth > 0:
             addresses[number] = pending
@@ -1321,7 +1329,34 @@ def _with_differential(patch: str, findings: list[Finding]) -> ScanFindings:
     return ScanFindings(findings, differential=_differential(patch, findings))
 
 
-def scan_patch(patch: str) -> list[Finding]:
+def scan_patch(
+    patch: str,
+    repo_root: str | Path | None = None,
+    source_rev: str | None = None,
+) -> list[Finding]:
+    """Scan a patch for test-runner subversion.
+
+    With ``repo_root`` and ``source_rev`` the patch is applied to that tree and
+    the *whole* post-image file is scanned. Without them the changed files are
+    rebuilt from the hunks the patch carries, so a partial hunk is only a
+    fragment of a file: ``ast`` cannot parse it and the scan reports
+    ``parse_error`` on a file that is valid once the patch applies. Verify
+    always has the repository and the dispatched source revision, so it passes
+    both; a patch that does not apply to that tree falls back to the patch-only
+    scan and is refused later by the revision checks.
+    """
+
+    if repo_root is not None and source_rev:
+        try:
+            findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+        except _ScanFailure:
+            findings = None
+        except (OSError, UnicodeError, ValueError, TypeError):
+            findings = None
+        if findings is not None:
+            return _with_differential(patch, findings)
+    elif (repo_root is None) != (source_rev is None):
+        return _with_differential(patch, _input_finding())
     try:
         findings = _scan_patch_only(patch)
     except _ScanFailure as exc:
@@ -1336,8 +1371,4 @@ def scan_for_verify(
     repo_root: str | Path | None = None,
     source_rev: str | None = None,
 ) -> list[Finding]:
-    if repo_root is None and source_rev is None:
-        return scan_patch(patch)
-    if repo_root is None or source_rev is None:
-        return _with_differential(patch, _input_finding())
-    return _with_differential(patch, scan_change(patch, repo_root, source_rev))
+    return scan_patch(patch, repo_root, source_rev)
