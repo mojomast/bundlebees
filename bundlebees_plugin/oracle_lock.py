@@ -165,41 +165,40 @@ def _addopts_tokens(value: Any) -> list[str]:
     return tokens
 
 
+def _add_plugin_name(names: list[str], name: str) -> None:
+    name = name.strip()
+    if not name or name.startswith("no:") or not _PLUGIN_NAME_RE.match(name):
+        return
+    if name not in names:
+        names.append(name)
+
+
+def _option_plugin(tokens: Sequence[str], index: int) -> tuple[str | None, int]:
+    """The plugin named by the token at *index*, and the index after it."""
+    token = tokens[index]
+    if token in {"-p", "--plugin"}:
+        if index + 1 < len(tokens):
+            return tokens[index + 1], index + 2
+        return None, index + 1
+    if token.startswith("--plugin="):
+        return token[len("--plugin=") :], index + 1
+    if token.startswith("-p") and not token.startswith("--") and len(token) > 2:
+        return token[2:], index + 1
+    return None, index + 1
+
+
 def _plugin_allowlist(options: Mapping[str, Any]) -> tuple[str, ...]:
     """The ``-p`` args plus ``pytest_plugins`` *main* itself loads."""
     names: list[str] = []
-
-    def add(name: str) -> None:
-        name = name.strip()
-        if not name or name.startswith("no:") or not _PLUGIN_NAME_RE.match(name):
-            return
-        if name not in names:
-            names.append(name)
-
     tokens = _addopts_tokens(options.get("addopts"))
     index = 0
     while index < len(tokens):
-        token = tokens[index]
-        candidate: str | None = None
-        if token in {"-p", "--plugin"}:
-            if index + 1 < len(tokens):
-                candidate = tokens[index + 1]
-                index += 2
-            else:
-                index += 1
-        elif token.startswith("--plugin="):
-            candidate = token[len("--plugin=") :]
-            index += 1
-        elif token.startswith("-p") and not token.startswith("--") and len(token) > 2:
-            candidate = token[2:]
-            index += 1
-        else:
-            index += 1
+        candidate, index = _option_plugin(tokens, index)
         if candidate is not None:
-            add(candidate)
+            _add_plugin_name(names, candidate)
     for item in _as_items(options.get("pytest_plugins")):
         for part in re.split(r"[,\s]+", item):
-            add(part)
+            _add_plugin_name(names, part)
     return tuple(names)
 
 
