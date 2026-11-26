@@ -42,7 +42,11 @@ def campaign(tmp_path_factory):
     # Only this test-authored repository and pytest command; real tests, real
     # local commits, real gitleaks. Does not exercise a sandbox/remote worker.
     def run(workdir, argv):
-        assert argv[:4] == [sys.executable, '-m', 'pytest', '-q']
+        # Verify runs the oracle under the lock: main's pytest config and the
+        # plugin allowlist, never the repository's own pyproject/pytest.ini.
+        assert argv[:4] == [sys.executable, '-B', '-m', 'pytest']
+        assert argv[4:6] == ['-c', '.bundlebees-oracle-pytest.ini']
+        assert argv[6:8] == ['--rootdir', '.']
         proc = subprocess.run(argv, cwd=workdir, capture_output=True, timeout=60)
         return dict(exit_code=proc.returncode, timed_out=False)
 
