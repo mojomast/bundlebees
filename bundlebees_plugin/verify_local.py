@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -27,6 +28,8 @@ from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from . import leases, sandbox, subversion_scan, tdd, test_receipts as receipts
 from .security import contain_path, scrub
+
+_LOGGER = logging.getLogger(__name__)
 
 RECORD_DIR = "verify-results"
 
@@ -98,6 +101,11 @@ def _junit_counter(value: Any, name: str) -> int:
         ) from exc
 
 
+def _junit_counter_or_default(junit: Mapping[str, Any], name: str, default: int) -> int:
+    value = junit.get(name)
+    return _junit_counter(default if value is None else value, name)
+
+
 def _check_frozen_green(
     preflight: Mapping[str, Any],
     approved_ids: Sequence[str],
@@ -114,10 +122,10 @@ def _check_frozen_green(
     cases = list(evidence.get("cases") or [])
     result = {
         "exit_code": evidence.get("exit_code"),
-        "tests": _junit_counter(junit.get("tests") or len(cases), "tests"),
-        "failures": _junit_counter(junit.get("failures") or 0, "failures"),
-        "errors": _junit_counter(junit.get("errors") or 0, "errors"),
-        "skipped": _junit_counter(junit.get("skipped") or 0, "skipped"),
+        "tests": _junit_counter_or_default(junit, "tests", len(cases)),
+        "failures": _junit_counter_or_default(junit, "failures", 0),
+        "errors": _junit_counter_or_default(junit, "errors", 0),
+        "skipped": _junit_counter_or_default(junit, "skipped", 0),
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
     }
@@ -180,21 +188,50 @@ class VerifyError(Exception):
         self.fix = fix
 
 
-def check_patch_subversion(patch: str) -> list[subversion_scan.Finding]:
-    findings = subversion_scan.scan_patch(patch)
+def _subversion_message(findings: Sequence[subversion_scan.Finding]) -> str:
+    listed = ", ".join(
+        f"{finding['kind']}@{subversion_scan.safe_path(finding['path'])}:{finding['line']}"
+        for finding in findings[:5]
+    )
+    message = f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
+    if len(findings) > 5:
+        message += f" (+{len(findings) - 5} more)"
+    return message
+
+
+def _log_subversion_differential(differential: Mapping[str, Any] | None) -> None:
+    """Log the V1/V2 scanner differential instead of recording it.
+
+    Report-only week: the differential is evidence about the scanner cutover,
+    not part of the verify record, whose field set is a closed contract
+    (``verify_workers.RECORD_FIELDS``). It goes to this module's log only.
+    """
+
+    if not differential:
+        return
+    delta = differential.get("delta") or {}
+    _LOGGER.warning(
+        "subversion differential (report-only, not in the verify record): "
+        "v1=%d v2=%d v1_only=%d v2_only=%d match=%s",
+        len(differential.get("v1") or ()),
+        len(differential.get("v2") or ()),
+        len(delta.get("v1_only") or ()),
+        len(delta.get("v2_only") or ()),
+        bool(differential.get("match")),
+    )
+
+
+def check_patch_subversion(
+    patch: str,
+    repo_root: Path | None = None,
+    source_rev: str | None = None,
+) -> list[subversion_scan.Finding]:
+    findings = subversion_scan.scan_for_verify(patch, repo_root, source_rev)
+    _log_subversion_differential(getattr(findings, "differential", None))
     if findings:
-        listed = ", ".join(
-            f"{finding['kind']}@{finding['path']}:{finding['line']}"
-            for finding in findings[:5]
-        )
-        message = (
-            f"patch can subvert the approved test run: {len(findings)} finding(s): {listed}"
-        )
-        if len(findings) > 5:
-            message += f" (+{len(findings) - 5} more)"
         raise VerifyError(
             "test_subversion",
-            message,
+            _subversion_message(findings),
             "Remove test-runner subversion from the patch.",
         )
     return findings
@@ -1083,9 +1120,11 @@ def _verify_and_commit_locked(
     on_receipt_written: Callable[[ReceiptPin], None] | None = None,
     stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    check_patch_subversion(patch)
     state_dir = Path(state_dir)
     repo = Path(repo)
+    # Refuses a subverting patch; the scanner's V1/V2 differential is logged by
+    # check_patch_subversion and is deliberately not part of the verify record.
+    check_patch_subversion(patch, repo_root=repo, source_rev=base_rev)
     stats = stats if stats is not None else _test_cache_stats()
 
     # Fail closed on missing evidence rather than recording a hollow pass.
@@ -1415,8 +1454,22 @@ def _verify_and_commit_locked(
     return record
 
 
-def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, patch_sha256=None, resumed=False, test_cache=None, execution_identity=None) -> dict[str, Any]:
-    return {
+def _record(
+    attempt_id,
+    sha,
+    base_rev,
+    files,
+    tests,
+    *,
+    red,
+    suite,
+    gitleaks,
+    patch_sha256=None,
+    resumed=False,
+    test_cache=None,
+    execution_identity=None,
+) -> dict[str, Any]:
+    record = {
         "attempt_id": attempt_id,
         "ok": True,
         "sha": sha,
@@ -1436,6 +1489,7 @@ def _record(attempt_id, sha, base_rev, files, tests, *, red, suite, gitleaks, pa
         "test_cache": dict(test_cache or _test_cache_stats()),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    return record
 
 
 def _identity_for_commit(

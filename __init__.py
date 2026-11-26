@@ -47,6 +47,12 @@ def approve_attempt_change(tool_name: str = "", args=None, **kwargs):
 
 def register(ctx) -> None:
     """Called by Hermes PluginManager. Keep this fast; lazy-import heavy deps in handlers."""
+    # The gateway is the other process that reads these flags. One line at
+    # startup, from the same loader the factory driver uses, so an operator
+    # sees one effective answer instead of two guesses.
+    from bundlebees_plugin import flags
+
+    flags.log_startup()
     skills_dir = _ROOT / "skills"
     if skills_dir.is_dir() and hasattr(ctx, "register_skill"):
         for child in sorted(p for p in skills_dir.iterdir() if p.is_dir()):

@@ -56,6 +56,7 @@ __all__ = [
     "record_failure",
     "enqueue_research",
     "validate_findings",
+    "attachment_cap",
     "record_findings",
     "require_findings",
     "route_verdict",
@@ -567,6 +568,46 @@ def validate_findings(artifact: Any, failure_id: str) -> list[str]:
             "verdict must be one of: " + ", ".join(VERDICTS)
         )
     return problems
+
+
+#: Caps on a findings artifact carried by a retry dispatch. A research record
+#: is evidence, not a payload: it must stay small enough to render into a
+#: worker prompt. Both limits are fixed, so the same artifact always gets the
+#: same verdict.
+ATTACH_MAX_ENTRIES = 20
+ATTACH_MAX_BYTES = 16 * 1024
+
+
+def attachment_cap(artifact: Any) -> dict[str, Any] | None:
+    """Why *artifact* cannot be attached as-is, or ``None`` when it fits.
+
+    Entries are the contract lists (``sources`` plus
+    ``rejected_alternatives``); bytes are the artifact's canonical JSON
+    encoding. The entry limit is checked first, so an artifact over both
+    limits reports ``entries``. The caller refuses the dispatch with this
+    recorded reason instead of trimming the record, so a worker never receives
+    a silently shortened research artifact.
+    """
+
+    limits = {"max_entries": ATTACH_MAX_ENTRIES, "max_bytes": ATTACH_MAX_BYTES}
+    if not isinstance(artifact, Mapping):
+        return {"reason": "not_an_object", "entries": 0, "bytes": 0, **limits}
+    entries = 0
+    for name in ("sources", "rejected_alternatives"):
+        value = artifact.get(name)
+        if isinstance(value, list):
+            entries += len(value)
+    try:
+        size = len(
+            json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return {"reason": "unserializable", "entries": entries, "bytes": 0, **limits}
+    if entries > ATTACH_MAX_ENTRIES:
+        return {"reason": "entries", "entries": entries, "bytes": size, **limits}
+    if size > ATTACH_MAX_BYTES:
+        return {"reason": "bytes", "entries": entries, "bytes": size, **limits}
+    return None
 
 
 def record_findings(state_dir: Any, artifact: Mapping[str, Any]) -> dict[str, Any]:

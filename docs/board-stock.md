@@ -17,6 +17,13 @@ subprocess and no file: the beat report and the service pass are exactly what
 they were before this check existed. `tests/test_board_stock.py` proves both
 directions.
 
+`BUNDLEBEES_BOARD_STOCK` is resolved by `bundlebees_plugin/flags.py`, the same
+loader `MEMORY_ENABLED` uses: process environment first, then the shared file
+`~/.config/bundlebees/flags.env` (override `BUNDLEBEES_FLAGS_FILE`). The factory
+driver and the Hermes gateway read that one file, so the flag means the same
+thing in both processes, and each startup logs one
+`bundlebees flags: BUNDLEBEES_BOARD_STOCK=0|1 ...` line.
+
 ## What is observed
 
 Two numbers, and nothing else:
