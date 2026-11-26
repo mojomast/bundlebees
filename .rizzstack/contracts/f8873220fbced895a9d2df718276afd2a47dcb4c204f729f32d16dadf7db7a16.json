@@ -1,0 +1,221 @@
+{
+ "contract_version": "acdd/1",
+ "id": "verify-writer",
+ "title": "Verify records carry repo, slice, PR and contract provenance, or are not written",
+ "outcome": {
+  "summary": "The verify writer stamps every record it writes for a contracted (slice) attempt with the repository slug, slice id and canonical contract hash that the record proves, plus the pull request number whenever one is known, and refuses to write a slice record it cannot bind. The merge lane already binds a record's repo/slice/contract_sha256 to the frozen base lease that classified the pull request, so a pre-provenance record is not evidence for any pull request; this slice makes the writer produce records the lane can accept, and makes an unbindable slice record a named refusal instead of a plausible-looking one.",
+  "observable_behavior": [
+   "a verify record written for a contracted attempt carries repo (owner/name), slice (the contract id) and contract_sha256 (lower-case 64-hex) at top level, and pr (positive integer) whenever a pull request is known",
+   "the record is written after the verified branch's pull request is opened or found, so pr names the pull request the verified head belongs to when one exists",
+   "a contracted attempt whose repo, slice or contract cannot be established is refused before any test runs, with code verify_provenance_missing naming the field; a lease contract edited after freeze or a brief slice that disagrees with the contract id is refused verify_provenance_invalid",
+   "a pull request that is present in the provenance but not a positive integer is refused rather than dropped, while an absent one leaves the binding intact -- so tdd/refactor verifies that run before a PR exists still record valid exact-head evidence",
+   "an uncontracted (legacy) attempt keeps the historical record shape and never carries provenance, so the lane never mistakes it for slice evidence",
+   "verify --pull-request N names the pull request explicitly when it is not discoverable from the attempt's delivery record or the lease brief"
+  ]
+ },
+ "interfaces": [
+  {
+   "name": "bundlebees_plugin.verify_provenance.stamp",
+   "kind": "function",
+   "change": "add",
+   "notes": "Validate and attach repo/slice/contract_sha256 (and pr when known) to a verify payload."
+  },
+  {
+   "name": "bundlebees_plugin.verify_provenance.from_lease",
+   "kind": "function",
+   "change": "add",
+   "notes": "repo/slice/contract from the dispatch-time lease and its embedded frozen contract."
+  },
+  {
+   "name": "bundlebees_plugin.verify_provenance.with_pr",
+   "kind": "function",
+   "change": "add",
+   "notes": "Add the pull request number when known; an absent one leaves the binding intact."
+  },
+  {
+   "name": "bundlebees_plugin.cli._write_verify_result",
+   "kind": "function",
+   "change": "modify",
+   "notes": "Adds provenance= and require_provenance=; a slice record without its binding is not written."
+  },
+  {
+   "name": "hermes bundlebees verify --pull-request",
+   "kind": "cli",
+   "change": "modify",
+   "notes": "Names the pull request the verified head belongs to when it is not discoverable."
+  },
+  {
+   "name": "verify-results/<attempt>.json",
+   "kind": "schema",
+   "change": "modify",
+   "notes": "Contracted attempts gain repo, slice, contract_sha256 and pr when known; legacy shapes are unchanged."
+  }
+ ],
+ "acceptance_criteria": [
+  {
+   "id": "AC-001",
+   "statement": "stamp attaches all four provenance fields, normalised, to a verify payload",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_stamp_adds_all_four_fields_normalised"
+   ]
+  },
+  {
+   "id": "AC-002",
+   "statement": "stamp refuses provenance missing repo, slice or contract_sha256, naming the field",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_stamp_refuses_a_mapping_missing_each_required_field"
+   ]
+  },
+  {
+   "id": "AC-003",
+   "statement": "an unknown pull request is omitted, and a present but invalid one is refused",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_stamp_omits_an_unknown_pull_request_and_refuses_an_invalid_one"
+   ]
+  },
+  {
+   "id": "AC-004",
+   "statement": "each field is validated: repo slug, slice id, positive PR number and 64-hex digest",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_repo_slug_accepts_a_slug_and_refuses_a_path_or_bare_name",
+    "tests/test_verify_writer_provenance.py::test_pull_url_parsing_returns_the_number_and_refuses_other_urls",
+    "tests/test_verify_writer_provenance.py::test_pull_number_refuses_a_boolean_a_zero_and_a_word",
+    "tests/test_verify_writer_provenance.py::test_contract_digest_refuses_a_short_or_non_hex_digest",
+    "tests/test_verify_writer_provenance.py::test_slice_name_refuses_a_path_shaped_name"
+   ]
+  },
+  {
+   "id": "AC-005",
+   "statement": "provenance is bound to the lease's frozen contract and refuses a missing, edited or contradicting one",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_from_lease_binds_the_slice_and_contract_hash",
+    "tests/test_verify_writer_provenance.py::test_from_lease_refuses_a_lease_without_a_contract",
+    "tests/test_verify_writer_provenance.py::test_from_lease_refuses_a_contract_edited_after_freeze",
+    "tests/test_verify_writer_provenance.py::test_from_lease_refuses_a_brief_slice_that_disagrees_with_the_contract",
+    "tests/test_verify_writer_provenance.py::test_from_lease_refuses_a_brief_without_a_repo_and_no_origin",
+    "tests/test_verify_writer_provenance.py::test_with_pr_adds_the_number_and_leaves_it_out_when_unknown"
+   ]
+  },
+  {
+   "id": "AC-006",
+   "statement": "the writer stamps the record, writes a PR-less binding, and refuses a slice record without its binding",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_the_written_record_carries_provenance_and_survives_scrub",
+    "tests/test_verify_writer_provenance.py::test_a_pr_less_slice_record_carries_the_binding",
+    "tests/test_verify_writer_provenance.py::test_the_writer_refuses_a_slice_record_without_provenance"
+   ]
+  },
+  {
+   "id": "AC-007",
+   "statement": "the CLI resolves the pull request from --pull-request, the delivery record, else the lease brief, and the repo from the brief else the origin slug",
+   "verification": "test",
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_the_cli_resolves_the_pr_from_the_delivery_record",
+    "tests/test_verify_writer_provenance.py::test_the_cli_prefers_an_explicit_pull_request_over_the_delivery",
+    "tests/test_verify_writer_provenance.py::test_the_cli_falls_back_to_the_lease_brief_for_the_pull_request",
+    "tests/test_verify_writer_provenance.py::test_the_cli_writes_the_binding_without_a_pull_request",
+    "tests/test_verify_writer_provenance.py::test_the_cli_falls_back_to_the_origin_slug_for_the_repo"
+   ]
+  },
+  {
+   "id": "AC-008",
+   "statement": "an uncontracted attempt's record keeps the historical shape and carries no provenance fields",
+   "verification": "test",
+   "regression": true,
+   "tests": [
+    "tests/test_verify_writer_provenance.py::test_a_legacy_record_is_written_without_provenance_fields"
+   ]
+  }
+ ],
+ "dependencies": [
+  "the merge lane reads verify-results/*.json and requires repo/slice/contract_sha256 to equal the frozen base lease (policy/merge-lane-v5.md)"
+ ],
+ "assumptions": [
+  "freezing this contract needs the owner's typed approval; it is authored as a draft and its PR carries it for that review",
+  "the lane's predicate binds on repo, slice and contract_sha256 and treats pr as additional evidence when present, so a verify that runs before a PR exists still records valid exact-head evidence",
+  "the pull request a first verify run opens is known before the record is written, because verify opens it eagerly and falls back to the delivery record"
+ ],
+ "scope": {
+  "assigned_files": [
+   "bundlebees_plugin/verify_provenance.py",
+   "bundlebees_plugin/cli.py"
+  ],
+  "test_files": [
+   "tests/test_verify_writer_provenance.py"
+  ],
+  "prohibited": [
+   "tests/test_verify_writer_provenance.py",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "evidence/**",
+   ".rizzstack/**",
+   "bundlebees_plugin/verify_local.py",
+   "bundlebees_plugin/contract.py"
+  ],
+  "read_only": [
+   "bundlebees_plugin/verify_local.py",
+   "bundlebees_plugin/contract.py",
+   "bundlebees_plugin/acdd_cli.py",
+   "bundlebees_plugin/delivery.py",
+   "bundlebees_plugin/leases.py",
+   "bundlebees_plugin/brief.py"
+  ]
+ },
+ "source_rev": "eaccb1b7170f8fd58478af2c0ba56f11a88447a6",
+ "tdd": {
+  "applicable": true,
+  "test_first": true
+ },
+ "verification": {
+  "independent": true,
+  "commands": [
+   "python3 -m pytest -q tests/test_verify_writer_provenance.py"
+  ]
+ },
+ "evidence_required": [
+  "red",
+  "green"
+ ],
+ "authorization": {
+  "human_gates": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish"
+  ],
+  "authorized": [
+   "write the provenance module and the cli.py writer plumbing",
+   "run the approved test file in the sandbox",
+   "push the feature branch and open a pull request"
+  ],
+  "not_authorized": [
+   "merge",
+   "deploy",
+   "restart",
+   "tag",
+   "close a pull request",
+   "edit the approved test file",
+   "change the gate, the lease store or the contract store beyond this PR's own files"
+  ]
+ },
+ "risk": {
+  "tier": "high",
+  "reasons": [
+   "verify code defines what 'verified' means for every slice the merge lane accepts",
+   "a wrongly accepted record could merge an unverified change"
+  ],
+  "blast_radius": "every slice pull request the merge lane evaluates"
+ },
+ "review": {
+  "status": "draft"
+ }
+}
