@@ -71,6 +71,7 @@ __all__ = [
     "MAX_EVENT_BYTES",
     "MAX_HTTP_BODY_BYTES",
     "EventError",
+    "validate_lease_files",
     "event_id_for",
     "build_event",
     "validate_event",
@@ -432,7 +433,17 @@ def _canonical_backend(
     return out
 
 
-def _canonical_assigned_files(value: Any) -> list[str]:
+def validate_lease_files(value: Any) -> list[str]:
+    """Validate a lease's ``assigned_files`` and return its canonical paths.
+
+    This is the single validator shared by dispatch and the terminal landing
+    write-back: both must agree on exactly which leases can complete. Every
+    repository-relative rule is enforced here, and a glob character is refused
+    by name so a lease that can never be written back is never dispatched.
+    An at-sign is a legal filename character; URL, IP and host:port text is
+    still refused as private.
+    """
+
     if value is None:
         return []
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
@@ -444,6 +455,12 @@ def _canonical_assigned_files(value: Any) -> list[str]:
     files: list[str] = []
     for index, item in enumerate(value):
         text = item.strip() if isinstance(item, str) else ""
+        if any(ch in text for ch in ("*", "?", "[")):
+            raise EventError(
+                "lease_glob_unsupported",
+                f"lease.assigned_files[{index}] contains a glob character",
+                "List exact files in lease.assigned_files instead of a glob pattern.",
+            )
         if (
             not text
             or len(text) > 256
@@ -459,10 +476,14 @@ def _canonical_assigned_files(value: Any) -> list[str]:
                 f"lease.assigned_files[{index}] is not a repository-relative path",
                 _FIX_EVENT,
             )
-        if looks_like_secret(text) or contains_address(text):
+        if looks_like_secret(text) or contains_address(text.replace("@", "")):
             raise EventError("event_private", "lease.assigned_files carries private text", _FIX_EVENT)
         files.append(text)
     return files
+
+
+def _canonical_assigned_files(value: Any) -> list[str]:
+    return validate_lease_files(value)
 
 
 def _canonical_lease(

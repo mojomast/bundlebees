@@ -708,6 +708,65 @@ def _run(
     return TickResult(status="idle", detail="nothing to do")
 
 
+def reconcile_tool_attempts(state_dir: Path, backend: Any) -> dict[str, Any]:
+    """Sweep terminal tool-path launcher attempts into the local attempt store.
+
+    The launcher is read once; matched rows whose state is ``succeeded``,
+    ``failed`` or ``cancelled`` are written through the same
+    :func:`agent_consumer.record_tool_completion` the polling path uses, so
+    ``status`` stops reporting finished work as in flight. Queued, running and
+    absent rows are left alone, and this never recreates an attempt.
+    """
+
+    from . import agent_consumer, leases
+
+    state = Path(state_dir)
+    try:
+        paths = sorted((state / "leases").glob("*.json"))
+    except OSError:
+        paths = []
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            records.append(leases.load_lease(state, path.stem))
+        except Exception:  # noqa: BLE001 - an unreadable lease is not a launcher row
+            continue
+
+    attempts = backend.attempts_raw()
+    states: dict[str, str] = {}
+    if isinstance(attempts, list):
+        for row in attempts:
+            if not isinstance(row, Mapping):
+                continue
+            attempt_id = str(row.get("attempt_id") or "").strip()
+            if not attempt_id:
+                continue
+            states[attempt_id] = str(
+                row.get("state") or row.get("status") or ""
+            ).strip().lower()
+
+    checked = 0
+    reconciled: list[str] = []
+    unchanged: list[str] = []
+    for record in records:
+        attempt_id = str(record.get("attempt_id") or "")
+        if not attempt_id:
+            continue
+        checked += 1
+        state_name = states.get(attempt_id, "")
+        if state_name not in {"succeeded", "failed", "cancelled"}:
+            unchanged.append(attempt_id)
+            continue
+        outcome = agent_consumer.record_tool_completion(
+            state, attempt_id, state=state_name
+        )
+        if isinstance(outcome, Mapping) and outcome.get("emitted"):
+            reconciled.append(attempt_id)
+        else:
+            unchanged.append(attempt_id)
+    return {"checked": checked, "reconciled": reconciled, "unchanged": unchanged}
+
+
 # --- uncertainty -----------------------------------------------------------
 
 

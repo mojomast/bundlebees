@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -28,6 +29,7 @@ from .adapters import UnsupportedAdapter
 from . import contract as _contract
 from . import contracts as _contracts
 from . import attribution as _attribution
+from . import bee_events as _bee_events
 from . import leases as _leases
 from . import metrics as _metrics
 from . import revision as _revision
@@ -331,6 +333,66 @@ def _lease_overlap(attempts: Any, brief: Mapping[str, Any]) -> bool:
         if wanted & leased:
             return True
     return False
+
+
+def _preflight_feature_branch(worktree: str, brief: Mapping[str, Any]) -> str | None:
+    """Refuse before dispatch unless the local feature branch descends from source_rev.
+
+    This only reads the repository: it never creates, moves, fetches or pushes
+    a branch. Without a configured worktree the preflight is skipped so callers
+    that do not own a local checkout keep their existing behaviour.
+    """
+
+    branch = brief.get("branch")
+    source_rev = brief.get("source_rev")
+    if not isinstance(branch, str) or not branch.strip():
+        return None
+    if not isinstance(source_rev, str) or not source_rev:
+        return None
+    ref = f"refs/heads/{branch.strip()}"
+    try:
+        exists = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _err(
+            "branch_not_found",
+            f"feature branch {branch!r} cannot be read locally",
+            "Check the configured worktree and create the feature branch before dispatch; "
+            "dispatch never creates or fetches a branch.",
+        )
+    if exists.returncode != 0:
+        return _err(
+            "branch_not_found",
+            f"feature branch {branch!r} does not exist locally",
+            "Create the feature branch at or after source_rev before dispatch; "
+            "dispatch never creates or fetches a branch.",
+        )
+    try:
+        ancestor = subprocess.run(
+            ["git", "-C", worktree, "merge-base", "--is-ancestor", source_rev, ref],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _err(
+            "branch_diverged",
+            f"feature branch {branch!r} cannot be compared with source_rev locally",
+            "Check the configured worktree and recreate the feature branch from source_rev; "
+            "dispatch never moves a branch.",
+        )
+    if ancestor.returncode != 0:
+        return _err(
+            "branch_diverged",
+            f"feature branch {branch!r} does not descend from source_rev",
+            "Recreate or fast-forward the feature branch from source_rev before dispatch; "
+            "dispatch never moves a branch.",
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +760,14 @@ def _gate(
     except BriefError as exc:
         return _err("brief_invalid", exc.error, exc.fix)
 
+    # The lease validator dispatch uses is the same one the terminal landing
+    # write-back uses: a glob lease must be refused before anything is recorded
+    # or dispatched, because it could never be completed locally.
+    try:
+        _bee_events.validate_lease_files(brief["assigned_files"])
+    except _bee_events.EventError as exc:
+        return _err(exc.code, exc.error, exc.fix)
+
     # RISK TIERS (enforced, fail closed): a declared tier below the path-derived floor is a
     # false declaration and is refused; a high-tier brief (sensitive, invalid or unknown paths,
     # or a human-raised tier) must carry a frozen ACDD contract so test-first provenance exists.
@@ -881,6 +951,13 @@ def _dispatch(
             "Wait for the running attempt or choose non-overlapping files. Lease "
             "checks require a readable live attempt list.",
         )
+
+    settings = args.get("_settings") if isinstance(args.get("_settings"), Mapping) else {}
+    worktree = settings.get("worktree")
+    if isinstance(worktree, str) and worktree.strip():
+        refusal = _preflight_feature_branch(worktree.strip(), brief)
+        if refusal is not None:
+            return refusal
 
     # No model means "the launcher decides": its default is the cheapest usable route on that host
     # (Zoo's free pass when a zoo key is readable, else the host's configured model). Substituting a
