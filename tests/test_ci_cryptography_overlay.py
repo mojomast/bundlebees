@@ -5,6 +5,11 @@ the core dependencies plus ``dev`` only. Without a CI overlay the Ed25519
 paths fail with ``ModuleNotFoundError`` instead of being tested. The overlay
 must stay a test-environment pin: cryptography never becomes a core
 dependency, and the pin must sit inside the range the extra declares.
+
+The overlay mirrors the verify interpreter exactly: ``cryptography==50.0.2``
+and its ``cffi==2.1.1`` / ``pycparser==3.12`` dependencies come from a
+hash-pinned requirements file installed with ``--require-hashes``, so a
+runner cannot resolve a different build than the one verify tested with.
 """
 
 from __future__ import annotations
@@ -15,7 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-PIN = "cryptography==44.0.0"
+REQUIREMENTS = ROOT / ".github" / "requirements" / "cryptography.txt"
+PIN = "cryptography==50.0.2"
+PINNED = {"cryptography": "50.0.2", "cffi": "2.1.1", "pycparser": "3.12"}
+HASH_RE = re.compile(r"--hash=sha256:[0-9a-f]{64}\b")
 
 
 def pyproject() -> dict:
@@ -24,6 +32,27 @@ def pyproject() -> dict:
 
 def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def requirements_text() -> str:
+    return REQUIREMENTS.read_text(encoding="utf-8")
+
+
+def requirement_blocks(text: str) -> list[str]:
+    """Logical requirement lines, with backslash continuations joined."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        current.append(stripped)
+        if not stripped.endswith("\\"):
+            blocks.append(" ".join(part.rstrip("\\").strip() for part in current))
+            current = []
+    if current:
+        blocks.append(" ".join(part.rstrip("\\").strip() for part in current))
+    return blocks
 
 
 def job_block(name: str) -> str:
@@ -73,12 +102,27 @@ def test_the_ci_pin_sits_inside_the_declared_range() -> None:
     )
 
 
-def test_the_tests_job_installs_the_pinned_overlay() -> None:
+def test_the_requirements_file_pins_every_version_with_hashes() -> None:
+    blocks = requirement_blocks(requirements_text())
+    assert blocks, "the overlay requirements file must declare its pins"
+    for name, version in PINNED.items():
+        matching = [block for block in blocks if block.split()[0] == f"{name}=={version}"]
+        assert len(matching) == 1, f"{name}=={version} must be pinned exactly once"
+        assert HASH_RE.search(matching[0]), f"{name}=={version} must carry sha256 hashes"
+    for block in blocks:
+        first = block.split()[0]
+        assert "==" in first, f"every overlay requirement must be exact: {block!r}"
+        assert HASH_RE.search(block), f"every overlay requirement needs a hash: {block!r}"
+
+
+def test_the_tests_job_installs_the_hash_pinned_overlay() -> None:
     block = job_block("tests")
-    assert PIN in block, f"the tests job must install {PIN}"
-    assert re.search(r"pip install[^\n]*" + re.escape(PIN), block), (
-        "the pin must be installed in the tests job before pytest runs"
-    )
+    assert "--require-hashes" in block, "the tests job must install with --require-hashes"
+    assert re.search(
+        r"pip install[^\n]*--require-hashes[^\n]*-r[^\n]*\.github/requirements/cryptography\.txt",
+        block,
+    ), "the tests job must install the hash-pinned requirements file before pytest runs"
+    assert PIN in requirements_text(), f"the requirements file must pin {PIN}"
 
 
 def test_cryptography_stays_out_of_the_core_dependencies() -> None:
