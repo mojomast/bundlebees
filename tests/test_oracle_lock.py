@@ -112,7 +112,15 @@ def _run(
     tmp_path: Path,
 ) -> subprocess.CompletedProcess[str]:
     oracle = _oracle()
-    env = oracle.locked_env(os.environ) if locked else dict(os.environ)
+    # The shard that runs this suite may itself be under the lock, so strip the
+    # lock variables from the control run: the control's whole point is that
+    # the PR's configuration *would* load the plugin without the lock.
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in oracle.LOCK_ENV
+    }
+    env = oracle.locked_env(base) if locked else base
     env["PYTHONPATH"] = str(pr)
     argv = [sys.executable, "-B", "-m", "pytest", "-q"]
     if locked:
