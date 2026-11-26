@@ -1,0 +1,212 @@
+{
+ "contract_version": "acdd/1",
+ "id": "pr-triage",
+ "title": "Read-only multi-repo pull-request audit with a closure list",
+ "outcome": {
+  "summary": "A pure, read-only audit that turns per-repo `gh pr list --json` rows plus measured ancestry/patch-id facts into one normalised row per open pull request, assigns exactly one disposition per row (close-superseded, close-abandoned, keep-building, owner-decide), renders a markdown table, and returns a closure list of prepared close commands. The module never opens a socket, never runs a subprocess and never mutates a pull request; closures are strings the coordinator applies.",
+  "observable_behavior": [
+   "`audit_rows(prs_by_repo, ancestry_by_repo, now_epoch=...)` returns one dict per open PR, sorted by (repo, number), carrying repo, number, title, branch, head, url, age_hours, updated_age_hours, draft, merge_state, ci_state, failing_checks, on_main, evidence and duplicate_of.",
+   "A head listed in `ancestor_heads` gets on_main true with evidence 'ancestor'; a head listed in `patch_matched_heads` gets on_main true with evidence 'patch-id'.",
+   "`dispositions(rows)` assigns close-superseded when the content is on main, close-abandoned for a later PR proposing the same head commit as an older one, keep-building for drafts, red CI, pending CI and BLOCKED/DIRTY merge states, and owner-decide for a green, mergeable PR that is not on main.",
+   "`build_report(...)` returns {rows, table, closures, counts} where table is markdown with a `| repo | pr |` header and closures is exactly one prepared `gh pr close <n> -R <repo> --comment \"<reason>\"` string per close row, in row order.",
+   "`python -m bundlebees_plugin.pr_audit --facts <json>` prints the report and exits 0; a missing, unreadable or malformed facts file exits 2 with a message on stderr.",
+   "An empty audit prints `0 open pull requests` and returns an empty closure list."
+  ]
+ },
+ "interfaces": [
+  {
+   "name": "bundlebees_plugin.pr_audit.audit_rows",
+   "kind": "function",
+   "change": "add",
+   "notes": "Pure join of PR rows with ancestry facts; no I/O beyond its arguments."
+  },
+  {
+   "name": "bundlebees_plugin.pr_audit.dispositions",
+   "kind": "function",
+   "change": "add",
+   "notes": "Precedence: on main > duplicate head > draft/red/blocked > owner-decide."
+  },
+  {
+   "name": "bundlebees_plugin.pr_audit.build_report",
+   "kind": "function",
+   "change": "add",
+   "notes": "Returns rows, markdown table, closure command strings and counts."
+  },
+  {
+   "name": "python -m bundlebees_plugin.pr_audit --facts",
+   "kind": "cli",
+   "change": "add",
+   "notes": "Reads one facts JSON (now_epoch, prs_by_repo, ancestry_by_repo) and prints the report."
+  },
+  {
+   "name": "tests/test_pr_audit.py",
+   "kind": "file",
+   "change": "add",
+   "notes": "Approved RED specification; read-only for the implementer."
+  }
+ ],
+ "acceptance_criteria": [
+  {
+   "id": "AC-001",
+   "statement": "every open pull request yields exactly one normalised row, ordered by repo then number, with head, branch, url, age and CI fields populated",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_every_open_pr_gets_one_row_ordered_by_repo_then_number"
+   ]
+  },
+  {
+   "id": "AC-002",
+   "statement": "a head that is an ancestor of main is reported on_main with evidence ancestor and disposition close-superseded",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_a_head_that_is_an_ancestor_of_main_is_close_superseded"
+   ]
+  },
+  {
+   "id": "AC-003",
+   "statement": "a head whose patch already landed on main under another commit is reported with evidence patch-id and disposition close-superseded",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_a_head_whose_patch_is_on_main_is_close_superseded_with_patch_evidence"
+   ]
+  },
+  {
+   "id": "AC-004",
+   "statement": "a later open PR proposing the same head commit as an older open PR is close-abandoned with duplicate_of naming the older number",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_a_second_pr_with_the_same_head_is_close_abandoned"
+   ]
+  },
+  {
+   "id": "AC-005",
+   "statement": "red CI keeps its failing check names and is keep-building, and a draft or BLOCKED/DIRTY merge state is keep-building even when every check is green",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_a_red_pr_is_keep_building_and_keeps_its_failing_check_names",
+    "tests/test_pr_audit.py::test_a_blocked_or_dirty_pr_is_keep_building_even_when_green"
+   ]
+  },
+  {
+   "id": "AC-006",
+   "statement": "a green mergeable PR that is not on main is owner-decide, and a pending check is keep-building rather than green",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_a_green_mergeable_pr_not_on_main_is_owner_decide",
+    "tests/test_pr_audit.py::test_a_pending_check_is_keep_building_not_green"
+   ]
+  },
+  {
+   "id": "AC-007",
+   "statement": "the report renders a markdown table with a '| repo | pr |' header and exactly one prepared close command per close row",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_the_report_renders_a_table_and_a_closure_command_per_close_row"
+   ]
+  },
+  {
+   "id": "AC-008",
+   "statement": "the module is read-only by construction: its own source carries no subprocess, socket, urllib, http.client or requests import and no prepared close or merge command literal outside the returned strings",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_the_module_is_read_only_by_construction"
+   ],
+   "regression": true
+  },
+  {
+   "id": "AC-009",
+   "statement": "the --facts entry point prints the report and exits 0, refuses a missing or malformed facts file with exit 2, and an empty audit says 0 open pull requests with no commands",
+   "verification": "test",
+   "tests": [
+    "tests/test_pr_audit.py::test_main_prints_the_report_and_exits_zero",
+    "tests/test_pr_audit.py::test_main_refuses_an_unreadable_or_malformed_facts_file",
+    "tests/test_pr_audit.py::test_an_empty_audit_says_so_and_emits_no_commands"
+   ]
+  }
+ ],
+ "dependencies": [
+  "the facts (gh pr list --json rows, git merge-base --is-ancestor and patch-id results) are collected by the coordinator; this slice is a pure join"
+ ],
+ "assumptions": [
+  "the input rows are the subset of `gh pr list --json` the audit consumes; the collector is out of scope and may be a later slice",
+  "duplicate detection is same-head-commit within one repo; same-branch or same-title duplicates are not guessed at",
+  "the closure list is text for the coordinator to apply one command at a time after re-checking the evidence"
+ ],
+ "scope": {
+  "assigned_files": [
+   "bundlebees_plugin/pr_audit.py"
+  ],
+  "test_files": [
+   "tests/test_pr_audit.py"
+  ],
+  "prohibited": [
+   "tests/test_pr_audit.py",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "evidence/**",
+   "bundlebees_plugin/cli.py"
+  ],
+  "read_only": [
+   "bundlebees_plugin/brief.py",
+   "bundlebees_plugin/leases.py",
+   "bundlebees_plugin/delivery.py",
+   "bundlebees_plugin/coverage.py"
+  ]
+ },
+ "source_rev": "855e6549159d5ae6e43d1d14f370abc80c2f8689",
+ "tdd": {
+  "applicable": true,
+  "test_first": true
+ },
+ "verification": {
+  "independent": true,
+  "commands": [
+   "timeout 600 python3 -m pytest -q -p no:cacheprovider tests/test_pr_audit.py"
+  ]
+ },
+ "evidence_required": [
+  "red",
+  "green",
+  "review"
+ ],
+ "authorization": {
+  "human_gates": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish"
+  ],
+  "authorized": [
+   "read pull-request metadata in the coordinator-collected facts",
+   "write the spot-check table, the dispositions and the prepared closure list"
+  ],
+  "not_authorized": [
+   "merge",
+   "deploy",
+   "restart",
+   "tag",
+   "branch deletion",
+   "close a pull request",
+   "write a label",
+   "comment on a pull request",
+   "live canary"
+  ]
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-25",
+  "approved_at": "2026-11-25T23:50:00Z",
+  "contract_sha256": "58560a1db87bf7e5cdf8690e31301a3bfbb9bf28fb41cb302d42d034730ad9af"
+ },
+ "risk": {
+  "tier": "medium",
+  "reasons": [
+   "one new read-only module on a source path; no dispatch, verify or merge surface",
+   "the closure list is advisory text, so a wrong disposition costs a review pass, not a mutation",
+   "the audit is the input to owner decisions about closing 20+ PRs, so the disposition rules are contract-bound"
+  ]
+ }
+}
