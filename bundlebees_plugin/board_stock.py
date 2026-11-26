@@ -32,13 +32,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import flags
 from .security import child_env, scrub
 
 SCHEMA = "rizzstack.board-stock/1"
 
-#: The flag is off unless it is exactly ``1``.  Any other value keeps the
-#: feature dark rather than guessing what an operator meant.
-FLAG_ENV = "BUNDLEBEES_BOARD_STOCK"
+#: The flag is off unless the shared flag source resolves it to exactly ``1``.
+#: Any other value keeps the feature dark rather than guessing what an operator
+#: meant. The factory driver and the Hermes gateway read the same file.
+FLAG_ENV = flags.FLAG_BOARD_STOCK
 #: Optional coordinator card that receives the shortfall comment.
 CARD_ENV = "BUNDLEBEES_BOARD_STOCK_CARD"
 #: Optional board slug (``hermes kanban --board``); empty means the default board.
@@ -141,10 +143,9 @@ def _default_comment(card: str, text: str) -> bool:
 
 
 def enabled(env: Mapping[str, str] | None = None) -> bool:
-    """True only when the operator set the flag to exactly ``1``."""
+    """True only when the shared flag source resolves the flag to ``1``."""
 
-    source = os.environ if env is None else env
-    return str(source.get(FLAG_ENV, "")).strip() == "1"
+    return flags.enabled(flags.FLAG_BOARD_STOCK, environ=env)
 
 
 def signal_dir(state_dir: Any) -> Path:

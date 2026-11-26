@@ -1,0 +1,42 @@
+{
+  "id": "wave-c-c3",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "wave-c-c3",
+  "pull_request": 310,
+  "branch": "feat/wave-c-c3",
+  "contract_id": "wave-c-c3",
+  "contract_sha256": "dd92dd27bfe969eaa074bc42b31ed068079505b53cd19ede7ea0bf4fce28682c",
+  "source_rev": "73ef014511132e4bb860729db0c7f9d228912a5d",
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/ticket.py",
+      "pyproject.toml"
+    ],
+    "test_files": [
+      "tests/test_ticket_issue.py"
+    ],
+    "prohibited": [
+      "tests/test_ticket_issue.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "uv.lock",
+      "evidence/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/leases.py",
+      "bundlebees_plugin/__init__.py"
+    ]
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/C3.contract.json",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C3 v2 dd92dd27 under option (a) - cryptography provisioned into the sandbox verify interpreter, pinned version+hash",
+    "approved_at": "2026-11-25T20:59:24Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C3 v2 dd92dd27 under option (a) - cryptography provisioned into the sandbox verify interpreter, pinned version+hash",
+    "approved_at": "2026-11-25T20:59:24Z",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope"
+  }
+}

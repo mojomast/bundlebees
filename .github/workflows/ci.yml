@@ -52,9 +52,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: Install test dependencies (declared in pyproject.toml)
+        # The optional `tickets` extra is installed here so the job that runs the
+        # whole suite actually exercises the ticket issuer/verifier. Those modules
+        # import cryptography lazily (the product must load without it), so a job
+        # that installs only the `dev` extra never sees the dependency and the
+        # crypto paths fail with ModuleNotFoundError instead of being tested.
+        # Extras are additive; .get() keeps this green on a pyproject that does
+        # not declare the extra yet.
         run: |
           python -m pip install --upgrade pip
-          python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies'] + d['project']['optional-dependencies']['dev']))" > "$RUNNER_TEMP/requirements-dev.txt"
+          python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); extras = d['project']['optional-dependencies']; print('\n'.join(d['project']['dependencies'] + extras['dev'] + extras.get('tickets', [])))" > "$RUNNER_TEMP/requirements-dev.txt"
           python -m pip install -r "$RUNNER_TEMP/requirements-dev.txt"
       - name: Report sandbox backend
         run: |
@@ -237,6 +244,46 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python3 .github/scripts/owner_held.py "$GITHUB_EVENT_PATH"
 
+  lease-tamper:
+    name: lease-tamper
+    # Required through ci-gate. Every pull request must resolve a slice
+    # contract; after the verify boundary only scope.assigned_files may change
+    # and scope.test_files/scope.prohibited are frozen. Applies to every
+    # author, including the coordinator and triage lanes. Canonical script and
+    # docs: mojomast/workflow .github/scripts/lease_tamper.py and
+    # docs/32-lease-tamper-gate.md (vendored from workflow 1ea44beaaea41ce2a5a249a1ce27c77d78ed98d6, carrying the
+    # slice/non-slice classification and the base-merge review carry-forward).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      # merge_group: prove each queued PR's head already passed this job by
+      # reading its check runs (GET /commits/{sha}/check-runs).
+      checks: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Lease/tamper gate unit tests
+        run: python3 -m unittest tests.test_lease_tamper -v
+      - name: Lease/tamper bypass regression (all five cases must fail closed)
+        run: python3 .github/scripts/lease_tamper_poc.py --expect fail-closed
+      - name: Lease/tamper adversarial reproduction v2 (13 cases must fail closed)
+        run: |
+          bash .github/scripts/lease_tamper_poc_v2.sh .github/scripts/lease_tamper.py | tee "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+          grep -q '^13 cases, 0 unexpected$' "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+      - name: Enforce the slice lease and frozen tests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 .github/scripts/lease_tamper.py "$GITHUB_EVENT_PATH"
+
   ci-gate:
     name: ci-gate
     # The main ruleset requires this one check. It passes only when every job
@@ -248,6 +295,7 @@ jobs:
       - plugin-doctor
       - secret-scan
       - owner-held
+      - lease-tamper
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

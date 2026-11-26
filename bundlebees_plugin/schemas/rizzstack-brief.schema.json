@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/schemas/rizzstack-brief.schema.json",
+  "title": "rizzstack.brief/1",
+  "description": "The one bee brief every dispatch client sends. Not referenced by any code yet; see docs/design/wave-b-worker-contract.md.",
+  "type": "object",
+  "required": [
+    "schema",
+    "objective",
+    "project",
+    "source_rev",
+    "assigned_files",
+    "acceptance",
+    "risk"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "rizzstack.brief/1"
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_rev": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "assigned_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "read_only": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "required": [
+        "criteria"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Approved tests the worker must make pass."
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Commands the worker may run."
+    },
+    "failing_output": {
+      "type": "string",
+      "maxLength": 12000,
+      "description": "Bounded RED output for the approved tests (test-context brief)."
+    },
+    "affected_tests": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Existing tests most likely to regress."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 4000
+      },
+      "maxItems": 20
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_s": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400
+        },
+        "max_tool_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "tier"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tier": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blast_radius": {
+          "type": "string"
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "description": "A frozen acdd/1 contract; required when risk.tier is high."
+    },
+    "deps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "wave": {
+      "type": "string"
+    },
+    "retry_of": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "ticket": {
+      "type": "string",
+      "description": "Wave C signed dispatch ticket (compact JWS)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "risk": {
+            "properties": {
+              "tier": {
+                "const": "high"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "contract"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "id": "toolpath-integrity",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "toolpath-integrity",
+  "branch": "feat/toolpath-integrity",
+  "contract_id": "wave-bc-toolpath-integrity",
+  "contract_sha256": "d84f37b1414ca8a3f637b4ae93e78a471c1df5e645ac0015773224445b9b9368",
+  "source_rev": "c419823208e6e441802e5c11d4a66323394cc6c5",
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/tools.py",
+      "bundlebees_plugin/bee_events.py",
+      "bundlebees_plugin/reconcile.py"
+    ],
+    "test_files": [
+      "tests/test_toolpath_integrity.py"
+    ],
+    "prohibited": [
+      "tests/test_toolpath_integrity.py",
+      "CHANGELOG.md"
+    ],
+    "read_only": [
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/leases.py",
+      "bundlebees_plugin/cli.py",
+      "bundlebees_plugin/agent_consumer.py"
+    ]
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/TOOLPATH-INTEGRITY.contract.json",
+    "approved_by": "Kyle (owner) typed: make sure this doesn't happen again, 2026-11-25",
+    "approved_at": "2026-11-25T14:25:00Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "Kyle (owner) typed: make sure this doesn't happen again, 2026-11-25",
+    "approved_at": "2026-11-25T14:25:00Z",
+    "note": "contract_sha256 names the owner-approved frozen contract; scope and source_rev are its verbatim scope"
+  }
+}
