@@ -33,5 +33,11 @@
   "contract": "rizzstack-t1634/contracts/PR-TRIAGE.contract.json",
   "approved_by": "Kyle (owner), typed approval in chat, 2026-11-25",
   "approved_at": "2026-11-25T23:50:00Z"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-25",
+  "approved_at": "2026-11-25T23:50:00Z",
+  "contract_sha256": "58560a1db87bf7e5cdf8690e31301a3bfbb9bf28fb41cb302d42d034730ad9af"
  }
 }
