@@ -493,9 +493,10 @@ def _dispatched(
     if acdd is not None:
         out["acdd"] = dict(acdd)
     problems = _contract_drift.check_brief_drift(brief)
-    out["brief_schema_drift"] = _contract_drift.record_brief_schema_drift(
-        state_dir, brief, problems
-    )
+    if problems:
+        out["brief_schema_drift"] = _contract_drift.record_brief_schema_drift(
+            state_dir, brief, problems
+        )
     out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
     return _ok(**out)
 
