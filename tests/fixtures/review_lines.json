@@ -1,0 +1,107 @@
+{
+  "note": "Vendored byte-identically into workflow and rizzstack; the gate and lane tests both assert this file's sha256 so the two parsers are proven to accept the same lines.",
+  "cases": [
+    {
+      "name": "canonical_independent",
+      "body": "APPROVE (independent review) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6\n\nVERDICT: APPROVE",
+      "kind": "approve_independent",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "canonical_owner",
+      "body": "APPROVE (owner) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6\n\nOne-time owner decision.",
+      "kind": "approve_owner",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "canonical_changes_requested",
+      "body": "CHANGES REQUESTED (the carry predicate accepts an evil merge) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6\n\nDetails below.",
+      "kind": "changes_requested",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "legacy_em_dash_independent",
+      "body": "APPROVE — independent review (outside reviewer Claude, posted at owner Kyle's request) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6\n\nChecked the diff.",
+      "kind": "approve_independent",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "legacy_parenthetical_independent",
+      "body": "APPROVE (independent review at 4ccf9d128764d826b8fc08c71ab4602f4843abe6)\n\nVERDICT: approve",
+      "kind": "approve_independent",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "markdown_bold_independent",
+      "body": "**APPROVE** (independent review at 4ccf9d128764d826b8fc08c71ab4602f4843abe6)",
+      "kind": "approve_independent",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "owner_shout",
+      "body": "OWNER APPROVED at 4ccf9d128764d826b8fc08c71ab4602f4843abe6",
+      "kind": "approve_owner",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "bare_approve_is_not_an_attestation",
+      "body": "APPROVE\n\nlooks fine",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "question_is_not_an_approval",
+      "body": "APPROVE? NO - not an independent review",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "approved_word_is_not_an_approval",
+      "body": "APPROVED (independent review at 4ccf9d128764d826b8fc08c71ab4602f4843abe6)",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "negated_independent_review",
+      "body": "APPROVE (not an independent review at 4ccf9d128764d826b8fc08c71ab4602f4843abe6)",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "changes_requested_without_sha",
+      "body": "CHANGES REQUESTED: fix the doc",
+      "kind": "changes_requested",
+      "sha": null
+    },
+    {
+      "name": "bold_changes_requested",
+      "body": "**CHANGES REQUESTED** (owner) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6",
+      "kind": "changes_requested",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "empty_body",
+      "body": "",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "attestation_must_be_the_first_line",
+      "body": "Looks good.\n\nAPPROVE (independent review) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6",
+      "kind": null,
+      "sha": null
+    },
+    {
+      "name": "bullet_prefix",
+      "body": "- APPROVE (independent review) at 4ccf9d128764d826b8fc08c71ab4602f4843abe6",
+      "kind": "approve_independent",
+      "sha": "4ccf9d128764d826b8fc08c71ab4602f4843abe6"
+    },
+    {
+      "name": "short_prefix",
+      "body": "APPROVE (independent review) at 4ccf9d1",
+      "kind": "approve_independent",
+      "sha": "4ccf9d1"
+    }
+  ]
+}

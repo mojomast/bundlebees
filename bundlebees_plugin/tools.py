@@ -26,6 +26,7 @@ from .client import (
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
 from . import contract as _contract
+from . import contract_drift as _contract_drift
 from . import contracts as _contracts
 from . import attribution as _attribution
 from . import flags
@@ -492,6 +493,11 @@ def _dispatched(
         out["kanban_task_id"] = kanban_task_id
     if acdd is not None:
         out["acdd"] = dict(acdd)
+    problems = _contract_drift.check_brief_drift(brief)
+    if problems:
+        out["brief_schema_drift"] = _contract_drift.record_brief_schema_drift(
+            state_dir, brief, problems
+        )
     out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
     return _ok(**out)
 
@@ -762,20 +768,26 @@ def _gated_failure_id(brief: Mapping[str, Any], state_dir: Path | None) -> str |
     return str(failure.get("failure_id") or "")
 
 
+def _supplied_findings(brief: Mapping[str, Any], fid: str) -> Mapping[str, Any] | None:
+    supplied = brief.get("findings")
+    if not isinstance(supplied, Mapping):
+        return None
+    if str(supplied.get("failure_id") or "") != fid:
+        return None
+    return supplied
+
+
 def _attach_accepted_findings(
     brief: dict[str, Any], state_dir: Path | None
 ) -> dict[str, Any] | str:
     """Attach the gated failure's accepted findings to the brief, or refuse.
 
-    A findings block supplied by the caller stays authoritative and is never
-    replaced by the state copy. The attach itself is dark by default: with
-    ``ATTACH_FINDINGS`` not exactly ``1`` the brief is returned untouched, so
-    the research gate still demands an accepted artifact while no state copy
-    travels to the worker. Caller-supplied findings win either way, so the
-    flag never touches them.
+    The attach is dark by default: with ``ATTACH_FINDINGS`` not exactly ``1``
+    the brief is returned untouched, so the research gate still demands an
+    accepted artifact while no state copy travels to the worker. A
+    caller-supplied findings block for the gated failure stays authoritative
+    and is never replaced by the state copy.
     """
-    if isinstance(brief.get("findings"), Mapping):
-        return brief
     if not flags.enabled(flags.FLAG_ATTACH_FINDINGS):
         return brief
     return _attach_state_findings(brief, state_dir)
@@ -804,6 +816,8 @@ def _attach_state_findings(
     except rg.ResearchGateError as exc:
         return _err(exc.code, exc.message, exc.fix)
     if not fid:
+        return brief
+    if _supplied_findings(brief, fid) is not None:
         return brief
     if state_dir is None:
         return _err(
