@@ -26,6 +26,7 @@ from .client import (
 from .settings import settings_from_ctx
 from .adapters import UnsupportedAdapter
 from . import contract as _contract
+from . import contract_drift as _contract_drift
 from . import contracts as _contracts
 from . import attribution as _attribution
 from . import leases as _leases
@@ -491,6 +492,10 @@ def _dispatched(
         out["kanban_task_id"] = kanban_task_id
     if acdd is not None:
         out["acdd"] = dict(acdd)
+    problems = _contract_drift.check_brief_drift(brief)
+    out["brief_schema_drift"] = _contract_drift.record_brief_schema_drift(
+        state_dir, brief, problems
+    )
     out.update(_record_dispatch(state_dir, data.get("attempt_id"), brief))
     return _ok(**out)
 
