@@ -56,6 +56,12 @@ jobs:
           python -m pip install --upgrade pip
           python -c "import tomllib, pathlib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies'] + d['project']['optional-dependencies']['dev']))" > "$RUNNER_TEMP/requirements-dev.txt"
           python -m pip install -r "$RUNNER_TEMP/requirements-dev.txt"
+      - name: Install the pinned cryptography overlay
+        # The tickets extra is optional at install time, and the test job
+        # installs core + dev only. This is a CI-only overlay, hash-pinned so
+        # every shard resolves the same build the verify interpreter carries.
+        run: |
+          python -m pip install --require-hashes -r .github/requirements/cryptography.txt
       - name: Report sandbox backend
         run: |
           python -c "from bundlebees_plugin import sandbox; print('auto backend:', sandbox.detect_backend())"
