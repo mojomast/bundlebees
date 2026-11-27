@@ -42,8 +42,8 @@ def shards(total):
 def _load_main_oracle_lock(main_ref):
     """Load oracle_lock from *main_ref*'s tree, never from the PR checkout.
 
-    Bootstrap exception: until this PR lands, origin/main has no oracle_lock.py;
-    only then does the loader fall back to the checkout's copy.
+    There is no bootstrap fallback: if the base tree has no oracle_lock.py, the
+    check fails closed rather than judging the suite with a PR-editable copy.
     """
     import importlib.util
     import tempfile
@@ -55,13 +55,12 @@ def _load_main_oracle_lock(main_ref):
         timeout=120,
         check=False,
     )
-    if shown.returncode == 0:
-        source = shown.stdout
-    else:
-        sys.path.insert(0, str(ROOT))
-        from bundlebees_plugin import oracle_lock as checkout_lock
-
-        return checkout_lock
+    if shown.returncode != 0:
+        sys.exit(
+            f"cannot load oracle_lock from {main_ref}: the base tree has no "
+            "bundlebees_plugin/oracle_lock.py; refusing to use the checkout's copy"
+        )
+    source = shown.stdout
     handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
     try:
         handle.write(source)

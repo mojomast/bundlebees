@@ -130,6 +130,9 @@ def _check_frozen_green(
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
     }
+    tools = evidence.get("staged_tools")
+    if tools is not None:
+        result["staged_tools"] = tools
     try:
         record = tdd.make_record(
             contract,
@@ -372,6 +375,8 @@ def _test_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         normalized["junit"] = evidence.get("junit")
     if "backend" in evidence:
         normalized["backend"] = evidence.get("backend")
+    if "staged_tools" in evidence:
+        normalized["staged_tools"] = evidence.get("staged_tools")
     return normalized
 
 
@@ -580,6 +585,46 @@ def _sandbox_policy(
     }
 
 
+_TOOL_IDENTITY_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
+
+
+def _pinned_tools_identity() -> dict[str, str]:
+    """Identity of the pinned portable tools a receipt's result depended on.
+
+    A receipt from different uv/pwsh bytes must not be reused, so the tool
+    identity is part of the key.  The pinned path is resolved first: staging
+    copies the bytes a symlink points at, so the key must hash those bytes, not
+    the link string.  A pin staging would refuse (foreign-owned or
+    group/world-writable) contributes nothing, so the identity never names a
+    tool that did not run.  Results are cached by
+    (path, inode, size, mtime_ns, mode, uid) so a receipt key does not re-hash
+    the pwsh tree on every call, and a mode/owner change invalidates it.
+    """
+    identity: dict[str, str] = {}
+    for name, raw in sandbox.PINNED_TOOLS:
+        try:
+            source = Path(str(raw)).expanduser().resolve()
+            if not sandbox._pinned_tool_is_safe(source):
+                continue
+            info = source.stat()
+        except OSError:
+            continue
+        key = (
+            str(source),
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_mode,
+            info.st_uid,
+        )
+        digest = _TOOL_IDENTITY_CACHE.get(key)
+        if digest is None:
+            digest = sandbox._staged_digest(source)
+            _TOOL_IDENTITY_CACHE[key] = digest
+        identity[str(name)] = digest
+    return identity
+
+
 def _receipt_key_inputs(
     worktree: Path,
     *,
@@ -611,6 +656,7 @@ def _receipt_key_inputs(
             timeout=timeout,
         ),
         "stage": str(stage),
+        "pinned_tools": _pinned_tools_identity(),
     }
     if approved_ids is not None:
         identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
@@ -684,6 +730,7 @@ def _verification_identity(
             timeout=timeout,
         ),
         "gitleaks": _gitleaks_identity(require_gitleaks, gitleaks),
+        "pinned_tools": _pinned_tools_identity(),
     }
     if approved_ids is not None:
         identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
@@ -740,6 +787,8 @@ def _receipt_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
         evidence["backend"] = result.get("backend")
     if "cases" in result:
         evidence["cases"] = result.get("cases")
+    if "staged_tools" in result:
+        evidence["staged_tools"] = result.get("staged_tools")
     return evidence
 
 
@@ -1635,6 +1684,18 @@ def _verify_and_commit_locked(
     return record
 
 
+def _test_evidence_block(result: Mapping[str, Any]) -> dict[str, Any]:
+    """One red/suite block; staged tools are added only when the runner saw them."""
+    block: dict[str, Any] = {
+        "exit_code": result["exit_code"],
+        "timed_out": bool(result.get("timed_out")),
+    }
+    tools = result.get("staged_tools")
+    if tools is not None:
+        block["staged_tools"] = tools
+    return block
+
+
 def _record(
     attempt_id,
     sha,
@@ -1658,8 +1719,8 @@ def _record(
         "base_rev": base_rev,
         "files": list(files),
         "tests": list(tests),
-        "red": None if red is None else {"exit_code": red["exit_code"], "timed_out": bool(red.get("timed_out"))},
-        "suite": None if suite is None else {"exit_code": suite.get("exit_code"), "timed_out": bool(suite.get("timed_out"))},
+        "red": None if red is None else _test_evidence_block(red),
+        "suite": None if suite is None else _test_evidence_block(suite),
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
         "patch_sha256": patch_sha256,
@@ -2036,6 +2097,7 @@ def _landed_evidence(
         "timed_out": bool(raw.get("timed_out")),
         "duration_s": raw.get("duration_s"),
         "junit": raw.get("junit") if isinstance(raw.get("junit"), Mapping) else None,
+        **({"staged_tools": raw["staged_tools"]} if raw.get("staged_tools") is not None else {}),
         "output_tail": str(tail or ""),
     }
 
@@ -2270,24 +2332,28 @@ def _landed_record(
         duration = float(evidence.get("duration_s") or 0.0)
     except (TypeError, ValueError):
         duration = 0.0
+    sandbox_block: dict[str, Any] = {
+        "backend": str(
+            evidence.get("backend")
+            or ("injected" if runner is not None else backend)
+        ),
+        "runner": str(evidence.get("runner") or "pytest"),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_s": max(0.0, duration),
+        "timeout_s": int(timeout),
+        "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
+    }
+    tools = evidence.get("staged_tools")
+    if tools is not None:
+        sandbox_block["staged_tools"] = tools
     return {
         "schema": LANDED_RECORD_SCHEMA,
         "sha": target,
         "tests": list(named),
         "ok": bool(exit_code == 0 and not timed_out),
         "counts": _landed_counts(evidence.get("junit"), len(named)),
-        "sandbox": {
-            "backend": str(
-                evidence.get("backend")
-                or ("injected" if runner is not None else backend)
-            ),
-            "runner": str(evidence.get("runner") or "pytest"),
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "duration_s": max(0.0, duration),
-            "timeout_s": int(timeout),
-            "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
-        },
+        "sandbox": sandbox_block,
         "created_at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

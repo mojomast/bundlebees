@@ -30,6 +30,7 @@ def _no_probe(name: str) -> bool:
 
 def _write_script(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
     return path
 
 
@@ -1168,6 +1169,20 @@ def test_staged_tool_hashes_record_file_and_directory(tmp_path: Path):
     assert hashes["pwsh"] != hashes["uv"]
 
 
+def test_staged_tool_hashes_record_a_symlinked_directory_as_a_link(tmp_path: Path):
+    target = tmp_path / "real-pwsh"
+    (target / "inner").mkdir(parents=True)
+    (target / "inner" / "helper").write_bytes(b"pwsh")
+    root = tmp_path / ".bundlebees-tools"
+    root.mkdir()
+    (root / "pwsh").symlink_to(target, target_is_directory=True)
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    expected = hashlib.sha256(b"link\0" + os.fsencode(str(target))).hexdigest()
+    assert hashes == {"pwsh": expected}
+
+
 def test_run_in_sandbox_puts_the_pinned_tool_on_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1187,3 +1202,34 @@ def test_run_in_sandbox_puts_the_pinned_tool_on_path(
     assert result["exit_code"] == 0, result
     assert ".bundlebees-tools/uv" in result["output_tail"]
     assert "staged-uv" in result["output_tail"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_staged_tool_hashes_never_read_a_fifo(tmp_path: Path):
+    root = tmp_path / ".bundlebees-tools"
+    root.mkdir()
+    (root / "uv").write_bytes(b"uv")
+    os.mkfifo(root / "pipe")
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    assert set(hashes) == {"pipe", "uv"}
+    assert len(hashes["pipe"]) == 64
+
+
+def test_stage_pinned_tools_refuses_a_group_writable_tool(tmp_path: Path):
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"uv")
+    uv.chmod(0o666)
+
+    env = sandbox.stage_pinned_tools(
+        copy_dir,
+        {"PATH": "/usr/bin:/bin"},
+        tools=[("uv", str(uv))],
+        needed={"uv"},
+    )
+
+    assert not (copy_dir / ".bundlebees-tools" / "uv").exists()
+    assert env["PATH"] == "/usr/bin:/bin"

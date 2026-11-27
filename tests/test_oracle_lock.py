@@ -409,3 +409,169 @@ def test_shard_tests_loads_the_main_lock_with_its_dataclasses():
     spec.loader.exec_module(module)
     lock = module._load_main_oracle_lock("HEAD")
     assert lock.CONFIG_NAME == ".bundlebees-oracle-pytest.ini"
+
+
+def test_test_evidence_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64, "pwsh": "b" * 64}
+    out = verify_local._test_evidence({"exit_code": 0, "staged_tools": tools})
+    assert out["staged_tools"] == tools
+
+
+def test_shard_loader_fails_closed_when_main_has_no_lock():
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "shard_tests_fail_closed", root / ".github" / "scripts" / "shard_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module._load_main_oracle_lock("refs/heads/no-such-ref")
+    except SystemExit as exc:
+        assert "refusing to use the checkout's copy" in str(exc)
+    else:
+        raise AssertionError("loader fell back to the checkout copy instead of failing closed")
+
+
+def test_receipt_evidence_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64}
+    out = verify_local._receipt_evidence(
+        {"key": "k", "result": {"exit_code": 0, "timed_out": False, "tail": "", "staged_tools": tools}}
+    )
+    assert out["staged_tools"] == tools
+
+
+def test_receipt_key_identity_hashes_the_pinned_tools(tmp_path, monkeypatch):
+    import hashlib
+
+    from bundlebees_plugin import sandbox, verify_local
+
+    tool = tmp_path / "uv"
+    tool.write_bytes(b"uv-bytes")
+    tool.chmod(0o644)
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(tool)),))
+    assert verify_local._pinned_tools_identity() == {
+        "uv": hashlib.sha256(b"uv-bytes").hexdigest()
+    }
+
+
+def test_pinned_tool_identity_resolves_links_and_caches(tmp_path, monkeypatch):
+    import hashlib
+
+    from bundlebees_plugin import sandbox, verify_local
+
+    target = tmp_path / "uv-real"
+    target.write_bytes(b"uv-bytes")
+    target.chmod(0o644)
+    link = tmp_path / "uv"
+    link.symlink_to(target)
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(link)),))
+    verify_local._TOOL_IDENTITY_CACHE.clear()
+    calls = {"n": 0}
+    real = sandbox._staged_digest
+
+    def counting(path):
+        calls["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(sandbox, "_staged_digest", counting)
+    first = verify_local._pinned_tools_identity()
+    second = verify_local._pinned_tools_identity()
+
+    assert first == second == {"uv": hashlib.sha256(b"uv-bytes").hexdigest()}
+    assert calls["n"] == 1
+
+
+def test_record_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64}
+    record = verify_local._record(
+        "att_x",
+        "sha",
+        "base",
+        ["f"],
+        ["t"],
+        red={"exit_code": 1, "timed_out": False, "staged_tools": tools},
+        suite={"exit_code": 0, "timed_out": False, "staged_tools": tools},
+        gitleaks=None,
+    )
+    assert record["red"]["staged_tools"] == tools
+    assert record["suite"]["staged_tools"] == tools
+
+
+def test_verification_identity_includes_pinned_tools(tmp_path, monkeypatch):
+    from bundlebees_plugin import verify_local
+
+    (tmp_path / "test_x.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+    kwargs = dict(
+        base_rev="0" * 40,
+        source_tree_sha256="a" * 64,
+        patch_sha256="b" * 64,
+        tests=["test_x.py"],
+        suite_command=["python", "-m", "pytest"],
+        runner=None,
+        backend="bwrap",
+        allow_unsafe_local=False,
+        allow_weak=False,
+        timeout=60,
+        require_gitleaks=False,
+        gitleaks=None,
+    )
+    monkeypatch.setattr(verify_local, "_pinned_tools_identity", lambda: {"uv": "a" * 64})
+    first = verify_local._verification_identity(tmp_path, **kwargs)
+    monkeypatch.setattr(verify_local, "_pinned_tools_identity", lambda: {"uv": "b" * 64})
+    second = verify_local._verification_identity(tmp_path, **kwargs)
+
+    assert first["pinned_tools"] == {"uv": "a" * 64}
+    assert first != second
+
+
+def test_landed_evidence_and_record_carry_staged_tools(tmp_path):
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "c" * 64}
+    evidence = verify_local._landed_evidence(
+        tmp_path,
+        ["true"],
+        runner_name="pytest",
+        runner=lambda tree, argv: {
+            "exit_code": 0,
+            "junit": {"tests": 1},
+            "staged_tools": tools,
+        },
+        backend="bwrap",
+        allow_unsafe_local=False,
+        allow_weak=False,
+        timeout=5,
+    )
+    assert evidence["staged_tools"] == tools
+
+    record = verify_local._landed_record(
+        "sha",
+        ["test_x.py"],
+        evidence,
+        runner=None,
+        backend="bwrap",
+        timeout=5,
+        now="2026-11-27T00:00:00Z",
+    )
+    assert record["sandbox"]["staged_tools"] == tools
+
+
+def test_pinned_identity_excludes_a_shared_writable_pin(tmp_path, monkeypatch):
+    from bundlebees_plugin import sandbox, verify_local
+
+    tool = tmp_path / "uv"
+    tool.write_bytes(b"uv")
+    tool.chmod(0o666)
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(tool)),))
+    verify_local._TOOL_IDENTITY_CACHE.clear()
+
+    assert verify_local._pinned_tools_identity() == {}

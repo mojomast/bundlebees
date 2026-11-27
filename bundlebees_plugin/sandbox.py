@@ -43,6 +43,7 @@ import re
 import shlex
 import shutil
 import site
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1105,6 +1106,20 @@ def _stage_uv_cache(
     return updated
 
 
+def _pinned_tool_is_safe(source: Path) -> bool:
+    """Refuse a pinned tool the current user does not own or others can write."""
+    try:
+        info = source.stat()
+    except OSError:
+        return False
+    if hasattr(os, "getuid"):
+        if info.st_uid != os.getuid():
+            return False
+        if info.st_mode & 0o022:
+            return False
+    return True
+
+
 def stage_pinned_tools(
     copy_dir: Path,
     env: Mapping[str, str],
@@ -1133,6 +1148,8 @@ def stage_pinned_tools(
         source = Path(str(raw)).expanduser()
         if not source.exists():
             continue
+        if not _pinned_tool_is_safe(source):
+            continue
         destination = root / str(name)
         _remove_staged_entry(destination)
         root.mkdir(parents=True, exist_ok=True)
@@ -1160,19 +1177,35 @@ def stage_pinned_tools(
 
 
 def _staged_digest(path: Path) -> str:
-    """SHA-256 of a staged file, or a deterministic tree digest for a directory."""
-    if path.is_file():
+    """SHA-256 of a file, a symlink target, or a deterministic tree digest.
+
+    Never reads a non-regular file: a FIFO or device in a tool tree would block
+    or change state, so only its type is recorded.
+    """
+    if path.is_symlink():
+        return hashlib.sha256(b"link\0" + os.readlink(path).encode()).hexdigest()
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return hashlib.sha256(b"unreadable\0" + str(exc.errno).encode()).hexdigest()
+    if stat.S_ISDIR(info.st_mode):
+        digest = hashlib.sha256()
+        for child in sorted(path.rglob("*")):
+            digest.update(child.relative_to(path).as_posix().encode() + b"\0")
+            if child.is_symlink():
+                digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
+                continue
+            child_info = child.lstat()
+            if stat.S_ISDIR(child_info.st_mode):
+                continue
+            if stat.S_ISREG(child_info.st_mode):
+                digest.update(hashlib.sha256(child.read_bytes()).digest())
+            else:
+                digest.update(b"special\0" + str(child_info.st_mode).encode() + b"\0")
+        return digest.hexdigest()
+    if stat.S_ISREG(info.st_mode):
         return hashlib.sha256(path.read_bytes()).hexdigest()
-    digest = hashlib.sha256()
-    for child in sorted(path.rglob("*")):
-        if child.is_dir():
-            continue
-        digest.update(child.relative_to(path).as_posix().encode() + b"\0")
-        if child.is_symlink():
-            digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
-        else:
-            digest.update(hashlib.sha256(child.read_bytes()).digest())
-    return digest.hexdigest()
+    return hashlib.sha256(b"special\0" + str(info.st_mode).encode()).hexdigest()
 
 
 def staged_tool_hashes(copy_dir: Path | str) -> dict[str, str]:
