@@ -221,3 +221,9 @@ config_schema:
     description: >-
       Optional read-only tiktoken encoding cache for offline tests in the
       verifier sandbox; must be outside your home directory.
+  roles:
+    type: dict
+    default: {}
+    description: >-
+      Role configuration. roles.reviewer may override the outside reviewer's
+      model and budget; omitted fields retain their defaults.

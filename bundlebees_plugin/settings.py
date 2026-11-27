@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "integrate_suite": "",
     "integrate_security_tests": "",
     "integrate_base": "",
+    "roles": {},
 }
 
 
