@@ -1,0 +1,180 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wa-a5b-fup2",
+  "title": "Close the three retry-findings residuals from the WA-A5B-FUP1 review",
+  "outcome": {
+    "summary": "The dispatch attach step refuses every shape it cannot resolve to exactly one gated failure: a truthy non-string explicit failure_id is refused instead of resolving to an empty id, and a brief whose explicit failure_id and retry_of-resolved failure id disagree is refused before anything reaches the launcher. The retry_of-resolved id path gains the same supplied-block preservation pin AC-003 already has on the explicit-id path. Every valid path keeps its current behaviour.",
+    "observable_behavior": [
+      "`tools._gated_failure_id({\"failure_id\": 5}, state)` raises ResearchGateError with code research_required and a message naming failure_id as needing a string, instead of returning the empty string.",
+      "`tools._attach_accepted_findings({\"failure_id\": 5, \"findings\": <block for another failure>}, state)` returns the typed error envelope (ok false, code research_required) and the stray block does not survive into any returned brief.",
+      "A supplied findings block that names the failure resolved through retry_of is preserved byte-identically (same object) instead of being replaced by the stored artifact.",
+      "A brief whose explicit failure_id resolves to failure A and whose retry_of resolves to failure B is refused by research_gate.require_findings with code research_required, and the message names both ids.",
+      "tools._dispatch of that contradictory brief returns ok false with code research_required and makes zero launcher create calls.",
+      "A brief whose explicit failure_id and retry_of name the same failure is still accepted: the gate returns None and the attach step preserves the supplied block."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "bundlebees_plugin.tools._gated_failure_id",
+      "kind": "function",
+      "change": "modify",
+      "notes": "Refuse a truthy non-string explicit id with ResearchGateError instead of returning \"\"; return None (no id) only when neither id resolves."
+    },
+    {
+      "name": "bundlebees_plugin.tools._attach_accepted_findings",
+      "kind": "function",
+      "change": "modify",
+      "notes": "Propagate the refusal as the typed error envelope; no other branch changes."
+    },
+    {
+      "name": "bundlebees_plugin.research_gate.require_findings",
+      "kind": "function",
+      "change": "modify",
+      "notes": "Refuse when the explicit failure id and the retry_of-resolved failure id disagree, naming both; one id or two equal ids keep today's behaviour."
+    },
+    {
+      "name": "tests/test_retry_findings_paths.py",
+      "kind": "file",
+      "change": "add",
+      "notes": "Approved RED specification; read-only for the implementer. WA-A5B-FUP1's tests/test_retry_findings_attach_scope.py stays untouched."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "a truthy non-string explicit failure_id is refused by the helper with research_required instead of resolving to an empty id",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_gated_failure_id_refuses_a_truthy_non_string_id"
+      ]
+    },
+    {
+      "id": "AC-002",
+      "statement": "the attach step refuses a non-string failure_id as the typed error envelope and the caller's block for another failure does not survive",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_attach_refuses_a_non_string_id_instead_of_forwarding_the_stray_block"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "a supplied findings block that names the retry_of-resolved failure is preserved byte-identically",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_a_supplied_block_matching_the_retry_of_failure_is_preserved"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-004",
+      "statement": "a brief whose explicit failure_id and retry_of-resolved failure id disagree is refused with research_required naming both ids",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_a_brief_whose_explicit_and_retry_of_ids_disagree_is_refused"
+      ]
+    },
+    {
+      "id": "AC-005",
+      "statement": "dispatch of the disagreeing brief returns the typed refusal and makes no launcher call",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_dispatch_refuses_the_disagreeing_brief_before_any_launcher_call"
+      ]
+    },
+    {
+      "id": "AC-006",
+      "statement": "a brief whose explicit failure_id and retry_of name the same failure is accepted and its supplied block preserved",
+      "verification": "test",
+      "tests": [
+        "tests/test_retry_findings_paths.py::test_a_brief_whose_explicit_and_retry_of_ids_agree_is_accepted"
+      ],
+      "regression": true
+    }
+  ],
+  "dependencies": [
+    "WA-A5B-FUP1 (bundlebees #311, merged 7e60481): the attach step this slice hardens",
+    "bundlebees #307 (merged 805a37c) made ATTACH_FINDINGS dark by default and capped the attach; the approved RED sets ATTACH_FINDINGS=1 for the enabled-path tests and leaves the dark default untouched",
+    "RED commit 9289a861a968f198c535d9e75335ef51aee8173b is test-only on bundlebees main c8c9953: four failures prove the non-string id resolves to empty, the stray block survives a direct helper call, and the disagreeing explicit/retry_of ids are accepted; the two preservation pins pass at source_rev"
+  ],
+  "assumptions": [
+    "research_gate.require_findings is the single gate every dispatch path crosses, so the both-id rule belongs there rather than in each caller",
+    "the refusal code stays research_required: it is the code the dispatch envelope already carries for a retry the gate will not allow",
+    "no accepted artifact is ever modified; the fix only narrows which briefs are allowed through",
+    "ATTACH_FINDINGS stays dark by default; this slice changes only the enabled attach path and the shared gate, never the flag default"
+  ],
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/tools.py",
+      "bundlebees_plugin/research_gate.py"
+    ],
+    "test_files": [
+      "tests/test_retry_findings_paths.py"
+    ],
+    "prohibited": [
+      "tests/test_retry_findings_paths.py",
+      "tests/test_retry_findings_attach_scope.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "pyproject.toml",
+      "uv.lock",
+      "evidence/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/leases.py",
+      "bundlebees_plugin/dispatch.py"
+    ]
+  },
+  "source_rev": "9289a861a968f198c535d9e75335ef51aee8173b",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "timeout 600 python3 -m pytest -q -p no:cacheprovider tests/test_retry_findings_paths.py"
+    ]
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "deploy",
+      "restart",
+      "tag",
+      "branch deletion",
+      "live canary"
+    ]
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26: approved: e96bc613 (A5B-FUP2)",
+    "approved_at": "2026-11-26T22:40:19Z",
+    "contract_sha256": "e96bc6133aef048a4d10ae543ed070a5ecbfb0462b371d569e5538b3a93764b5",
+    "test_collection": {
+      "manifest_sha256": "3d41367b3642cc8810611f21ce129c28e0bd9c9640f9c6e03eaa5e4fa82cf9a5",
+      "source_rev": "9289a861a968f198c535d9e75335ef51aee8173b",
+      "collected": 6
+    }
+  },
+  "risk": {
+    "tier": "medium",
+    "reasons": [
+      "changes which retries the dispatch gate allows, on the research-before-retry path",
+      "two product files on the dispatch path; no contract, schema or evidence-format change",
+      "closes the three minors of the WA-A5B-FUP1 review; every branch fails closed"
+    ]
+  }
+}
