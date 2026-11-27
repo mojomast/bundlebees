@@ -1201,3 +1201,16 @@ def test_run_in_sandbox_puts_the_pinned_tool_on_path(
     assert result["exit_code"] == 0, result
     assert ".bundlebees-tools/uv" in result["output_tail"]
     assert "staged-uv" in result["output_tail"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_staged_tool_hashes_never_read_a_fifo(tmp_path: Path):
+    root = tmp_path / ".bundlebees-tools"
+    root.mkdir()
+    (root / "uv").write_bytes(b"uv")
+    os.mkfifo(root / "pipe")
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    assert set(hashes) == {"pipe", "uv"}
+    assert len(hashes["pipe"]) == 64

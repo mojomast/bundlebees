@@ -582,6 +582,24 @@ def _sandbox_policy(
     }
 
 
+def _pinned_tools_identity() -> dict[str, str]:
+    """Identity of the pinned portable tools a receipt's result depended on.
+
+    A receipt from different uv/pwsh bytes must not be reused, so the tool
+    identity is part of the key.  Missing tools contribute nothing: the run
+    will stage nothing either.
+    """
+    identity: dict[str, str] = {}
+    for name, raw in sandbox.PINNED_TOOLS:
+        source = Path(str(raw)).expanduser()
+        try:
+            if source.is_symlink() or source.exists():
+                identity[str(name)] = sandbox._staged_digest(source)
+        except OSError:
+            continue
+    return identity
+
+
 def _receipt_key_inputs(
     worktree: Path,
     *,
@@ -613,6 +631,7 @@ def _receipt_key_inputs(
             timeout=timeout,
         ),
         "stage": str(stage),
+        "pinned_tools": _pinned_tools_identity(),
     }
     if approved_ids is not None:
         identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
@@ -742,6 +761,8 @@ def _receipt_evidence(receipt: Mapping[str, Any]) -> dict[str, Any]:
         evidence["backend"] = result.get("backend")
     if "cases" in result:
         evidence["cases"] = result.get("cases")
+    if "staged_tools" in result:
+        evidence["staged_tools"] = result.get("staged_tools")
     return evidence
 
 

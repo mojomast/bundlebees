@@ -43,6 +43,7 @@ import re
 import shlex
 import shutil
 import site
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1160,21 +1161,35 @@ def stage_pinned_tools(
 
 
 def _staged_digest(path: Path) -> str:
-    """SHA-256 of a staged file, a symlink target, or a deterministic tree digest."""
+    """SHA-256 of a file, a symlink target, or a deterministic tree digest.
+
+    Never reads a non-regular file: a FIFO or device in a tool tree would block
+    or change state, so only its type is recorded.
+    """
     if path.is_symlink():
         return hashlib.sha256(b"link\0" + os.readlink(path).encode()).hexdigest()
-    if path.is_dir():
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return hashlib.sha256(b"unreadable\0" + str(exc.errno).encode()).hexdigest()
+    if stat.S_ISDIR(info.st_mode):
         digest = hashlib.sha256()
         for child in sorted(path.rglob("*")):
-            if child.is_dir():
-                continue
             digest.update(child.relative_to(path).as_posix().encode() + b"\0")
             if child.is_symlink():
                 digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
-            else:
+                continue
+            child_info = child.lstat()
+            if stat.S_ISDIR(child_info.st_mode):
+                continue
+            if stat.S_ISREG(child_info.st_mode):
                 digest.update(hashlib.sha256(child.read_bytes()).digest())
+            else:
+                digest.update(b"special\0" + str(child_info.st_mode).encode() + b"\0")
         return digest.hexdigest()
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    if stat.S_ISREG(info.st_mode):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(b"special\0" + str(info.st_mode).encode()).hexdigest()
 
 
 def staged_tool_hashes(copy_dir: Path | str) -> dict[str, str]:

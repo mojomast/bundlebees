@@ -435,3 +435,26 @@ def test_shard_loader_fails_closed_when_main_has_no_lock():
         assert "refusing to use the checkout's copy" in str(exc)
     else:
         raise AssertionError("loader fell back to the checkout copy instead of failing closed")
+
+
+def test_receipt_evidence_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64}
+    out = verify_local._receipt_evidence(
+        {"key": "k", "result": {"exit_code": 0, "timed_out": False, "tail": "", "staged_tools": tools}}
+    )
+    assert out["staged_tools"] == tools
+
+
+def test_receipt_key_identity_hashes_the_pinned_tools(tmp_path, monkeypatch):
+    import hashlib
+
+    from bundlebees_plugin import sandbox, verify_local
+
+    tool = tmp_path / "uv"
+    tool.write_bytes(b"uv-bytes")
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(tool)),))
+    assert verify_local._pinned_tools_identity() == {
+        "uv": hashlib.sha256(b"uv-bytes").hexdigest()
+    }
