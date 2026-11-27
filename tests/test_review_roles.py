@@ -29,7 +29,7 @@ def test_default_reviewer_is_kimi():
     m = _load()
     role = m.reviewer_role({})
     assert role["model"] == m.DEFAULT_MODEL == "k3.1-pro"
-    assert role["m.model_family"] == "kimi"
+    assert role["model_family"] == "kimi"
     assert role["budget"] == m.DEFAULT_BUDGET == {"timeout_s": 2700, "max_tool_calls": 120}
     assert role["identity"] == "rizzstack-reviewer"
     assert role["post_mode"] == "auto_reject"
@@ -73,7 +73,7 @@ def test_kimi_authored_routes_to_deepseek():
     m = _load()
     route = m.route_reviewer({}, ["k3.1-pro", "k3.1-pro"])
     assert route["model"] == m.FALLBACK_MODEL == "nous:deepseek-v4.1-flash-1017"
-    assert route["m.model_family"] == "deepseek"
+    assert route["model_family"] == "deepseek"
     assert route["reason"] == "kimi_authored"
 
 
@@ -81,7 +81,7 @@ def test_deepseek_authored_keeps_kimi():
     m = _load()
     route = m.route_reviewer({}, ["nous:deepseek-v4.1-flash-1017"])
     assert route["model"] == m.DEFAULT_MODEL
-    assert route["m.model_family"] == "kimi"
+    assert route["model_family"] == "kimi"
     assert route["reason"] == "default"
 
 
@@ -115,4 +115,4 @@ def test_routed_family_always_differs_from_every_author_family():
 
     for authors in (["k3.1-pro"], ["nous:deepseek-v4.1-flash-1017"]):
         route = m.route_reviewer({}, authors)
-        assert route["m.model_family"] not in m.author_families(authors)
+        assert route["model_family"] not in m.author_families(authors)
