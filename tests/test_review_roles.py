@@ -118,3 +118,12 @@ def test_routed_family_always_differs_from_every_author_family():
     for authors in (["k3.1-pro"], ["nous:deepseek-v4.1-flash-1017"]):
         route = m.route_reviewer({}, authors)
         assert route["model_family"] not in m.author_families(authors)
+
+
+def test_k2_is_not_kimi():
+    """A 'k2' substring is an older Kimi name, not the family this role routes on; only the
+    explicit Kimi ids are family kimi, everything else unidentifiable is unknown."""
+    m = _load()
+    assert m.model_family("k2") == "unknown"
+    assert m.model_family("kimi-k2-0905") == "unknown"
+    assert m.model_family("nous:k2-preview") == "unknown"
