@@ -14,7 +14,7 @@ import textwrap
 import tomllib
 from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, NamedTuple, TypedDict
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence, TypedDict
 
 from . import risk
 
@@ -1071,51 +1071,493 @@ class _AstScanner(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _repair_python(text: str) -> str | None:
-    candidates = [textwrap.dedent(text), f"def _scan_fragment():\n{textwrap.indent(text, '    ')}"]
-    if text.rstrip().endswith(":"):
-        candidates.append(f"{text}\n    pass\n")
-    for candidate in candidates:
+#: Synthetic scopes for a fragment of a Python file, smallest first.
+#:
+#: A patch-only scan rebuilds only the lines its hunks carry, so the
+#: "post-image" it parses is a fragment of the real file: it can open on a
+#: block continuation (``else:``, ``except``), on a ``return``, or inside a
+#: bracketed expression. Each entry is an opener plus whether the body is
+#: indented under it. The module-level openers come first: ``sys.exit`` is a
+#: ``forced_exit`` only at module level, so a hunk that really is at module
+#: level must keep that depth.
+_FRAGMENT_SCOPES: tuple[tuple[str, bool], ...] = (
+    ("", False),
+    ("if True:\n    pass\n", False),
+    ("try:\n    pass\n", False),
+    ("while True:\n", True),
+    ("def _scan_fragment():\n", True),
+)
+
+
+def _pad_open_block(text: str) -> str:
+    """Close a fragment whose last line opens a block (``if x:``)."""
+    lines = text.rstrip("\n").split("\n")
+    if not lines[-1].rstrip().endswith(":"):
+        return text
+    indent = len(lines[-1]) - len(lines[-1].lstrip())
+    return "\n".join([*lines, " " * (indent + 4) + "pass"]) + "\n"
+
+
+def _repair_python(text: str) -> ast.Module | None:
+    """Parse *text* as a fragment of a Python file, under a synthetic scope.
+
+    The fragment is dedented first, so a hunk that starts mid-function parses
+    as a statement list while its own relative indentation is preserved, and
+    then wrapped in the smallest scope that makes it parse. The synthetic
+    prefix lines are subtracted from every node's line number, so findings keep
+    the post-image's own numbering.
+    """
+    body = _pad_open_block(textwrap.dedent(text))
+    for prefix, indented in _FRAGMENT_SCOPES:
+        source = prefix + (textwrap.indent(body, "    ") if indented else body)
         try:
-            ast.parse(candidate)
-            return candidate
+            tree = ast.parse(source)
         except (SyntaxError, ValueError):
             continue
+        prefix_lines = prefix.count("\n")
+        if prefix_lines:
+            ast.increment_lineno(tree, -prefix_lines)
+        return tree
     return None
 
 
-def _python_findings(path: str, content: bytes, *, recover: bool = False) -> list[Finding]:
-    try:
-        text = content.decode("utf-8", "strict")
-        tree = ast.parse(text)
-    except UnicodeDecodeError:
-        return [_finding("parse_error", path)]
-    except (SyntaxError, ValueError) as exc:
-        findings = [_finding("parse_error", path, getattr(exc, "lineno", 1) or 1)]
-        repaired = _repair_python(text)
-        if repaired is None:
-            return findings
-        try:
-            tree = ast.parse(repaired)
-        except (SyntaxError, ValueError):
-            return findings
-        if recover:
-            findings = []
-    else:
-        findings = []
+def _scan_tree(path: str, tree: ast.AST) -> list[Finding]:
     scanner = _AstScanner(path, tree)
     scanner.visit(tree)
-    return _dedupe([*findings, *scanner.findings])
+    return _dedupe(scanner.findings)
 
 
-def _content_findings(path: str, content: bytes, *, recover: bool = False) -> list[Finding]:
+def _contiguous_runs(numbers: Sequence[int]) -> list[list[int]]:
+    """Group ascending line numbers into runs of consecutive numbers."""
+    runs: list[list[int]] = []
+    for number in numbers:
+        if runs and number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    return runs
+
+
+def _fragment_statement_tree(body: str, *, indented: bool) -> ast.AST | None:
+    """Parse one run of added lines as statements, preserving its depth.
+
+    A column-0 run is module-level code, so an unguarded ``sys.exit`` there
+    keeps module depth. A run that is indented in the post-image continues a
+    block, and is parsed inside a synthetic function so it is not promoted to
+    module level; the synthetic line is subtracted from every node again.
+    """
+    candidates = (
+        (("def _scan_fragment():\n", True),)
+        if indented
+        else (("", False), ("while True:\n", True), ("def _scan_fragment():\n", True))
+    )
+    for prefix, wrap in candidates:
+        source = prefix + (textwrap.indent(body, "    ") if wrap else body)
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        prefix_lines = prefix.count("\n")
+        if prefix_lines:
+            ast.increment_lineno(tree, -prefix_lines)
+        return tree
+    return None
+
+
+def _fragment_run_findings(
+    path: str, text: str, added: Sequence[int]
+) -> list[Finding]:
+    """Tree rules for the added lines of an unparseable hunk fragment.
+
+    The per-line content rules have no pattern for the module-level shapes
+    that only the tree scanner knows (a ``sys.modules`` write or call, an
+    unguarded ``sys.exit``). When no synthetic scope repairs the whole
+    fragment, each run of consecutive added lines is parsed on its own, so
+    those shapes are still evaluated on the lines the hunk adds instead of
+    becoming a no-op. Findings are mapped back to the fragment's own line
+    numbers.
+    """
+    if not added:
+        return []
+    lines = text.split("\n")
+    findings = []
+    for run in _contiguous_runs(added):
+        block = [lines[number - 1] for number in run if 1 <= number <= len(lines)]
+        if not block or not any(line.strip() for line in block):
+            continue
+        body = textwrap.dedent("\n".join(block)) + "\n"
+        indent = min(len(line) - len(line.lstrip()) for line in block if line.strip())
+        tree = _fragment_statement_tree(body, indented=indent > 0)
+        if tree is None:
+            continue
+        for finding in _scan_tree(path, tree):
+            position = finding["line"]
+            if 1 <= position <= len(run):
+                findings.append(
+                    Finding(kind=finding["kind"], path=path, line=run[position - 1])
+                )
+    return findings
+
+
+def _fragment_line_findings(
+    path: str, text: str, added: Sequence[int] | None
+) -> list[Finding]:
+    """Findings for the added lines when no scope could repair the fragment.
+
+    The per-added-line rules are exactly the rules the line-based scan applies
+    (so ``os._exit`` still fires), and the tree-only module-level shapes are
+    evaluated on each run of consecutive added lines, so a fragment that
+    cannot be parsed is not a no-op.
+    """
+    if not added:
+        return []
+    lines = text.splitlines()
+    findings = []
+    for number in added:
+        if 1 <= number <= len(lines):
+            findings.extend(_added_line_findings(path, lines[number - 1], number))
+    findings.extend(_fragment_run_findings(path, text, added))
+    return _dedupe(findings)
+
+
+def _unparsed_findings(
+    path: str,
+    text: str,
+    exc: SyntaxError | ValueError,
+    *,
+    recover: bool,
+    added: Sequence[int] | None,
+) -> list[Finding]:
+    """Findings for content that does not parse as a file.
+
+    ``recover`` marks a partial input - the lines a hunk carries. Such a
+    fragment is not required to be syntactically self-contained: once repaired
+    it is scanned, and when it cannot be repaired the added lines are still
+    checked line by line and as statement runs. A complete file (a created
+    file, or any input at all in a repo-backed scan) keeps the ``parse_error``
+    finding.
+    """
+    error = [_finding("parse_error", path, getattr(exc, "lineno", 1) or 1)]
+    tree = _repair_python(text)
+    if tree is not None:
+        kept = [] if recover else error
+        return _dedupe([*kept, *_scan_tree(path, tree)])
+    if not recover:
+        return error
+    return _fragment_line_findings(path, text, added)
+
+
+def _python_findings(
+    path: str,
+    content: bytes,
+    *,
+    recover: bool = False,
+    added: Sequence[int] | None = None,
+) -> list[Finding]:
+    try:
+        text = content.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return [_finding("parse_error", path)]
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        return _unparsed_findings(path, text, exc, recover=recover, added=added)
+    return _scan_tree(path, tree)
+
+
+def _content_findings(
+    path: str,
+    content: bytes,
+    *,
+    recover: bool = False,
+    added: Sequence[int] | None = None,
+) -> list[Finding]:
     name = path.rsplit("/", 1)[-1].lower()
     findings = []
     if name in _CONFIG_NAMES:
         findings.extend(_config_findings(path, content, recover=recover))
     if name.endswith(".py"):
-        findings.extend(_python_findings(path, content, recover=recover))
+        findings.extend(_python_findings(path, content, recover=recover, added=added))
     return findings
+
+
+class _StatementShape(NamedTuple):
+    """One statement's source span: line range, first-line indent, text, guards."""
+
+    start: int
+    end: int
+    indent: int
+    text: str
+    ancestry: tuple[str, ...]
+
+
+#: Compound statements whose header decides whether a nested finding fires at
+#: all: flipping a guard (``if __name__ == "__main__":`` -> ``if True:``) leaves
+#: the nested statement untouched, so the guard has to be part of its shape.
+_COMPOUND_STATEMENTS = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+    getattr(ast, "TryStar", ast.Try),
+    ast.ExceptHandler,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.match_case,
+)
+
+
+def _parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+    """Map ``id(node)`` to its parent node for one parsed tree."""
+
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents.setdefault(id(child), parent)
+    return parents
+
+
+def _header_text(node: ast.AST, lines: Sequence[str]) -> str | None:
+    """The source of a compound statement's header (everything before its body)."""
+
+    start = getattr(node, "lineno", None)
+    if not isinstance(start, int):
+        return None
+    body = getattr(node, "body", None) or ()
+    first = getattr(body[0], "lineno", None) if body else None
+    stop = first - 1 if isinstance(first, int) and first > start else start
+    header = []
+    for number in range(start, stop + 1):
+        line = _code_line(lines[number - 1]) if 1 <= number <= len(lines) else None
+        if line is not None:
+            header.append(line)
+    if not header and 1 <= start <= len(lines):
+        line = _code_line(lines[start - 1])
+        if line is not None:
+            header.append(line)
+    text = "\n".join(header)
+    return textwrap.dedent(text) if text else None
+
+
+def _ancestor_headers(
+    node: ast.AST, parents: dict[int, ast.AST], lines: Sequence[str]
+) -> tuple[str, ...]:
+    """Every enclosing compound-statement header, outermost first."""
+
+    headers = []
+    parent = parents.get(id(node))
+    while parent is not None:
+        if isinstance(parent, _COMPOUND_STATEMENTS):
+            header = _header_text(parent, lines)
+            if header:
+                headers.append(header)
+        parent = parents.get(id(parent))
+    headers.reverse()
+    return tuple(headers)
+
+
+def _decoded(content: bytes) -> str | None:
+    try:
+        return content.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return None
+
+
+def _parsed(text: str) -> ast.AST | None:
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _code_line(line: str) -> str | None:
+    """The line with trailing whitespace dropped, or ``None`` if it has no code."""
+
+    stripped = line.rstrip()
+    body = stripped.lstrip()
+    return stripped if body and not body.startswith("#") else None
+
+
+def _statement_shape(
+    node: ast.AST, lines: Sequence[str], parents: dict[int, ast.AST]
+) -> _StatementShape | None:
+    """The shape of one statement node, or ``None`` if it has no code span."""
+
+    if not isinstance(node, ast.stmt):
+        return None
+    start = getattr(node, "lineno", None)
+    end = getattr(node, "end_lineno", None)
+    if start is None or end is None:
+        return None
+    if not 1 <= start <= end <= len(lines):
+        return None
+    segment = []
+    for number in range(start, end + 1):
+        line = _code_line(lines[number - 1])
+        if line is not None:
+            segment.append(line)
+    if not segment:
+        return None
+    first = segment[0]
+    body = first.lstrip()
+    return _StatementShape(
+        start=start,
+        end=end,
+        indent=len(first) - len(body),
+        text="\n".join([body, *segment[1:]]),
+        ancestry=_ancestor_headers(node, parents, lines),
+    )
+
+
+def _statement_shapes(content: bytes) -> list[_StatementShape] | None:
+    """Full statement segments of *content*, for line-independent identity.
+
+    ``ast`` reports a finding at the line of the assignment target or the
+    call, which for a multi-line statement is its first line. Two shapes can
+    share that line while the statement does something else entirely (a patch
+    can rewrite the continuation of a pre-existing ``sys.modules`` statement),
+    so the whole statement segment is the shape: its first-line indentation (a
+    dedent out of a guard is a code change) plus every code line of the span
+    plus the headers of every enclosing compound statement, outermost first (a
+    flipped guard such as ``if __name__ == "__main__":`` -> ``if True:``
+    changes whether the statement runs at import time without touching it).
+    Blank and comment-only lines inside the span are dropped, so a comment
+    added inside a pre-existing statement is still the same shape. ``None``
+    means the content does not parse; nothing is subtracted then.
+    """
+
+    text = _decoded(content)
+    if text is None:
+        return None
+    tree = _parsed(text)
+    if tree is None:
+        return None
+    lines = text.split("\n")
+    parents = _parent_map(tree)
+    shapes = []
+    for node in ast.walk(tree):
+        shape = _statement_shape(node, lines, parents)
+        if shape is not None:
+            shapes.append(shape)
+    return shapes
+
+
+def _finding_shape(
+    shapes: Sequence[_StatementShape] | None, finding: Finding
+) -> tuple[str, int, tuple[str, ...], str] | None:
+    """Line-independent identity of a Python finding, or ``None`` if unknown.
+
+    The shape is the rule id plus the full source segment of the statement the
+    finding's node belongs to, its indentation, and the headers of the compound
+    statements that enclose it. Line numbers are deliberately absent: a hunk
+    that shifts a pre-existing statement down must not resurrect it as "new".
+    Indentation is kept because a patch that dedents a statement out of its
+    guard is a code change, not a line shift, and has to be reported. The whole
+    segment (not just its first line) is part of the identity so a patch that
+    rewrites the continuation of a multi-line ``sys.modules`` statement cannot
+    hide behind the line it did not touch, and the guard chain is part of it so
+    a patch that changes only the guard around a pre-existing exit is reported.
+    ``parse_error`` and content that does not parse are never subtracted (fail
+    closed).
+    """
+
+    if finding["kind"] == "parse_error" or not shapes:
+        return None
+    line = finding["line"]
+    candidates = [shape for shape in shapes if shape.start <= line <= shape.end]
+    if not candidates:
+        return None
+    # The innermost statement that starts closest to the finding: a statement
+    # nested in a block (or a body inside a compound statement) wins over the
+    # compound it sits in.
+    shape = min(candidates, key=lambda item: (item.end - item.start, -item.start))
+    return finding["kind"], shape.indent, shape.ancestry, shape.text
+
+
+def _subtract_base_findings(
+    base: list[Finding],
+    base_content: bytes,
+    after: list[Finding],
+    after_content: bytes,
+    added: Sequence[int] = (),
+) -> list[Finding]:
+    """Drop post-image findings whose shape is already present at the base.
+
+    A finding on a line the patch added is never subtracted: the base cannot
+    have carried that line, and a moved pre-existing shape (an exit moved into
+    a helper, a ``sys.modules`` stub moved to import time) keeps the same text
+    while changing when it runs. Counted, not just matched, for the findings
+    that remain: a patch that adds a second copy of a shape the base already
+    carried still keeps one finding. Shapes that cannot be identified are
+    never subtracted (fail closed).
+    """
+
+    added_lines = set(added)
+    base_shapes = _statement_shapes(base_content)
+    after_shapes = _statement_shapes(after_content)
+    remaining = Counter(
+        shape
+        for finding in base
+        if (shape := _finding_shape(base_shapes, finding)) is not None
+    )
+    kept = []
+    for finding in after:
+        shape = _finding_shape(after_shapes, finding)
+        if finding["line"] in added_lines or shape is None or not remaining[shape]:
+            kept.append(finding)
+            continue
+        remaining[shape] -= 1
+    return kept
+
+
+def _change_findings(
+    change: _Change,
+    before: bytes,
+    after: bytes,
+    *,
+    recover: bool = False,
+    subtract_base: bool = False,
+    added: Sequence[int] | None = None,
+) -> list[Finding]:
+    """Content findings for one changed file, minus what the base already had.
+
+    Only Python content findings are subtracted. A document-level config
+    finding (the INI rules report the whole ``pytest.ini``/``tox.ini``/
+    ``setup.cfg`` document at line 1) has no per-line shape that could tell a
+    pre-existing ``addopts`` plugin from a newly added one, so those keep the
+    fail-closed whole-file behaviour; ``pyproject.toml`` findings are already
+    attributed to added lines by ``_path_findings``. A new file (no pre-image)
+    and a file whose pre-image is empty have nothing to subtract.
+    """
+
+    tolerance = _fragment_tolerant(change, recover)
+    after_findings = _content_findings(change.path, after, recover=tolerance, added=added)
+    is_python = change.path.lower().endswith(".py")
+    if not subtract_base or not is_python or not before:
+        return after_findings
+    base_path = change.old_path or change.path
+    # The base scan gets no ``added`` lines: they are post-image numbers, and
+    # nothing subtracted from an unparseable base fragment keeps the check
+    # fail-closed.
+    base_findings = _content_findings(base_path, before, recover=tolerance)
+    return _subtract_base_findings(base_findings, before, after_findings, after, added or ())
+
+
+def _fragment_tolerant(change: _Change, recover: bool) -> bool:
+    """Whether an unparseable post-image is fragment noise, not evidence.
+
+    A patch-only scan rebuilds a modified file's post-image from the hunk
+    lines alone, so it is a fragment of the real file. A created file's
+    post-image is the whole file, so a parse error there is real evidence and
+    stays a finding even in a fragment-tolerant scan.
+    """
+    if not recover:
+        return False
+    return not change.status.startswith("A")
 
 
 def _changed_content(
@@ -1126,6 +1568,7 @@ def _changed_content(
     env: dict[str, str],
     *,
     recover: bool = False,
+    subtract_base: bool = False,
 ) -> list[Finding]:
     active = [change for change in changes if not change.status.startswith("D")]
     try:
@@ -1141,7 +1584,16 @@ def _changed_content(
             continue
         added = _added_lines(change, before, after)
         findings.extend(_path_findings(change, added, after))
-        findings.extend(_content_findings(change.path, after, recover=recover))
+        findings.extend(
+            _change_findings(
+                change,
+                before,
+                after,
+                recover=recover,
+                subtract_base=subtract_base,
+                added=added,
+            )
+        )
     return findings
 
 
@@ -1151,6 +1603,7 @@ def _scan_change_tree(
     source_rev: str,
     *,
     recover: bool = False,
+    subtract_base: bool = False,
 ) -> list[Finding]:
     tree = _resolve_tree(repo_root, source_rev)
     with tempfile.TemporaryDirectory(prefix="bundlebees-subversion-") as scratch:
@@ -1170,12 +1623,28 @@ def _scan_change_tree(
         changes = _changed_paths(diff)
         listing = _git(repo_root, ["ls-files", "-s", "-z"], env=env)
         entries = _index_entries(listing)
-        return _changed_content(repo_root, tree, changes, entries, env, recover=recover)
+        return _changed_content(
+            repo_root,
+            tree,
+            changes,
+            entries,
+            env,
+            recover=recover,
+            subtract_base=subtract_base,
+        )
 
 
 def scan_change(patch: str, repo_root: str | Path, source_rev: str) -> list[Finding]:
+    """Repo-backed scan: whole-file findings minus the ones the base already had.
+
+    The patch-only scan (``scan_patch``) keeps its own reconstruction semantics;
+    only this path has a real base revision to subtract.
+    """
+
     try:
-        findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+        findings = _scan_change_tree(
+            patch, Path(repo_root), str(source_rev), subtract_base=True
+        )
         return ScanFindings(_dedupe(findings))
     except _ScanFailure as exc:
         return _input_finding(exc.path)
@@ -1337,18 +1806,21 @@ def scan_patch(
     """Scan a patch for test-runner subversion.
 
     With ``repo_root`` and ``source_rev`` the patch is applied to that tree and
-    the *whole* post-image file is scanned. Without them the changed files are
-    rebuilt from the hunks the patch carries, so a partial hunk is only a
-    fragment of a file: ``ast`` cannot parse it and the scan reports
-    ``parse_error`` on a file that is valid once the patch applies. Verify
-    always has the repository and the dispatched source revision, so it passes
-    both; a patch that does not apply to that tree falls back to the patch-only
-    scan and is refused later by the revision checks.
+    the *whole* post-image file is scanned, minus the content findings the base
+    revision already carried. Without them the changed files are rebuilt from
+    the hunks the patch carries, so a partial hunk is only a fragment of a
+    file: ``ast`` cannot parse it and the scan reports ``parse_error`` on a
+    file that is valid once the patch applies. Verify always has the repository
+    and the dispatched source revision, so it passes both; a patch that does
+    not apply to that tree falls back to the patch-only scan and is refused
+    later by the revision checks.
     """
 
     if repo_root is not None and source_rev:
         try:
-            findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+            findings = _scan_change_tree(
+                patch, Path(repo_root), str(source_rev), subtract_base=True
+            )
         except _ScanFailure:
             findings = None
         except (OSError, UnicodeError, ValueError, TypeError):
