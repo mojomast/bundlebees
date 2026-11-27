@@ -14,7 +14,7 @@ import textwrap
 import tomllib
 from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, NamedTuple, TypedDict
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence, TypedDict
 
 from . import risk
 
@@ -1071,51 +1071,152 @@ class _AstScanner(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _repair_python(text: str) -> str | None:
-    candidates = [textwrap.dedent(text), f"def _scan_fragment():\n{textwrap.indent(text, '    ')}"]
-    if text.rstrip().endswith(":"):
-        candidates.append(f"{text}\n    pass\n")
-    for candidate in candidates:
+#: Synthetic scopes for a fragment of a Python file, smallest first.
+#:
+#: A patch-only scan rebuilds only the lines its hunks carry, so the
+#: "post-image" it parses is a fragment of the real file: it can open on a
+#: block continuation (``else:``, ``except``), on a ``return``, or inside a
+#: bracketed expression. Each entry is an opener plus whether the body is
+#: indented under it. The module-level openers come first: ``sys.exit`` is a
+#: ``forced_exit`` only at module level, so a hunk that really is at module
+#: level must keep that depth.
+_FRAGMENT_SCOPES: tuple[tuple[str, bool], ...] = (
+    ("", False),
+    ("if True:\n    pass\n", False),
+    ("try:\n    pass\n", False),
+    ("while True:\n", True),
+    ("def _scan_fragment():\n", True),
+)
+
+
+def _pad_open_block(text: str) -> str:
+    """Close a fragment whose last line opens a block (``if x:``)."""
+    lines = text.rstrip("\n").split("\n")
+    if not lines[-1].rstrip().endswith(":"):
+        return text
+    indent = len(lines[-1]) - len(lines[-1].lstrip())
+    return "\n".join([*lines, " " * (indent + 4) + "pass"]) + "\n"
+
+
+def _repair_python(text: str) -> ast.Module | None:
+    """Parse *text* as a fragment of a Python file, under a synthetic scope.
+
+    The fragment is dedented first, so a hunk that starts mid-function parses
+    as a statement list while its own relative indentation is preserved, and
+    then wrapped in the smallest scope that makes it parse. The synthetic
+    prefix lines are subtracted from every node's line number, so findings keep
+    the post-image's own numbering.
+    """
+    body = _pad_open_block(textwrap.dedent(text))
+    for prefix, indented in _FRAGMENT_SCOPES:
+        source = prefix + (textwrap.indent(body, "    ") if indented else body)
         try:
-            ast.parse(candidate)
-            return candidate
+            tree = ast.parse(source)
         except (SyntaxError, ValueError):
             continue
+        prefix_lines = prefix.count("\n")
+        if prefix_lines:
+            ast.increment_lineno(tree, -prefix_lines)
+        return tree
     return None
 
 
-def _python_findings(path: str, content: bytes, *, recover: bool = False) -> list[Finding]:
-    try:
-        text = content.decode("utf-8", "strict")
-        tree = ast.parse(text)
-    except UnicodeDecodeError:
-        return [_finding("parse_error", path)]
-    except (SyntaxError, ValueError) as exc:
-        findings = [_finding("parse_error", path, getattr(exc, "lineno", 1) or 1)]
-        repaired = _repair_python(text)
-        if repaired is None:
-            return findings
-        try:
-            tree = ast.parse(repaired)
-        except (SyntaxError, ValueError):
-            return findings
-        if recover:
-            findings = []
-    else:
-        findings = []
+def _scan_tree(path: str, tree: ast.AST) -> list[Finding]:
     scanner = _AstScanner(path, tree)
     scanner.visit(tree)
-    return _dedupe([*findings, *scanner.findings])
+    return _dedupe(scanner.findings)
 
 
-def _content_findings(path: str, content: bytes, *, recover: bool = False) -> list[Finding]:
+def _fragment_line_findings(
+    path: str, text: str, added: Sequence[int] | None
+) -> list[Finding]:
+    """Apply the per-added-line rules when no scope could repair the fragment.
+
+    These are exactly the rules the line-based scan applies to added lines, so
+    a fragment that cannot be parsed still evaluates them instead of becoming
+    a no-op.
+    """
+    if not added:
+        return []
+    lines = text.splitlines()
+    findings = []
+    for number in added:
+        if 1 <= number <= len(lines):
+            findings.extend(_added_line_findings(path, lines[number - 1], number))
+    return _dedupe(findings)
+
+
+def _unparsed_findings(
+    path: str,
+    text: str,
+    exc: SyntaxError | ValueError,
+    *,
+    recover: bool,
+    added: Sequence[int] | None,
+) -> list[Finding]:
+    """Findings for content that does not parse as a file.
+
+    ``recover`` marks a partial input - the lines a hunk carries. Such a
+    fragment is not required to be syntactically self-contained: once repaired
+    it is scanned, and when it cannot be repaired the added lines are still
+    checked line by line. A complete file (a created file, or any input at all
+    in a repo-backed scan) keeps the ``parse_error`` finding.
+    """
+    error = [_finding("parse_error", path, getattr(exc, "lineno", 1) or 1)]
+    tree = _repair_python(text)
+    if tree is not None:
+        kept = [] if recover else error
+        return _dedupe([*kept, *_scan_tree(path, tree)])
+    if not recover:
+        return error
+    return _fragment_line_findings(path, text, added)
+
+
+def _python_findings(
+    path: str,
+    content: bytes,
+    *,
+    recover: bool = False,
+    added: Sequence[int] | None = None,
+) -> list[Finding]:
+    try:
+        text = content.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return [_finding("parse_error", path)]
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        return _unparsed_findings(path, text, exc, recover=recover, added=added)
+    return _scan_tree(path, tree)
+
+
+def _content_findings(
+    path: str,
+    content: bytes,
+    *,
+    recover: bool = False,
+    added: Sequence[int] | None = None,
+) -> list[Finding]:
     name = path.rsplit("/", 1)[-1].lower()
     findings = []
     if name in _CONFIG_NAMES:
         findings.extend(_config_findings(path, content, recover=recover))
     if name.endswith(".py"):
-        findings.extend(_python_findings(path, content, recover=recover))
+        findings.extend(_python_findings(path, content, recover=recover, added=added))
     return findings
+
+
+def _fragment_tolerant(change: _Change, recover: bool) -> bool:
+    """Whether an unparseable post-image is fragment noise, not evidence.
+
+    A patch-only scan rebuilds a modified file's post-image from the hunk
+    lines alone, so it is a fragment of the real file. A created file's
+    post-image is the whole file, so a parse error there is real evidence and
+    stays a finding even in a fragment-tolerant scan.
+    """
+    if not recover:
+        return False
+    return not change.status.startswith("A")
 
 
 def _changed_content(
@@ -1141,7 +1242,14 @@ def _changed_content(
             continue
         added = _added_lines(change, before, after)
         findings.extend(_path_findings(change, added, after))
-        findings.extend(_content_findings(change.path, after, recover=recover))
+        findings.extend(
+            _content_findings(
+                change.path,
+                after,
+                recover=_fragment_tolerant(change, recover),
+                added=added,
+            )
+        )
     return findings
 
 

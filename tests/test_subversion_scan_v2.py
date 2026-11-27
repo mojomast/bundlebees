@@ -1343,9 +1343,15 @@ def _palette_patch() -> str:
 
 
 def test_partial_hunk_is_a_fragment_for_a_patch_only_scan():
-    """The patch alone rebuilds only the hunk, so ``ast`` refuses the fragment."""
-    kinds = {finding["kind"] for finding in subversion_scan.scan_patch(_palette_patch())}
-    assert kinds == {"parse_error"}
+    """The patch alone rebuilds only the hunk, so ``ast`` cannot read the file.
+
+    A fragment is not required to be syntactically self-contained, so it is not
+    evidence of test subversion: the patch is not refused, and the rules the
+    added lines still expose are evaluated (see
+    ``tests/test_verify_subversion_fragment.py``).
+    """
+
+    assert subversion_scan.scan_patch(_palette_patch()) == []
 
 
 def test_scan_patch_reads_the_applied_tree_when_given_repo_and_source_rev():
