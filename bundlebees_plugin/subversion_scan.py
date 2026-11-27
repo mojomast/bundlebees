@@ -1118,6 +1118,93 @@ def _content_findings(path: str, content: bytes, *, recover: bool = False) -> li
     return findings
 
 
+def _finding_shape(content: bytes, finding: Finding) -> tuple[str, int, str] | None:
+    """Line-independent identity of a Python finding, or ``None`` if unknown.
+
+    The shape is the rule id plus the finding's own source line with its
+    indentation kept and its trailing whitespace dropped. Line numbers are
+    deliberately absent: a hunk that shifts a pre-existing statement down must
+    not resurrect it as "new". Indentation is kept because a patch that dedents
+    a statement out of its guard is a code change, not a line shift, and has to
+    be reported. ``parse_error`` is never subtracted (a file that does not
+    parse at the base stays fail-closed), and a line that cannot be read keeps
+    its finding for the same reason.
+    """
+
+    if finding["kind"] == "parse_error":
+        return None
+    try:
+        # Split on "\n" exactly like ``ast`` counts lines; ``str.splitlines``
+        # also splits on form feeds and other separators and would misalign.
+        lines = content.decode("utf-8", "strict").split("\n")
+    except UnicodeDecodeError:
+        return None
+    line = finding["line"]
+    if not 1 <= line <= len(lines):
+        return None
+    text = lines[line - 1].rstrip()
+    body = text.lstrip()
+    if not body:
+        return None
+    return finding["kind"], len(text) - len(body), body
+
+
+def _subtract_base_findings(
+    base: list[Finding],
+    base_content: bytes,
+    after: list[Finding],
+    after_content: bytes,
+) -> list[Finding]:
+    """Drop post-image findings whose shape is already present at the base.
+
+    Counted, not just matched: a patch that adds a second copy of a shape the
+    base already carried still keeps one finding. Shapes that cannot be
+    identified are never subtracted (fail closed).
+    """
+
+    remaining = Counter(
+        shape
+        for finding in base
+        if (shape := _finding_shape(base_content, finding)) is not None
+    )
+    kept = []
+    for finding in after:
+        shape = _finding_shape(after_content, finding)
+        if shape is not None and remaining[shape]:
+            remaining[shape] -= 1
+            continue
+        kept.append(finding)
+    return kept
+
+
+def _change_findings(
+    change: _Change,
+    before: bytes,
+    after: bytes,
+    *,
+    recover: bool = False,
+    subtract_base: bool = False,
+) -> list[Finding]:
+    """Content findings for one changed file, minus what the base already had.
+
+    Only Python content findings are subtracted. A document-level config
+    finding (the INI rules report the whole ``pytest.ini``/``tox.ini``/
+    ``setup.cfg`` document at line 1) has no per-line shape that could tell a
+    pre-existing ``addopts`` plugin from a newly added one, so those keep the
+    fail-closed whole-file behaviour; ``pyproject.toml`` findings are already
+    attributed to added lines by ``_path_findings``. A new file (no pre-image)
+    and a file whose pre-image is empty have nothing to subtract.
+    """
+
+    after_findings = _content_findings(change.path, after, recover=recover)
+    is_python = change.path.lower().endswith(".py")
+    if not subtract_base or not is_python or not before:
+        return after_findings
+    base_path = change.old_path or change.path
+    base_findings = _content_findings(base_path, before, recover=recover)
+    return _subtract_base_findings(base_findings, before, after_findings, after)
+
+
 def _changed_content(
     repo: Path,
     tree: str,
@@ -1126,6 +1213,7 @@ def _changed_content(
     env: dict[str, str],
     *,
     recover: bool = False,
+    subtract_base: bool = False,
 ) -> list[Finding]:
     active = [change for change in changes if not change.status.startswith("D")]
     try:
@@ -1141,7 +1229,11 @@ def _changed_content(
             continue
         added = _added_lines(change, before, after)
         findings.extend(_path_findings(change, added, after))
-        findings.extend(_content_findings(change.path, after, recover=recover))
+        findings.extend(
+            _change_findings(
+                change, before, after, recover=recover, subtract_base=subtract_base
+            )
+        )
     return findings
 
 
@@ -1151,6 +1243,7 @@ def _scan_change_tree(
     source_rev: str,
     *,
     recover: bool = False,
+    subtract_base: bool = False,
 ) -> list[Finding]:
     tree = _resolve_tree(repo_root, source_rev)
     with tempfile.TemporaryDirectory(prefix="bundlebees-subversion-") as scratch:
@@ -1170,12 +1263,28 @@ def _scan_change_tree(
         changes = _changed_paths(diff)
         listing = _git(repo_root, ["ls-files", "-s", "-z"], env=env)
         entries = _index_entries(listing)
-        return _changed_content(repo_root, tree, changes, entries, env, recover=recover)
+        return _changed_content(
+            repo_root,
+            tree,
+            changes,
+            entries,
+            env,
+            recover=recover,
+            subtract_base=subtract_base,
+        )
 
 
 def scan_change(patch: str, repo_root: str | Path, source_rev: str) -> list[Finding]:
+    """Repo-backed scan: whole-file findings minus the ones the base already had.
+
+    The patch-only scan (``scan_patch``) keeps its own reconstruction semantics;
+    only this path has a real base revision to subtract.
+    """
+
     try:
-        findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+        findings = _scan_change_tree(
+            patch, Path(repo_root), str(source_rev), subtract_base=True
+        )
         return ScanFindings(_dedupe(findings))
     except _ScanFailure as exc:
         return _input_finding(exc.path)
@@ -1337,18 +1446,21 @@ def scan_patch(
     """Scan a patch for test-runner subversion.
 
     With ``repo_root`` and ``source_rev`` the patch is applied to that tree and
-    the *whole* post-image file is scanned. Without them the changed files are
-    rebuilt from the hunks the patch carries, so a partial hunk is only a
-    fragment of a file: ``ast`` cannot parse it and the scan reports
-    ``parse_error`` on a file that is valid once the patch applies. Verify
-    always has the repository and the dispatched source revision, so it passes
-    both; a patch that does not apply to that tree falls back to the patch-only
-    scan and is refused later by the revision checks.
+    the *whole* post-image file is scanned, minus the content findings the base
+    revision already carried. Without them the changed files are rebuilt from
+    the hunks the patch carries, so a partial hunk is only a fragment of a
+    file: ``ast`` cannot parse it and the scan reports ``parse_error`` on a
+    file that is valid once the patch applies. Verify always has the repository
+    and the dispatched source revision, so it passes both; a patch that does
+    not apply to that tree falls back to the patch-only scan and is refused
+    later by the revision checks.
     """
 
     if repo_root is not None and source_rev:
         try:
-            findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+            findings = _scan_change_tree(
+                patch, Path(repo_root), str(source_rev), subtract_base=True
+            )
         except _ScanFailure:
             findings = None
         except (OSError, UnicodeError, ValueError, TypeError):
