@@ -12,17 +12,18 @@ Run: python -m pytest tests/test_review_calibration.py -q
 
 from __future__ import annotations
 
-from bundlebees_plugin.review_calibration import (
-    calibration_table,
-    promotion_status,
-    record_pair,
-)
 
+
+
+def _load():
+    import importlib
+
+    return importlib.import_module("bundlebees_plugin.review_calibration")
 HEAD = "c" * 40
 
 
 def _pair(pr: int, bee: str, human: str, *, types=("general",), bee_block=(), human_block=()):
-    return record_pair(
+    return m.record_pair(
         {
             "repo": "mojomast/rizzstack",
             "pr": pr,
@@ -43,8 +44,9 @@ def _pair(pr: int, bee: str, human: str, *, types=("general",), bee_block=(), hu
 
 
 def test_table_pairs_both_verdicts_and_names_the_deltas():
+    m = _load()
     record = _pair(41, "approve", "changes_requested", human_block=("gate bypass",))
-    table = calibration_table([record])
+    table = m.calibration_table([record])
     row = table[0]
     assert row["pr"] == 41
     assert row["bee"] == "approve"
@@ -54,54 +56,59 @@ def test_table_pairs_both_verdicts_and_names_the_deltas():
 
 
 def test_false_blocks_are_bee_findings_the_human_did_not_raise():
+    m = _load()
     record = _pair(42, "changes_requested", "approve", bee_block=("style nit",))
-    row = calibration_table([record])[0]
+    row = m.calibration_table([record])[0]
     assert row["false_blocks"] == ["style nit"]
     assert row["missed"] == []
 
 
 def test_nine_reviews_are_not_promoted():
+    m = _load()
     records = [_pair(n, "approve", "approve") for n in range(1, 10)]
-    status = promotion_status(records)
+    status = m.promotion_status(records)
     assert status["prs"] == 9
     assert status["promoted"] is False
 
 
 def test_ten_reviews_with_three_sensitive_ones_can_promote():
+    m = _load()
     records = [_pair(n, "approve", "approve") for n in range(1, 8)]
     records += [
         _pair(8, "approve", "approve", types=("gate_security",)),
         _pair(9, "approve", "approve", types=("deploy_path",)),
         _pair(10, "approve", "approve", types=("gate_security", "general")),
     ]
-    status = promotion_status(records)
+    status = m.promotion_status(records)
     assert (status["prs"], status["sensitive"]) == (10, 3)
     assert status["missed"] == 0
     assert status["promoted"] is True
 
 
 def test_one_missed_blocking_finding_blocks_promotion():
+    m = _load()
     records = [_pair(n, "approve", "approve") for n in range(1, 8)]
     records += [_pair(8, "approve", "approve", types=("gate_security",)),
                 _pair(9, "approve", "approve", types=("deploy_path",)),
                 _pair(10, "approve", "changes_requested", types=("gate_security",),
                       human_block=("vendored copy is stale",))]
-    status = promotion_status(records)
+    status = m.promotion_status(records)
     assert status["missed"] == 1
     assert status["promoted"] is False
 
 
 def test_false_block_rate_boundary_is_twenty_percent():
+    m = _load()
     records = []
     for n in range(1, 9):
         records.append(_pair(n, "approve", "approve", types=("gate_security",)))
     records.append(_pair(9, "changes_requested", "approve", bee_block=("nit",)))
     records.append(_pair(10, "changes_requested", "approve", bee_block=("nit",)))
-    status = promotion_status(records)
+    status = m.promotion_status(records)
     assert status["false_block_rate"] == 0.2
     assert status["promoted"] is True
 
     records.append(_pair(11, "changes_requested", "approve", bee_block=("nit",)))
-    status = promotion_status(records)
+    status = m.promotion_status(records)
     assert status["false_block_rate"] > 0.2
     assert status["promoted"] is False
