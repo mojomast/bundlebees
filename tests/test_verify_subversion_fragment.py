@@ -17,7 +17,8 @@ Covered here:
   still a ``forced_exit`` (the repair must not hide it behind a synthetic
   function);
 * an unrepairable fragment still evaluates the per-added-line rules
-  (``os._exit``) instead of becoming a no-op;
+  (``os._exit``) and the tree-only module-level shapes (``sys.modules``,
+  ``sys.exit``) on the added lines instead of becoming a no-op;
 * a *created* file's post-image is complete, so a file that really does not
   parse is still refused.
 """
@@ -27,6 +28,8 @@ from __future__ import annotations
 import ast
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from bundlebees_plugin import subversion_scan, verify_local
 
@@ -246,6 +249,66 @@ def test_an_unrepairable_fragment_still_evaluates_the_added_lines(tmp_path: Path
     findings = subversion_scan.scan_patch(exiting_patch)
     assert _kinds(findings) == {"forced_exit"}, findings
     assert [finding["line"] for finding in findings] == [_line_of(exiting, "    os._exit(1)")], findings
+
+
+def _assert_gate_refuses(patch: str, **kwargs) -> None:
+    with pytest.raises(verify_local.VerifyError) as refused:
+        verify_local.check_patch_subversion(patch, **kwargs)
+    assert refused.value.code == "test_subversion"
+
+
+@pytest.mark.parametrize(
+    ("addition", "kind"),
+    (
+        ('sys.modules["probe"] = sys.modules[__name__]', "patched_sys_modules"),
+        ("sys.exit(1)", "forced_exit"),
+    ),
+)
+def test_an_unrepairable_fragment_still_evaluates_tree_only_shapes(
+    tmp_path: Path, addition: str, kind: str
+):
+    """A fragment no scope can repair must still apply the tree-only rules.
+
+    ``sys.modules`` writes and module-level ``sys.exit`` have no per-line
+    pattern, so a fragment that cannot be repaired used to turn them into
+    no-ops (the review-round-1 false accept). Both scanner paths must name the
+    real rule — a bare refusal for ``parse_error`` does not count.
+    """
+
+    repo, base = _fixture_repo(tmp_path, {"pkg/ledger.py": LEDGER})
+    exiting = LEDGER + "\n" + addition + "\n"
+    patch = _patch_after(repo, "pkg/ledger.py", exiting)
+    _assert_applies(repo, patch, exiting)
+    assert [line for line in patch.splitlines() if line.startswith("@@")] == [
+        "@@ -7,3 +7,5 @@ def run(values):"
+    ], patch
+
+    # Premise: the hunk's fragment opens inside ``parts = [`` and ends on a
+    # module-level line, so no synthetic scope repairs it. Trees that predate
+    # the fragment fix have no repair helper at all; there every fragment was
+    # a ``parse_error``, which the assertions below still reject.
+    fragment = "        for value in values\n    ]\n    return parts\n\n" + addition + "\n"
+    repair = getattr(subversion_scan, "_repair_python", None)
+    assert repair is None or repair(fragment) is None
+
+    findings = subversion_scan.scan_patch(patch)
+    assert _kinds(findings) == {kind}, findings
+    assert [finding["line"] for finding in findings] == [_line_of(exiting, addition)], findings
+    _assert_gate_refuses(patch)
+
+    findings = subversion_scan.scan_patch(patch, repo_root=repo, source_rev=base)
+    assert _kinds(findings) == {kind}, findings
+    _assert_gate_refuses(patch, repo_root=repo, source_rev=base)
+
+
+def test_an_unrepairable_fragment_with_a_benign_added_line_is_accepted(tmp_path: Path):
+    """The fallback must not turn every unrepairable fragment into a refusal."""
+
+    repo, _base = _fixture_repo(tmp_path, {"pkg/ledger.py": LEDGER})
+    benign = LEDGER + "\n# tidy\n"
+    patch = _patch_after(repo, "pkg/ledger.py", benign)
+    _assert_applies(repo, patch, benign)
+    assert subversion_scan.scan_patch(patch) == []
 
 
 def test_a_created_file_that_does_not_parse_is_still_refused(tmp_path: Path):

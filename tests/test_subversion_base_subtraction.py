@@ -16,6 +16,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from bundlebees_plugin import subversion_scan, verify_local
 
 #: Both shapes below are pre-existing and legitimate for this module: the
@@ -41,6 +43,22 @@ CLEAN = '''"""Clean module (fixture)."""
 
 def value():
     return 1
+'''
+
+#: A pre-existing module-level shape whose payload spans several lines: the
+#: finding names the first line, so a shape keyed on that line alone would
+#: subtract a rewritten continuation.
+MULTILINE = '''"""Multi-line legacy module (fixture)."""
+
+import sys
+
+sys.modules["probe"] = (
+    object()
+)
+
+
+def run(argv):
+    return len(argv)
 '''
 
 
@@ -140,6 +158,47 @@ def test_a_second_copy_of_a_pre_existing_shape_is_refused(tmp_path: Path):
     findings = _findings(repo, base, _edit_patch(repo, "pkg/legacy.py", post))
 
     assert [finding["kind"] for finding in findings] == ["patched_sys_modules"]
+
+
+def test_rewriting_a_pre_existing_multiline_shape_is_refused(tmp_path: Path):
+    """The shape is the whole statement, not just the line the finding names.
+
+    A patch can leave a pre-existing ``sys.modules`` statement's first line
+    untouched and rewrite its payload on a continuation line. Keyed on the
+    first line alone that shape was subtracted and the repo-backed scan
+    accepted a changed tampering payload (review-round-1 finding 2).
+    """
+
+    repo, base = _repo(tmp_path, {"pkg/legacy.py": MULTILINE})
+    post = MULTILINE.replace("    object()\n", "    __import__('evil')\n", 1)
+
+    findings = _findings(repo, base, _edit_patch(repo, "pkg/legacy.py", post))
+
+    assert [finding["kind"] for finding in findings] == ["patched_sys_modules"]
+    assert findings[0]["line"] == 5
+    with pytest.raises(verify_local.VerifyError) as refused:
+        verify_local.check_patch_subversion(
+            _edit_patch(repo, "pkg/legacy.py", post), repo_root=repo, source_rev=base
+        )
+    assert refused.value.code == "test_subversion"
+
+    # And the patch-only scan names the same rule: the change is real in both
+    # paths, only the refusal mechanism differs.
+    patch_only = subversion_scan.scan_patch(_edit_patch(repo, "pkg/legacy.py", post))
+    assert {finding["kind"] for finding in patch_only} == {"patched_sys_modules"}
+
+
+def test_a_comment_inside_a_pre_existing_multiline_shape_is_still_subtracted(tmp_path: Path):
+    """Comment-only lines inside the statement are not part of its shape.
+
+    The whole-segment identity must not turn a comment added inside a
+    pre-existing multi-line statement into a refusal.
+    """
+
+    repo, base = _repo(tmp_path, {"pkg/legacy.py": MULTILINE})
+    post = MULTILINE.replace("    object()\n", "    # note\n    object()\n", 1)
+
+    assert _findings(repo, base, _edit_patch(repo, "pkg/legacy.py", post)) == []
 
 
 def test_dedenting_a_pre_existing_exit_out_of_its_guard_is_refused(tmp_path: Path):

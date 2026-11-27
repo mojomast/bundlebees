@@ -1127,14 +1127,87 @@ def _scan_tree(path: str, tree: ast.AST) -> list[Finding]:
     return _dedupe(scanner.findings)
 
 
+def _contiguous_runs(numbers: Sequence[int]) -> list[list[int]]:
+    """Group ascending line numbers into runs of consecutive numbers."""
+    runs: list[list[int]] = []
+    for number in numbers:
+        if runs and number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    return runs
+
+
+def _fragment_statement_tree(body: str, *, indented: bool) -> ast.AST | None:
+    """Parse one run of added lines as statements, preserving its depth.
+
+    A column-0 run is module-level code, so an unguarded ``sys.exit`` there
+    keeps module depth. A run that is indented in the post-image continues a
+    block, and is parsed inside a synthetic function so it is not promoted to
+    module level; the synthetic line is subtracted from every node again.
+    """
+    candidates = (
+        (("def _scan_fragment():\n", True),)
+        if indented
+        else (("", False), ("while True:\n", True), ("def _scan_fragment():\n", True))
+    )
+    for prefix, wrap in candidates:
+        source = prefix + (textwrap.indent(body, "    ") if wrap else body)
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        prefix_lines = prefix.count("\n")
+        if prefix_lines:
+            ast.increment_lineno(tree, -prefix_lines)
+        return tree
+    return None
+
+
+def _fragment_run_findings(
+    path: str, text: str, added: Sequence[int]
+) -> list[Finding]:
+    """Tree rules for the added lines of an unparseable hunk fragment.
+
+    The per-line content rules have no pattern for the module-level shapes
+    that only the tree scanner knows (a ``sys.modules`` write or call, an
+    unguarded ``sys.exit``). When no synthetic scope repairs the whole
+    fragment, each run of consecutive added lines is parsed on its own, so
+    those shapes are still evaluated on the lines the hunk adds instead of
+    becoming a no-op. Findings are mapped back to the fragment's own line
+    numbers.
+    """
+    if not added:
+        return []
+    lines = text.split("\n")
+    findings = []
+    for run in _contiguous_runs(added):
+        block = [lines[number - 1] for number in run if 1 <= number <= len(lines)]
+        if not block or not any(line.strip() for line in block):
+            continue
+        body = textwrap.dedent("\n".join(block)) + "\n"
+        indent = min(len(line) - len(line.lstrip()) for line in block if line.strip())
+        tree = _fragment_statement_tree(body, indented=indent > 0)
+        if tree is None:
+            continue
+        for finding in _scan_tree(path, tree):
+            position = finding["line"]
+            if 1 <= position <= len(run):
+                findings.append(
+                    Finding(kind=finding["kind"], path=path, line=run[position - 1])
+                )
+    return findings
+
+
 def _fragment_line_findings(
     path: str, text: str, added: Sequence[int] | None
 ) -> list[Finding]:
-    """Apply the per-added-line rules when no scope could repair the fragment.
+    """Findings for the added lines when no scope could repair the fragment.
 
-    These are exactly the rules the line-based scan applies to added lines, so
-    a fragment that cannot be parsed still evaluates them instead of becoming
-    a no-op.
+    The per-added-line rules are exactly the rules the line-based scan applies
+    (so ``os._exit`` still fires), and the tree-only module-level shapes are
+    evaluated on each run of consecutive added lines, so a fragment that
+    cannot be parsed is not a no-op.
     """
     if not added:
         return []
@@ -1143,6 +1216,7 @@ def _fragment_line_findings(
     for number in added:
         if 1 <= number <= len(lines):
             findings.extend(_added_line_findings(path, lines[number - 1], number))
+    findings.extend(_fragment_run_findings(path, text, added))
     return _dedupe(findings)
 
 
@@ -1159,8 +1233,9 @@ def _unparsed_findings(
     ``recover`` marks a partial input - the lines a hunk carries. Such a
     fragment is not required to be syntactically self-contained: once repaired
     it is scanned, and when it cannot be repaired the added lines are still
-    checked line by line. A complete file (a created file, or any input at all
-    in a repo-backed scan) keeps the ``parse_error`` finding.
+    checked line by line and as statement runs. A complete file (a created
+    file, or any input at all in a repo-backed scan) keeps the ``parse_error``
+    finding.
     """
     error = [_finding("parse_error", path, getattr(exc, "lineno", 1) or 1)]
     tree = _repair_python(text)
@@ -1206,35 +1281,122 @@ def _content_findings(
     return findings
 
 
-def _finding_shape(content: bytes, finding: Finding) -> tuple[str, int, str] | None:
-    """Line-independent identity of a Python finding, or ``None`` if unknown.
+class _StatementShape(NamedTuple):
+    """One statement's source span: line range, first-line indent, code text."""
 
-    The shape is the rule id plus the finding's own source line with its
-    indentation kept and its trailing whitespace dropped. Line numbers are
-    deliberately absent: a hunk that shifts a pre-existing statement down must
-    not resurrect it as "new". Indentation is kept because a patch that dedents
-    a statement out of its guard is a code change, not a line shift, and has to
-    be reported. ``parse_error`` is never subtracted (a file that does not
-    parse at the base stays fail-closed), and a line that cannot be read keeps
-    its finding for the same reason.
-    """
+    start: int
+    end: int
+    indent: int
+    text: str
 
-    if finding["kind"] == "parse_error":
-        return None
+
+def _decoded(content: bytes) -> str | None:
     try:
-        # Split on "\n" exactly like ``ast`` counts lines; ``str.splitlines``
-        # also splits on form feeds and other separators and would misalign.
-        lines = content.decode("utf-8", "strict").split("\n")
+        return content.decode("utf-8", "strict")
     except UnicodeDecodeError:
         return None
+
+
+def _parsed(text: str) -> ast.AST | None:
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _code_line(line: str) -> str | None:
+    """The line with trailing whitespace dropped, or ``None`` if it has no code."""
+
+    stripped = line.rstrip()
+    body = stripped.lstrip()
+    return stripped if body and not body.startswith("#") else None
+
+
+def _statement_shape(node: ast.AST, lines: Sequence[str]) -> _StatementShape | None:
+    """The shape of one statement node, or ``None`` if it has no code span."""
+
+    if not isinstance(node, ast.stmt):
+        return None
+    start = getattr(node, "lineno", None)
+    end = getattr(node, "end_lineno", None)
+    if start is None or end is None:
+        return None
+    if not 1 <= start <= end <= len(lines):
+        return None
+    segment = []
+    for number in range(start, end + 1):
+        line = _code_line(lines[number - 1])
+        if line is not None:
+            segment.append(line)
+    if not segment:
+        return None
+    first = segment[0]
+    body = first.lstrip()
+    return _StatementShape(
+        start=start,
+        end=end,
+        indent=len(first) - len(body),
+        text="\n".join([body, *segment[1:]]),
+    )
+
+
+def _statement_shapes(content: bytes) -> list[_StatementShape] | None:
+    """Full statement segments of *content*, for line-independent identity.
+
+    ``ast`` reports a finding at the line of the assignment target or the
+    call, which for a multi-line statement is its first line. Two shapes can
+    share that line while the statement does something else entirely (a patch
+    can rewrite the continuation of a pre-existing ``sys.modules`` statement),
+    so the whole statement segment is the shape: its first-line indentation (a
+    dedent out of a guard is a code change) plus every code line of the span.
+    Blank and comment-only lines inside the span are dropped, so a comment
+    added inside a pre-existing statement is still the same shape. ``None``
+    means the content does not parse; nothing is subtracted then.
+    """
+
+    text = _decoded(content)
+    if text is None:
+        return None
+    tree = _parsed(text)
+    if tree is None:
+        return None
+    lines = text.split("\n")
+    shapes = []
+    for node in ast.walk(tree):
+        shape = _statement_shape(node, lines)
+        if shape is not None:
+            shapes.append(shape)
+    return shapes
+
+
+def _finding_shape(
+    shapes: Sequence[_StatementShape] | None, finding: Finding
+) -> tuple[str, int, str] | None:
+    """Line-independent identity of a Python finding, or ``None`` if unknown.
+
+    The shape is the rule id plus the full source segment of the statement the
+    finding's node belongs to, with its indentation kept and trailing
+    whitespace dropped. Line numbers are deliberately absent: a hunk that
+    shifts a pre-existing statement down must not resurrect it as "new".
+    Indentation is kept because a patch that dedents a statement out of its
+    guard is a code change, not a line shift, and has to be reported. The
+    whole segment (not just its first line) is part of the identity so a patch
+    that rewrites the continuation of a multi-line ``sys.modules`` statement
+    cannot hide behind the line it did not touch. ``parse_error`` and content
+    that does not parse are never subtracted (fail closed).
+    """
+
+    if finding["kind"] == "parse_error" or not shapes:
+        return None
     line = finding["line"]
-    if not 1 <= line <= len(lines):
+    candidates = [shape for shape in shapes if shape.start <= line <= shape.end]
+    if not candidates:
         return None
-    text = lines[line - 1].rstrip()
-    body = text.lstrip()
-    if not body:
-        return None
-    return finding["kind"], len(text) - len(body), body
+    # The innermost statement that starts closest to the finding: a statement
+    # nested in a block (or a body inside a compound statement) wins over the
+    # compound it sits in.
+    shape = min(candidates, key=lambda item: (item.end - item.start, -item.start))
+    return finding["kind"], shape.indent, shape.text
 
 
 def _subtract_base_findings(
@@ -1250,14 +1412,16 @@ def _subtract_base_findings(
     identified are never subtracted (fail closed).
     """
 
+    base_shapes = _statement_shapes(base_content)
+    after_shapes = _statement_shapes(after_content)
     remaining = Counter(
         shape
         for finding in base
-        if (shape := _finding_shape(base_content, finding)) is not None
+        if (shape := _finding_shape(base_shapes, finding)) is not None
     )
     kept = []
     for finding in after:
-        shape = _finding_shape(after_content, finding)
+        shape = _finding_shape(after_shapes, finding)
         if shape is not None and remaining[shape]:
             remaining[shape] -= 1
             continue
