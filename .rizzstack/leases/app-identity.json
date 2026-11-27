@@ -1,0 +1,38 @@
+{
+  "branch": "feat/app-identity",
+  "contract_id": "app-identity",
+  "contract_sha256": "1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6",
+  "derived_from": {
+    "approved_at": "2026-11-27T20:21:34Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "contract": ".rizzstack/contracts/1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6.json"
+  },
+  "id": "app-identity",
+  "lease_version": "rizzstack.lease/1",
+  "review": {
+    "approved_at": "2026-11-27T20:21:34Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
+    "status": "frozen"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/app_auth.py",
+      "bundlebees_plugin/settings.py",
+      "plugin.yaml"
+    ],
+    "prohibited": [
+      "tests/test_app_auth.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_app_auth.py"
+    ]
+  },
+  "slice": "app-identity",
+  "source_rev": "d808275ae5249d59052d8f1aa47115706ba60eec"
+}

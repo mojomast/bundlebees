@@ -1,0 +1,128 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "build_claims sets iss to the app id, iat 60 s back and exp 540 s ahead.",
+      "tests": [
+        "tests/test_app_auth.py::test_claims_are_short_lived_and_issued_for_the_app"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "A cached installation token is reused within its lifetime and re-minted after expiry.",
+      "tests": [
+        "tests/test_app_auth.py::test_installation_token_is_cached_until_just_before_expiry"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "A private key with mode 0644 is refused with app_key_permissions.",
+      "tests": [
+        "tests/test_app_auth.py::test_group_readable_key_is_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "token_for returns the token without key material and refuses an unconfigured app with app_not_configured.",
+      "tests": [
+        "tests/test_app_auth.py::test_token_for_reads_the_configured_app_without_leaking_the_key"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "The reviewer key path is accepted at 0600 and refused at 0640.",
+      "tests": [
+        "tests/test_app_auth.py::test_reviewer_key_is_only_readable_by_the_poster_user"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "app-identity",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "claims are short-lived and issued for the app",
+      "tokens are cached and refreshed",
+      "an insecurely permissioned key is refused"
+    ],
+    "summary": "Mint coordinator installation tokens from the app private key (short-lived JWT, cached until just before expiry), refuse a key readable by group/other, never return key material, and expose the reviewer key path only to the configured poster user."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:21:34Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "contract_sha256": "1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6",
+    "status": "approved",
+    "test_collection": {
+      "collected": 5,
+      "manifest_sha256": "59705c404ea5fefd44ef476b48da082a8748c8209adb85e4a70c10958cbafa34",
+      "source_rev": "d808275ae5249d59052d8f1aa47115706ba60eec"
+    }
+  },
+  "risk": {
+    "blast_radius": "the coordinator's GitHub identity and the reviewer app's signing key",
+    "reasons": [
+      "this code holds the keys that post reviews and push branches"
+    ],
+    "tier": "high"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/app_auth.py",
+      "bundlebees_plugin/settings.py",
+      "plugin.yaml"
+    ],
+    "prohibited": [
+      "tests/test_app_auth.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_app_auth.py"
+    ]
+  },
+  "source_rev": "d808275ae5249d59052d8f1aa47115706ba60eec",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "GitHub App installation tokens and reviewer key isolation",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_app_auth.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}
