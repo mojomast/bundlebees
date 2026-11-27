@@ -1107,16 +1107,33 @@ def _stage_uv_cache(
 
 
 def _pinned_tool_is_safe(source: Path) -> bool:
-    """Refuse a pinned tool the current user does not own or others can write."""
+    """Refuse a pinned tool with a foreign-owned or group/world-writable entry.
+
+    The tool is staged as a tree, so checking only the top path misses a
+    group-writable file deep inside a 244 MB runtime.  Walk every entry with
+    lstat (no reads, symlinks are checked as links because they are copied as
+    links).
+    """
     try:
-        info = source.stat()
+        entries = [source]
+        if source.is_dir():
+            entries.extend(source.rglob("*"))
     except OSError:
         return False
     if hasattr(os, "getuid"):
-        if info.st_uid != os.getuid():
-            return False
-        if info.st_mode & 0o022:
-            return False
+        for entry in entries:
+            try:
+                info = entry.lstat()
+            except OSError:
+                return False
+            if info.st_uid != os.getuid():
+                return False
+            if stat.S_ISLNK(info.st_mode):
+                # lstat on a Linux symlink always reports 0777; the link is
+                # copied as a link, so only its owner matters here.
+                continue
+            if info.st_mode & 0o022:
+                return False
     return True
 
 
