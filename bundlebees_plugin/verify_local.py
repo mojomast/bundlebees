@@ -129,8 +129,10 @@ def _check_frozen_green(
         "skipped": _junit_counter_or_default(junit, "skipped", 0),
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
-        "staged_tools": evidence.get("staged_tools"),
     }
+    tools = evidence.get("staged_tools")
+    if tools is not None:
+        result["staged_tools"] = tools
     try:
         record = tdd.make_record(
             contract,
@@ -1682,6 +1684,18 @@ def _verify_and_commit_locked(
     return record
 
 
+def _test_evidence_block(result: Mapping[str, Any]) -> dict[str, Any]:
+    """One red/suite block; staged tools are added only when the runner saw them."""
+    block: dict[str, Any] = {
+        "exit_code": result["exit_code"],
+        "timed_out": bool(result.get("timed_out")),
+    }
+    tools = result.get("staged_tools")
+    if tools is not None:
+        block["staged_tools"] = tools
+    return block
+
+
 def _record(
     attempt_id,
     sha,
@@ -1705,16 +1719,8 @@ def _record(
         "base_rev": base_rev,
         "files": list(files),
         "tests": list(tests),
-        "red": None if red is None else {
-            "exit_code": red["exit_code"],
-            "timed_out": bool(red.get("timed_out")),
-            "staged_tools": red.get("staged_tools"),
-        },
-        "suite": None if suite is None else {
-            "exit_code": suite.get("exit_code"),
-            "timed_out": bool(suite.get("timed_out")),
-            "staged_tools": suite.get("staged_tools"),
-        },
+        "red": None if red is None else _test_evidence_block(red),
+        "suite": None if suite is None else _test_evidence_block(suite),
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
         "patch_sha256": patch_sha256,
@@ -2091,7 +2097,7 @@ def _landed_evidence(
         "timed_out": bool(raw.get("timed_out")),
         "duration_s": raw.get("duration_s"),
         "junit": raw.get("junit") if isinstance(raw.get("junit"), Mapping) else None,
-        "staged_tools": raw.get("staged_tools"),
+        **({"staged_tools": raw["staged_tools"]} if raw.get("staged_tools") is not None else {}),
         "output_tail": str(tail or ""),
     }
 
@@ -2326,25 +2332,28 @@ def _landed_record(
         duration = float(evidence.get("duration_s") or 0.0)
     except (TypeError, ValueError):
         duration = 0.0
+    sandbox_block: dict[str, Any] = {
+        "backend": str(
+            evidence.get("backend")
+            or ("injected" if runner is not None else backend)
+        ),
+        "runner": str(evidence.get("runner") or "pytest"),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_s": max(0.0, duration),
+        "timeout_s": int(timeout),
+        "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
+    }
+    tools = evidence.get("staged_tools")
+    if tools is not None:
+        sandbox_block["staged_tools"] = tools
     return {
         "schema": LANDED_RECORD_SCHEMA,
         "sha": target,
         "tests": list(named),
         "ok": bool(exit_code == 0 and not timed_out),
         "counts": _landed_counts(evidence.get("junit"), len(named)),
-        "sandbox": {
-            "backend": str(
-                evidence.get("backend")
-                or ("injected" if runner is not None else backend)
-            ),
-            "runner": str(evidence.get("runner") or "pytest"),
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "duration_s": max(0.0, duration),
-            "timeout_s": int(timeout),
-            "staged_tools": evidence.get("staged_tools"),
-            "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
-        },
+        "sandbox": sandbox_block,
         "created_at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
