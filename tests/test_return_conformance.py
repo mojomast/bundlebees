@@ -42,7 +42,11 @@ def campaign(tmp_path_factory):
     # Only this test-authored repository and pytest command; real tests, real
     # local commits, real gitleaks. Does not exercise a sandbox/remote worker.
     def run(workdir, argv):
-        assert argv[:4] == [sys.executable, '-m', 'pytest', '-q']
+        # verify hands this runner the oracle-locked command (main config +
+        # allowlist); integrate's regression suite passes its own bare pytest
+        # argv. Both are real pytest invocations against the same tree.
+        assert argv[0] == sys.executable
+        assert 'pytest' in argv
         proc = subprocess.run(argv, cwd=workdir, capture_output=True, timeout=60)
         return dict(exit_code=proc.returncode, timed_out=False)
 

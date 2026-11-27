@@ -51,7 +51,7 @@ from . import coverage as _coverage
 from . import delivery as _delivery
 from . import campaign_cli
 from . import job_cli
-from . import acdd_cli, adapters, dispatch, leases, metrics, revision, sandbox
+from . import acdd_cli, adapters, dispatch, leases, metrics, oracle_lock, revision, sandbox
 from .security import child_env, config_flag, contain_path, first_secret_rule, looks_like_secret, scrub
 
 TOKEN_SECRET_NAME = "BUNDLEBEES_LAUNCHER_TOKEN"
@@ -2606,6 +2606,7 @@ def _run_sandboxed(
     config: Mapping[str, Any],
     *,
     strict_targets: bool = False,
+    main_ref: str | None = None,
 ) -> dict[str, Any]:
     """Run the selected test runner on a disposable copy of *workdir*; evidence only.
 
@@ -2613,6 +2614,10 @@ def _run_sandboxed(
     Python or Node test, and a mixed/unrecognised set is refused. ACDD passes
     contract ``scope.test_files``, which may include non-test fixtures, so its
     callers keep the legacy pytest-only selection.
+
+    With *main_ref*, pytest runs under the oracle lock: main's pytest
+    configuration and plugin allowlist, never the PR's. The lock file lives in
+    *workdir* only for the duration of the sandbox copy and is removed after.
     """
     if strict_targets:
         runner, selected = _select_test_runner(list(targets), Path(workdir))
@@ -2622,12 +2627,43 @@ def _run_sandboxed(
             runner, selected = "pytest", pytest_targets
         else:
             runner, selected = _select_test_runner(list(targets), Path(workdir))
+    lock: oracle_lock.OracleLock | None = None
+    env_extra: dict[str, str] | None = None
+    staged_config: Path | None = None
     if runner == "node-test":
         argv = ["node", "--test", *selected]
     else:
         argv = sandbox.pytest_argv(selected)
+        if main_ref:
+            try:
+                lock = oracle_lock.from_git(
+                    Path(workdir),
+                    str(main_ref),
+                    inside_name=oracle_lock.CONFIG_NAME,
+                )
+            except oracle_lock.OracleLockError as exc:
+                raise CliError(
+                    "oracle_lock_unavailable",
+                    str(exc),
+                    "Ensure the pinned base revision carries main's pytest "
+                    "configuration; verify refuses to run the PR's configuration.",
+                ) from exc
+            argv = oracle_lock.locked_argv(lock, argv, rootdir=workdir)
+            env_extra = lock.env()
+            # The canonical ini lives outside the checkout; stage the stable
+            # name into the copy the child runs in, and remove it afterwards.
+            staged_config = Path(workdir) / lock.config_name
+            if staged_config.exists() or staged_config.is_symlink():
+                raise CliError(
+                    "oracle_config_in_patch",
+                    f"the worktree already contains {lock.config_name}",
+                    "Reject this artifact; the harness owns the oracle configuration name.",
+                )
+            staged_config.write_bytes(lock.read_bytes())
     try:
-        result = sandbox.run_in_sandbox(workdir, argv, **_sandbox_options(config))
+        result = sandbox.run_in_sandbox(
+            workdir, argv, env_extra=env_extra, **_sandbox_options(config)
+        )
     except sandbox.SandboxUnavailable as exc:
         raise CliError(exc.code, exc.error, exc.fix) from exc
     except OSError as exc:
@@ -2646,6 +2682,14 @@ def _run_sandboxed(
             f"unknown verify_isolation backend: {exc}",
             "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
         ) from exc
+    finally:
+        if staged_config is not None:
+            try:
+                staged_config.unlink()
+            except OSError:
+                pass
+        if lock is not None:
+            lock.cleanup()
     if runner == "node-test" and _node_runner_missing(result):
         raise CliError(
             "node_runner_unavailable",
@@ -2658,8 +2702,16 @@ def _run_sandboxed(
     return evidence
 
 
-def _run_tests(workdir: Path, tests: list[str], config: Mapping[str, Any]) -> dict[str, Any]:
-    evidence = _run_sandboxed(workdir, tests, config, strict_targets=True)
+def _run_tests(
+    workdir: Path,
+    tests: list[str],
+    config: Mapping[str, Any],
+    *,
+    main_ref: str | None = None,
+) -> dict[str, Any]:
+    evidence = _run_sandboxed(
+        workdir, tests, config, strict_targets=True, main_ref=main_ref
+    )
     if evidence.get("timed_out") or evidence.get("exit_code") != 0:
         detail = _tail(evidence.get("output_tail"))
         raise CliError(
@@ -3259,8 +3311,24 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 "the worker result has no patch yet",
                 "Wait for the worker to finish and collect a result with a patch.",
             )
+        # The subversion scan reads the applied tree when it can: a patch hunk
+        # is a file fragment, and a patch-only scan reports parse_error on
+        # files that are valid after the patch applies. The lease's source_rev
+        # and the repository/worktree being verified are the tree inputs.
+        scan_repo = repo
+        if scan_repo is None:
+            candidate = getattr(args, "workdir", None) or config.get("worktree")
+            if candidate:
+                try:
+                    scan_repo = Path(str(candidate)).expanduser().resolve()
+                except (OSError, RuntimeError):
+                    scan_repo = None
         try:
-            verify_local.check_patch_subversion(patch)
+            verify_local.check_patch_subversion(
+                patch,
+                repo_root=scan_repo if source_rev else None,
+                source_rev=source_rev or None,
+            )
         except verify_local.VerifyError as exc:
             raise _as_cli_error(exc) from exc
 
@@ -3351,7 +3419,9 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
         # 4. Worker-produced code runs only in the disposable sandbox.
         green: dict[str, Any] | None = None
         if acdd_state is not None:
-            test_evidence = _run_sandboxed(workdir, tests, config)
+            test_evidence = _run_sandboxed(
+                workdir, tests, config, main_ref=source_rev
+            )
             passed = not test_evidence.get("timed_out") and test_evidence.get("exit_code") == 0
             if not passed or dry_run:
                 # Record against source_rev: the patch is applied but not committed.
@@ -3365,7 +3435,7 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                     raise
         else:
             try:
-                test_evidence = _run_tests(workdir, tests, config)
+                test_evidence = _run_tests(workdir, tests, config, main_ref=source_rev)
             except CliError:
                 _reset_patch(workdir)
                 raise
