@@ -44,11 +44,13 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import difflib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Iterator
 
@@ -57,6 +59,7 @@ import pytest
 from bundlebees_plugin import cli, subversion_scan, verify_local
 from tests.test_cli import (
     ATTEMPT_ID,
+    IN_LEASE_PATCH,
     FakeClient,
     _ctx,
     _git as _cli_git,
@@ -412,6 +415,275 @@ def test_findings_name_the_path_and_line_without_echoing_secrets():
     assert finding["path"] == "src/pkg/core.py"
     assert isinstance(finding["line"], int) and finding["line"] >= 1
     assert "abcdef123" not in repr(finding)
+
+
+# --- pyproject scope: pytest/coverage only, build tables are clean -------
+#
+# A pyproject.toml edit is not test-runner subversion by itself.  A build or
+# packaging table and ordinary [project] metadata must stay clean; a pytest or
+# coverage table, a pytest11 entry point and a pytest plugin dependency must
+# not.  Every line is attributed to the real TOML table that contains it, so a
+# header-looking line in a multiline string cannot move a build line into a
+# pytest table.
+
+
+_PYPROJECT_BASE = """\
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pkg"
+version = "0.1.0"
+description = "A package"
+dependencies = [
+  "requests>=2",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/**",
+  "README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pkg"]
+"""
+
+
+def _text_patch(path: str, before: str, after: str) -> str:
+    """A git-shaped unified diff between two whole-file texts."""
+    lines = difflib.unified_diff(
+        before.splitlines(),
+        after.splitlines(),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+    )
+    return f"diff --git a/{path} b/{path}\n" + "\n".join(lines) + "\n"
+
+
+def _pyproject_patch(before: str, after: str) -> list[subversion_scan.Finding]:
+    assert before != after
+    return _scan(
+        _text_patch("pyproject.toml", before, after),
+        base={"pyproject.toml": before},
+    )
+
+
+_C2_PKG_PYPROJECT = """\
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyvv"
+version = "0.1.18"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "result.schema.json",
+  "config.example.json",
+  "contract/**",
+  "scripts/**",
+  "tests/**",
+  "README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hyvv"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"rails_log_source.py" = "rails_log_source.py"
+"rails_export.py" = "rails_export.py"
+"contrib/rizzstack_rails" = "contrib/rizzstack_rails"
+"agy_cua_mcp.py" = "agy_cua_mcp.py"
+"brief.schema.json" = "brief.schema.json"
+"result.schema.json" = "result.schema.json"
+"""
+
+
+def _c2_pkg_patch() -> str:
+    after = _C2_PKG_PYPROJECT.replace(
+        '  "contract/**",\n',
+        '  "contract/**",\n  "schemas/**",\n',
+    ).replace(
+        '"contrib/rizzstack_rails" = "contrib/rizzstack_rails"\n',
+        '"contrib/rizzstack_rails" = "contrib/rizzstack_rails"\n'
+        '"schemas/rizzstack-ticket.schema.json" = "schemas/rizzstack-ticket.schema.json"\n',
+    )
+    return _text_patch("pyproject.toml", _C2_PKG_PYPROJECT, after)
+
+
+def test_c2_pkg_actual_packaging_lines_are_not_findings():
+    patch = _c2_pkg_patch()
+    assert _scan(patch, base={"pyproject.toml": _C2_PKG_PYPROJECT}) == []
+    assert subversion_scan.scan_patch(patch) == []
+
+
+def test_build_system_and_hatch_build_lines_are_not_findings():
+    before = _PYPROJECT_BASE
+    after = before.replace(
+        'requires = ["hatchling"]', 'requires = ["hatchling", "wheel"]'
+    ).replace('  "README.md",\n', '  "README.md",\n  "schemas/**",\n')
+    assert _pyproject_patch(before, after) == []
+
+
+def test_project_metadata_lines_are_not_findings():
+    before = _PYPROJECT_BASE
+    after = before.replace('version = "0.1.0"', 'version = "0.1.1"').replace(
+        'description = "A package"', 'description = "A renamed package"'
+    )
+    assert _pyproject_patch(before, after) == []
+
+
+def test_build_line_is_clean_when_pytest_config_already_exists():
+    before = (
+        _PYPROJECT_BASE
+        + '\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "-p preexisting"\n'
+    )
+    after = before.replace('  "README.md",\n', '  "README.md",\n  "schemas/**",\n')
+    assert _pyproject_patch(before, after) == []
+
+
+def test_build_line_is_clean_when_a_pytest11_entry_point_already_exists():
+    before = (
+        _PYPROJECT_BASE
+        + '\n[project.entry-points.pytest11]\npreexisting = "preexisting.plugin"\n'
+    )
+    after = before.replace('  "README.md",\n', '  "README.md",\n  "schemas/**",\n')
+    assert _pyproject_patch(before, after) == []
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("addopts", '"-q"'),
+        ("testpaths", '["tests"]'),
+        ("markers", '["slow: slow tests"]'),
+        ("filterwarnings", '["ignore::DeprecationWarning"]'),
+        ("minversion", '"7.0"'),
+        ("python_files", '"test_*.py"'),
+    ],
+    ids=["addopts", "testpaths", "markers", "filterwarnings", "minversion", "python_files"],
+)
+def test_tool_pytest_option_is_a_finding(option, value):
+    before = _PYPROJECT_BASE + "\n[tool.pytest.ini_options]\n"
+    kinds = {finding["kind"] for finding in _pyproject_patch(before, before + f"{option} = {value}\n")}
+    assert "pytest_config" in kinds
+
+
+def test_tool_pytest_addopts_plugin_flag_is_a_finding():
+    before = _PYPROJECT_BASE + "\n[tool.pytest.ini_options]\n"
+    kinds = {
+        finding["kind"]
+        for finding in _pyproject_patch(before, before + 'addopts = "-q -p evil"\n')
+    }
+    assert {"pytest_config", "pytest_plugin"} <= kinds
+
+
+def test_tool_coverage_table_is_a_finding():
+    before = _PYPROJECT_BASE + "\n[tool.coverage.run]\n"
+    findings = _pyproject_patch(before, before + 'omit = ["pkg/*"]\n')
+    assert "coverage_config" in {finding["kind"] for finding in findings}
+
+
+def test_pytest11_entry_point_table_is_a_finding():
+    before = _PYPROJECT_BASE
+    after = before + '\n[project.entry-points.pytest11]\nevil = "evil.plugin"\n'
+    findings = _pyproject_patch(before, after)
+    assert {finding["kind"] for finding in findings} >= {"pytest_plugin"}
+
+
+def test_quoted_pytest11_entry_point_table_is_a_finding():
+    before = _PYPROJECT_BASE
+    after = before + '\n[project.entry-points."pytest11"]\nevil = "evil.plugin"\n'
+    findings = _pyproject_patch(before, after)
+    assert "pytest_plugin" in {finding["kind"] for finding in findings}
+
+
+def test_core_pytest_plugin_dependency_is_a_finding():
+    before = _PYPROJECT_BASE
+    after = before.replace(
+        '  "requests>=2",\n', '  "requests>=2",\n  "pytest-evil>=1",\n'
+    )
+    findings = _pyproject_patch(before, after)
+    assert "pytest_plugin" in {finding["kind"] for finding in findings}
+
+
+def test_optional_pytest_plugin_dependency_is_a_finding():
+    before = _PYPROJECT_BASE + '\n[project.optional-dependencies]\ntest = [\n  "pytest>=8",\n]\n'
+    after = before.replace('  "pytest>=8",\n', '  "pytest>=8",\n  "pytest-evil>=1",\n')
+    findings = _pyproject_patch(before, after)
+    assert "pytest_plugin" in {finding["kind"] for finding in findings}
+
+
+def test_dependency_named_by_a_pytest11_entry_point_is_a_finding():
+    before = _PYPROJECT_BASE + '\n[project.entry-points.pytest11]\nacme = "acme_hooks"\n'
+    after = before.replace(
+        '  "requests>=2",\n', '  "requests>=2",\n  "acme-hooks>=1",\n'
+    )
+    findings = _pyproject_patch(before, after)
+    assert "pytest_plugin" in {finding["kind"] for finding in findings}
+
+
+def test_ordinary_dependency_is_not_a_finding():
+    before = _PYPROJECT_BASE
+    after = before.replace('  "requests>=2",\n', '  "requests>=2",\n  "httpx>=0.27",\n')
+    assert _pyproject_patch(before, after) == []
+
+
+def test_pytest_looking_key_in_a_build_table_is_not_a_finding():
+    before = _PYPROJECT_BASE + "\n[tool.hatch.build.targets.sdist.extra]\n"
+    assert _pyproject_patch(before, before + 'addopts = "-p evil"\n') == []
+
+
+def test_header_shaped_line_inside_a_multiline_string_is_not_a_finding():
+    before = (
+        _PYPROJECT_BASE
+        + "\n[tool.hatch.build.targets.sdist.metadata]\nnote = \"\"\"\n"
+    )
+    after = before + '[tool.pytest.ini_options]\n"""\n'
+    assert _pyproject_patch(before, after) == []
+
+
+def test_pytest_header_after_a_build_table_is_a_finding():
+    before = _PYPROJECT_BASE
+    after = before + "\n[tool.pytest.ini_options]\n"
+    findings = _pyproject_patch(before, after)
+    assert [(f["kind"], f["path"]) for f in findings if f["kind"] == "pytest_config"] == [
+        ("pytest_config", "pyproject.toml")
+    ]
+
+
+def test_multiline_close_sharing_the_array_bracket_keeps_later_tables_visible():
+    """A multiline close sharing its line with ``]`` must still close the array.
+
+    Dropping the remainder of a multiline-close line left the array depth above
+    zero, so every later line was addressed as the array's pending key and the
+    pytest table below it was never a finding (a gate weakening).
+    """
+    before = _PYPROJECT_BASE + "\n[tool.hatch.build.targets.sdist.extra]\ninclude = [\n"
+    after = (
+        before
+        + '  """multi\n[tool.pytest.ini_options]\n"""]\n'
+        + '[tool.pytest.ini_options]\naddopts = "-p evil"\n'
+    )
+    tomllib.loads(after)  # the shape must be valid TOML for the case to be real
+    findings = _pyproject_patch(before, after)
+    lines = after.splitlines()
+    addopts_line = lines.index('addopts = "-p evil"') + 1
+    occurrences = [
+        index + 1
+        for index, line in enumerate(lines)
+        if line == "[tool.pytest.ini_options]"
+    ]
+    assert len(occurrences) == 2, "one header inside the string, one real table"
+    _string_header, header_line = occurrences
+    assert [(f["kind"], f["line"]) for f in findings if f["kind"] == "pytest_config"] == [
+        ("pytest_config", header_line),
+        ("pytest_config", addopts_line),
+    ]
 
 
 # --- the wired verify gate ------------------------------------------------
@@ -1049,3 +1321,64 @@ def test_the_scan_alone_refuses_the_patch(tmp_path: Path, monkeypatch: pytest.Mo
     record = _record(state)
     assert record["ok"] is True
     assert "code" not in record
+
+
+# --- tree inputs: a partial hunk is a fragment, not a parse error ---------
+
+_PALETTE = """\
+COLORS = [
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "indigo",
+]
+"""
+
+
+def _palette_patch() -> str:
+    after = _PALETTE.replace('    "green",\n', '    "green2",\n')
+    return _text_patch("src/palette.py", _PALETTE, after)
+
+
+def test_partial_hunk_is_a_fragment_for_a_patch_only_scan():
+    """The patch alone rebuilds only the hunk, so ``ast`` refuses the fragment."""
+    kinds = {finding["kind"] for finding in subversion_scan.scan_patch(_palette_patch())}
+    assert kinds == {"parse_error"}
+
+
+def test_scan_patch_reads_the_applied_tree_when_given_repo_and_source_rev():
+    """repo_root + source_rev scan the whole post-image, so the fragment class is gone."""
+    patch = _palette_patch()
+    with _case(patch, {"src/palette.py": _PALETTE}) as (repo, sha):
+        assert subversion_scan.scan_patch(patch, repo, sha) == []
+        assert subversion_scan.scan_for_verify(patch, repo, sha) == []
+
+
+def test_scan_patch_with_only_one_tree_input_fails_closed():
+    patch = _palette_patch()
+    with _case(patch, {"src/palette.py": _PALETTE}) as (repo, _sha):
+        findings = subversion_scan.scan_patch(patch, repo_root=repo)
+    assert [finding["kind"] for finding in findings] == ["unreadable_input"]
+
+
+def test_cli_verify_passes_the_worktree_and_source_rev_to_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo, state, base_sha = _setup(tmp_path)
+    seen: dict[str, object] = {}
+    real = verify_local.check_patch_subversion
+
+    def spy(patch, repo_root=None, source_rev=None):
+        seen["repo_root"] = repo_root
+        seen["source_rev"] = source_rev
+        return real(patch, repo_root, source_rev)
+
+    monkeypatch.setattr(verify_local, "check_patch_subversion", spy)
+
+    rc, error, _doubles = _drive(repo, state, CLEAN_PATCH, base_sha, monkeypatch)
+
+    assert rc == 0, f"a clean patch was refused: {_code(error, rc, state)}"
+    assert Path(seen["repo_root"]).resolve() == repo.resolve()
+    assert seen["source_rev"] == base_sha

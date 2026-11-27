@@ -7,6 +7,7 @@ user namespaces are disabled). The worktree is always a ``tmp_path``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -1120,3 +1121,69 @@ def test_run_in_sandbox_reads_the_sha256_head_once(
 
     assert len(reads) == 1
     assert caught.value.code == "sandbox_git_head_unsupported"
+
+
+# --- pinned portable tools --------------------------------------------------
+
+
+def test_needed_pinned_tools_reads_literal_tool_names(tmp_path: Path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_install.py").write_text(
+        'import shutil\nuv = shutil.which("uv")\npwsh = shutil.which("pwsh")\nnot_uv = "uvicorn"\n',
+        encoding="utf-8",
+    )
+    assert sandbox._needed_pinned_tools(tmp_path) == {"uv", "pwsh"}
+
+
+def test_stage_pinned_tools_copies_only_needed_names(tmp_path: Path):
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    uv = _write_script(tmp_path / "uv", "#!/bin/sh\necho uv\n")
+    pwsh = _write_script(tmp_path / "pwsh", "#!/bin/sh\necho pwsh\n")
+    env = sandbox.stage_pinned_tools(
+        copy_dir,
+        {"PATH": "/usr/bin:/bin"},
+        tools=[("uv", str(uv)), ("pwsh", str(pwsh))],
+        needed={"uv"},
+    )
+    assert (copy_dir / ".bundlebees-tools" / "uv").is_file()
+    assert not (copy_dir / ".bundlebees-tools" / "pwsh").exists()
+    assert env["PATH"].startswith("./.bundlebees-tools:")
+    assert env["PATH"].endswith("/usr/bin:/bin")
+
+
+def test_staged_tool_hashes_record_file_and_directory(tmp_path: Path):
+    root = tmp_path / ".bundlebees-tools"
+    (root / "pwsh" / "dotnet").mkdir(parents=True)
+    (root / "uv").write_bytes(b"uv-bytes")
+    (root / "pwsh" / "dotnet" / "helper.so").write_bytes(b"pwsh-bytes")
+    (root / "uv-cache").mkdir()
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    assert set(hashes) == {"pwsh", "uv"}
+    assert hashes["uv"] == hashlib.sha256(b"uv-bytes").hexdigest()
+    assert len(hashes["pwsh"]) == 64
+    assert hashes["pwsh"] != hashes["uv"]
+
+
+def test_run_in_sandbox_puts_the_pinned_tool_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tool = _write_script(tmp_path / "uv", "#!/bin/sh\necho staged-uv\n")
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(tool)),))
+    work = tmp_path / "work"
+    (work / "tests").mkdir(parents=True)
+    (work / "tests" / "test_build.py").write_text(
+        'import shutil\nshutil.which("uv")\n', encoding="utf-8"
+    )
+    result = sandbox.run_in_sandbox(
+        work,
+        ["/bin/sh", "-c", "command -v uv; uv"],
+        allow_unsafe_local=True,
+        timeout=120,
+    )
+    assert result["exit_code"] == 0, result
+    assert ".bundlebees-tools/uv" in result["output_tail"]
+    assert "staged-uv" in result["output_tail"]
