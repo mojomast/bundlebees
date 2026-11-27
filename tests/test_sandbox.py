@@ -7,6 +7,7 @@ user namespaces are disabled). The worktree is always a ``tmp_path``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -1150,6 +1151,21 @@ def test_stage_pinned_tools_copies_only_needed_names(tmp_path: Path):
     assert not (copy_dir / ".bundlebees-tools" / "pwsh").exists()
     assert env["PATH"].startswith("./.bundlebees-tools:")
     assert env["PATH"].endswith("/usr/bin:/bin")
+
+
+def test_staged_tool_hashes_record_file_and_directory(tmp_path: Path):
+    root = tmp_path / ".bundlebees-tools"
+    (root / "pwsh" / "dotnet").mkdir(parents=True)
+    (root / "uv").write_bytes(b"uv-bytes")
+    (root / "pwsh" / "dotnet" / "helper.so").write_bytes(b"pwsh-bytes")
+    (root / "uv-cache").mkdir()
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    assert set(hashes) == {"pwsh", "uv"}
+    assert hashes["uv"] == hashlib.sha256(b"uv-bytes").hexdigest()
+    assert len(hashes["pwsh"]) == 64
+    assert hashes["pwsh"] != hashes["uv"]
 
 
 def test_run_in_sandbox_puts_the_pinned_tool_on_path(
