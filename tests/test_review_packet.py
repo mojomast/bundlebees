@@ -17,14 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin.review_packet import (
-    PACKET_PATHS,
-    PacketError,
-    build_packet,
-    claims_markdown,
-    head_matches,
-)
 
+
+
+def _load():
+    import importlib
+
+    return importlib.import_module("bundlebees_plugin.review_packet")
 HEAD = "1a1d032f98691fb4121d5b9673b36562c77a5627"
 
 
@@ -81,9 +80,10 @@ def _sources(checkout: Path) -> dict:
 
 
 def test_packet_layout_matches_skill(tmp_path: Path, checkout: Path):
+    m = _load()
     out = tmp_path / "review-root"
-    build_packet(_sources(checkout), out)
-    for rel in PACKET_PATHS:
+    m.build_packet(_sources(checkout), out)
+    for rel in m.PACKET_PATHS:
         assert (out / rel).exists(), rel
     packet = json.loads((out / "review/packet.json").read_text())
     assert packet["head_sha"] == _git(checkout, "rev-parse", "HEAD")
@@ -91,37 +91,41 @@ def test_packet_layout_matches_skill(tmp_path: Path, checkout: Path):
 
 
 def test_claims_are_claims_not_transcript():
-    text = claims_markdown(["the gate accepts the owner line"])
+    m = _load()
+    text = m.claims_markdown(["the gate accepts the owner line"])
     assert text.startswith("# Claims")
     assert "- [ ] the gate accepts the owner line" in text
 
 
 def test_author_transcript_is_not_a_trusted_source(tmp_path: Path, checkout: Path):
+    m = _load()
     sources = _sources(checkout)
     sources["transcript"] = "the author's reasoning"
-    with pytest.raises(PacketError) as caught:
-        build_packet(sources, tmp_path / "out")
+    with pytest.raises(m.PacketError) as caught:
+        m.build_packet(sources, tmp_path / "out")
     assert caught.value.code == "packet_untrusted_source"
 
     sources = _sources(checkout)
     sources["author_reasoning"] = "why the change is right"
-    with pytest.raises(PacketError) as caught:
-        build_packet(sources, tmp_path / "out")
+    with pytest.raises(m.PacketError) as caught:
+        m.build_packet(sources, tmp_path / "out")
     assert caught.value.code == "packet_untrusted_source"
 
 
 def test_head_mismatch_refused(tmp_path: Path, checkout: Path):
+    m = _load()
     sources = _sources(checkout)
     sources["packet"]["head_sha"] = "f" * 40
-    with pytest.raises(PacketError) as caught:
-        build_packet(sources, tmp_path / "out")
+    with pytest.raises(m.PacketError) as caught:
+        m.build_packet(sources, tmp_path / "out")
     assert caught.value.code == "packet_head_mismatch"
-    assert not head_matches(checkout, "f" * 40)
+    assert not m.head_matches(checkout, "f" * 40)
 
 
 def test_incomplete_packet_refused(tmp_path: Path, checkout: Path):
+    m = _load()
     sources = _sources(checkout)
     del sources["packet"]["head_sha"]
-    with pytest.raises(PacketError) as caught:
-        build_packet(sources, tmp_path / "out")
+    with pytest.raises(m.PacketError) as caught:
+        m.build_packet(sources, tmp_path / "out")
     assert caught.value.code == "packet_incomplete"
