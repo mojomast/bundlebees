@@ -1082,6 +1082,28 @@ def _needed_pinned_tools(copy_dir: Path) -> set[str]:
     return needed
 
 
+def _stage_uv_cache(
+    root: Path, env: Mapping[str, str], path_prefix: str, staged: set[str]
+) -> dict[str, str]:
+    """Stage the small pinned uv build cache when uv itself was staged."""
+    cache_source = Path(PINNED_UV_CACHE).expanduser()
+    if "uv" not in staged or not cache_source.is_dir():
+        return dict(env)
+    cache_destination = root / "uv-cache"
+    _remove_staged_entry(cache_destination)
+    try:
+        shutil.copytree(cache_source, cache_destination)
+    except OSError:
+        _remove_staged_entry(cache_destination)
+        return dict(env)
+    updated = dict(env)
+    updated["UV_CACHE_DIR"] = (
+        f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}/uv-cache"
+    )
+    updated["UV_OFFLINE"] = "1"
+    return updated
+
+
 def stage_pinned_tools(
     copy_dir: Path,
     env: Mapping[str, str],
@@ -1128,25 +1150,30 @@ def stage_pinned_tools(
             else f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}"
         )
         staged.add(str(name))
-    cache_source = Path(PINNED_UV_CACHE).expanduser()
-    if "uv" in staged and cache_source.is_dir():
-        cache_destination = root / "uv-cache"
-        _remove_staged_entry(cache_destination)
-        try:
-            shutil.copytree(cache_source, cache_destination)
-        except OSError:
-            _remove_staged_entry(cache_destination)
-        else:
-            env = dict(env)
-            env["UV_CACHE_DIR"] = (
-                f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}/uv-cache"
-            )
-            env["UV_OFFLINE"] = "1"
+    env = _stage_uv_cache(root, env, path_prefix, staged)
     if entries:
         updated = dict(env)
         updated["PATH"] = ":".join([*entries, updated.get("PATH", "")]).strip(":")
         return updated
     return dict(env)
+
+
+def _stage_tools_for_backend(
+    copy_dir: Path, env: Mapping[str, str], chosen: str | None
+) -> dict[str, str]:
+    """Stage named tools at the backend's view of the copy, then update PATH."""
+    if chosen == "bwrap":
+        prefix = "/work"
+    elif chosen == "firejail":
+        prefix = env["HOME"]
+    else:
+        prefix = str(copy_dir)
+    return stage_pinned_tools(
+        copy_dir,
+        env,
+        needed=_needed_pinned_tools(copy_dir),
+        path_prefix=prefix,
+    )
 
 
 def run_in_sandbox(
@@ -1310,18 +1337,7 @@ def run_in_sandbox(
             if cache is not None:
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
 
-        if chosen == "bwrap":
-            tools_prefix = "/work"
-        elif chosen == "firejail":
-            tools_prefix = env["HOME"]
-        else:
-            tools_prefix = str(copy_dir)
-        env = stage_pinned_tools(
-            copy_dir,
-            env,
-            needed=_needed_pinned_tools(copy_dir),
-            path_prefix=tools_prefix,
-        )
+        env = _stage_tools_for_backend(copy_dir, env, chosen)
         if payload:
             env.update(stage_payload(copy_dir, payload))
         if env_extra:
