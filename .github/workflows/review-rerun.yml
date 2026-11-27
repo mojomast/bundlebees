@@ -1,0 +1,59 @@
+name: review rerun
+
+# A submitted review changes what lease-tamper/ci-gate answer, but GitHub keeps
+# a failed check from the pull_request run beside any later green run of the same
+# name, so the merge box stays blocked. Re-run only the failed GATE jobs for the
+# reviewed head: a review must re-judge the review gate, never re-roll a failing
+# test.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rerun-failed-gates:
+    name: rerun failed gate jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Rerun lease-tamper and ci-gate on the pull_request runs for this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api --paginate --slurp \
+            "repos/$REPO/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100")
+          run_ids=$(printf '%s' "$runs" | jq -r --argjson pr "$PR_NUMBER" '
+            [.[].workflow_runs[]
+             | select(.status == "completed" and .conclusion == "failure")
+             | select(any(.pull_requests[]?; .number == $pr))
+             | .id] | unique | .[]')
+          if [ -z "$run_ids" ]; then
+            echo "no failed pull_request run for $REPO#$PR_NUMBER at $HEAD_SHA"
+            exit 0
+          fi
+          reran=0
+          for run in $run_ids; do
+            jobs=$(gh api --paginate --slurp \
+              "repos/$REPO/actions/runs/$run/jobs?per_page=100")
+            job_ids=$(printf '%s' "$jobs" | jq -r '
+              [.[].jobs[]
+               | select(.conclusion == "failure")
+               | select(.name == "lease-tamper" or .name == "ci-gate")
+               | .id] | unique | .[]')
+            for job in $job_ids; do
+              echo "rerun gate job: $job (run $run)"
+              gh api -X POST "repos/$REPO/actions/jobs/$job/rerun"
+              reran=$((reran + 1))
+            done
+          done
+          if [ "$reran" -eq 0 ]; then
+            echo "no failed gate job on $REPO#$PR_NUMBER at $HEAD_SHA"
+          fi
