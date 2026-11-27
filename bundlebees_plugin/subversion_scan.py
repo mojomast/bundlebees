@@ -1282,12 +1282,82 @@ def _content_findings(
 
 
 class _StatementShape(NamedTuple):
-    """One statement's source span: line range, first-line indent, code text."""
+    """One statement's source span: line range, first-line indent, text, guards."""
 
     start: int
     end: int
     indent: int
     text: str
+    ancestry: tuple[str, ...]
+
+
+#: Compound statements whose header decides whether a nested finding fires at
+#: all: flipping a guard (``if __name__ == "__main__":`` -> ``if True:``) leaves
+#: the nested statement untouched, so the guard has to be part of its shape.
+_COMPOUND_STATEMENTS = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+    getattr(ast, "TryStar", ast.Try),
+    ast.ExceptHandler,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.match_case,
+)
+
+
+def _parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+    """Map ``id(node)`` to its parent node for one parsed tree."""
+
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents.setdefault(id(child), parent)
+    return parents
+
+
+def _header_text(node: ast.AST, lines: Sequence[str]) -> str | None:
+    """The source of a compound statement's header (everything before its body)."""
+
+    start = getattr(node, "lineno", None)
+    if not isinstance(start, int):
+        return None
+    body = getattr(node, "body", None) or ()
+    first = getattr(body[0], "lineno", None) if body else None
+    stop = first - 1 if isinstance(first, int) and first > start else start
+    header = []
+    for number in range(start, stop + 1):
+        line = _code_line(lines[number - 1]) if 1 <= number <= len(lines) else None
+        if line is not None:
+            header.append(line)
+    if not header and 1 <= start <= len(lines):
+        line = _code_line(lines[start - 1])
+        if line is not None:
+            header.append(line)
+    text = "\n".join(header)
+    return textwrap.dedent(text) if text else None
+
+
+def _ancestor_headers(
+    node: ast.AST, parents: dict[int, ast.AST], lines: Sequence[str]
+) -> tuple[str, ...]:
+    """Every enclosing compound-statement header, outermost first."""
+
+    headers = []
+    parent = parents.get(id(node))
+    while parent is not None:
+        if isinstance(parent, _COMPOUND_STATEMENTS):
+            header = _header_text(parent, lines)
+            if header:
+                headers.append(header)
+        parent = parents.get(id(parent))
+    headers.reverse()
+    return tuple(headers)
 
 
 def _decoded(content: bytes) -> str | None:
@@ -1312,7 +1382,9 @@ def _code_line(line: str) -> str | None:
     return stripped if body and not body.startswith("#") else None
 
 
-def _statement_shape(node: ast.AST, lines: Sequence[str]) -> _StatementShape | None:
+def _statement_shape(
+    node: ast.AST, lines: Sequence[str], parents: dict[int, ast.AST]
+) -> _StatementShape | None:
     """The shape of one statement node, or ``None`` if it has no code span."""
 
     if not isinstance(node, ast.stmt):
@@ -1337,6 +1409,7 @@ def _statement_shape(node: ast.AST, lines: Sequence[str]) -> _StatementShape | N
         end=end,
         indent=len(first) - len(body),
         text="\n".join([body, *segment[1:]]),
+        ancestry=_ancestor_headers(node, parents, lines),
     )
 
 
@@ -1348,7 +1421,10 @@ def _statement_shapes(content: bytes) -> list[_StatementShape] | None:
     share that line while the statement does something else entirely (a patch
     can rewrite the continuation of a pre-existing ``sys.modules`` statement),
     so the whole statement segment is the shape: its first-line indentation (a
-    dedent out of a guard is a code change) plus every code line of the span.
+    dedent out of a guard is a code change) plus every code line of the span
+    plus the headers of every enclosing compound statement, outermost first (a
+    flipped guard such as ``if __name__ == "__main__":`` -> ``if True:``
+    changes whether the statement runs at import time without touching it).
     Blank and comment-only lines inside the span are dropped, so a comment
     added inside a pre-existing statement is still the same shape. ``None``
     means the content does not parse; nothing is subtracted then.
@@ -1361,9 +1437,10 @@ def _statement_shapes(content: bytes) -> list[_StatementShape] | None:
     if tree is None:
         return None
     lines = text.split("\n")
+    parents = _parent_map(tree)
     shapes = []
     for node in ast.walk(tree):
-        shape = _statement_shape(node, lines)
+        shape = _statement_shape(node, lines, parents)
         if shape is not None:
             shapes.append(shape)
     return shapes
@@ -1371,19 +1448,21 @@ def _statement_shapes(content: bytes) -> list[_StatementShape] | None:
 
 def _finding_shape(
     shapes: Sequence[_StatementShape] | None, finding: Finding
-) -> tuple[str, int, str] | None:
+) -> tuple[str, int, tuple[str, ...], str] | None:
     """Line-independent identity of a Python finding, or ``None`` if unknown.
 
     The shape is the rule id plus the full source segment of the statement the
-    finding's node belongs to, with its indentation kept and trailing
-    whitespace dropped. Line numbers are deliberately absent: a hunk that
-    shifts a pre-existing statement down must not resurrect it as "new".
+    finding's node belongs to, its indentation, and the headers of the compound
+    statements that enclose it. Line numbers are deliberately absent: a hunk
+    that shifts a pre-existing statement down must not resurrect it as "new".
     Indentation is kept because a patch that dedents a statement out of its
-    guard is a code change, not a line shift, and has to be reported. The
-    whole segment (not just its first line) is part of the identity so a patch
-    that rewrites the continuation of a multi-line ``sys.modules`` statement
-    cannot hide behind the line it did not touch. ``parse_error`` and content
-    that does not parse are never subtracted (fail closed).
+    guard is a code change, not a line shift, and has to be reported. The whole
+    segment (not just its first line) is part of the identity so a patch that
+    rewrites the continuation of a multi-line ``sys.modules`` statement cannot
+    hide behind the line it did not touch, and the guard chain is part of it so
+    a patch that changes only the guard around a pre-existing exit is reported.
+    ``parse_error`` and content that does not parse are never subtracted (fail
+    closed).
     """
 
     if finding["kind"] == "parse_error" or not shapes:
@@ -1396,7 +1475,7 @@ def _finding_shape(
     # nested in a block (or a body inside a compound statement) wins over the
     # compound it sits in.
     shape = min(candidates, key=lambda item: (item.end - item.start, -item.start))
-    return finding["kind"], shape.indent, shape.text
+    return finding["kind"], shape.indent, shape.ancestry, shape.text
 
 
 def _subtract_base_findings(
@@ -1404,14 +1483,20 @@ def _subtract_base_findings(
     base_content: bytes,
     after: list[Finding],
     after_content: bytes,
+    added: Sequence[int] = (),
 ) -> list[Finding]:
     """Drop post-image findings whose shape is already present at the base.
 
-    Counted, not just matched: a patch that adds a second copy of a shape the
-    base already carried still keeps one finding. Shapes that cannot be
-    identified are never subtracted (fail closed).
+    A finding on a line the patch added is never subtracted: the base cannot
+    have carried that line, and a moved pre-existing shape (an exit moved into
+    a helper, a ``sys.modules`` stub moved to import time) keeps the same text
+    while changing when it runs. Counted, not just matched, for the findings
+    that remain: a patch that adds a second copy of a shape the base already
+    carried still keeps one finding. Shapes that cannot be identified are
+    never subtracted (fail closed).
     """
 
+    added_lines = set(added)
     base_shapes = _statement_shapes(base_content)
     after_shapes = _statement_shapes(after_content)
     remaining = Counter(
@@ -1422,10 +1507,10 @@ def _subtract_base_findings(
     kept = []
     for finding in after:
         shape = _finding_shape(after_shapes, finding)
-        if shape is not None and remaining[shape]:
-            remaining[shape] -= 1
+        if finding["line"] in added_lines or shape is None or not remaining[shape]:
+            kept.append(finding)
             continue
-        kept.append(finding)
+        remaining[shape] -= 1
     return kept
 
 
@@ -1459,7 +1544,7 @@ def _change_findings(
     # nothing subtracted from an unparseable base fragment keeps the check
     # fail-closed.
     base_findings = _content_findings(base_path, before, recover=tolerance)
-    return _subtract_base_findings(base_findings, before, after_findings, after)
+    return _subtract_base_findings(base_findings, before, after_findings, after, added or ())
 
 
 def _fragment_tolerant(change: _Change, recover: bool) -> bool:

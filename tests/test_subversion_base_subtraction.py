@@ -61,6 +61,48 @@ def run(argv):
     return len(argv)
 '''
 
+#: A pre-existing module-level exit behind a real guard. Flipping the guard to
+#: ``if True:`` makes it run at import time while the exit line itself never
+#: moves, so the guard has to be part of the finding's shape.
+GUARDED = '''"""Guarded module (fixture)."""
+
+import sys
+
+
+def main():
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+#: A pre-existing exit that the patch only moves into another function. The
+#: moved line is added by the diff and must never be subtracted.
+MOVED_EXIT = '''"""Move fixture: a pre-existing exit inside main()."""
+
+import os
+
+
+def helper():
+    return 0
+
+
+def main():
+    os._exit(0)
+'''
+
+#: A dormant module stub moved to import time by a patch that only moves it.
+MOVED_STUB = '''"""Move fixture: a dormant module stub."""
+
+import sys
+
+
+def cli():
+    sys.modules["probe"] = None
+    return 0
+'''
+
 
 def _git(
     repo: Path, *args: str, input_text: str | None = None
@@ -199,6 +241,63 @@ def test_a_comment_inside_a_pre_existing_multiline_shape_is_still_subtracted(tmp
     post = MULTILINE.replace("    object()\n", "    # note\n    object()\n", 1)
 
     assert _findings(repo, base, _edit_patch(repo, "pkg/legacy.py", post)) == []
+
+
+def test_flipping_the_guard_around_a_pre_existing_exit_is_refused(tmp_path: Path):
+    """The guard is part of the shape: ``if True:`` makes the exit run at import.
+
+    The exit line itself never moves, so a statement-only shape subtracted it
+    and the repo-backed scan accepted a patch that turns a guarded exit into an
+    import-time exit (review round 2, guard flip).
+    """
+
+    repo, base = _repo(tmp_path, {"pkg/app.py": GUARDED})
+    post = GUARDED.replace('if __name__ == "__main__":', "if True:", 1)
+
+    findings = _findings(repo, base, _edit_patch(repo, "pkg/app.py", post))
+
+    assert [finding["kind"] for finding in findings] == ["forced_exit"]
+    assert findings[0]["line"] == 11
+    with pytest.raises(verify_local.VerifyError) as refused:
+        verify_local.check_patch_subversion(
+            _edit_patch(repo, "pkg/app.py", post), repo_root=repo, source_rev=base
+        )
+    assert refused.value.code == "test_subversion"
+
+    # The patch-only path already names the real rule; keep it pinned.
+    patch_only = subversion_scan.scan_patch(_edit_patch(repo, "pkg/app.py", post))
+    assert {finding["kind"] for finding in patch_only} == {"forced_exit"}
+
+
+def test_moving_a_pre_existing_exit_into_a_helper_is_refused(tmp_path: Path):
+    """A moved shape sits on an added line and is never subtracted."""
+
+    repo, base = _repo(tmp_path, {"pkg/app.py": MOVED_EXIT})
+    post = MOVED_EXIT.replace("def helper():\n    return 0\n",
+                              "def helper():\n    os._exit(0)\n", 1)
+    post = post.replace("def main():\n    os._exit(0)\n",
+                        "def main():\n    return 0\n", 1)
+
+    findings = _findings(repo, base, _edit_patch(repo, "pkg/app.py", post))
+
+    assert [finding["kind"] for finding in findings] == ["forced_exit"]
+    assert findings[0]["line"] == 7
+
+
+def test_moving_a_pre_existing_module_stub_to_import_time_is_refused(tmp_path: Path):
+    """Turning a dormant stub into an import-time one is the rule's purpose."""
+
+    repo, base = _repo(tmp_path, {"pkg/app.py": MOVED_STUB})
+    post = MOVED_STUB.replace(
+        "def cli():\n    sys.modules[\"probe\"] = None\n    return 0\n",
+        "def _boot():\n    sys.modules[\"probe\"] = None\n    return 0\n\n\n_boot()\n",
+        1,
+    )
+
+    findings = _findings(repo, base, _edit_patch(repo, "pkg/app.py", post))
+
+    assert [finding["kind"] for finding in findings] == ["patched_sys_modules"]
+    assert findings[0]["line"] == 7
 
 
 def test_dedenting_a_pre_existing_exit_out_of_its_guard_is_refused(tmp_path: Path):
