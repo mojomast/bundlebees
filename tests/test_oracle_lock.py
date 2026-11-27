@@ -575,3 +575,24 @@ def test_pinned_identity_excludes_a_shared_writable_pin(tmp_path, monkeypatch):
     verify_local._TOOL_IDENTITY_CACHE.clear()
 
     assert verify_local._pinned_tools_identity() == {}
+
+
+def test_pinned_identity_invalidates_on_a_deep_edit(tmp_path, monkeypatch):
+    from bundlebees_plugin import sandbox, verify_local
+
+    tree = tmp_path / "pwsh"
+    (tree / "a").mkdir(parents=True)
+    deep = tree / "a" / "x.dll"
+    deep.write_bytes(b"one")
+    deep.chmod(0o644)
+    (tree / "a").chmod(0o755)
+    tree.chmod(0o755)
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("pwsh", str(tree)),))
+    verify_local._TOOL_IDENTITY_CACHE.clear()
+
+    first = verify_local._pinned_tools_identity()
+    deep.write_bytes(b"two-two")
+    deep.chmod(0o644)
+    second = verify_local._pinned_tools_identity()
+
+    assert first != second

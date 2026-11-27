@@ -1233,3 +1233,15 @@ def test_stage_pinned_tools_refuses_a_group_writable_tool(tmp_path: Path):
 
     assert not (copy_dir / ".bundlebees-tools" / "uv").exists()
     assert env["PATH"] == "/usr/bin:/bin"
+
+
+def test_pinned_tool_safety_walks_the_tree(tmp_path: Path):
+    tree = tmp_path / "pwsh"
+    (tree / "a").mkdir(parents=True)
+    deep = tree / "a" / "pwsh"
+    deep.write_bytes(b"binary")
+    deep.chmod(0o666)
+    (tree / "a").chmod(0o755)
+    tree.chmod(0o755)
+
+    assert not sandbox._pinned_tool_is_safe(tree)
