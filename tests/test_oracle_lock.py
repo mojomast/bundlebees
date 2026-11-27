@@ -395,3 +395,17 @@ def test_harness_owned_tool_dir_is_refused_by_name():
         "pkg/.bundlebees-tools/pwsh/x"
     ]
     assert verify_local._harness_owned_paths(["src/app.py", "tests/test_app.py"]) == []
+
+
+def test_shard_tests_loads_the_main_lock_with_its_dataclasses():
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "shard_tests_under_test", root / ".github" / "scripts" / "shard_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    lock = module._load_main_oracle_lock("HEAD")
+    assert lock.CONFIG_NAME == ".bundlebees-oracle-pytest.ini"
