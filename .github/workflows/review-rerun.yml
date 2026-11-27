@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Rerun lease-tamper and ci-gate on the pull_request runs for this head
+      - name: Rerun lease-tamper on the pull_request runs for this head
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -46,7 +46,7 @@ jobs:
             job_ids=$(printf '%s' "$jobs" | jq -r '
               [.[].jobs[]
                | select(.conclusion == "failure")
-               | select(.name == "lease-tamper" or .name == "ci-gate")
+               | select(.name == "lease-tamper")
                | .id] | unique | .[]')
             for job in $job_ids; do
               echo "rerun gate job: $job (run $run)"
