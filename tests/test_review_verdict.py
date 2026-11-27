@@ -13,15 +13,13 @@ from __future__ import annotations
 
 import pytest
 
-from bundlebees_plugin.review_verdict import (
-    VerdictError,
-    check_binding,
-    post_verdict,
-    record_line,
-    render_review,
-    validate_verdict,
-)
 
+
+
+def _load():
+    import importlib
+
+    return importlib.import_module("bundlebees_plugin.review_verdict")
 HEAD = "1a1d032f98691fb4121d5b9673b36562c77a5627"
 PACKET = {"repo": "mojomast/rizzstack", "pr": 41, "head_sha": HEAD, "author_model_family": "unknown"}
 REVIEWER = {"identity": "rizzstack-reviewer", "model": "k3.1-pro", "model_family": "kimi"}
@@ -44,68 +42,77 @@ def _verdict(**overrides):
 
 
 def test_schema_invalid_refused():
-    with pytest.raises(VerdictError) as caught:
-        validate_verdict({"verdict": "approve"})
+    m = _load()
+    with pytest.raises(m.VerdictError) as caught:
+        m.validate_verdict({"verdict": "approve"})
     assert caught.value.code == "verdict_schema_invalid"
 
 
 def test_approve_with_a_blocking_finding_is_inconsistent():
+    m = _load()
     finding = {"severity": "blocking", "title": "gate bypass", "failure_scenario": "x -> y"}
-    with pytest.raises(VerdictError) as caught:
-        validate_verdict(_verdict(findings=[finding]))
+    with pytest.raises(m.VerdictError) as caught:
+        m.validate_verdict(_verdict(findings=[finding]))
     assert caught.value.code == "verdict_inconsistent"
 
 
 def test_changes_requested_needs_blocking_evidence():
-    with pytest.raises(VerdictError) as caught:
-        validate_verdict(_verdict(verdict="changes_requested"))
+    m = _load()
+    with pytest.raises(m.VerdictError) as caught:
+        m.validate_verdict(_verdict(verdict="changes_requested"))
     assert caught.value.code == "verdict_inconsistent"
 
     finding = {"severity": "blocking", "title": "gate bypass"}
-    with pytest.raises(VerdictError) as caught:
-        validate_verdict(_verdict(verdict="changes_requested", findings=[finding]))
+    with pytest.raises(m.VerdictError) as caught:
+        m.validate_verdict(_verdict(verdict="changes_requested", findings=[finding]))
     assert caught.value.code == "verdict_inconsistent"
 
 
 def test_needs_owner_names_a_decision():
-    with pytest.raises(VerdictError) as caught:
-        validate_verdict(_verdict(verdict="needs_owner"))
+    m = _load()
+    with pytest.raises(m.VerdictError) as caught:
+        m.validate_verdict(_verdict(verdict="needs_owner"))
     assert caught.value.code == "verdict_inconsistent"
-    validate_verdict(_verdict(verdict="needs_owner", owner_decisions=["allow the lease widen"]))
+    m.validate_verdict(_verdict(verdict="needs_owner", owner_decisions=["allow the lease widen"]))
 
 
 def test_head_moved_refused():
-    with pytest.raises(VerdictError) as caught:
-        check_binding(_verdict(), PACKET, "f" * 40)
+    m = _load()
+    with pytest.raises(m.VerdictError) as caught:
+        m.check_binding(_verdict(), PACKET, "f" * 40)
     assert caught.value.code == "head_moved"
 
 
 def test_repo_or_pr_mismatch_refused():
-    with pytest.raises(VerdictError) as caught:
-        check_binding(_verdict(repo="mojomast/other"), PACKET, HEAD)
+    m = _load()
+    with pytest.raises(m.VerdictError) as caught:
+        m.check_binding(_verdict(repo="mojomast/other"), PACKET, HEAD)
     assert caught.value.code == "verdict_binding_mismatch"
-    with pytest.raises(VerdictError) as caught:
-        check_binding(_verdict(pr=42), PACKET, HEAD)
+    with pytest.raises(m.VerdictError) as caught:
+        m.check_binding(_verdict(pr=42), PACKET, HEAD)
     assert caught.value.code == "verdict_binding_mismatch"
 
 
 def test_independence_rechecked():
+    m = _load()
     packet = dict(PACKET, author_model_family="kimi")
-    with pytest.raises(VerdictError) as caught:
-        check_binding(_verdict(), packet, HEAD)
+    with pytest.raises(m.VerdictError) as caught:
+        m.check_binding(_verdict(), packet, HEAD)
     assert caught.value.code == "review_not_independent"
 
 
 def test_render_approve_line_is_canonical():
-    line = render_review(_verdict()).splitlines()[0]
+    m = _load()
+    line = m.render_review(_verdict()).splitlines()[0]
     assert line == (
         "APPROVE (independent review — rizzstack-reviewer, model family kimi) at " + HEAD
     )
 
 
 def test_render_changes_line_names_the_first_blocking_title():
+    m = _load()
     finding = {"severity": "blocking", "title": "gate bypass", "failure_scenario": "x -> y"}
-    line = render_review(_verdict(verdict="changes_requested", findings=[finding])).splitlines()[0]
+    line = m.render_review(_verdict(verdict="changes_requested", findings=[finding])).splitlines()[0]
     assert line == (
         "CHANGES REQUESTED (independent review — rizzstack-reviewer, model family kimi: "
         "gate bypass) at " + HEAD
@@ -113,31 +120,36 @@ def test_render_changes_line_names_the_first_blocking_title():
 
 
 def test_needs_owner_renders_nothing():
-    assert render_review(_verdict(verdict="needs_owner", owner_decisions=["decide x"])) is None
+    m = _load()
+    assert m.render_review(_verdict(verdict="needs_owner", owner_decisions=["decide x"])) is None
 
 
 def test_auto_reject_posts_changes_requested():
+    m = _load()
     finding = {"severity": "blocking", "title": "gate bypass", "failure_scenario": "x -> y"}
     verdict = _verdict(verdict="changes_requested", findings=[finding])
     posted = []
-    result = post_verdict(verdict, lambda v, body: posted.append((v, body)), mode="auto_reject")
+    result = m.post_verdict(verdict, lambda v, body: posted.append((v, body)), mode="auto_reject")
     assert result == {"posted": True, "queued": False}
     assert posted and posted[0][1].startswith("CHANGES REQUESTED")
 
 
 def test_approve_is_queued_not_posted():
+    m = _load()
     posted = []
-    result = post_verdict(_verdict(), lambda v, body: posted.append((v, body)), mode="auto_reject")
+    result = m.post_verdict(_verdict(), lambda v, body: posted.append((v, body)), mode="auto_reject")
     assert result == {"posted": False, "queued": True}
     assert posted == []
 
 
 def test_needs_owner_posts_nothing():
+    m = _load()
     verdict = _verdict(verdict="needs_owner", owner_decisions=["decide x"])
-    result = post_verdict(verdict, lambda v, body: pytest.fail("posted"), mode="auto_reject")
+    result = m.post_verdict(verdict, lambda v, body: pytest.fail("posted"), mode="auto_reject")
     assert result == {"posted": False, "queued": False}
 
 
 def test_one_record_line_per_verdict():
-    line = record_line(_verdict(), attempt_id="att_abc", status="posted")
+    m = _load()
+    line = m.record_line(_verdict(), attempt_id="att_abc", status="posted")
     assert line == f"mojomast/rizzstack#41 {HEAD} approve kimi att_abc posted"
