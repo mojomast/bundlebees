@@ -2394,6 +2394,35 @@ def _secret_trips(
     return trips
 
 
+def _subversion_evidence(scan: Any) -> dict[str, Any]:
+    """The subversion scan as verify evidence: found and subtracted findings.
+
+    The repo-backed scan subtracts a post-image finding whose statement shape
+    the base revision already carried. That subtraction used to be invisible in
+    the verify record, so a sweep could widen and every refusal still read
+    green while nothing was actually checked. Both halves are recorded here,
+    deterministically ordered.
+    """
+
+    if scan is None:
+        return {"scanned": False}
+
+    def rows(items: Any) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                {"kind": str(item["kind"]), "path": str(item["path"]), "line": int(item["line"])}
+                for item in items or ()
+            ),
+            key=lambda row: (row["path"], row["line"], row["kind"]),
+        )
+
+    return {
+        "scanned": True,
+        "findings": rows(list(scan)),
+        "subtracted": rows(getattr(scan, "subtracted", ())),
+    }
+
+
 def _secret_refusal(flagged: list[str], trips: list[dict[str, Any]]) -> str:
     """Refusal text: the original file list plus one diagnosable entry per trip."""
     parts: list[str] = []
@@ -3324,13 +3353,16 @@ def _cmd_verify(ctx: Any, args: Any) -> int:
                 except (OSError, RuntimeError):
                     scan_repo = None
         try:
-            verify_local.check_patch_subversion(
+            scan = verify_local.check_patch_subversion(
                 patch,
                 repo_root=scan_repo if source_rev else None,
                 source_rev=source_rev or None,
             )
         except verify_local.VerifyError as exc:
+            evidence["subversion"] = _subversion_evidence(getattr(exc, "scan", None))
             raise _as_cli_error(exc) from exc
+        if getattr(scan, "subtracted", None):
+            evidence["subversion"] = _subversion_evidence(scan)
 
         # ACDD: a contract in the lease makes approved tests read-only and
         # requires a valid RED before anything is applied. None = legacy.
