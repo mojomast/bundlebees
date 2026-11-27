@@ -129,6 +129,7 @@ def _check_frozen_green(
         "skipped": _junit_counter_or_default(junit, "skipped", 0),
         "timed_out": bool(evidence.get("timed_out")),
         "cases": cases,
+        "staged_tools": evidence.get("staged_tools"),
     }
     try:
         record = tdd.make_record(
@@ -582,7 +583,7 @@ def _sandbox_policy(
     }
 
 
-_TOOL_IDENTITY_CACHE: dict[tuple[str, int, int, int], str] = {}
+_TOOL_IDENTITY_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
 
 
 def _pinned_tools_identity() -> dict[str, str]:
@@ -591,17 +592,29 @@ def _pinned_tools_identity() -> dict[str, str]:
     A receipt from different uv/pwsh bytes must not be reused, so the tool
     identity is part of the key.  The pinned path is resolved first: staging
     copies the bytes a symlink points at, so the key must hash those bytes, not
-    the link string.  Results are cached by (path, inode, size, mtime_ns) so a
-    receipt key does not re-hash the pwsh tree on every call.
+    the link string.  A pin staging would refuse (foreign-owned or
+    group/world-writable) contributes nothing, so the identity never names a
+    tool that did not run.  Results are cached by
+    (path, inode, size, mtime_ns, mode, uid) so a receipt key does not re-hash
+    the pwsh tree on every call, and a mode/owner change invalidates it.
     """
     identity: dict[str, str] = {}
     for name, raw in sandbox.PINNED_TOOLS:
         try:
             source = Path(str(raw)).expanduser().resolve()
+            if not sandbox._pinned_tool_is_safe(source):
+                continue
             info = source.stat()
         except OSError:
             continue
-        key = (str(source), info.st_ino, info.st_size, info.st_mtime_ns)
+        key = (
+            str(source),
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_mode,
+            info.st_uid,
+        )
         digest = _TOOL_IDENTITY_CACHE.get(key)
         if digest is None:
             digest = sandbox._staged_digest(source)
@@ -715,6 +728,7 @@ def _verification_identity(
             timeout=timeout,
         ),
         "gitleaks": _gitleaks_identity(require_gitleaks, gitleaks),
+        "pinned_tools": _pinned_tools_identity(),
     }
     if approved_ids is not None:
         identity["approved_ids"] = [str(test_id) for test_id in approved_ids]
@@ -2077,6 +2091,7 @@ def _landed_evidence(
         "timed_out": bool(raw.get("timed_out")),
         "duration_s": raw.get("duration_s"),
         "junit": raw.get("junit") if isinstance(raw.get("junit"), Mapping) else None,
+        "staged_tools": raw.get("staged_tools"),
         "output_tail": str(tail or ""),
     }
 
@@ -2327,6 +2342,7 @@ def _landed_record(
             "timed_out": timed_out,
             "duration_s": max(0.0, duration),
             "timeout_s": int(timeout),
+            "staged_tools": evidence.get("staged_tools"),
             "output_tail": str(scrub(str(evidence.get("output_tail") or "").strip()[-300:])),
         },
         "created_at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
