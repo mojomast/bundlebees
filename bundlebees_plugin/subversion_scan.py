@@ -299,9 +299,15 @@ class ScanFindings(list[Finding]):
         findings: Iterable[Finding] = (),
         *,
         differential: dict[str, Any] | None = None,
+        subtracted: Iterable[Finding] = (),
     ) -> None:
         super().__init__(findings)
         self.differential = differential
+        #: Findings dropped because the base revision already carried the same
+        #: statement shape. Recorded, never silent: the verify evidence names
+        #: what was subtracted so a reviewer can tell "nothing found" from
+        #: "everything subtracted".
+        self.subtracted = list(subtracted)
 
 
 class _ScanFailure(Exception):
@@ -1484,6 +1490,7 @@ def _subtract_base_findings(
     after: list[Finding],
     after_content: bytes,
     added: Sequence[int] = (),
+    subtracted: list[Finding] | None = None,
 ) -> list[Finding]:
     """Drop post-image findings whose shape is already present at the base.
 
@@ -1493,7 +1500,8 @@ def _subtract_base_findings(
     while changing when it runs. Counted, not just matched, for the findings
     that remain: a patch that adds a second copy of a shape the base already
     carried still keeps one finding. Shapes that cannot be identified are
-    never subtracted (fail closed).
+    never subtracted (fail closed). ``subtracted``, when given, collects the
+    findings that were dropped so the verify evidence can name them.
     """
 
     added_lines = set(added)
@@ -1511,6 +1519,8 @@ def _subtract_base_findings(
             kept.append(finding)
             continue
         remaining[shape] -= 1
+        if subtracted is not None:
+            subtracted.append(finding)
     return kept
 
 
@@ -1522,6 +1532,7 @@ def _change_findings(
     recover: bool = False,
     subtract_base: bool = False,
     added: Sequence[int] | None = None,
+    subtracted: list[Finding] | None = None,
 ) -> list[Finding]:
     """Content findings for one changed file, minus what the base already had.
 
@@ -1544,7 +1555,9 @@ def _change_findings(
     # nothing subtracted from an unparseable base fragment keeps the check
     # fail-closed.
     base_findings = _content_findings(base_path, before, recover=tolerance)
-    return _subtract_base_findings(base_findings, before, after_findings, after, added or ())
+    return _subtract_base_findings(
+        base_findings, before, after_findings, after, added or (), subtracted
+    )
 
 
 def _fragment_tolerant(change: _Change, recover: bool) -> bool:
@@ -1569,6 +1582,7 @@ def _changed_content(
     *,
     recover: bool = False,
     subtract_base: bool = False,
+    subtracted: list[Finding] | None = None,
 ) -> list[Finding]:
     active = [change for change in changes if not change.status.startswith("D")]
     try:
@@ -1592,6 +1606,7 @@ def _changed_content(
                 recover=recover,
                 subtract_base=subtract_base,
                 added=added,
+                subtracted=subtracted,
             )
         )
     return findings
@@ -1604,6 +1619,7 @@ def _scan_change_tree(
     *,
     recover: bool = False,
     subtract_base: bool = False,
+    subtracted: list[Finding] | None = None,
 ) -> list[Finding]:
     tree = _resolve_tree(repo_root, source_rev)
     with tempfile.TemporaryDirectory(prefix="bundlebees-subversion-") as scratch:
@@ -1631,6 +1647,7 @@ def _scan_change_tree(
             env,
             recover=recover,
             subtract_base=subtract_base,
+            subtracted=subtracted,
         )
 
 
@@ -1641,11 +1658,12 @@ def scan_change(patch: str, repo_root: str | Path, source_rev: str) -> list[Find
     only this path has a real base revision to subtract.
     """
 
+    subtracted: list[Finding] = []
     try:
         findings = _scan_change_tree(
-            patch, Path(repo_root), str(source_rev), subtract_base=True
+            patch, Path(repo_root), str(source_rev), subtract_base=True, subtracted=subtracted
         )
-        return ScanFindings(_dedupe(findings))
+        return ScanFindings(_dedupe(findings), subtracted=_dedupe(subtracted))
     except _ScanFailure as exc:
         return _input_finding(exc.path)
     except (OSError, UnicodeError, ValueError, TypeError):
@@ -1794,8 +1812,12 @@ def _differential(patch: str, v2: list[Finding]) -> dict[str, Any] | None:
     }
 
 
-def _with_differential(patch: str, findings: list[Finding]) -> ScanFindings:
-    return ScanFindings(findings, differential=_differential(patch, findings))
+def _with_differential(
+    patch: str, findings: list[Finding], subtracted: Iterable[Finding] = ()
+) -> ScanFindings:
+    return ScanFindings(
+        findings, differential=_differential(patch, findings), subtracted=subtracted
+    )
 
 
 def scan_patch(
@@ -1816,17 +1838,18 @@ def scan_patch(
     later by the revision checks.
     """
 
+    subtracted: list[Finding] = []
     if repo_root is not None and source_rev:
         try:
             findings = _scan_change_tree(
-                patch, Path(repo_root), str(source_rev), subtract_base=True
+                patch, Path(repo_root), str(source_rev), subtract_base=True, subtracted=subtracted
             )
         except _ScanFailure:
             findings = None
         except (OSError, UnicodeError, ValueError, TypeError):
             findings = None
         if findings is not None:
-            return _with_differential(patch, findings)
+            return _with_differential(patch, findings, _dedupe(subtracted))
     elif (repo_root is None) != (source_rev is None):
         return _with_differential(patch, _input_finding())
     try:

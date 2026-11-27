@@ -233,11 +233,18 @@ def check_patch_subversion(
     findings = subversion_scan.scan_for_verify(patch, repo_root, source_rev)
     _log_subversion_differential(getattr(findings, "differential", None))
     if findings:
-        raise VerifyError(
+        error = VerifyError(
             "test_subversion",
             _subversion_message(findings),
             "Remove test-runner subversion from the patch.",
         )
+        # The refusal evidence carries the whole scan, including the findings
+        # the base revision already had and the scan therefore subtracted: a
+        # refusal must not hide how much was silently tolerated on the base.
+        error.scan = findings
+        error.findings = list(findings)
+        error.subtracted = list(getattr(findings, "subtracted", ()))
+        raise error
     return findings
 
 
