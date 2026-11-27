@@ -28,6 +28,7 @@ configuration shape the scanner misses cannot change the oracle.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import os
 import re
 import shlex
@@ -39,13 +40,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-#: Written into the verified worktree and copied into the sandbox with it.
+#: The stable name the harness stages for the child.  The canonical file lives
+#: in the verify attempt directory, never in the worktree being patched.
 CONFIG_NAME = ".bundlebees-oracle-pytest.ini"
 
-#: Exactly the two variables pytest reads before it reads any config file.
+#: Variables pytest reads before it reads any config file, plus the interpreter
+#: path guard that keeps the repository root off ``sys.path`` for ``-m``.
 LOCK_ENV = {
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     "PYTEST_ADDOPTS": "",
+    "PYTHONSAFEPATH": "1",
 }
 
 _PLUGIN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
@@ -72,19 +76,44 @@ class OracleLock:
 
     config_name: str
     config_path: Path
+    config_sha256: str
     plugins: tuple[str, ...]
     main_ref: str
 
     def env(self) -> dict[str, str]:
-        """The two pytest variables the lock pins, ready for a sandbox overlay."""
+        """The pytest variables the lock pins, ready for a sandbox overlay."""
         return dict(LOCK_ENV)
 
     def lock_argv(self, argv: Sequence[str], *, rootdir: str | Path) -> list[str]:
         return locked_argv(self, argv, rootdir=rootdir)
 
+    def read_bytes(self) -> bytes:
+        """The canonical configuration bytes, or a refusal; never fail open."""
+        try:
+            return self.config_path.read_bytes()
+        except OSError as exc:
+            raise OracleLockError(
+                f"cannot read the main pytest config at {self.config_name}: {exc}"
+            ) from exc
+
+    def assert_intact(self) -> None:
+        """Refuse when the rendered main config changed after it was extracted."""
+        actual = hashlib.sha256(self.read_bytes()).hexdigest()
+        if actual != self.config_sha256:
+            raise OracleLockError(
+                "the main pytest config changed after extraction "
+                f"({self.config_name}: expected sha256 {self.config_sha256}, got {actual})"
+            )
+
     def cleanup(self) -> None:
         try:
             self.config_path.unlink()
+        except OSError:
+            pass
+        # A default destination is a private harness directory; remove it when
+        # empty so cleanup leaves nothing behind outside the worktree either.
+        try:
+            self.config_path.parent.rmdir()
         except OSError:
             pass
 
@@ -258,6 +287,12 @@ def _ini_text(options: Mapping[str, Any]) -> str:
                 f"    {part}" for part in text.splitlines() if part.strip()
             )
         lines.append(f"{name} = {text}" if text else f"{name} =")
+    if "pythonpath" not in {str(key) for key in options}:
+        # pytest itself must see the repository root: with ``-P`` the
+        # interpreter no longer puts cwd on sys.path, and a project whose tests
+        # import a top-level package (``smoke.answer``) needs the root here.
+        # This is pytest's own pythonpath support, not the PR's configuration.
+        lines.append("pythonpath = .")
     return "\n".join(lines) + "\n"
 
 
@@ -275,39 +310,68 @@ def main_config(repo: str | Path, ref: str) -> tuple[str, tuple[str, ...]]:
 
 
 def from_git(
-    repo: str | Path, ref: str, *, dest: str | Path | None = None
+    repo: str | Path,
+    ref: str,
+    *,
+    dest: str | Path | None = None,
+    inside_name: str | None = None,
 ) -> OracleLock:
-    """Extract main *ref*'s config into *dest* and return the lock."""
+    """Extract main *ref*'s config outside the worktree and return the lock.
+
+    The canonical file lives in a harness directory, never in *repo*: a patch
+    applied later can therefore never use the rendered ini as a preimage and
+    replace the configuration that judges it.  ``dest`` names the exact
+    harness file; without it a private temporary directory is used.
+    ``inside_name`` is the stable ``-c`` value a sandbox stages under; by
+    default the absolute canonical path is used, which is safe for direct
+    executions that do not copy the tree.
+    """
     repo = Path(repo)
     try:
         text, plugins = main_config(repo, str(ref))
     except (OSError, ValueError, TypeError) as exc:
         raise OracleLockError(f"cannot read pytest configuration from {ref}: {exc}") from exc
-    if dest is None:
-        target = repo / CONFIG_NAME
-    else:
-        target = Path(dest)
+    target = Path(dest) if dest is not None else (
+        Path(tempfile.mkdtemp(prefix="bundlebees-oracle-")) / CONFIG_NAME
+    )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
     except OSError as exc:
         raise OracleLockError(f"cannot write the main pytest config: {exc}") from exc
     try:
-        name = target.resolve().relative_to(repo.resolve()).as_posix()
+        target.resolve().relative_to(repo.resolve())
     except (OSError, ValueError):
-        name = str(target)
+        pass
+    else:
+        # The canonical file must not be patchable preimage state.
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise OracleLockError(
+            "the oracle config destination is inside the verified worktree; "
+            "pass a harness directory outside it"
+        )
     return OracleLock(
-        config_name=name,
+        config_name=inside_name or str(target),
         config_path=target,
+        config_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         plugins=tuple(plugins),
         main_ref=str(ref),
     )
 
 
 def locked_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """A child environment that disables plugin autoload and PYTEST_ADDOPTS."""
+    """A child environment that disables plugin autoload and PYTEST_ADDOPTS.
+
+    ``PYTHONPATH`` is removed as well: the PR checkout names modules that the
+    repository root would otherwise put on ``sys.path``, and the lock's whole
+    point is that the judged tree cannot contribute import roots.
+    """
     env = dict(os.environ if environ is None else environ)
     env.update(LOCK_ENV)
+    env.pop("PYTHONPATH", None)
     return env
 
 
@@ -333,7 +397,13 @@ def _strip_config_overrides(tail: Sequence[str]) -> list[str]:
         if any(token.startswith(prefix) for prefix in _LONG_OVERRIDES):
             index += 1
             continue
-        if token.startswith("-p") and not token.startswith("--") and len(token) > 2:
+        # Attached short forms are overrides too: ``-cEVIL.ini``,
+        # ``-oEVIL=1`` and ``-pEVIL``.  A bare ``-c`` was handled above.
+        if (
+            token.startswith(("-c", "-o", "-p"))
+            and not token.startswith("--")
+            and len(token) > 2
+        ):
             index += 1
             continue
         kept.append(token)
@@ -382,6 +452,7 @@ def locked_argv(
     return [
         *wrappers,
         interpreter,
+        "-P",
         "-B",
         "-m",
         "pytest",

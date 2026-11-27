@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
@@ -817,6 +818,98 @@ def _execute_test_command(
     return _test_evidence(evidence)
 
 
+@contextmanager
+def _staged_oracle_config(workdir: Path, oracle: oracle_lock.OracleLock | None):
+    """Put the canonical main config into the executable copy, then remove it.
+
+    The file is staged only after the patch has been applied and scope-checked,
+    so it can never be used as a patch preimage; the canonical bytes live in
+    the attempt's harness directory.  The child sees the stable name it was
+    given in argv (``-c .bundlebees-oracle-pytest.ini``).
+    """
+    if oracle is None:
+        yield None
+        return
+    target = Path(workdir) / oracle.config_name
+    if target.exists() or target.is_symlink():
+        raise VerifyError(
+            "oracle_config_in_patch",
+            f"the worktree already contains {oracle.config_name}; refusing to run",
+            "Reject this artifact; the harness owns the oracle configuration name.",
+        )
+    try:
+        oracle.assert_intact()
+        target.write_bytes(oracle.read_bytes())
+        oracle.assert_intact()
+        yield target
+    except oracle_lock.OracleLockError as exc:
+        raise VerifyError(
+            "oracle_config_tampered",
+            str(exc),
+            "Re-extract main's pytest configuration; do not trust this run.",
+        ) from exc
+    finally:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+
+
+def _assert_oracle_intact(oracle: oracle_lock.OracleLock | None) -> None:
+    if oracle is None:
+        return
+    try:
+        oracle.assert_intact()
+    except oracle_lock.OracleLockError as exc:
+        raise VerifyError(
+            "oracle_config_tampered",
+            str(exc),
+            "Re-extract main's pytest configuration; do not trust this run.",
+        ) from exc
+
+
+def _oracle_config_paths(paths: Sequence[str], config_name: str) -> list[str]:
+    """Patch paths that touch the oracle config name, in any directory."""
+    touched: list[str] = []
+    for raw in paths:
+        path = str(raw).split(" -> ")[-1]
+        if path.rsplit("/", 1)[-1] == config_name:
+            touched.append(path)
+    return touched
+
+
+def _import_shadow_paths(paths: Sequence[str], plugins: Sequence[str]) -> list[str]:
+    """New top-level modules that would shadow pytest or a stdlib import.
+
+    ``python -m`` used to put the repository root first on ``sys.path``.  Even
+    with ``-P``/``PYTHONSAFEPATH=1`` this tripwire keeps a patch from placing a
+    runner, a plugin, a dependency or a stdlib module where collection or an
+    import could load it instead of the real one.
+    """
+    protected = {
+        "pytest",
+        "_pytest",
+        "pluggy",
+        "iniconfig",
+        "packaging",
+        "sitecustomize",
+        "usercustomize",
+    }
+    protected.update(sys.stdlib_module_names)
+    for plugin in plugins:
+        name = str(plugin).strip().split(".", 1)[0]
+        if name:
+            protected.add(name)
+    found: set[str] = set()
+    for raw in paths:
+        path = str(raw).split(" -> ")[-1]
+        top = path.split("/", 1)[0]
+        stem = top[:-3] if top.endswith(".py") else top
+        if stem in protected:
+            found.add(path)
+    return sorted(found)
+
+
 def _run_test_command(
     workdir: Path,
     argv: Sequence[str],
@@ -837,16 +930,18 @@ def _run_test_command(
         else [str(argument) for argument in argv]
     )
     env_extra = oracle.env() if oracle is not None else None
-    execute = lambda: _execute_test_command(  # noqa: E731 - local closure keeps the call site small
-        workdir,
-        command,
-        runner=runner,
-        backend=backend,
-        allow_unsafe_local=allow_unsafe_local,
-        allow_weak=allow_weak,
-        timeout=timeout,
-        env_extra=env_extra,
-    )
+    def execute():
+        with _staged_oracle_config(Path(workdir), oracle):
+            return _execute_test_command(
+                workdir,
+                command,
+                runner=runner,
+                backend=backend,
+                allow_unsafe_local=allow_unsafe_local,
+                allow_weak=allow_weak,
+                timeout=timeout,
+                env_extra=env_extra,
+            )
     if receipt_context is None:
         return execute()
 
@@ -881,6 +976,7 @@ def _run_test_command(
             allow_weak=allow_weak,
         )
         stats["hits"] += 1
+        _assert_oracle_intact(oracle)
         return _receipt_evidence(hit)
 
     if not cacheable:
@@ -905,6 +1001,7 @@ def _run_test_command(
                 allow_weak=allow_weak,
             )
             stats["hits"] += 1
+            _assert_oracle_intact(oracle)
             return _receipt_evidence(hit)
 
         stats["misses"] += 1
@@ -1294,7 +1391,12 @@ def _verify_and_commit_locked(
         # pytest.ini / setup.cfg is never allowed to configure the tests that
         # judge it; the scanner remains a tripwire, not the boundary.
         try:
-            oracle = oracle_lock.from_git(worktree, base_rev)
+            oracle = oracle_lock.from_git(
+                worktree,
+                base_rev,
+                dest=root / oracle_lock.CONFIG_NAME,
+                inside_name=oracle_lock.CONFIG_NAME,
+            )
         except oracle_lock.OracleLockError as exc:
             raise VerifyError(
                 "oracle_lock_unavailable",
@@ -1345,9 +1447,24 @@ def _verify_and_commit_locked(
         # Test runs create bytecode/caches; they are not part of the worker's patch.
         touched = [path for path in touched
                    if not (path.endswith(".pyc") or "__pycache__" in path.split("/") or ".pytest_cache" in path.split("/"))]
-        # The oracle lock config is harness state written into the worktree, not
-        # worker content; it is never committed or treated as a patch file.
-        touched = [path for path in touched if path != oracle.config_name]
+        if oracle is not None:
+            # The config name is harness-owned.  A patch that touches it is an
+            # attempt to replace the oracle, not a test change: refuse by name
+            # before any scope comparison can dismiss it.
+            stray = _oracle_config_paths(touched, oracle.config_name)
+            if stray:
+                raise VerifyError(
+                    "oracle_config_in_patch",
+                    f"the patch touches the harness oracle config: {stray}",
+                    "Reject this artifact; the oracle configuration is never patch content.",
+                )
+            shadow = _import_shadow_paths(touched, oracle.plugins)
+            if shadow:
+                raise VerifyError(
+                    "import_shadow",
+                    f"the patch adds top-level import shadows: {shadow}",
+                    "Reject this artifact; a shadowing module can replace pytest or a dependency.",
+                )
         touched = sorted({path.split(" -> ")[-1] for path in touched if path})
         if touched != declared:
             raise VerifyError(
@@ -1405,6 +1522,9 @@ def _verify_and_commit_locked(
                 f"named tests failed after the patch: {green.get('tail', '')}",
                 "Reject and re-dispatch." + _git_context_hint(green.get("tail")),
             )
+        # The GREEN verdict is only valid while the rendered main config is the
+        # exact file extracted before the patch.
+        _assert_oracle_intact(oracle)
 
         suite = None
         if suite_command:
@@ -1431,6 +1551,7 @@ def _verify_and_commit_locked(
                     f"regression suite failed: {suite.get('tail', '')}",
                     "Reject and re-dispatch." + _git_context_hint(suite.get("tail")),
                 )
+            _assert_oracle_intact(oracle)
 
         scan = None
         if gitleaks:

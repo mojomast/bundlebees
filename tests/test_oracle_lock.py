@@ -121,7 +121,10 @@ def _run(
         if key not in oracle.LOCK_ENV
     }
     env = oracle.locked_env(base) if locked else base
-    env["PYTHONPATH"] = str(pr)
+    if not locked:
+        # Only the control run needs the PR tree importable for the evil plugin;
+        # the locked run must not receive an import root from the judged tree.
+        env["PYTHONPATH"] = str(pr)
     argv = [sys.executable, "-B", "-m", "pytest", "-q"]
     if locked:
         lock = oracle.from_git(main_repo, main_sha, dest=tmp_path / "main-pytest.ini")
@@ -250,7 +253,7 @@ def test_verify_named_tests_run_with_the_main_config(tmp_path: Path, monkeypatch
     from bundlebees_plugin import verify_local
 
     repo, sha = _main_repo(tmp_path)
-    lock = oracle.from_git(repo, sha)
+    lock = oracle.from_git(repo, sha, inside_name=oracle.CONFIG_NAME)
     seen: list[list[str]] = []
 
     def runner(workdir: Path, argv):
@@ -268,3 +271,113 @@ def test_verify_named_tests_run_with_the_main_config(tmp_path: Path, monkeypatch
     assert "-p" in argv  # at least the disable-cache provider argument
     assert not any("pyproject.toml" in argument for argument in argv)
     lock.cleanup()
+
+
+# --- drill cases for the 782fd3b review -----------------------------------
+
+
+def test_from_git_extracts_outside_the_worktree(tmp_path: Path):
+    """The ini must not exist in the tree a patch is applied to."""
+    oracle = _oracle()
+    repo, sha = _main_repo(tmp_path)
+    lock = oracle.from_git(repo, sha, inside_name=oracle.CONFIG_NAME)
+    try:
+        assert not (repo / oracle.CONFIG_NAME).exists()
+        assert lock.config_path.parent != repo
+        assert lock.config_name == oracle.CONFIG_NAME
+        assert lock.config_path.read_text(encoding="utf-8") == oracle.main_config(repo, sha)[0]
+    finally:
+        lock.cleanup()
+    assert not lock.config_path.exists()
+
+
+def test_from_git_refuses_a_destination_inside_the_worktree(tmp_path: Path):
+    oracle = _oracle()
+    repo, sha = _main_repo(tmp_path)
+    with pytest.raises(oracle.OracleLockError):
+        oracle.from_git(repo, sha, dest=repo / oracle.CONFIG_NAME)
+
+
+def test_patch_that_touches_the_oracle_config_name_is_refused(tmp_path: Path):
+    oracle = _oracle()
+    from bundlebees_plugin import verify_local
+
+    assert verify_local._oracle_config_paths(
+        [oracle.CONFIG_NAME, f"nested/{oracle.CONFIG_NAME}"], oracle.CONFIG_NAME
+    ) == [oracle.CONFIG_NAME, f"nested/{oracle.CONFIG_NAME}"]
+    assert verify_local._oracle_config_paths(["tests/test_ok.py"], oracle.CONFIG_NAME) == []
+
+
+def test_top_level_import_shadows_are_refused():
+    from bundlebees_plugin import verify_local
+
+    found = verify_local._import_shadow_paths(
+        ["pytest.py", "_pytest/__init__.py", "pluggy.py", "iniconfig.py",
+         "packaging/__init__.py", "json.py", "pytest_asyncio.py",
+         "tests/test_ok.py", "bundlebees_plugin/verify_local.py"],
+        ("pytest_asyncio",),
+    )
+    assert found == [
+        "_pytest/__init__.py",
+        "iniconfig.py",
+        "json.py",
+        "packaging/__init__.py",
+        "pluggy.py",
+        "pytest.py",
+        "pytest_asyncio.py",
+    ]
+
+
+def test_locked_argv_uses_the_safe_path_interpreter_flags(tmp_path: Path):
+    oracle = _oracle()
+    repo, sha = _main_repo(tmp_path)
+    lock = oracle.from_git(repo, sha)
+    try:
+        argv = oracle.locked_argv(lock, [sys.executable, "-m", "pytest", "-q"], rootdir=repo)
+        assert argv[:5] == [sys.executable, "-P", "-B", "-m", "pytest"]
+        assert oracle.LOCK_ENV["PYTHONSAFEPATH"] == "1"
+    finally:
+        lock.cleanup()
+
+
+def test_attached_short_config_and_override_options_are_stripped():
+    oracle = _oracle()
+    assert oracle._strip_config_overrides(
+        ["-cEVIL.ini", "-oEVIL=1", "-pEVIL", "tests/test_ok.py"]
+    ) == ["tests/test_ok.py"]
+
+
+def test_a_shadowing_root_pytest_module_cannot_stand_in_for_pytest(tmp_path: Path):
+    """A root pytest.py printing '1 passed' must not decide the run."""
+    oracle = _oracle()
+    repo, sha = _main_repo(tmp_path)
+    pr = _pr_tree(
+        repo,
+        tmp_path,
+        MAIN_PYPROJECT,
+        {
+            "pytest.py": "print('1 passed')\nraise SystemExit(0)\n",
+            "tests/test_fail.py": "def test_fail():\n    assert False\n",
+        },
+    )
+    lock = oracle.from_git(repo, sha)
+    try:
+        argv = oracle.locked_argv(
+            lock, [sys.executable, "-B", "-m", "pytest", "-q"], rootdir=pr
+        )
+        env = oracle.locked_env()
+        completed = subprocess.run(
+            argv, cwd=pr, env=env, capture_output=True, text=True, timeout=120, check=False
+        )
+    finally:
+        lock.cleanup()
+    assert completed.returncode != 0, (completed.stdout, completed.stderr)
+    assert "1 passed" not in completed.stdout
+
+
+def test_ci_loads_the_oracle_lock_from_main_not_the_checkout():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "git show origin/main:bundlebees_plugin/oracle_lock.py" in workflow
+    assert "python -m bundlebees_plugin.oracle_lock" not in workflow
+    assert "python -P" in workflow

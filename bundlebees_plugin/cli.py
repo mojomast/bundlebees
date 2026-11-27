@@ -2629,13 +2629,18 @@ def _run_sandboxed(
             runner, selected = _select_test_runner(list(targets), Path(workdir))
     lock: oracle_lock.OracleLock | None = None
     env_extra: dict[str, str] | None = None
+    staged_config: Path | None = None
     if runner == "node-test":
         argv = ["node", "--test", *selected]
     else:
         argv = sandbox.pytest_argv(selected)
         if main_ref:
             try:
-                lock = oracle_lock.from_git(Path(workdir), str(main_ref))
+                lock = oracle_lock.from_git(
+                    Path(workdir),
+                    str(main_ref),
+                    inside_name=oracle_lock.CONFIG_NAME,
+                )
             except oracle_lock.OracleLockError as exc:
                 raise CliError(
                     "oracle_lock_unavailable",
@@ -2645,6 +2650,16 @@ def _run_sandboxed(
                 ) from exc
             argv = oracle_lock.locked_argv(lock, argv, rootdir=workdir)
             env_extra = lock.env()
+            # The canonical ini lives outside the checkout; stage the stable
+            # name into the copy the child runs in, and remove it afterwards.
+            staged_config = Path(workdir) / lock.config_name
+            if staged_config.exists() or staged_config.is_symlink():
+                raise CliError(
+                    "oracle_config_in_patch",
+                    f"the worktree already contains {lock.config_name}",
+                    "Reject this artifact; the harness owns the oracle configuration name.",
+                )
+            staged_config.write_bytes(lock.read_bytes())
     try:
         result = sandbox.run_in_sandbox(
             workdir, argv, env_extra=env_extra, **_sandbox_options(config)
@@ -2668,6 +2683,11 @@ def _run_sandboxed(
             "Set verify_isolation to auto, bwrap or firejail (unshare needs the weak override).",
         ) from exc
     finally:
+        if staged_config is not None:
+            try:
+                staged_config.unlink()
+            except OSError:
+                pass
         if lock is not None:
             lock.cleanup()
     if runner == "node-test" and _node_runner_missing(result):

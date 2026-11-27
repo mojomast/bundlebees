@@ -107,10 +107,23 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
-          python .github/scripts/shard_tests.py --check 4 --against-pytest --main-ref origin/main
-          mapfile -t files < <(python3 .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
+          # ORACLE LOCK BOOTSTRAP: load the lock from origin/main, never from the
+          # PR checkout.  This PR is the one bootstrap exception: until it lands,
+          # origin/main has no oracle_lock.py, so the first run falls back to this
+          # checkout's copy.  After merge the main copy always wins.
+          mkdir -p "$RUNNER_TEMP/oracle-lock"
+          if git show origin/main:bundlebees_plugin/oracle_lock.py \
+              > "$RUNNER_TEMP/oracle-lock/oracle_lock.py" 2>/dev/null; then
+            echo "oracle lock: loaded from origin/main"
+          else
+            echo "oracle lock: bootstrap exception, origin/main has none; using this PR's copy"
+            cp bundlebees_plugin/oracle_lock.py "$RUNNER_TEMP/oracle-lock/oracle_lock.py"
+          fi
+          PYTHONSAFEPATH=1 PYTHONPATH= python -P .github/scripts/shard_tests.py --check 4 --against-pytest --main-ref origin/main
+          mapfile -t files < <(python3 -P .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
           test "${#files[@]}" -gt 0
-          python -m bundlebees_plugin.oracle_lock --main-ref origin/main --rootdir . -- -rs "${files[@]}"
+          PYTHONSAFEPATH=1 python -P -B "$RUNNER_TEMP/oracle-lock/oracle_lock.py" \
+            --main-ref origin/main --rootdir . -- -rs "${files[@]}"
       - name: Measure tool-schema tokens
         if: ${{ matrix.shard == 1 }}
         run: python scripts/measure_schemas.py

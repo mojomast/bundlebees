@@ -108,7 +108,7 @@ def test_a_py_target_still_selects_pytest(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert rc == 0
     # Verify's oracle runs with main's pytest configuration, never the PR's.
-    lock = oracle_lock.from_git(repo, base_sha)
+    lock = oracle_lock.from_git(repo, base_sha, inside_name=oracle_lock.CONFIG_NAME)
     try:
         expected = oracle_lock.locked_argv(
             lock, sandbox.pytest_argv(["tests/test_sample.py"]), rootdir=repo

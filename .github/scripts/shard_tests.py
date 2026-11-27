@@ -39,6 +39,45 @@ def shards(total):
     return [sorted(x[2]) for x in loads]
 
 
+def _load_main_oracle_lock(main_ref):
+    """Load oracle_lock from *main_ref*'s tree, never from the PR checkout.
+
+    Bootstrap exception: until this PR lands, origin/main has no oracle_lock.py;
+    only then does the loader fall back to the checkout's copy.
+    """
+    import importlib.util
+    import tempfile
+
+    shown = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{main_ref}:bundlebees_plugin/oracle_lock.py"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if shown.returncode == 0:
+        source = shown.stdout
+    else:
+        sys.path.insert(0, str(ROOT))
+        from bundlebees_plugin import oracle_lock as checkout_lock
+
+        return checkout_lock
+    handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    try:
+        handle.write(source)
+        handle.close()
+        spec = importlib.util.spec_from_file_location(
+            "bundlebees_main_oracle_lock", handle.name
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load oracle_lock from main")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        Path(handle.name).unlink(missing_ok=True)
+
+
 def pytest_files(main_ref=None):
     """The test files pytest itself collects for the whole suite (independent of test_files()).
 
@@ -48,12 +87,12 @@ def pytest_files(main_ref=None):
     argv = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"]
     env = None
     if main_ref:
-        sys.path.insert(0, str(ROOT))
-        from bundlebees_plugin import oracle_lock
+        oracle_lock = _load_main_oracle_lock(main_ref)
 
         lock = oracle_lock.from_git(ROOT, main_ref)
         argv = oracle_lock.locked_argv(lock, argv, rootdir=ROOT)
         env = oracle_lock.locked_env()
+        env["PYTHONSAFEPATH"] = "1"
     out = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=600, env=env)
     if out.returncode not in (0, 5):
         sys.exit("pytest collection failed:\n" + out.stdout[-2000:] + out.stderr[-2000:])
