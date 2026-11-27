@@ -3,15 +3,15 @@
   "contract_id": "app-identity",
   "contract_sha256": "1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6",
   "derived_from": {
-    "approved_at": "2026-11-27T20:21:34Z",
-    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "approved_at": "2026-11-27T20:34:43Z",
+    "approved_by": "Kyle (owner) typed: approved: 1db50f73 (app-identity re-freeze: source_rev + RED fixture only), 2026-11-27",
     "contract": ".rizzstack/contracts/1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6.json"
   },
   "id": "app-identity",
   "lease_version": "rizzstack.lease/1",
   "review": {
-    "approved_at": "2026-11-27T20:21:34Z",
-    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "approved_at": "2026-11-27T20:34:43Z",
+    "approved_by": "Kyle (owner) typed: approved: 1db50f73 (app-identity re-freeze: source_rev + RED fixture only), 2026-11-27",
     "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
     "status": "frozen"
   },

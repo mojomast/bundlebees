@@ -78,13 +78,13 @@
     "summary": "Mint coordinator installation tokens from the app private key (short-lived JWT, cached until just before expiry), refuse a key readable by group/other, never return key material, and expose the reviewer key path only to the configured poster user."
   },
   "review": {
-    "approved_at": "2026-11-27T20:21:34Z",
-    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 ... on 2026-11-27 (app-identity source_rev re-cut for scanner safety; new hash pending)",
+    "approved_at": "2026-11-27T20:34:43Z",
+    "approved_by": "Kyle (owner) typed: approved: 1db50f73 (app-identity re-freeze: source_rev + RED fixture only), 2026-11-27",
     "contract_sha256": "1db50f734a5ff3c068ad69b4e61077a0c40a686329796dc48a8a93054b1e1de6",
     "status": "approved",
     "test_collection": {
       "collected": 5,
-      "manifest_sha256": "59705c404ea5fefd44ef476b48da082a8748c8209adb85e4a70c10958cbafa34",
+      "manifest_sha256": "3ec7ce5c9a93ff440153f4124e2b1189ce420dcf45755ad010c759184682079b",
       "source_rev": "d808275ae5249d59052d8f1aa47115706ba60eec"
     }
   },
