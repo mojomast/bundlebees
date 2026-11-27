@@ -286,7 +286,6 @@ _NAME_KINDS = {
     "conftest.py": "conftest",
     "sitecustomize.py": "startup_hook",
     "usercustomize.py": "startup_hook",
-    "pyproject.toml": "pytest_config",
     "pytest.ini": "pytest_config",
     "tox.ini": "pytest_config",
     "setup.cfg": "pytest_config",
@@ -469,6 +468,311 @@ def _workflow_path(path: str) -> bool:
     return normalized.startswith(".github/workflows/") or "/.github/workflows/" in normalized
 
 
+_PYTEST_TABLE = ("tool", "pytest")
+_COVERAGE_TABLE = ("tool", "coverage")
+_PYTEST11_TABLES = (
+    ("project", "entry-points", "pytest11"),
+    ("tool", "poetry", "plugins", "pytest11"),
+)
+_DEPENDENCY_TABLES = (
+    ("project", "dependencies"),
+    ("project", "optional-dependencies"),
+    ("dependency-groups",),
+)
+_QUOTED_STRING_RE = re.compile(r'"((?:\\.|[^"\\])*)"|\'([^\']*)\'')
+_DEPENDENCY_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _toml_python_path(document: Any) -> tuple[str, ...] | None:
+    """The one dotted key path a tiny parsed TOML document names, else None."""
+    path: list[str] = []
+    node = document
+    while True:
+        if isinstance(node, dict):
+            if not node:
+                return tuple(path)
+            if len(node) != 1:
+                return None
+            key, node = next(iter(node.items()))
+            path.append(str(key))
+            continue
+        if isinstance(node, list):
+            if len(node) != 1:
+                return None
+            node = node[0]
+            continue
+        return tuple(path)
+
+
+def _toml_header_path(line: str) -> tuple[str, ...] | None:
+    if not line.startswith("["):
+        return None
+    try:
+        return _toml_python_path(tomllib.loads(line))
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+
+
+def _toml_key_path(text: str) -> tuple[str, ...] | None:
+    try:
+        return _toml_python_path(tomllib.loads(f"{text} = 0"))
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+
+
+def _skip_basic_string(value: str, index: int) -> int:
+    while index < len(value):
+        if value[index] == "\\":
+            index += 2
+        elif value[index] == '"':
+            return index + 1
+        else:
+            index += 1
+    return len(value)
+
+
+def _toml_string_end(value: str, index: int) -> tuple[int, str | None]:
+    """Return ``(next_index, open_multiline_delimiter)`` for a string at *index*."""
+    if value.startswith('"""', index):
+        close = value.find('"""', index + 3)
+        return (len(value), '"""') if close < 0 else (close + 3, None)
+    if value.startswith("'''", index):
+        close = value.find("'''", index + 3)
+        return (len(value), "'''") if close < 0 else (close + 3, None)
+    if value[index] == '"':
+        return _skip_basic_string(value, index + 1), None
+    close = value.find("'", index + 1)
+    return (len(value) if close < 0 else close + 1), None
+
+
+def _toml_value_state(value: str, depth: int = 0) -> tuple[str | None, int]:
+    """Return the open multiline string delimiter and array depth after *value*."""
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char in {'"', "'"}:
+            index, multiline = _toml_string_end(value, index)
+            if multiline is not None:
+                return multiline, depth
+            continue
+        if char == "#":
+            return None, depth
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        index += 1
+    return None, depth
+
+
+def _toml_multiline_close_end(line: str, delimiter: str) -> int | None:
+    """Index just past this line's closing *delimiter*, or None if it stays open."""
+    index = 0
+    while index < len(line):
+        if line.startswith(delimiter, index):
+            return index + len(delimiter)
+        if delimiter == '"""' and line[index] == "\\":
+            index += 2
+        else:
+            index += 1
+    return None
+
+
+def _split_toml_assignment(line: str) -> tuple[str, str] | None:
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "=":
+            return line[:index].strip(), line[index + 1 :]
+        elif char == "#":
+            return None
+        index += 1
+    return None
+
+
+def _toml_structural_line(
+    stripped: str, table: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None, int]:
+    """Classify one structural TOML line; return (table, address, multiline, depth)."""
+    if not stripped or stripped.startswith("#"):
+        return table, table, None, 0
+    if stripped.startswith("["):
+        header = _toml_header_path(stripped)
+        if header is not None:
+            return header, header, None, 0
+    assignment = _split_toml_assignment(stripped)
+    if assignment is None:
+        return table, table, None, 0
+    key = _toml_key_path(assignment[0])
+    if key is None:
+        return table, table, None, 0
+    multiline, depth = _toml_value_state(assignment[1])
+    return table, table + key, multiline, depth
+
+
+def _toml_line_addresses(text: str) -> dict[int, tuple[str, ...]]:
+    """Map each line to the dotted key path of the real table that owns it."""
+    addresses: dict[int, tuple[str, ...]] = {}
+    table: tuple[str, ...] = ()
+    pending: tuple[str, ...] = ()
+    multiline: str | None = None
+    depth = 0
+    for number, raw in enumerate(text.splitlines(), 1):
+        if multiline is not None:
+            addresses[number] = pending
+            close = _toml_multiline_close_end(raw, multiline)
+            if close is None:
+                continue
+            # The remainder of the line still counts: ``"""]`` closes the
+            # multiline string and its array on one line, and dropping that
+            # bracket left ``depth`` above zero, so every later line was
+            # addressed as the array's pending key and real pytest tables
+            # became invisible.
+            multiline, depth = _toml_value_state(raw[close:], depth)
+            continue
+        if depth > 0:
+            addresses[number] = pending
+            multiline, depth = _toml_value_state(raw, depth)
+            continue
+        table, pending, multiline, depth = _toml_structural_line(raw.strip(), table)
+        addresses[number] = pending
+    return addresses
+
+
+def _entry_point_modules(document: Any) -> frozenset[str]:
+    """Module roots named by this document's ``pytest11`` entry points."""
+    modules = set()
+    for keys in _PYTEST11_TABLES:
+        table = _mapping_path(document, keys)
+        for value in table.values():
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if not isinstance(item, str):
+                    continue
+                root = re.split(r"[.:]", item.strip(), 1)[0]
+                if root:
+                    modules.add(re.sub(r"[-_.]+", "-", root).lower())
+    return frozenset(modules)
+
+
+def _dependency_name(spec: str) -> str | None:
+    match = _DEPENDENCY_NAME_RE.match(spec)
+    if match is None:
+        return None
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+def _dependency_is_pytest_plugin(line: str, modules: frozenset[str]) -> bool:
+    for match in _QUOTED_STRING_RE.finditer(line):
+        spec = match.group(1) if match.group(1) is not None else match.group(2)
+        name = _dependency_name(spec)
+        if name is not None and (name.startswith("pytest-") or name in modules):
+            return True
+    return False
+
+
+def _starts_with(address: tuple[str, ...], prefix: tuple[str, ...]) -> bool:
+    return address[: len(prefix)] == prefix
+
+
+def _plugin_option_addresses(document: Any) -> frozenset[tuple[str, ...]]:
+    """Key addresses whose parsed value loads a pytest plugin."""
+    options = _mapping_path(document, ("tool", "pytest", "ini_options"))
+    candidates = (
+        (("tool", "pytest", "ini_options", "addopts"), options, "addopts"),
+        (("tool", "pytest", "ini_options", "pytest_plugins"), options, "pytest_plugins"),
+        (("addopts",), document, "addopts"),
+        (("pytest_plugins",), document, "pytest_plugins"),
+    )
+    addresses = set()
+    for address, table, key in candidates:
+        if not isinstance(table, Mapping) or key not in table:
+            continue
+        if key == "pytest_plugins":
+            addresses.add(address)
+            continue
+        try:
+            if _addopts_plugin(table[key]):
+                addresses.add(address)
+        except (ValueError, TypeError):
+            addresses.add(address)
+    return frozenset(addresses)
+
+
+def _pyproject_line_kinds(
+    address: tuple[str, ...],
+    line: str,
+    modules: frozenset[str],
+    plugin_addresses: frozenset[tuple[str, ...]] = frozenset(),
+) -> tuple[str, ...]:
+    """Classify one pyproject line by the real TOML table that contains it."""
+    kinds = []
+    if _starts_with(address, _PYTEST_TABLE):
+        kinds.append("pytest_config")
+    if address in plugin_addresses:
+        kinds.append("pytest_plugin")
+    if _starts_with(address, _COVERAGE_TABLE):
+        kinds.append("coverage_config")
+    if any(_starts_with(address, prefix) for prefix in _PYTEST11_TABLES):
+        kinds.append("pytest_plugin")
+    if any(_starts_with(address, prefix) for prefix in _DEPENDENCY_TABLES):
+        if _dependency_is_pytest_plugin(line, modules):
+            kinds.append("pytest_plugin")
+    return tuple(dict.fromkeys(kinds))
+
+
+def _pyproject_findings(
+    path: str, added: list[int], content: bytes | None
+) -> list[Finding]:
+    """Line findings for pyproject.toml, scoped to pytest/coverage tables only.
+
+    Build and packaging tables (``[build-system]``, ``[tool.hatch.build*]``)
+    and ordinary ``[project]`` metadata are not test-runner subversion and are
+    deliberately not findings.  The table of every line comes from the parsed
+    TOML document, not from a text match, so a header-looking string inside a
+    build list or a multiline string cannot move a line into a pytest table.
+    """
+    if content is None:
+        return []
+    try:
+        text = content.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return []
+    lines = text.splitlines()
+    addresses = _toml_line_addresses(text)
+    try:
+        document: Any = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError):
+        document = None
+    modules = _entry_point_modules(document) if document is not None else frozenset()
+    plugin_addresses = (
+        _plugin_option_addresses(document) if document is not None else frozenset()
+    )
+    findings = []
+    for line in added:
+        if not 1 <= line <= len(lines):
+            continue
+        address = addresses.get(line)
+        if address is None:
+            continue
+        for kind in _pyproject_line_kinds(
+            address, lines[line - 1], modules, plugin_addresses
+        ):
+            findings.append(_finding(kind, path, line))
+    return findings
+
+
 def _path_kinds(path: str) -> tuple[str, ...]:
     name = path.rsplit("/", 1)[-1].lower()
     kinds = []
@@ -487,15 +791,23 @@ def _path_kinds(path: str) -> tuple[str, ...]:
     return tuple(kinds)
 
 
-def _path_findings(change: _Change, added: list[int]) -> list[Finding]:
+def _path_findings(
+    change: _Change, added: list[int], content: bytes | None = None
+) -> list[Finding]:
     kinds = _path_kinds(change.path)
     entered = change.status.startswith(("A", "R", "C"))
     lines = added or ([1] if entered and kinds else [])
-    return [
+    findings = [
         _finding(kind, change.path, line)
         for line in lines
         for kind in kinds
     ]
+    if change.path.rsplit("/", 1)[-1].lower() == "pyproject.toml":
+        targets = list(added)
+        if not targets and entered and content is not None:
+            targets = list(range(1, len(content.splitlines()) + 1))
+        findings.extend(_pyproject_findings(change.path, targets, content))
+    return findings
 
 
 def _config_error(path: str) -> list[Finding]:
@@ -555,19 +867,13 @@ def _dedupe(findings: Iterable[Finding]) -> list[Finding]:
     return list({(item["kind"], item["path"], item["line"]): item for item in findings}.values())
 
 
-def _toml_findings(path: str, text: str) -> list[Finding]:
+def _toml_findings(path: str, text: str, *, recover: bool = False) -> list[Finding]:
+    """Validate a pyproject document; line semantics live in ``_path_findings``."""
     try:
-        document = tomllib.loads(text)
+        tomllib.loads(text)
     except (tomllib.TOMLDecodeError, ValueError):
-        return _config_error(path)
-    options = _mapping_path(document, ("tool", "pytest", "ini_options"))
-    root_options = {key: document[key] for key in ("addopts", "pytest_plugins", *_DISCOVERY_OPTIONS) if key in document}
-    findings = _option_findings(path, {**root_options, **options})
-    entry_points = _mapping_path(document, ("project", "entry-points"))
-    poetry_plugins = _mapping_path(document, ("tool", "poetry", "plugins"))
-    if "pytest11" in entry_points or "pytest11" in poetry_plugins:
-        findings.append(_finding("pytest_plugin", path))
-    return _dedupe(findings)
+        return [] if recover else _config_error(path)
+    return []
 
 
 def _ini_parser() -> configparser.ConfigParser:
@@ -603,13 +909,15 @@ def _ini_findings(path: str, text: str) -> list[Finding]:
     return _dedupe(findings)
 
 
-def _config_findings(path: str, content: bytes) -> list[Finding]:
+def _config_findings(
+    path: str, content: bytes, *, recover: bool = False
+) -> list[Finding]:
     try:
         text = content.decode("utf-8", "strict")
     except UnicodeDecodeError:
         return _config_error(path)
     if path.rsplit("/", 1)[-1].lower() == "pyproject.toml":
-        return _toml_findings(path, text)
+        return _toml_findings(path, text, recover=recover)
     return _ini_findings(path, text)
 
 
@@ -804,7 +1112,7 @@ def _content_findings(path: str, content: bytes, *, recover: bool = False) -> li
     name = path.rsplit("/", 1)[-1].lower()
     findings = []
     if name in _CONFIG_NAMES:
-        findings.extend(_config_findings(path, content))
+        findings.extend(_config_findings(path, content, recover=recover))
     if name.endswith(".py"):
         findings.extend(_python_findings(path, content, recover=recover))
     return findings
@@ -832,7 +1140,7 @@ def _changed_content(
         if change.status.startswith(("M", "T")) and before == after:
             continue
         added = _added_lines(change, before, after)
-        findings.extend(_path_findings(change, added))
+        findings.extend(_path_findings(change, added, after))
         findings.extend(_content_findings(change.path, after, recover=recover))
     return findings
 
@@ -1021,7 +1329,34 @@ def _with_differential(patch: str, findings: list[Finding]) -> ScanFindings:
     return ScanFindings(findings, differential=_differential(patch, findings))
 
 
-def scan_patch(patch: str) -> list[Finding]:
+def scan_patch(
+    patch: str,
+    repo_root: str | Path | None = None,
+    source_rev: str | None = None,
+) -> list[Finding]:
+    """Scan a patch for test-runner subversion.
+
+    With ``repo_root`` and ``source_rev`` the patch is applied to that tree and
+    the *whole* post-image file is scanned. Without them the changed files are
+    rebuilt from the hunks the patch carries, so a partial hunk is only a
+    fragment of a file: ``ast`` cannot parse it and the scan reports
+    ``parse_error`` on a file that is valid once the patch applies. Verify
+    always has the repository and the dispatched source revision, so it passes
+    both; a patch that does not apply to that tree falls back to the patch-only
+    scan and is refused later by the revision checks.
+    """
+
+    if repo_root is not None and source_rev:
+        try:
+            findings = _scan_change_tree(patch, Path(repo_root), str(source_rev))
+        except _ScanFailure:
+            findings = None
+        except (OSError, UnicodeError, ValueError, TypeError):
+            findings = None
+        if findings is not None:
+            return _with_differential(patch, findings)
+    elif (repo_root is None) != (source_rev is None):
+        return _with_differential(patch, _input_finding())
     try:
         findings = _scan_patch_only(patch)
     except _ScanFailure as exc:
@@ -1036,8 +1371,4 @@ def scan_for_verify(
     repo_root: str | Path | None = None,
     source_rev: str | None = None,
 ) -> list[Finding]:
-    if repo_root is None and source_rev is None:
-        return scan_patch(patch)
-    if repo_root is None or source_rev is None:
-        return _with_differential(patch, _input_finding())
-    return _with_differential(patch, scan_change(patch, repo_root, source_rev))
+    return scan_patch(patch, repo_root, source_rev)

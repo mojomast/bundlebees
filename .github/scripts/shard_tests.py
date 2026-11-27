@@ -39,10 +39,68 @@ def shards(total):
     return [sorted(x[2]) for x in loads]
 
 
-def pytest_files():
-    """The test files pytest itself collects for the whole suite (independent of test_files())."""
-    out = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
-                         cwd=ROOT, capture_output=True, text=True, timeout=600)
+def _load_main_oracle_lock(main_ref):
+    """Load oracle_lock from *main_ref*'s tree, never from the PR checkout.
+
+    Bootstrap exception: until this PR lands, origin/main has no oracle_lock.py;
+    only then does the loader fall back to the checkout's copy.
+    """
+    import importlib.util
+    import tempfile
+
+    shown = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{main_ref}:bundlebees_plugin/oracle_lock.py"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if shown.returncode == 0:
+        source = shown.stdout
+    else:
+        sys.path.insert(0, str(ROOT))
+        from bundlebees_plugin import oracle_lock as checkout_lock
+
+        return checkout_lock
+    handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    try:
+        handle.write(source)
+        handle.close()
+        spec = importlib.util.spec_from_file_location(
+            "bundlebees_main_oracle_lock", handle.name
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load oracle_lock from main")
+        module = importlib.util.module_from_spec(spec)
+        # Register before exec: a dataclass defined by the lock resolves its
+        # module through sys.modules, and an unregistered module reads as None.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
+        return module
+    finally:
+        sys.modules.pop("bundlebees_main_oracle_lock", None)
+        Path(handle.name).unlink(missing_ok=True)
+
+
+def pytest_files(main_ref=None):
+    """The test files pytest itself collects for the whole suite (independent of test_files()).
+
+    With *main_ref*, collection also runs under the oracle lock: main's pytest
+    configuration and plugin allowlist, never the checkout's own config.
+    """
+    argv = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"]
+    env = None
+    if main_ref:
+        oracle_lock = _load_main_oracle_lock(main_ref)
+
+        lock = oracle_lock.from_git(ROOT, main_ref)
+        argv = oracle_lock.locked_argv(lock, argv, rootdir=ROOT)
+        env = oracle_lock.locked_env()
+    out = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=600, env=env)
     if out.returncode not in (0, 5):
         sys.exit("pytest collection failed:\n" + out.stdout[-2000:] + out.stderr[-2000:])
     files = set()
@@ -55,9 +113,9 @@ def pytest_files():
     return files
 
 
-def check(total, against_pytest=False):
+def check(total, against_pytest=False, main_ref=None):
     if against_pytest:
-        missing = sorted(pytest_files() - set(test_files()))
+        missing = sorted(pytest_files(main_ref=main_ref) - set(test_files()))
         if missing:
             sys.exit("pytest collects files the shards would not run: " + ", ".join(missing))
     parts = shards(total)
@@ -70,10 +128,21 @@ def check(total, against_pytest=False):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) in (3, 4) and sys.argv[1] == "--check" and sys.argv[3:] in ([], ["--against-pytest"]):
-        check(int(sys.argv[2]), against_pytest=sys.argv[3:] == ["--against-pytest"])
-    elif len(sys.argv) == 3:
-        index, total = int(sys.argv[1]), int(sys.argv[2])
+    args = list(sys.argv[1:])
+    main_ref = None
+    if "--main-ref" in args:
+        position = args.index("--main-ref")
+        try:
+            main_ref = args[position + 1]
+        except IndexError:
+            sys.exit("--main-ref needs a git ref")
+        del args[position : position + 2]
+    against_pytest = "--against-pytest" in args
+    args = [argument for argument in args if argument != "--against-pytest"]
+    if len(args) == 2 and args[0] == "--check":
+        check(int(args[1]), against_pytest=against_pytest, main_ref=main_ref)
+    elif len(args) == 2 and main_ref is None and not against_pytest:
+        index, total = int(args[0]), int(args[1])
         if not 1 <= index <= total:
             sys.exit("index must be in 1..total")
         print("\n".join(shards(total)[index - 1]))

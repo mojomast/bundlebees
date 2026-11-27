@@ -175,6 +175,32 @@ def build_slice(
     return repo, base, verification
 
 
+def event_payload(base, head, number=12, branch="slice", labels=(), reviewed_sha=None, review_state="APPROVED"):
+    """A pull-request event payload; ``reviewed_sha`` makes it a review payload.
+
+    GitHub sends the pull request itself on both ``pull_request`` and
+    ``pull_request_review`` events.  A review payload additionally carries
+    ``review.commit_id``: the commit the review was submitted against, which is
+    not necessarily the pull request's head.
+    """
+    payload = {
+        "number": number,
+        "pull_request": {
+            "number": number,
+            "base": {"sha": base},
+            "head": {"sha": head, "ref": branch},
+            "labels": [{"name": name} for name in labels],
+            "body": "",
+        },
+    }
+    if reviewed_sha is None:
+        payload["action"] = "opened"
+    else:
+        payload["action"] = "submitted"
+        payload["review"] = {"state": review_state, "commit_id": reviewed_sha, "body": ""}
+    return payload
+
+
 class LeaseTamperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-test-"))
@@ -519,6 +545,133 @@ class LeaseTamperTests(unittest.TestCase):
 
     # -- event handling ---------------------------------------------------
 
+    def run_event(self, repo, payload, event_name, verify=None):
+        """Drive the gate from an event payload the way the CI job does.
+
+        The CI job passes ``$GITHUB_EVENT_PATH`` and ``GITHUB_EVENT_NAME``; the
+        verify boundary is pinned locally because a real base lease carries it.
+        """
+        event = self.tmp / ("event-%02d-%s.json" % (len(list(self.tmp.glob("event-*.json"))), event_name))
+        event.write_text(json.dumps(payload), encoding="utf-8")
+        env = dict(os.environ)
+        for key in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_REPOSITORY", "GITHUB_TOKEN"):
+            env.pop(key, None)
+        env["GITHUB_EVENT_NAME"] = event_name
+        env["GITHUB_EVENT_PATH"] = str(event)
+        command = [sys.executable, str(SCRIPT), "--repo", str(repo.path)]
+        if verify:
+            command += ["--verify-sha", verify]
+        command.append(str(event))
+        return subprocess.run(command, capture_output=True, text=True, env=env, timeout=120)
+
+    def tampered_slice(self, name):
+        """A slice whose head steps outside the lease; its parent commit is clean."""
+        repo, base, verify = self.make_slice(name=name)
+        repo.write("src/slice.py", "clean follow-up inside the lease\n")
+        clean = repo.commit("clean follow-up inside the lease")
+        repo.write("src/unleased.py", "tamper\n")
+        head = repo.commit("step outside the lease")
+        return repo, base, verify, clean, head
+
+    def test_pull_request_event_reads_the_head_from_the_payload(self):
+        repo, base, verify, _clean, head = self.tampered_slice("pr-event")
+
+        proc = self.run_event(repo, event_payload(base, head), "pull_request", verify=verify)
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("'src/unleased.py' is outside the slice lease", proc.stdout)
+        self.assertIn("PR head " + head, proc.stdout)
+
+    def test_review_event_reads_the_head_from_pull_request_head_sha(self):
+        repo, base, verify, clean, head = self.tampered_slice("review-event")
+
+        proc = self.run_event(
+            repo, event_payload(base, head, reviewed_sha=clean), "pull_request_review", verify=verify
+        )
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("head read from pull_request.head.sha " + head, proc.stdout)
+        self.assertIn("PR head " + head, proc.stdout)
+
+    def test_review_event_applies_the_same_rules_as_a_pull_request_event(self):
+        repo, base, verify, clean, head = self.tampered_slice("same-rules")
+
+        pull = self.run_event(repo, event_payload(base, head), "pull_request", verify=verify)
+        review = self.run_event(
+            repo, event_payload(base, head, reviewed_sha=clean), "pull_request_review", verify=verify
+        )
+
+        self.assertEqual(pull.returncode, review.returncode)
+        self.assertEqual(pull.returncode, 1, pull.stdout + pull.stderr)
+        for proc in (pull, review):
+            self.assertIn("'src/unleased.py' is outside the slice lease", proc.stdout)
+            self.assertIn("PR head " + head, proc.stdout)
+
+    def test_review_commit_id_never_moves_the_head_backwards(self):
+        # The reviewed commit is the clean parent; the head is the tampered
+        # child. Reading commit_id would pass the gate; reading the head fails it.
+        repo, base, verify, clean, head = self.tampered_slice("commit-id-old")
+
+        proc = self.run_event(
+            repo, event_payload(base, head, reviewed_sha=clean), "pull_request_review", verify=verify
+        )
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("PR head " + head, proc.stdout)
+        self.assertNotIn("PR head " + clean, proc.stdout)
+
+    def test_review_commit_id_never_moves_the_head_forwards(self):
+        # Here the reviewed commit is a tampered DESCENDANT of a clean head.
+        # Reading commit_id would fail the gate; reading the head passes it.
+        repo, base, verify, _clean, head = self.tampered_slice("commit-id-new")
+        clean_head = repo.rev("%s~1" % head)
+
+        proc = self.run_event(
+            repo, event_payload(base, clean_head, reviewed_sha=head), "pull_request_review", verify=verify
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("lease-tamper: OK:", proc.stdout)
+        self.assertNotIn("'src/unleased.py'", proc.stdout)
+
+    def test_review_event_without_a_pull_request_head_fails_closed(self):
+        # A review payload with no pull_request.head.sha must never borrow the
+        # review's commit_id as the head.
+        repo, base, verify, clean, _head = self.tampered_slice("no-head")
+
+        proc = self.run_event(
+            repo, event_payload(base, "", reviewed_sha=clean), "pull_request_review", verify=verify
+        )
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=review_event_head_missing", proc.stdout)
+        self.assertIn("never substituted for it", proc.stdout)
+        self.assertNotIn("lease-tamper: OK", proc.stdout)
+
+    def test_infer_event_name_distinguishes_a_review_payload(self):
+        module = load_gate_module()
+        base, head, reviewed = "a" * 40, "b" * 40, "c" * 40
+
+        self.assertEqual(
+            module.infer_event_name(event_payload(base, head, reviewed_sha=reviewed)),
+            "pull_request_review",
+        )
+        self.assertEqual(module.infer_event_name(event_payload(base, head)), "pull_request")
+        self.assertEqual(module.infer_event_name({"review": {"commit_id": head}}), "other")
+        self.assertEqual(module.infer_event_name({"merge_group": {"head_sha": head}}), "merge_group")
+
+    def test_target_from_event_reads_the_same_head_from_both_payloads(self):
+        module = load_gate_module()
+        base, head, reviewed = "a" * 40, "b" * 40, "c" * 40
+
+        pull = module.target_from_event(event_payload(base, head), "pull_request", {})
+        review = module.target_from_event(
+            event_payload(base, head, reviewed_sha=reviewed), "pull_request_review", {}
+        )
+
+        self.assertEqual((pull.base, pull.head, pull.number, pull.branch), (base, head, 12, "slice"))
+        self.assertEqual((review.base, review.head, review.number, review.branch), (base, head, 12, "slice"))
+
     def test_push_event_is_a_no_op(self):
         repo = self.new_repo("push")
         repo.write("src/slice.py", "base\n")
@@ -797,6 +950,53 @@ class SliceClassificationTests(unittest.TestCase):
         ]
 
         proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+
+    # -- the same rule on a review event ----------------------------------
+
+    def run_event(self, repo, payload, event_name="pull_request_review"):
+        """Drive the gate from an event payload with the fake API in the env."""
+        path = self.tmp / ("%s.json" % event_name)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        env = dict(os.environ)
+        for key in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_REPOSITORY", "GITHUB_TOKEN"):
+            env.pop(key, None)
+        env.update(self.api_env())
+        env["GITHUB_EVENT_NAME"] = event_name
+        env["GITHUB_EVENT_PATH"] = str(path)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--repo", str(repo.path), str(path)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_review_event_applies_the_non_slice_review_rule(self):
+        repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
+        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+
+        proc = self.run_event(
+            repo, event_payload(base, head, branch="feat/wave-x-x1", reviewed_sha=head)
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("is not a slice", proc.stdout)
+        self.assertIn("independent review (APPROVED)", proc.stdout)
+
+    def test_review_event_refuses_a_review_recorded_at_an_older_head(self):
+        # The review's commit_id (the parent) is in the payload; the head moved
+        # after the review. The gate judges the head, so the review does not carry.
+        repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
+        repo.write("src/slice.py", "one more commit\n")
+        newer = repo.commit("the head moves after review")
+        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+
+        proc = self.run_event(
+            repo, event_payload(base, newer, branch="feat/wave-x-x1", reviewed_sha=head)
+        )
 
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
