@@ -72,9 +72,17 @@ def _load_main_oracle_lock(main_ref):
         if spec is None or spec.loader is None:
             raise ImportError("cannot load oracle_lock from main")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Register before exec: a dataclass defined by the lock resolves its
+        # module through sys.modules, and an unregistered module reads as None.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
         return module
     finally:
+        sys.modules.pop("bundlebees_main_oracle_lock", None)
         Path(handle.name).unlink(missing_ok=True)
 
 
