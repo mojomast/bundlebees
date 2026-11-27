@@ -36,6 +36,7 @@ Strategy
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1158,6 +1159,38 @@ def stage_pinned_tools(
     return dict(env)
 
 
+def _staged_digest(path: Path) -> str:
+    """SHA-256 of a staged file, or a deterministic tree digest for a directory."""
+    if path.is_file():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    for child in sorted(path.rglob("*")):
+        if child.is_dir():
+            continue
+        digest.update(child.relative_to(path).as_posix().encode() + b"\0")
+        if child.is_symlink():
+            digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
+        else:
+            digest.update(hashlib.sha256(child.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def staged_tool_hashes(copy_dir: Path | str) -> dict[str, str]:
+    """Record the identity of every portable tool staged into the copy.
+
+    A GREEN must say which uv/pwsh bytes ran.  ``uv-cache`` is build data, not
+    a tool, and is excluded from the map.
+    """
+    root = Path(copy_dir) / _SANDBOX_TOOLS_DIR
+    if not root.is_dir():
+        return {}
+    return {
+        child.name: _staged_digest(child)
+        for child in sorted(root.iterdir())
+        if child.name != "uv-cache"
+    }
+
+
 def _stage_tools_for_backend(
     copy_dir: Path, env: Mapping[str, str], chosen: str | None
 ) -> dict[str, str]:
@@ -1420,6 +1453,7 @@ def run_in_sandbox(
             "output_tail": _output_tail(stdout, stderr),
             "junit": _junit_summary(evidence_host),
             "cases": cases,
+            "staged_tools": staged_tool_hashes(copy_dir),
         }
         if collect_file:
             result["collected"] = _read_collected(evidence_host / collect_file)

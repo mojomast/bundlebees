@@ -379,5 +379,19 @@ def test_ci_loads_the_oracle_lock_from_main_not_the_checkout():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "git show origin/main:bundlebees_plugin/oracle_lock.py" in workflow
+    assert "bootstrap exception" not in workflow
+    assert "cp bundlebees_plugin/oracle_lock.py" not in workflow
     assert "python -m bundlebees_plugin.oracle_lock" not in workflow
     assert "python -P" in workflow
+
+
+def test_harness_owned_tool_dir_is_refused_by_name():
+    from bundlebees_plugin import verify_local
+
+    assert verify_local._harness_owned_paths([".bundlebees-tools/uv"]) == [
+        ".bundlebees-tools/uv"
+    ]
+    assert verify_local._harness_owned_paths(["pkg/.bundlebees-tools/pwsh/x"]) == [
+        "pkg/.bundlebees-tools/pwsh/x"
+    ]
+    assert verify_local._harness_owned_paths(["src/app.py", "tests/test_app.py"]) == []

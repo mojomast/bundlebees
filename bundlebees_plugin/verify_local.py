@@ -878,6 +878,21 @@ def _oracle_config_paths(paths: Sequence[str], config_name: str) -> list[str]:
     return touched
 
 
+#: Directories the sandbox stages itself.  A patch may never add these names:
+#: they are harness state, not repository content.
+HARNESS_OWNED_DIRS: tuple[str, ...] = (".bundlebees-tools",)
+
+
+def _harness_owned_paths(paths: Sequence[str]) -> list[str]:
+    """Patch paths inside a harness-owned staging directory, in any directory."""
+    touched: list[str] = []
+    for raw in paths:
+        path = str(raw).split(" -> ")[-1]
+        if any(part in HARNESS_OWNED_DIRS for part in path.split("/")):
+            touched.append(path)
+    return touched
+
+
 def _import_shadow_paths(paths: Sequence[str], plugins: Sequence[str]) -> list[str]:
     """New top-level modules that would shadow pytest or a stdlib import.
 
@@ -1447,6 +1462,13 @@ def _verify_and_commit_locked(
         # Test runs create bytecode/caches; they are not part of the worker's patch.
         touched = [path for path in touched
                    if not (path.endswith(".pyc") or "__pycache__" in path.split("/") or ".pytest_cache" in path.split("/"))]
+        owned = _harness_owned_paths(touched)
+        if owned:
+            raise VerifyError(
+                "harness_path_in_patch",
+                f"the patch touches harness-owned paths: {owned}",
+                "Reject this artifact; the sandbox stages those names itself.",
+            )
         if oracle is not None:
             # The config name is harness-owned.  A patch that touches it is an
             # attempt to replace the oracle, not a test change: refuse by name
