@@ -1,0 +1,45 @@
+name: review rerun
+
+# A submitted review changes what lease-tamper/ci-gate answer, but GitHub keeps
+# a failed check from the pull_request run beside any later green run of the same
+# name, so the merge box stays blocked. Re-run the failed jobs on the failed
+# pull_request run(s) for the reviewed head instead of repeating the whole suite
+# under a second check-run set.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rerun-failed:
+    name: rerun failed pull_request jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Rerun failed jobs on the pull_request runs for this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api --paginate --slurp \
+            "repos/$REPO/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100")
+          ids=$(printf '%s' "$runs" | jq -r --argjson pr "$PR_NUMBER" '
+            [.[].workflow_runs[]
+             | select(.status == "completed" and .conclusion == "failure")
+             | select(any(.pull_requests[]?; .number == $pr))
+             | .id] | unique | .[]')
+          if [ -z "$ids" ]; then
+            echo "no failed pull_request run for $REPO#$PR_NUMBER at $HEAD_SHA"
+            exit 0
+          fi
+          for id in $ids; do
+            echo "rerun failed jobs: run $id"
+            gh api -X POST "repos/$REPO/actions/runs/$id/rerun-failed-jobs"
+          done
