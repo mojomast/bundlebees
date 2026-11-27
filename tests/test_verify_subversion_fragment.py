@@ -259,3 +259,29 @@ def test_a_created_file_that_does_not_parse_is_still_refused(tmp_path: Path):
 
     kinds = _kinds(subversion_scan.scan_patch(patch))
     assert kinds == {"parse_error"}, kinds
+
+
+def test_a_dangling_block_continuation_is_repairable():
+    """A hunk can open on ``else:``/``except``: a synthetic scope covers it."""
+
+    fragments = (
+        "    else:\n        total = 0\n",
+        "        except ValueError:\n            total = 0\n",
+    )
+    for fragment in fragments:
+        assert subversion_scan._repair_python(fragment) is not None, fragment
+        assert subversion_scan._python_findings("pkg/branch.py", fragment.encode(), recover=True) == []
+
+
+def test_a_repo_backed_scan_still_refuses_a_file_that_does_not_parse(tmp_path: Path):
+    """With a tree the scan reads the whole post-image: ``parse_error`` stays."""
+
+    valid = '"""Broken fixture."""\n\n\ndef broken():\n    pass\n'
+    repo, base = _fixture_repo(tmp_path, {"pkg/broken.py": valid})
+    broken = valid.replace("def broken():", "def broken(:")
+    patch = _patch_after(repo, "pkg/broken.py", broken)
+    _assert_applies(repo, patch)
+
+    findings = subversion_scan.scan_for_verify(patch, repo, base)
+    assert _kinds(findings) == {"parse_error"}, findings
+    assert [finding["line"] for finding in findings] == [4], findings
