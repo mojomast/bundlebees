@@ -1,0 +1,36 @@
+{
+  "branch": "feat/review-calibration",
+  "contract_id": "review-calibration",
+  "contract_sha256": "8665c168e76a9abdf461c72383611fe3887dd78beaa838515a163217ba117069",
+  "derived_from": {
+    "approved_at": "2026-11-27T20:13:07Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract": ".rizzstack/contracts/8665c168e76a9abdf461c72383611fe3887dd78beaa838515a163217ba117069.json"
+  },
+  "id": "review-calibration",
+  "lease_version": "rizzstack.lease/1",
+  "review": {
+    "approved_at": "2026-11-27T20:13:07Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
+    "status": "frozen"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_calibration.py"
+    ],
+    "prohibited": [
+      "tests/test_review_calibration.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_review_calibration.py"
+    ]
+  },
+  "slice": "review-calibration",
+  "source_rev": "a22d79a6762177f08d321212f78da79511060dd6"
+}

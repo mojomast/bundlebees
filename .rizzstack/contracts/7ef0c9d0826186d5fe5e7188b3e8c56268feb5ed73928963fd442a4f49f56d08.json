@@ -1,0 +1,128 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "After build_packet every PACKET_PATHS entry exists, packet.json carries the head sha and review/repo contains a git checkout.",
+      "tests": [
+        "tests/test_review_packet.py::test_packet_layout_matches_skill"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "claims_markdown renders a Claims heading and unchecked claim items.",
+      "tests": [
+        "tests/test_review_packet.py::test_claims_are_claims_not_transcript"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "A transcript or author_reasoning source key is refused with packet_untrusted_source.",
+      "tests": [
+        "tests/test_review_packet.py::test_author_transcript_is_not_a_trusted_source"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "A packet head that differs from the checkout HEAD is refused with packet_head_mismatch.",
+      "tests": [
+        "tests/test_review_packet.py::test_head_mismatch_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "A packet without a head sha is refused with packet_incomplete.",
+      "tests": [
+        "tests/test_review_packet.py::test_incomplete_packet_refused"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-packet",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "build_packet writes every path in the skill's review/ layout",
+      "the checkout's HEAD must equal packet.head_sha",
+      "claims.md is a checklist of claims, never transcript text"
+    ],
+    "summary": "review-packet <repo>#<pr> stages the offline review/ tree from trusted sources only: the PR, checks and prior reviews from the GitHub API, the trusted gate's class/tier, verify records, base-branch leases/contracts and canonical related files. claims.md is the coordinator's own claim list; an author transcript or reasoning is refused as a source."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:12:32Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "7ef0c9d0826186d5fe5e7188b3e8c56268feb5ed73928963fd442a4f49f56d08",
+    "status": "approved",
+    "test_collection": {
+      "collected": 5,
+      "manifest_sha256": "c3c841e0f764bc77c2d55d2afe8836687e2ff0eb7e6781756f2eeb19e02e6c48",
+      "source_rev": "758e0b6e8e8e60be5b70c8ddaee91e85b3c480ce"
+    }
+  },
+  "risk": {
+    "blast_radius": "all outside reviews; a poisoned packet makes an approval meaningless",
+    "reasons": [
+      "the packet is the reviewer's only evidence; an untrusted or mislabeled source corrupts every verdict"
+    ],
+    "tier": "medium"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_packet.py",
+      "bundlebees_plugin/cli.py"
+    ],
+    "prohibited": [
+      "tests/test_review_packet.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/dispatch.py"
+    ],
+    "test_files": [
+      "tests/test_review_packet.py"
+    ]
+  },
+  "source_rev": "758e0b6e8e8e60be5b70c8ddaee91e85b3c480ce",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Staged review packet builder",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_packet.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "FORBIDDEN_CLASSES contains gate, merge_lane, policy, rulesets, preauth, secrets, force_push, delete_data and deploy_without_rollback.",
+      "tests": [
+        "tests/test_preauth.py::test_never_preauthorizable_classes_are_frozen"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "An envelope validates only with every required field, max_uses >= 1 and an expiry within 7 days of now.",
+      "tests": [
+        "tests/test_preauth.py::test_envelope_fields_and_expiry_ceiling"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "may_act refuses every forbidden action class with preauth_forbidden_class.",
+      "tests": [
+        "tests/test_preauth.py::test_forbidden_action_class_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "conditions_met is true only when every named fact matches its value; a missing or unknown fact is false.",
+      "tests": [
+        "tests/test_preauth.py::test_conditions_are_proven_from_data_and_fail_closed"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "After max_uses recorded uses the next may_act refuses with preauth_exhausted.",
+      "tests": [
+        "tests/test_preauth.py::test_max_uses_counts_the_ledger"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "A revoked envelope is refused on the next may_act call.",
+      "tests": [
+        "tests/test_preauth.py::test_revocation_is_effective_immediately"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-007",
+      "statement": "The digest counts uses by envelope and lists revocations for the day.",
+      "tests": [
+        "tests/test_preauth.py::test_daily_digest_counts_uses_and_revocations"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "preauth-checker",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "forbidden action classes are refused",
+      "conditions are proven from facts and fail closed",
+      "uses, exhaustion, revocation and the daily digest come from the ledger"
+    ],
+    "summary": "A checker that proves every envelope condition from data before acting, refuses the never-preauthorizable classes and expired/exhausted/revoked envelopes, and an append-only ledger that records each use with its evidence and feeds a daily digest."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:13:18Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "9057d3800b21bd8dac099cd2199ab0e0193fce1e6e3c0574ea1376a57c44b444",
+    "status": "approved",
+    "test_collection": {
+      "collected": 7,
+      "manifest_sha256": "46b2b76ceaa8d9d2e26fd36c71a9c442db8e3ec0b49f7fa6748635e1b02e443b",
+      "source_rev": "574ec664c1dd54d3a3bb3d11e8d4acfbfd9ebecb"
+    }
+  },
+  "risk": {
+    "blast_radius": "every action taken without the owner in the loop",
+    "reasons": [
+      "an envelope is standing authority; a checker that trusts labels instead of facts is a permanent bypass"
+    ],
+    "tier": "high"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/preauth.py"
+    ],
+    "prohibited": [
+      "tests/test_preauth.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/approval.py",
+      "bundlebees_plugin/security.py"
+    ],
+    "test_files": [
+      "tests/test_preauth.py"
+    ]
+  },
+  "source_rev": "574ec664c1dd54d3a3bb3d11e8d4acfbfd9ebecb",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Pre-authorization checker and ledger",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_preauth.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}

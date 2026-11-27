@@ -1,0 +1,38 @@
+{
+  "branch": "feat/review-trigger",
+  "contract_id": "review-trigger",
+  "contract_sha256": "80e7f8cfaef2941df61a0b8ef57eebb8c39ecc7a9ac5906ffcab6990bc5aa588",
+  "derived_from": {
+    "approved_at": "2026-11-27T20:13:01Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract": ".rizzstack/contracts/80e7f8cfaef2941df61a0b8ef57eebb8c39ecc7a9ac5906ffcab6990bc5aa588.json"
+  },
+  "id": "review-trigger",
+  "lease_version": "rizzstack.lease/1",
+  "review": {
+    "approved_at": "2026-11-27T20:13:01Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
+    "status": "frozen"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_trigger.py",
+      "bundlebees_plugin/cli.py"
+    ],
+    "prohibited": [
+      "tests/test_review_trigger.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/client.py",
+      "bundlebees_plugin/dispatch.py"
+    ],
+    "test_files": [
+      "tests/test_review_trigger.py"
+    ]
+  },
+  "slice": "review-trigger",
+  "source_rev": "af7e628cb0e4530fa742824c5f6971f64050c485"
+}

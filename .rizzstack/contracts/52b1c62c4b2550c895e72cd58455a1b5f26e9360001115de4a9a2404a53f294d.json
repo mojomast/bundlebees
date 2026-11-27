@@ -1,0 +1,169 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "With no roles configuration the reviewer is k3.1-pro, family kimi, budget timeout_s 2700 and max_tool_calls 120.",
+      "tests": [
+        "tests/test_review_roles.py::test_default_reviewer_is_kimi"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "A roles.reviewer model and budget override the defaults while unspecified fields keep them.",
+      "tests": [
+        "tests/test_review_roles.py::test_configured_role_overrides_defaults"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "settings_from_ctx returns the roles mapping, proving the key is declared in DEFAULTS and reaches the code.",
+      "tests": [
+        "tests/test_review_roles.py::test_roles_key_is_delivered_through_settings_defaults"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "model_family maps Kimi ids to kimi, DeepSeek ids to deepseek, and every other or empty id to unknown.",
+      "tests": [
+        "tests/test_review_roles.py::test_model_family_table"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "A PR with any Kimi-authored commit routes to nous:deepseek-v4.1-flash-1017 with reason kimi_authored.",
+      "tests": [
+        "tests/test_review_roles.py::test_kimi_authored_routes_to_deepseek"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "A DeepSeek-only authored PR keeps the default Kimi reviewer with reason default.",
+      "tests": [
+        "tests/test_review_roles.py::test_deepseek_authored_keeps_kimi"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-007",
+      "statement": "A PR whose commits include both families refuses with code review_not_independent.",
+      "tests": [
+        "tests/test_review_roles.py::test_both_families_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-008",
+      "statement": "An empty, unknown-model or unrecognised author list refuses with review_not_independent.",
+      "tests": [
+        "tests/test_review_roles.py::test_unknown_author_needs_owner"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-009",
+      "statement": "author_families folds recorded author models into a family set and reports unknown for an empty list.",
+      "tests": [
+        "tests/test_review_roles.py::test_author_families_from_records"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-010",
+      "statement": "Every returned route's family is absent from the author family set.",
+      "tests": [
+        "tests/test_review_roles.py::test_routed_family_always_differs_from_every_author_family"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-roles",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "reviewer_role({}) returns k3.1-pro / kimi with the 2700 s, 120-call budget",
+      "a Kimi-authored PR routes to nous:deepseek-v4.1-flash-1017",
+      "an unknown author or a mixed-family PR refuses with review_not_independent",
+      "the roles key is delivered through settings.DEFAULTS"
+    ],
+    "summary": "Resolve the outside reviewer from roles.reviewer and route per PR from the recorded author model families: Kimi by default, Nous DeepSeek flash when any commit is Kimi-authored, and a refusal (review_not_independent) when the author is unknown or both families authored the PR."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:12:25Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "52b1c62c4b2550c895e72cd58455a1b5f26e9360001115de4a9a2404a53f294d",
+    "status": "approved",
+    "test_collection": {
+      "collected": 10,
+      "manifest_sha256": "d77241b3be0b124e3aa846e35c44220787958c39e7b82b816a580f18c84d676a",
+      "source_rev": "864b4ac247c489e386d0a97f93d3824c04ecc0a9"
+    }
+  },
+  "risk": {
+    "blast_radius": "every review dispatch's model choice and the independence check",
+    "reasons": [
+      "reviewer routing decides which model may bless a merge; a wrong route is a self-review"
+    ],
+    "tier": "medium"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_roles.py",
+      "bundlebees_plugin/settings.py",
+      "plugin.yaml"
+    ],
+    "prohibited": [
+      "tests/test_review_roles.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_review_roles.py"
+    ]
+  },
+  "source_rev": "864b4ac247c489e386d0a97f93d3824c04ecc0a9",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Reviewer routing by author model family",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_roles.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}

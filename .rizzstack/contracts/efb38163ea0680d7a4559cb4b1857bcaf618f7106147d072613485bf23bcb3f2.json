@@ -1,0 +1,199 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "A verdict missing its required fields is refused with verdict_schema_invalid.",
+      "tests": [
+        "tests/test_review_verdict.py::test_schema_invalid_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "An approve verdict carrying a blocking finding is refused with verdict_inconsistent.",
+      "tests": [
+        "tests/test_review_verdict.py::test_approve_with_a_blocking_finding_is_inconsistent"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "A changes_requested verdict with no blocking finding, or one without a failure_scenario, is refused.",
+      "tests": [
+        "tests/test_review_verdict.py::test_changes_requested_needs_blocking_evidence"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "needs_owner requires at least one owner decision and is accepted with one.",
+      "tests": [
+        "tests/test_review_verdict.py::test_needs_owner_names_a_decision"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "A verdict whose head differs from the current head is refused with head_moved.",
+      "tests": [
+        "tests/test_review_verdict.py::test_head_moved_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "A verdict for another repo or PR is refused with verdict_binding_mismatch.",
+      "tests": [
+        "tests/test_review_verdict.py::test_repo_or_pr_mismatch_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-007",
+      "statement": "A verdict whose reviewer family equals the packet author family is refused with review_not_independent.",
+      "tests": [
+        "tests/test_review_verdict.py::test_independence_rechecked"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-008",
+      "statement": "The approve body's first line is the canonical APPROVE (independent review \u2014 identity, model family family) at head line.",
+      "tests": [
+        "tests/test_review_verdict.py::test_render_approve_line_is_canonical"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-009",
+      "statement": "The changes_requested first line is canonical and names the first blocking title.",
+      "tests": [
+        "tests/test_review_verdict.py::test_render_changes_line_names_the_first_blocking_title"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-010",
+      "statement": "needs_owner renders no review body.",
+      "tests": [
+        "tests/test_review_verdict.py::test_needs_owner_renders_nothing"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-011",
+      "statement": "Under auto_reject a changes_requested verdict is posted and reported as posted.",
+      "tests": [
+        "tests/test_review_verdict.py::test_auto_reject_posts_changes_requested"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-012",
+      "statement": "Under auto_reject an approve verdict is queued and the poster is not called.",
+      "tests": [
+        "tests/test_review_verdict.py::test_approve_is_queued_not_posted"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-013",
+      "statement": "needs_owner neither posts nor queues.",
+      "tests": [
+        "tests/test_review_verdict.py::test_needs_owner_posts_nothing"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-014",
+      "statement": "record_line returns one campaign-record line naming repo#pr, head, verdict, family, attempt and status.",
+      "tests": [
+        "tests/test_review_verdict.py::test_one_record_line_per_verdict"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-verdict",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "an inconsistent verdict is refused before rendering",
+      "a moved head or a changed repo/PR is refused",
+      "auto_reject posts rejections and queues approvals"
+    ],
+    "summary": "Validate a review-verdict/1 against its schema and the packet (repo, PR, head, independence), render the gate-parsed first line, and post under post_mode auto_reject: changes_requested is posted, approve is queued for the owner, needs_owner posts nothing."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:12:54Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "efb38163ea0680d7a4559cb4b1857bcaf618f7106147d072613485bf23bcb3f2",
+    "status": "approved",
+    "test_collection": {
+      "collected": 14,
+      "manifest_sha256": "26bedaccc61e8e9158dd2d1b3194c64734818c737b89bc1a49ff6ee982d7cddd",
+      "source_rev": "252a9b785f4756c6f8fc6224a7f6a4bbf28480e8"
+    }
+  },
+  "risk": {
+    "blast_radius": "every posted review and the gate's independent-review decision",
+    "reasons": [
+      "the poster writes text the merge gate parses; a mis-rendered line can block or bless the wrong head"
+    ],
+    "tier": "high"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_verdict.py"
+    ],
+    "prohibited": [
+      "tests/test_review_verdict.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py",
+      "policy/outside-review.md"
+    ],
+    "test_files": [
+      "tests/test_review_verdict.py"
+    ]
+  },
+  "source_rev": "252a9b785f4756c6f8fc6224a7f6a4bbf28480e8",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Verdict validation, rendering and posting",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_verdict.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}
