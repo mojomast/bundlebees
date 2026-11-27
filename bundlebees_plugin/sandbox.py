@@ -1106,6 +1106,20 @@ def _stage_uv_cache(
     return updated
 
 
+def _pinned_tool_is_safe(source: Path) -> bool:
+    """Refuse a pinned tool the current user does not own or others can write."""
+    try:
+        info = source.stat()
+    except OSError:
+        return False
+    if hasattr(os, "getuid"):
+        if info.st_uid != os.getuid():
+            return False
+        if info.st_mode & 0o022:
+            return False
+    return True
+
+
 def stage_pinned_tools(
     copy_dir: Path,
     env: Mapping[str, str],
@@ -1133,6 +1147,8 @@ def stage_pinned_tools(
             continue
         source = Path(str(raw)).expanduser()
         if not source.exists():
+            continue
+        if not _pinned_tool_is_safe(source):
             continue
         destination = root / str(name)
         _remove_staged_entry(destination)

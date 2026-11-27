@@ -30,6 +30,7 @@ def _no_probe(name: str) -> bool:
 
 def _write_script(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
     return path
 
 
@@ -1214,3 +1215,21 @@ def test_staged_tool_hashes_never_read_a_fifo(tmp_path: Path):
 
     assert set(hashes) == {"pipe", "uv"}
     assert len(hashes["pipe"]) == 64
+
+
+def test_stage_pinned_tools_refuses_a_group_writable_tool(tmp_path: Path):
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"uv")
+    uv.chmod(0o666)
+
+    env = sandbox.stage_pinned_tools(
+        copy_dir,
+        {"PATH": "/usr/bin:/bin"},
+        tools=[("uv", str(uv))],
+        needed={"uv"},
+    )
+
+    assert not (copy_dir / ".bundlebees-tools" / "uv").exists()
+    assert env["PATH"] == "/usr/bin:/bin"

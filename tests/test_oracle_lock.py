@@ -458,3 +458,47 @@ def test_receipt_key_identity_hashes_the_pinned_tools(tmp_path, monkeypatch):
     assert verify_local._pinned_tools_identity() == {
         "uv": hashlib.sha256(b"uv-bytes").hexdigest()
     }
+
+
+def test_pinned_tool_identity_resolves_links_and_caches(tmp_path, monkeypatch):
+    import hashlib
+
+    from bundlebees_plugin import sandbox, verify_local
+
+    target = tmp_path / "uv-real"
+    target.write_bytes(b"uv-bytes")
+    link = tmp_path / "uv"
+    link.symlink_to(target)
+    monkeypatch.setattr(sandbox, "PINNED_TOOLS", (("uv", str(link)),))
+    verify_local._TOOL_IDENTITY_CACHE.clear()
+    calls = {"n": 0}
+    real = sandbox._staged_digest
+
+    def counting(path):
+        calls["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(sandbox, "_staged_digest", counting)
+    first = verify_local._pinned_tools_identity()
+    second = verify_local._pinned_tools_identity()
+
+    assert first == second == {"uv": hashlib.sha256(b"uv-bytes").hexdigest()}
+    assert calls["n"] == 1
+
+
+def test_record_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64}
+    record = verify_local._record(
+        "att_x",
+        "sha",
+        "base",
+        ["f"],
+        ["t"],
+        red={"exit_code": 1, "timed_out": False, "staged_tools": tools},
+        suite={"exit_code": 0, "timed_out": False, "staged_tools": tools},
+        gitleaks=None,
+    )
+    assert record["red"]["staged_tools"] == tools
+    assert record["suite"]["staged_tools"] == tools

@@ -582,21 +582,31 @@ def _sandbox_policy(
     }
 
 
+_TOOL_IDENTITY_CACHE: dict[tuple[str, int, int, int], str] = {}
+
+
 def _pinned_tools_identity() -> dict[str, str]:
     """Identity of the pinned portable tools a receipt's result depended on.
 
     A receipt from different uv/pwsh bytes must not be reused, so the tool
-    identity is part of the key.  Missing tools contribute nothing: the run
-    will stage nothing either.
+    identity is part of the key.  The pinned path is resolved first: staging
+    copies the bytes a symlink points at, so the key must hash those bytes, not
+    the link string.  Results are cached by (path, inode, size, mtime_ns) so a
+    receipt key does not re-hash the pwsh tree on every call.
     """
     identity: dict[str, str] = {}
     for name, raw in sandbox.PINNED_TOOLS:
-        source = Path(str(raw)).expanduser()
         try:
-            if source.is_symlink() or source.exists():
-                identity[str(name)] = sandbox._staged_digest(source)
+            source = Path(str(raw)).expanduser().resolve()
+            info = source.stat()
         except OSError:
             continue
+        key = (str(source), info.st_ino, info.st_size, info.st_mtime_ns)
+        digest = _TOOL_IDENTITY_CACHE.get(key)
+        if digest is None:
+            digest = sandbox._staged_digest(source)
+            _TOOL_IDENTITY_CACHE[key] = digest
+        identity[str(name)] = digest
     return identity
 
 
@@ -1681,8 +1691,16 @@ def _record(
         "base_rev": base_rev,
         "files": list(files),
         "tests": list(tests),
-        "red": None if red is None else {"exit_code": red["exit_code"], "timed_out": bool(red.get("timed_out"))},
-        "suite": None if suite is None else {"exit_code": suite.get("exit_code"), "timed_out": bool(suite.get("timed_out"))},
+        "red": None if red is None else {
+            "exit_code": red["exit_code"],
+            "timed_out": bool(red.get("timed_out")),
+            "staged_tools": red.get("staged_tools"),
+        },
+        "suite": None if suite is None else {
+            "exit_code": suite.get("exit_code"),
+            "timed_out": bool(suite.get("timed_out")),
+            "staged_tools": suite.get("staged_tools"),
+        },
         "gitleaks": None if gitleaks is None else {"exit_code": gitleaks.returncode},
         "mode": "commit-local",
         "patch_sha256": patch_sha256,
