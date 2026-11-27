@@ -468,7 +468,7 @@ _SANDBOX_TOOLS_DIR = ".bundlebees-tools"
 #: mounts, hide both, so the staging below is what puts them on the child PATH.
 PINNED_TOOLS: tuple[tuple[str, str], ...] = (
     ("uv", "~/.local/bin/uv"),
-    ("pwsh", "/var/tmp/pwsh"),
+    ("pwsh", "~/.local/share/bundlebees/tools/pwsh"),
 )
 #: A small uv cache with the build backend wheels the packaging tests need.
 #: The sandbox has no network, so ``UV_OFFLINE=1`` plus this cache is what makes
