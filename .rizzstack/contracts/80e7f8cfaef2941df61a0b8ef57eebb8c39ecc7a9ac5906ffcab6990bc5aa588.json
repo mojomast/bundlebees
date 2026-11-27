@@ -1,0 +1,128 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "A previously unseen (repo, pr) head builds and dispatches one review and records the head.",
+      "tests": [
+        "tests/test_review_trigger.py::test_new_head_dispatches_once"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "A head already seen dispatches nothing.",
+      "tests": [
+        "tests/test_review_trigger.py::test_unchanged_head_does_nothing"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "A changed head dispatches at the new head and heads_to_review reports it.",
+      "tests": [
+        "tests/test_review_trigger.py::test_updated_head_dispatches_at_the_new_head"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "The verify_review and lane_dryrun lanes are findings_only and lane_may_approve is False for both.",
+      "tests": [
+        "tests/test_review_trigger.py::test_lanes_are_findings_only_and_never_approve"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "An unknown lane kind raises instead of being treated as an approver.",
+      "tests": [
+        "tests/test_review_trigger.py::test_unknown_lane_kind_is_not_silently_allowed"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-trigger",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "a new head dispatches once and a repeated head does nothing",
+      "a moved head dispatches at the new head",
+      "both advisory lanes report findings_only and cannot approve"
+    ],
+    "summary": "Trigger the review pipeline once per pull-request head change, tracking (repo, pr) -> head so a new or updated PR dispatches exactly one review bee. The two advisory cron lanes call the same pipeline and remain findings-only: they never post APPROVE."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:13:01Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "80e7f8cfaef2941df61a0b8ef57eebb8c39ecc7a9ac5906ffcab6990bc5aa588",
+    "status": "approved",
+    "test_collection": {
+      "collected": 5,
+      "manifest_sha256": "95ed0a279b3e80858668d0bc58224373fea286443030fb94ac8288a0d0f2f2f9",
+      "source_rev": "af7e628cb0e4530fa742824c5f6971f64050c485"
+    }
+  },
+  "risk": {
+    "blast_radius": "dispatch volume and the exact-head review of every PR",
+    "reasons": [
+      "the trigger decides when an approval may exist; a duplicate or missed head breaks the exact-head rule"
+    ],
+    "tier": "high"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_trigger.py",
+      "bundlebees_plugin/cli.py"
+    ],
+    "prohibited": [
+      "tests/test_review_trigger.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/client.py",
+      "bundlebees_plugin/dispatch.py"
+    ],
+    "test_files": [
+      "tests/test_review_trigger.py"
+    ]
+  },
+  "source_rev": "af7e628cb0e4530fa742824c5f6971f64050c485",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Head-change review trigger and findings-only lanes",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_trigger.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}

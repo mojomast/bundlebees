@@ -1,0 +1,144 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "The brief's security block has no credentials and no token-shaped key anywhere in it.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_no_push_or_api_credentials"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "The only allowed network destination is model-provider.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_network_provider_only"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "The brief carries kind review, the role model and budget, the packet head as source_rev, and the two writable review paths.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_brief_uses_the_routed_model_and_budget"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "The brief's hard rules forbid push, merge and posting reviews.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_hard_rules_forbid_push_merge_and_posting"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "A packet authored by the reviewer's own family is refused with review_not_independent.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_same_family_author_is_refused"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "A brief whose security block allows push is refused with review_profile_invalid and the dispatcher is never called.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_tampered_profile_is_refused_before_dispatch"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-007",
+      "statement": "dispatch_review passes the brief to the dispatcher exactly once and returns its result.",
+      "tests": [
+        "tests/test_review_dispatch.py::test_dispatch_calls_the_dispatcher_once"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-dispatch",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "the brief carries the routed model and the role budget",
+      "the security profile forbids push, API calls and credentials",
+      "a same-family author is refused before dispatch"
+    ],
+    "summary": "Build and dispatch a review bee from the routed role and the packet head, with a read-only security profile: it may write review/verdict.json and review/scratch/ only, holds no push or API credential, and its only network destination is the model provider."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:12:43Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "77ad1f384b729f789879817ac1c0d78be3276c2ebe4f1472eb8350bc5fd203d6",
+    "status": "approved",
+    "test_collection": {
+      "collected": 7,
+      "manifest_sha256": "b81f94af9b5315d47ffb5cdb63a62d55b703bdc899b6fc4378fc57bf48f07543",
+      "source_rev": "e80099dd5fc661b82a7c4c1b6e7b3a47ad7f487f"
+    }
+  },
+  "risk": {
+    "blast_radius": "every outside review dispatch",
+    "reasons": [
+      "a review bee with write or API credentials could edit the PR it reviews or post its own verdict"
+    ],
+    "tier": "high"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_dispatch.py"
+    ],
+    "prohibited": [
+      "tests/test_review_dispatch.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/dispatch.py",
+      "bundlebees_plugin/brief.py",
+      "bundlebees_plugin/security.py"
+    ],
+    "test_files": [
+      "tests/test_review_dispatch.py"
+    ]
+  },
+  "source_rev": "e80099dd5fc661b82a7c4c1b6e7b3a47ad7f487f",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Read-only review-bee dispatch",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_dispatch.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}

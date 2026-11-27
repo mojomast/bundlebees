@@ -1,0 +1,38 @@
+{
+  "branch": "feat/review-roles",
+  "contract_id": "review-roles",
+  "contract_sha256": "52b1c62c4b2550c895e72cd58455a1b5f26e9360001115de4a9a2404a53f294d",
+  "derived_from": {
+    "approved_at": "2026-11-27T20:12:25Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract": ".rizzstack/contracts/52b1c62c4b2550c895e72cd58455a1b5f26e9360001115de4a9a2404a53f294d.json"
+  },
+  "id": "review-roles",
+  "lease_version": "rizzstack.lease/1",
+  "review": {
+    "approved_at": "2026-11-27T20:12:25Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
+    "status": "frozen"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_roles.py",
+      "bundlebees_plugin/settings.py",
+      "plugin.yaml"
+    ],
+    "prohibited": [
+      "tests/test_review_roles.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_review_roles.py"
+    ]
+  },
+  "slice": "review-roles",
+  "source_rev": "864b4ac247c489e386d0a97f93d3824c04ecc0a9"
+}

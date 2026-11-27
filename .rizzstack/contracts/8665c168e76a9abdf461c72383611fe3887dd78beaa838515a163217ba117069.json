@@ -1,0 +1,134 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "calibration_table pairs both verdicts for a head and reports missed and false-block titles.",
+      "tests": [
+        "tests/test_review_calibration.py::test_table_pairs_both_verdicts_and_names_the_deltas"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "A bee blocking finding the human did not raise appears as a false block and not as a miss.",
+      "tests": [
+        "tests/test_review_calibration.py::test_false_blocks_are_bee_findings_the_human_did_not_raise"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "Nine paired reviews are not enough to promote.",
+      "tests": [
+        "tests/test_review_calibration.py::test_nine_reviews_are_not_promoted"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "Ten reviews including three gate_security/deploy_path reviews with no misses promote.",
+      "tests": [
+        "tests/test_review_calibration.py::test_ten_reviews_with_three_sensitive_ones_can_promote"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "One missed blocking finding blocks promotion even at ten reviews.",
+      "tests": [
+        "tests/test_review_calibration.py::test_one_missed_blocking_finding_blocks_promotion"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "A false-block rate of exactly 20% promotes and anything above 20% does not.",
+      "tests": [
+        "tests/test_review_calibration.py::test_false_block_rate_boundary_is_twenty_percent"
+      ],
+      "verification": "test"
+    }
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit approved tests"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "review-calibration",
+  "interfaces": [],
+  "outcome": {
+    "observable_behavior": [
+      "missed findings are human findings absent from the bee's",
+      "false blocks are bee findings absent from the human's",
+      "promotion needs 10 PRs, 3 sensitive reviews, zero misses and <= 20% false blocks"
+    ],
+    "summary": "Record the bee and human/outside verdicts for the same head, compute the calibration table (missed findings, false blocks) and the promotion status: at least 10 PRs including 3 gate_security or deploy_path reviews, zero missed blocking findings, false-block rate <= 20%."
+  },
+  "review": {
+    "approved_at": "2026-11-27T20:13:07Z",
+    "approved_by": "Kyle (owner) typed: approved 52b1c62c4b25 7ef0c9d08261 77ad1f384b72 efb38163ea06 80e7f8cfaef2 8665c168e76a 10d4cdeb93a0 9057d3800b21 19593ba24c9c ba367f1b2661 on 2026-11-27",
+    "contract_sha256": "8665c168e76a9abdf461c72383611fe3887dd78beaa838515a163217ba117069",
+    "status": "approved",
+    "test_collection": {
+      "collected": 6,
+      "manifest_sha256": "32d5a3a5b6a7b6d2b39323a4a6be1fd68cc3df81f9aa42ed6a1bbb3ae688605a",
+      "source_rev": "a22d79a6762177f08d321212f78da79511060dd6"
+    }
+  },
+  "risk": {
+    "blast_radius": "the shadow period and the decision to enable automatic approvals",
+    "reasons": [
+      "promotion of the bee to auto-approve rests on this bar; a loose metric silently widens approval"
+    ],
+    "tier": "medium"
+  },
+  "scope": {
+    "assigned_files": [
+      "bundlebees_plugin/review_calibration.py"
+    ],
+    "prohibited": [
+      "tests/test_review_calibration.py",
+      "CHANGELOG.md",
+      ".rizzstack/**"
+    ],
+    "read_only": [
+      "bundlebees_plugin/cli.py"
+    ],
+    "test_files": [
+      "tests/test_review_calibration.py"
+    ]
+  },
+  "source_rev": "a22d79a6762177f08d321212f78da79511060dd6",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Shadow calibration and promotion bar",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_review_calibration.py"
+    ],
+    "independent": true,
+    "integration": false
+  }
+}
