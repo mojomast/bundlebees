@@ -15,12 +15,6 @@ from __future__ import annotations
 
 import pytest
 
-from bundlebees_plugin.review_dispatch import (
-    REVIEW_SECURITY,
-    ReviewDispatchError,
-    build_review_brief,
-    dispatch_review,
-)
 
 PACKET = {
     "repo": "mojomast/rizzstack",
@@ -37,10 +31,17 @@ ROLE = {
 }
 
 
+def _load():
+    import importlib
+
+    return importlib.import_module("bundlebees_plugin.review_dispatch")
+
+
 def test_no_push_or_api_credentials():
-    brief = build_review_brief(PACKET, ROLE)
+    m = _load()
+    brief = m.build_review_brief(PACKET, ROLE)
     security = brief["security"]
-    assert security == REVIEW_SECURITY
+    assert security == m.REVIEW_SECURITY
     assert security["allow_push"] is False
     assert security["allow_api"] is False
     assert list(security["credentials"]) == []
@@ -50,12 +51,14 @@ def test_no_push_or_api_credentials():
 
 
 def test_network_provider_only():
-    brief = build_review_brief(PACKET, ROLE)
+    m = _load()
+    brief = m.build_review_brief(PACKET, ROLE)
     assert list(brief["security"]["network"]) == ["model-provider"]
 
 
 def test_brief_uses_the_routed_model_and_budget():
-    brief = build_review_brief(PACKET, ROLE)
+    m = _load()
+    brief = m.build_review_brief(PACKET, ROLE)
     assert brief["kind"] == "review"
     assert brief["model"] == "k3.1-pro"
     assert brief["model_family"] == "kimi"
@@ -66,31 +69,35 @@ def test_brief_uses_the_routed_model_and_budget():
 
 
 def test_hard_rules_forbid_push_merge_and_posting():
-    rules = " ".join(build_review_brief(PACKET, ROLE)["hard_rules"]).lower()
+    m = _load()
+    rules = " ".join(m.build_review_brief(PACKET, ROLE)["hard_rules"]).lower()
     for verb in ("never push", "never merge", "never post"):
         assert verb in rules
 
 
 def test_same_family_author_is_refused():
+    m = _load()
     packet = dict(PACKET, author_model_family="kimi")
-    with pytest.raises(ReviewDispatchError) as caught:
-        build_review_brief(packet, ROLE)
+    with pytest.raises(m.ReviewDispatchError) as caught:
+        m.build_review_brief(packet, ROLE)
     assert caught.value.code == "review_not_independent"
 
 
 def test_tampered_profile_is_refused_before_dispatch():
-    brief = build_review_brief(PACKET, ROLE)
+    m = _load()
+    brief = m.build_review_brief(PACKET, ROLE)
     brief["security"] = dict(brief["security"], allow_push=True)
     called = []
-    with pytest.raises(ReviewDispatchError) as caught:
-        dispatch_review(brief, lambda b: called.append(b) or {"attempt": "att_x"})
+    with pytest.raises(m.ReviewDispatchError) as caught:
+        m.dispatch_review(brief, lambda b: called.append(b) or {"attempt": "att_x"})
     assert caught.value.code == "review_profile_invalid"
     assert called == []
 
 
 def test_dispatch_calls_the_dispatcher_once():
-    brief = build_review_brief(PACKET, ROLE)
+    m = _load()
+    brief = m.build_review_brief(PACKET, ROLE)
     calls = []
-    result = dispatch_review(brief, lambda b: calls.append(b) or {"attempt": "att_x"})
+    result = m.dispatch_review(brief, lambda b: calls.append(b) or {"attempt": "att_x"})
     assert calls == [brief]
     assert result["attempt"] == "att_x"
