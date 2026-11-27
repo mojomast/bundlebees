@@ -675,3 +675,25 @@ class SourceHygieneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticDedupeTests(unittest.TestCase):
+    def test_source_error_key_tracks_the_projection(self):
+        from bundlebees_plugin.rails_bundlebees_source import _map
+
+        def key(at):
+            entry = (None, "verify-results/att_key.json", "verify-results",
+                     {"at": at}, "raw-digest")
+            return _map(entry, "bb:test", disk=True, key=None)[0]["dedupe_key"]
+
+        self.assertEqual(key("2026-01-01T00:00:00Z"), key("2026-01-01T00:00:00Z"))
+        self.assertNotEqual(key("2026-01-01T00:00:00Z"), key("2026-01-01T01:00:00Z"))
+
+    def test_anonymous_snapshot_errors_stay_identical(self):
+        from bundlebees_plugin import rails_bundlebees_source as source
+
+        def page(note):
+            rows = source.BundlebeesSource(snapshot=[{"note": note}]).read_batch()
+            return rows["records"][0]["dedupe_key"]
+
+        self.assertEqual(page("fixture one"), page("fixture two"))

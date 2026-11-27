@@ -257,8 +257,16 @@ def _map(entry, instance, *, disk, key):
                     lane=lane, redaction_policy=redact, dedupe_key=_alias('bb', [instance, rid, part]))
 
     def error(code):
-        return [draft('source.error', dict(range=[0, 0], cursor=None, code=code,
-                                           count=1, digest=None), 'imported_observation', revision=_ERROR_REVISION)]
+        row = draft('source.error', dict(range=[0, 0], cursor=None, code=code,
+                                         count=1, digest=None), 'imported_observation',
+                    revision=_ERROR_REVISION)
+        # A diagnostic is content-addressed: the projection for one record can
+        # legitimately change (an older producer emitted a different shape or
+        # timing), and a fixed revision then makes a retry collide with
+        # different semantic bytes.  Unchanged diagnostics still dedupe.
+        basis = {key: value for key, value in row.items() if key != 'dedupe_key'}
+        row['dedupe_key'] = _alias('bb', [instance, rid, _hash(basis)])
+        return [row]
 
     if record is None:
         return error('invalid_record')
