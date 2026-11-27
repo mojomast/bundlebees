@@ -1168,6 +1168,20 @@ def test_staged_tool_hashes_record_file_and_directory(tmp_path: Path):
     assert hashes["pwsh"] != hashes["uv"]
 
 
+def test_staged_tool_hashes_record_a_symlinked_directory_as_a_link(tmp_path: Path):
+    target = tmp_path / "real-pwsh"
+    (target / "inner").mkdir(parents=True)
+    (target / "inner" / "helper").write_bytes(b"pwsh")
+    root = tmp_path / ".bundlebees-tools"
+    root.mkdir()
+    (root / "pwsh").symlink_to(target, target_is_directory=True)
+
+    hashes = sandbox.staged_tool_hashes(tmp_path)
+
+    expected = hashlib.sha256(b"link\0" + os.fsencode(str(target))).hexdigest()
+    assert hashes == {"pwsh": expected}
+
+
 def test_run_in_sandbox_puts_the_pinned_tool_on_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

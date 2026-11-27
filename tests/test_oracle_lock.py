@@ -409,3 +409,29 @@ def test_shard_tests_loads_the_main_lock_with_its_dataclasses():
     spec.loader.exec_module(module)
     lock = module._load_main_oracle_lock("HEAD")
     assert lock.CONFIG_NAME == ".bundlebees-oracle-pytest.ini"
+
+
+def test_test_evidence_carries_staged_tools():
+    from bundlebees_plugin import verify_local
+
+    tools = {"uv": "a" * 64, "pwsh": "b" * 64}
+    out = verify_local._test_evidence({"exit_code": 0, "staged_tools": tools})
+    assert out["staged_tools"] == tools
+
+
+def test_shard_loader_fails_closed_when_main_has_no_lock():
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "shard_tests_fail_closed", root / ".github" / "scripts" / "shard_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module._load_main_oracle_lock("refs/heads/no-such-ref")
+    except SystemExit as exc:
+        assert "refusing to use the checkout's copy" in str(exc)
+    else:
+        raise AssertionError("loader fell back to the checkout copy instead of failing closed")

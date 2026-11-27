@@ -372,6 +372,8 @@ def _test_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         normalized["junit"] = evidence.get("junit")
     if "backend" in evidence:
         normalized["backend"] = evidence.get("backend")
+    if "staged_tools" in evidence:
+        normalized["staged_tools"] = evidence.get("staged_tools")
     return normalized
 
 

@@ -1160,19 +1160,21 @@ def stage_pinned_tools(
 
 
 def _staged_digest(path: Path) -> str:
-    """SHA-256 of a staged file, or a deterministic tree digest for a directory."""
-    if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    digest = hashlib.sha256()
-    for child in sorted(path.rglob("*")):
-        if child.is_dir():
-            continue
-        digest.update(child.relative_to(path).as_posix().encode() + b"\0")
-        if child.is_symlink():
-            digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
-        else:
-            digest.update(hashlib.sha256(child.read_bytes()).digest())
-    return digest.hexdigest()
+    """SHA-256 of a staged file, a symlink target, or a deterministic tree digest."""
+    if path.is_symlink():
+        return hashlib.sha256(b"link\0" + os.readlink(path).encode()).hexdigest()
+    if path.is_dir():
+        digest = hashlib.sha256()
+        for child in sorted(path.rglob("*")):
+            if child.is_dir():
+                continue
+            digest.update(child.relative_to(path).as_posix().encode() + b"\0")
+            if child.is_symlink():
+                digest.update(b"link\0" + os.readlink(child).encode() + b"\0")
+            else:
+                digest.update(hashlib.sha256(child.read_bytes()).digest())
+        return digest.hexdigest()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def staged_tool_hashes(copy_dir: Path | str) -> dict[str, str]:
