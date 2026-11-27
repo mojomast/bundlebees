@@ -381,6 +381,11 @@ def locked_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     env = dict(os.environ if environ is None else environ)
     env.update(LOCK_ENV)
+    # ``-P`` is the per-process guard.  Exporting PYTHONSAFEPATH would also be
+    # inherited by every Python child a test spawns, and legitimate helpers do
+    # ``python -m tool`` from their own directory (the repo's acdd-lint test is
+    # one); the pytest process itself is already safe before it imports tests.
+    env.pop("PYTHONSAFEPATH", None)
     env.pop("PYTHONPATH", None)
     return env
 

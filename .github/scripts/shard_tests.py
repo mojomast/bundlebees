@@ -92,7 +92,6 @@ def pytest_files(main_ref=None):
         lock = oracle_lock.from_git(ROOT, main_ref)
         argv = oracle_lock.locked_argv(lock, argv, rootdir=ROOT)
         env = oracle_lock.locked_env()
-        env["PYTHONSAFEPATH"] = "1"
     out = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=600, env=env)
     if out.returncode not in (0, 5):
         sys.exit("pytest collection failed:\n" + out.stdout[-2000:] + out.stderr[-2000:])

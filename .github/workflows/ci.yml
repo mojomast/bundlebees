@@ -119,10 +119,10 @@ jobs:
             echo "oracle lock: bootstrap exception, origin/main has none; using this PR's copy"
             cp bundlebees_plugin/oracle_lock.py "$RUNNER_TEMP/oracle-lock/oracle_lock.py"
           fi
-          PYTHONSAFEPATH=1 PYTHONPATH= python -P .github/scripts/shard_tests.py --check 4 --against-pytest --main-ref origin/main
+          PYTHONPATH= python -P .github/scripts/shard_tests.py --check 4 --against-pytest --main-ref origin/main
           mapfile -t files < <(python3 -P .github/scripts/shard_tests.py ${{ matrix.shard }} 4)
           test "${#files[@]}" -gt 0
-          PYTHONSAFEPATH=1 python -P -B "$RUNNER_TEMP/oracle-lock/oracle_lock.py" \
+          python -P -B "$RUNNER_TEMP/oracle-lock/oracle_lock.py" \
             --main-ref origin/main --rootdir . -- -rs "${files[@]}"
       - name: Measure tool-schema tokens
         if: ${{ matrix.shard == 1 }}
