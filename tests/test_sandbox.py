@@ -1245,3 +1245,16 @@ def test_pinned_tool_safety_walks_the_tree(tmp_path: Path):
     tree.chmod(0o755)
 
     assert not sandbox._pinned_tool_is_safe(tree)
+
+
+def test_pinned_tool_safety_allows_symlinks_in_the_tree(tmp_path: Path):
+    tree = tmp_path / "pwsh"
+    (tree / "a").mkdir(parents=True)
+    real = tree / "a" / "pwsh"
+    real.write_bytes(b"binary")
+    real.chmod(0o644)
+    (tree / "a" / "pwsh-link").symlink_to("pwsh")
+    (tree / "a").chmod(0o755)
+    tree.chmod(0o755)
+
+    assert sandbox._pinned_tool_is_safe(tree)

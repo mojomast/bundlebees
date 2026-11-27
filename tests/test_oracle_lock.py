@@ -596,3 +596,19 @@ def test_pinned_identity_invalidates_on_a_deep_edit(tmp_path, monkeypatch):
     second = verify_local._pinned_tools_identity()
 
     assert first != second
+
+
+def test_stat_key_includes_inode_and_ctime(tmp_path):
+    import os
+
+    from bundlebees_plugin import verify_local
+
+    tool = tmp_path / "uv"
+    tool.write_bytes(b"uv")
+    tool.chmod(0o644)
+    first = verify_local._tool_stat_key(tool)
+    info = tool.stat()
+    os.utime(tool, ns=(info.st_atime_ns, info.st_mtime_ns))
+    second = verify_local._tool_stat_key(tool)
+
+    assert first != second

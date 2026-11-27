@@ -585,11 +585,17 @@ def _sandbox_policy(
     }
 
 
-_TOOL_IDENTITY_CACHE: dict[tuple[str, tuple[tuple[str, int, int, int, int], ...]], str] = {}
+_TOOL_IDENTITY_CACHE: dict[
+    tuple[str, tuple[tuple[str, int, int, int, int, int, int], ...]], str
+] = {}
 
 
-def _tool_stat_key(root: Path) -> tuple[str, tuple[tuple[str, int, int, int, int], ...]]:
-    """Stat-only fingerprint of a tool tree (path, mode, uid, size, mtime_ns).
+def _tool_stat_key(
+    root: Path,
+) -> tuple[str, tuple[tuple[str, int, int, int, int, int, int], ...]]:
+    """Stat-only fingerprint of a tool tree.
+
+    Keys on path, mode, uid, size, mtime_ns, inode and ctime_ns per entry.
 
     A directory's own mtime does not change when a file deep inside is edited,
     so the key walks the tree.  It never reads file contents.
@@ -598,14 +604,24 @@ def _tool_stat_key(root: Path) -> tuple[str, tuple[tuple[str, int, int, int, int
         paths = sorted(root.rglob("*"))
     else:
         paths = [root]
-    entries: list[tuple[str, int, int, int, int]] = []
+    entries: list[tuple[str, int, int, int, int, int, int]] = []
     for path in paths:
         try:
             info = path.lstat() if path.is_symlink() else path.stat()
         except OSError:
             continue
         rel = "" if path == root else str(path.relative_to(root))
-        entries.append((rel, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns))
+        entries.append(
+            (
+                rel,
+                info.st_mode,
+                info.st_uid,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ino,
+                info.st_ctime_ns,
+            )
+        )
     return (str(root), tuple(entries))
 
 

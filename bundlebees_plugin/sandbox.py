@@ -1128,6 +1128,10 @@ def _pinned_tool_is_safe(source: Path) -> bool:
                 return False
             if info.st_uid != os.getuid():
                 return False
+            if stat.S_ISLNK(info.st_mode):
+                # lstat on a Linux symlink always reports 0777; the link is
+                # copied as a link, so only its owner matters here.
+                continue
             if info.st_mode & 0o022:
                 return False
     return True
