@@ -16,16 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from bundlebees_plugin.preauth import (
-    FORBIDDEN_CLASSES,
-    PreauthError,
-    conditions_met,
-    daily_digest,
-    may_act,
-    record_use,
-    revoke,
-    validate_envelope,
-)
 
 NOW = "2026-11-27T20:00:00Z"
 
@@ -49,71 +39,84 @@ def _facts(**overrides):
     return value
 
 
+def _load():
+    import importlib
+
+    return importlib.import_module("bundlebees_plugin.preauth")
+
+
 def test_never_preauthorizable_classes_are_frozen():
+    m = _load()
     assert {
         "gate", "merge_lane", "policy", "rulesets", "preauth", "secrets",
         "force_push", "delete_data", "deploy_without_rollback",
-    } <= set(FORBIDDEN_CLASSES)
+    } <= set(m.FORBIDDEN_CLASSES)
 
 
 def test_envelope_fields_and_expiry_ceiling():
-    validate_envelope(_envelope(), NOW)
-    with pytest.raises(PreauthError) as caught:
-        validate_envelope(_envelope(expires_at="2026-12-31T00:00:00Z"), NOW)
+    m = _load()
+    m.validate_envelope(_envelope(), NOW)
+    with pytest.raises(m.PreauthError) as caught:
+        m.validate_envelope(_envelope(expires_at="2026-12-31T00:00:00Z"), NOW)
     assert caught.value.code == "preauth_expiry_too_long"
-    with pytest.raises(PreauthError) as caught:
-        validate_envelope(_envelope(max_uses=0), NOW)
+    with pytest.raises(m.PreauthError) as caught:
+        m.validate_envelope(_envelope(max_uses=0), NOW)
     assert caught.value.code == "preauth_envelope_invalid"
-    with pytest.raises(PreauthError) as caught:
-        validate_envelope(_envelope(expires_at="2026-11-01T00:00:00Z"), NOW)
+    with pytest.raises(m.PreauthError) as caught:
+        m.validate_envelope(_envelope(expires_at="2026-11-01T00:00:00Z"), NOW)
     assert caught.value.code == "preauth_expired"
 
 
 def test_forbidden_action_class_refused():
-    for action_class in sorted(FORBIDDEN_CLASSES):
-        with pytest.raises(PreauthError) as caught:
-            may_act(_envelope(action_class=action_class), _facts(), Path("/nonexistent"), NOW)
+    m = _load()
+    for action_class in sorted(m.FORBIDDEN_CLASSES):
+        with pytest.raises(m.PreauthError) as caught:
+            m.may_act(_envelope(action_class=action_class), _facts(), Path("/nonexistent"), NOW)
         assert caught.value.code == "preauth_forbidden_class"
 
 
 def test_conditions_are_proven_from_data_and_fail_closed():
+    m = _load()
     envelope = _envelope()
-    assert conditions_met(envelope, _facts()) is True
-    assert conditions_met(envelope, _facts(diff_limited=False)) is False
-    assert conditions_met(envelope, {}) is False
+    assert m.conditions_met(envelope, _facts()) is True
+    assert m.conditions_met(envelope, _facts(diff_limited=False)) is False
+    assert m.conditions_met(envelope, {}) is False
     unknown = _envelope(conditions=[{"name": "vibes", "fact": "unknown_fact", "value": True}])
-    assert conditions_met(unknown, _facts(unknown_fact=True)) is False
+    assert m.conditions_met(unknown, _facts(unknown_fact=True)) is False
 
 
 def test_max_uses_counts_the_ledger(tmp_path: Path):
+    m = _load()
     ledger = tmp_path / "preauth.jsonl"
     envelope = _envelope(max_uses=2)
     for _ in range(2):
-        result = may_act(envelope, _facts(), ledger, NOW)
+        result = m.may_act(envelope, _facts(), ledger, NOW)
         assert result["allowed"] is True
-        record_use(ledger, envelope["id"], "refreeze contract", {"command": "contract freeze"})
-    with pytest.raises(PreauthError) as caught:
-        may_act(envelope, _facts(), ledger, NOW)
+        m.record_use(ledger, envelope["id"], "refreeze contract", {"command": "contract freeze"})
+    with pytest.raises(m.PreauthError) as caught:
+        m.may_act(envelope, _facts(), ledger, NOW)
     assert caught.value.code == "preauth_exhausted"
 
 
 def test_revocation_is_effective_immediately(tmp_path: Path):
+    m = _load()
     ledger = tmp_path / "preauth.jsonl"
     envelope = _envelope()
-    record_use(ledger, envelope["id"], "refreeze", {})
-    revoke(ledger, envelope["id"], NOW)
-    with pytest.raises(PreauthError) as caught:
-        may_act(envelope, _facts(), ledger, NOW)
+    m.record_use(ledger, envelope["id"], "refreeze", {})
+    m.revoke(ledger, envelope["id"], NOW)
+    with pytest.raises(m.PreauthError) as caught:
+        m.may_act(envelope, _facts(), ledger, NOW)
     assert caught.value.code == "preauth_revoked"
 
 
 def test_daily_digest_counts_uses_and_revocations(tmp_path: Path):
+    m = _load()
     ledger = tmp_path / "preauth.jsonl"
-    record_use(ledger, "p1", "refreeze", {"sha": "a"})
-    record_use(ledger, "p1", "refreeze", {"sha": "b"})
-    record_use(ledger, "p2", "close", {"pr": 41})
-    revoke(ledger, "p2", NOW)
-    digest = daily_digest(ledger, "2026-11-27")
+    m.record_use(ledger, "p1", "refreeze", {"sha": "a"})
+    m.record_use(ledger, "p1", "refreeze", {"sha": "b"})
+    m.record_use(ledger, "p2", "close", {"pr": 41})
+    m.revoke(ledger, "p2", NOW)
+    digest = m.daily_digest(ledger, "2026-11-27")
     assert digest["uses"] == 3
     assert digest["by_envelope"] == {"p1": 2, "p2": 1}
     assert digest["revoked"] == ["p2"]
