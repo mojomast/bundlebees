@@ -81,8 +81,18 @@ class OracleLock:
     main_ref: str
 
     def env(self) -> dict[str, str]:
-        """The pytest variables the lock pins, ready for a sandbox overlay."""
-        return dict(LOCK_ENV)
+        """The pytest variables an outer sandbox overlay carries.
+
+        ``PYTHONSAFEPATH`` is deliberately not exported here: ``-P`` on the
+        pytest command already protects the runner, while exporting the
+        variable would also change every Python child a test spawns (a plain
+        ``python -c 'import launcher'`` legitimately imports from its cwd).
+        Direct executions use :func:`locked_env`, which sets it.
+        """
+        return {
+            name: LOCK_ENV[name]
+            for name in ("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTEST_ADDOPTS")
+        }
 
     def lock_argv(self, argv: Sequence[str], *, rootdir: str | Path) -> list[str]:
         return locked_argv(self, argv, rootdir=rootdir)

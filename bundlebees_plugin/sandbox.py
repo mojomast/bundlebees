@@ -460,6 +460,19 @@ PYTHON_ENV = "BUNDLEBEES_VERIFY_PYTHON"
 _SANDBOX_PYTHON_DIR = ".bundlebees-python"
 #: Where a staged tiktoken cache lives inside the sandbox copy.
 _SANDBOX_TIKTOKEN_DIR = ".bundlebees-tiktoken"
+#: Where operator-owned portable tools are staged inside the sandbox copy.
+_SANDBOX_TOOLS_DIR = ".bundlebees-tools"
+#: Portable tools the packaging tests resolve by name.  They live at pinned
+#: coordinator paths; firejail's private home and /var/tmp, and bwrap's minimal
+#: mounts, hide both, so the staging below is what puts them on the child PATH.
+PINNED_TOOLS: tuple[tuple[str, str], ...] = (
+    ("uv", "~/.local/bin/uv"),
+    ("pwsh", "/var/tmp/pwsh"),
+)
+#: A small uv cache with the build backend wheels the packaging tests need.
+#: The sandbox has no network, so ``UV_OFFLINE=1`` plus this cache is what makes
+#: ``uv build`` deterministic; the operator's 1.6 GB cache is never staged.
+PINNED_UV_CACHE = "~/.cache/bundlebees/uv-build-cache"
 #: Where a served lease payload lives inside the sandbox copy.
 _SANDBOX_PAYLOAD_DIR = ".bundlebees-payload"
 #: Shape of a lease-payload entry name (it becomes an environment variable).
@@ -1044,6 +1057,98 @@ def _fresh_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+_TOOL_REFERENCE_RE = re.compile(r"""["'](uv|pwsh)["']""")
+
+
+def _needed_pinned_tools(copy_dir: Path) -> set[str]:
+    """Tool names a test tree resolves by literal name (``shutil.which("uv")``).
+
+    Staging the 244 MB pwsh runtime into every sandbox copy would tax runs that
+    never touch it; the packaging tests name the tools they resolve, so only
+    those names are staged.
+    """
+    needed: set[str] = set()
+    tests = Path(copy_dir) / "tests"
+    if not tests.is_dir():
+        return needed
+    for path in tests.rglob("*"):
+        if path.suffix not in {".py", ".sh", ".ps1"} or "__pycache__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        needed.update(_TOOL_REFERENCE_RE.findall(text))
+    return needed
+
+
+def stage_pinned_tools(
+    copy_dir: Path,
+    env: Mapping[str, str],
+    tools: Sequence[tuple[str, str]] | None = None,
+    needed: set[str] | None = None,
+    path_prefix: str = ".",
+) -> dict[str, str]:
+    """Stage pinned portable tools into the copy and put them on *env* PATH.
+
+    The pins are operator paths (uv under the coordinator home, pwsh under
+    /var/tmp).  A strong backend hides one or both; a test that resolves the
+    tool by name would then silently skip, which the frozen-id GREEN check
+    treats as a missing test.  Copying the file (or the pwsh runtime directory)
+    into the disposable copy makes the same pinned binary visible under the
+    stable ``.bundlebees-tools`` prefix.  *path_prefix* is where the copy is
+    mounted inside the backend (``/work`` for bwrap, the real home for
+    firejail, the host copy path otherwise); the PATH entries must be absolute
+    because a test may run the tool from a different working directory.
+    """
+    root = Path(copy_dir) / _SANDBOX_TOOLS_DIR
+    entries: list[str] = []
+    staged: set[str] = set()
+    for name, raw in tools if tools is not None else PINNED_TOOLS:
+        if needed is not None and name not in needed:
+            continue
+        source = Path(str(raw)).expanduser()
+        if not source.exists():
+            continue
+        destination = root / str(name)
+        _remove_staged_entry(destination)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.is_dir():
+                shutil.copytree(source, destination, symlinks=True)
+            else:
+                shutil.copy2(source, destination)
+                destination.chmod(destination.stat().st_mode | 0o111)
+        except OSError:
+            _remove_staged_entry(destination)
+            continue
+        entries.append(
+            f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}/{name}"
+            if destination.is_dir()
+            else f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}"
+        )
+        staged.add(str(name))
+    cache_source = Path(PINNED_UV_CACHE).expanduser()
+    if "uv" in staged and cache_source.is_dir():
+        cache_destination = root / "uv-cache"
+        _remove_staged_entry(cache_destination)
+        try:
+            shutil.copytree(cache_source, cache_destination)
+        except OSError:
+            _remove_staged_entry(cache_destination)
+        else:
+            env = dict(env)
+            env["UV_CACHE_DIR"] = (
+                f"{path_prefix.rstrip('/')}/{_SANDBOX_TOOLS_DIR}/uv-cache"
+            )
+            env["UV_OFFLINE"] = "1"
+    if entries:
+        updated = dict(env)
+        updated["PATH"] = ":".join([*entries, updated.get("PATH", "")]).strip(":")
+        return updated
+    return dict(env)
+
+
 def run_in_sandbox(
     workdir: Path,
     argv: list[str],
@@ -1205,6 +1310,18 @@ def run_in_sandbox(
             if cache is not None:
                 env["TIKTOKEN_CACHE_DIR"] = str(cache)
 
+        if chosen == "bwrap":
+            tools_prefix = "/work"
+        elif chosen == "firejail":
+            tools_prefix = env["HOME"]
+        else:
+            tools_prefix = str(copy_dir)
+        env = stage_pinned_tools(
+            copy_dir,
+            env,
+            needed=_needed_pinned_tools(copy_dir),
+            path_prefix=tools_prefix,
+        )
         if payload:
             env.update(stage_payload(copy_dir, payload))
         if env_extra:
