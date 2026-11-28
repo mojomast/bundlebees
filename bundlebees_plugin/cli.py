@@ -344,6 +344,17 @@ def _build_parser(parser: Any) -> Any:
     coverage_cmd.add_argument("--candidates", required=True)
     coverage_cmd.add_argument("--json", action="store_true")
     coverage_cmd.set_defaults(command="coverage")
+    packet_cmd = subparsers.add_parser(
+        "review-packet",
+        help="Stage an offline, trusted-source packet for independent PR review.",
+    )
+    packet_cmd.add_argument("review_target", metavar="repo#pr", help="Pull request as <owner>/<repo>#<number>.")
+    packet_cmd.add_argument("--out-dir", "--out", dest="out_dir", default=None, help="New directory to stage the packet in.")
+    packet_cmd.add_argument("--worktree", default=None, help="Canonical checkout used to seed the isolated PR clone.")
+    packet_cmd.add_argument("--state-dir", default=None, help="Plugin data directory containing verify-results.")
+    packet_cmd.add_argument("--author-model-family", default="unknown", help="Author model family recorded for independence routing.")
+    packet_cmd.add_argument("--claim", action="append", dest="claims", default=[], help="Coordinator claim to verify; repeatable.")
+    packet_cmd.set_defaults(command="review-packet")
     reviewer = subparsers.add_parser("reviewer", help="Enrolled reviewer identities for signed REVIEW evidence.")
     reviewer_sub = reviewer.add_subparsers(dest="reviewer_command", required=True)
     rv_enroll = reviewer_sub.add_parser("enroll", help="Create (or adopt) a reviewer key and record the identity.")
@@ -748,6 +759,33 @@ def _cmd_reviewer(ctx: Any, args: Any) -> int:
     return 2
 
 
+def _cmd_review_packet(ctx: Any, args: Any) -> int:
+    from . import review_packet as packets
+
+    configured = _config(ctx)
+    worktree = getattr(args, "worktree", None) or configured.get("worktree") or None
+    out_dir = getattr(args, "out_dir", None)
+    if not out_dir:
+        out_dir = Path(tempfile.mkdtemp(prefix="bundlebees-review-")) / "packet"
+    try:
+        staged = packets.stage_packet(
+            str(args.review_target),
+            Path(out_dir).expanduser().resolve(),
+            state_dir=_state_dir_or_none(args),
+            worktree=worktree,
+            claims=tuple(getattr(args, "claims", ()) or ()),
+            author_model_family=str(getattr(args, "author_model_family", "unknown") or "unknown"),
+        )
+    except packets.PacketError as exc:
+        raise CliError(
+            exc.code,
+            exc.error,
+            exc.fix or "Correct the review target or source evidence and retry.",
+        ) from exc
+    print(str(staged))
+    return 0
+
+
 def _cmd_coverage(ctx: Any, args: Any) -> int:
     import json as _json
     backlog = _json.loads(Path(args.backlog).read_text(encoding="utf-8"))
@@ -785,6 +823,8 @@ def _dispatch(ctx: Any, args: Any) -> int:
             return _cmd_reviewer(ctx, args)
         if command == "coverage":
             return _cmd_coverage(ctx, args)
+        if command == "review-packet":
+            return _cmd_review_packet(ctx, args)
         if command == "verify":
             if getattr(args, "commit_local", False) and getattr(args, "dry_run", False):
                 raise CliError(
