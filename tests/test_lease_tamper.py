@@ -24,7 +24,10 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 #: sha256 of the shared policy block and the shared fixtures.  Both repositories
 #: that vendor this gate (workflow and hyvv) and the merge lane (rizzstack)
 #: assert the same values, so the copies cannot drift silently.
-SHARED_POLICY_SHA256 = "f749821a6170379743a7e440edcb0d90141de8d04bf22ef9a3b6d28a78b83ec8"
+# The pinned hash of the shared gate/lane policy block lives in one fixture both suites read.
+SHARED_POLICY_SHA256 = (Path(__file__).resolve().parent / "fixtures" / "shared_policy.sha256").read_text(
+    encoding="ascii").strip()
+REVIEWER_LOGIN = "rizzstack-reviewer[bot]"
 REVIEW_LINES_SHA256 = "ac2de684dd22fceed5aa2f18ac6d7d6f8c101c0fd67a619d2a2c6a663642311b"
 CARRY_FIXTURES_SHA256 = "33435d738b84742c8e2b5cfa3e153cf20921fb7a1985f808bbde68603941165e"
 SHARED_BLOCK_BEGIN = "# --- BEGIN SHARED GATE POLICY"
@@ -911,7 +914,7 @@ class SliceClassificationTests(unittest.TestCase):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
         self.api.reviews[12] = [
             {
-                "state": "COMMENTED",
+                "user": {"login": REVIEWER_LOGIN}, "state": "COMMENTED",
                 "commit_id": head,
                 "body": "APPROVE (independent review at %s)\n\nVERDICT: APPROVE" % head,
             }
@@ -925,7 +928,7 @@ class SliceClassificationTests(unittest.TestCase):
 
     def test_non_slice_pr_with_an_approved_review_at_head_passes(self):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
-        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+        self.api.reviews[12] = [{"user": {"login": REVIEWER_LOGIN}, "state": "APPROVED", "commit_id": head, "body": ""}]
 
         proc = self.run_gate(repo, base, head, env=self.api_env())
 
@@ -936,7 +939,7 @@ class SliceClassificationTests(unittest.TestCase):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
         repo.write("src/slice.py", "one more commit\n")
         newer = repo.commit("the head moves after review")
-        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+        self.api.reviews[12] = [{"user": {"login": REVIEWER_LOGIN}, "state": "APPROVED", "commit_id": head, "body": ""}]
 
         proc = self.run_gate(repo, base, newer, env=self.api_env())
 
@@ -946,7 +949,7 @@ class SliceClassificationTests(unittest.TestCase):
     def test_non_slice_changes_requested_is_not_an_approval(self):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
         self.api.reviews[12] = [
-            {"state": "COMMENTED", "commit_id": head, "body": "CHANGES REQUESTED: fix the doc"}
+            {"user": {"login": REVIEWER_LOGIN}, "state": "COMMENTED", "commit_id": head, "body": "CHANGES REQUESTED: fix the doc"}
         ]
 
         proc = self.run_gate(repo, base, head, env=self.api_env())
@@ -976,7 +979,7 @@ class SliceClassificationTests(unittest.TestCase):
 
     def test_review_event_applies_the_non_slice_review_rule(self):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
-        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+        self.api.reviews[12] = [{"user": {"login": REVIEWER_LOGIN}, "state": "APPROVED", "commit_id": head, "body": ""}]
 
         proc = self.run_event(
             repo, event_payload(base, head, branch="feat/wave-x-x1", reviewed_sha=head)
@@ -992,7 +995,7 @@ class SliceClassificationTests(unittest.TestCase):
         repo, base, head, _path = self.build(lease_extra={"id": "wave-other-slice", "branch": "feat/other", "pull_request": 99})
         repo.write("src/slice.py", "one more commit\n")
         newer = repo.commit("the head moves after review")
-        self.api.reviews[12] = [{"state": "APPROVED", "commit_id": head, "body": ""}]
+        self.api.reviews[12] = [{"user": {"login": REVIEWER_LOGIN}, "state": "APPROVED", "commit_id": head, "body": ""}]
 
         proc = self.run_event(
             repo, event_payload(base, newer, branch="feat/wave-x-x1", reviewed_sha=head)
@@ -1050,7 +1053,7 @@ class CarryFixtureTests(unittest.TestCase):
     def review_at(self, sha):
         self.api.reviews[12] = [
             {
-                "state": "COMMENTED",
+                "user": {"login": REVIEWER_LOGIN}, "state": "COMMENTED",
                 "commit_id": sha,
                 "body": "APPROVE (independent review at %s)\n\nVERDICT: approve" % sha,
             }
@@ -1221,6 +1224,7 @@ class RejectionGovernsTests(CarryFixtureTests):
 
     def review(self, sha, state="COMMENTED", body=None, submitted_at="2026-11-26T00:00:00Z"):
         return {
+            "user": {"login": REVIEWER_LOGIN},
             "state": state,
             "commit_id": sha,
             "body": body if body is not None else "APPROVE (independent review) at %s" % sha,
@@ -1470,7 +1474,7 @@ class LeaseHardeningTests(unittest.TestCase):
         head_with_lease = repo.commit("land another approved contract")
         api.reviews[12] = [
             {
-                "state": "COMMENTED",
+                "user": {"login": REVIEWER_LOGIN}, "state": "COMMENTED",
                 "commit_id": head_with_lease,
                 "body": "APPROVE (independent review at %s)" % head_with_lease,
             }
