@@ -460,13 +460,64 @@ def _git_runner(repo: Path) -> Callable[[Sequence[str]], tuple[int, str, str]]:
     return run
 
 
-def _gh_runner(repo: Path) -> Callable[[Sequence[str]], tuple[int, str, str]]:
+#: A GitHub remote in any of the forms git emits: https, ssh://, scp-style.
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<slug>[^/]+/[^/]+?)(?:\.git)?/?$"
+)
+
+
+def _github_slug(
+    repo: Path,
+    *,
+    git: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
+) -> str:
+    """The ``owner/name`` slug of the repo's ``origin`` remote.
+
+    Every ``gh`` call the sweep makes carries ``--repo <slug>`` so the host's
+    ``gh`` wrapper (``~/.local/bin/gh``) mints a coordinator-app installation
+    token scoped to exactly that repository. An unscoped call falls back to the
+    operator's personal token, so an unresolvable origin fails closed instead.
+    """
+
+    run = git if git is not None else _git_runner(Path(repo))
+    code, out, err = run(["config", "--get", "remote.origin.url"])
+    if code != 0:
+        raise SweepError(
+            "repo_unresolved",
+            _clip(scrub(err.strip() or "origin remote is not configured")),
+            "Add an origin remote pointing at github.com/<owner>/<repo>.",
+        )
+    match = _GITHUB_REMOTE_RE.match(out.strip())
+    if not match:
+        raise SweepError(
+            "repo_unresolved",
+            "origin is not a github.com repository",
+            "Point origin at github.com/<owner>/<repo>; the sweep never uses the operator token.",
+        )
+    return match.group("slug")
+
+
+def _gh_runner(
+    repo: Path,
+    *,
+    git: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
+) -> Callable[[Sequence[str]], tuple[int, str, str]]:
+    slug = _github_slug(Path(repo), git=git)
+
     def run(argv: Sequence[str]) -> tuple[int, str, str]:
         if shutil.which("gh") is None:
             raise SweepError("pr_tool_missing", "the gh CLI is not installed", "Install gh and authenticate it for the repository.")
+        args = list(argv)
+        scoped = any(
+            arg in ("--repo", "-R") or arg.startswith("--repo=") or (arg.startswith("-R") and len(arg) > 2)
+            for arg in args
+        )
+        if not scoped:
+            args += ["--repo", slug]
         try:
             proc = subprocess.run(
-                ["gh", *argv],
+                ["gh", *args],
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
