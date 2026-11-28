@@ -99,6 +99,13 @@ config_schema:
     default: ""
     description: >-
       Optional label sent to Orbit; ownership is the per-attempt capability.
+  github_apps:
+    type: dict
+    default: {}
+    description: >-
+      GitHub App identities. coordinator requires app_id, installation_id and
+      key_path; reviewer requires key_path and poster_user. Private key files
+      must be mode 0600 and key material is never returned with tokens.
   worktree:
     type: str
     default: ""

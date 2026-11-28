@@ -28,6 +28,7 @@ DEFAULTS: dict[str, Any] = {
     "allow_private": False,
     "orbit_url": "http://127.0.0.1:4318",
     "coordinator": "",
+    "github_apps": {},
     "worktree": "",
     "branch": "",
     "deploy_host_alias": "",
